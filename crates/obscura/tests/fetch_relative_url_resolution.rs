@@ -27,7 +27,9 @@ fn spawn_server() -> String {
                     .nth(1)
                     .map(str::to_string)
                     .unwrap_or_default();
-                let (content_type, body) = if target.starts_with("/api") || target.starts_with("/deep/api") {
+                let (content_type, body) = if target.starts_with("/api")
+                    || target.starts_with("/deep/api")
+                {
                     ("application/json", format!("{{\"path\":\"{}\"}}", target))
                 } else {
                     (

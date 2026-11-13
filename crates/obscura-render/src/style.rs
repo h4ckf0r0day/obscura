@@ -554,7 +554,7 @@ pub fn inline_style_change_preserves_box_metrics(old: Option<&str>, new: Option<
 }
 
 fn parse_containment(value: &str) -> Option<u8> {
-    use crate::{CONTAIN_SIZE, CONTAIN_INLINE_SIZE, CONTAIN_LAYOUT, CONTAIN_STYLE, CONTAIN_PAINT};
+    use crate::{CONTAIN_INLINE_SIZE, CONTAIN_LAYOUT, CONTAIN_PAINT, CONTAIN_SIZE, CONTAIN_STYLE};
     let value = value.trim().to_ascii_lowercase();
     match value.as_str() {
         "none" | "initial" | "unset" | "revert" | "revert-layer" => return Some(0),
@@ -573,11 +573,14 @@ fn parse_containment(value: &str) -> Option<u8> {
             "paint" => CONTAIN_PAINT,
             _ => return None,
         };
-        if flags & flag != 0 { return None; }
+        if flags & flag != 0 {
+            return None;
+        }
         flags |= flag;
     }
-    (flags != 0 && flags & (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)
-        != (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)).then_some(flags)
+    (flags != 0
+        && flags & (CONTAIN_SIZE | CONTAIN_INLINE_SIZE) != (CONTAIN_SIZE | CONTAIN_INLINE_SIZE))
+        .then_some(flags)
 }
 
 fn parse_container_type(value: &str) -> Option<crate::ContainerType> {
@@ -1954,8 +1957,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "contain" => {
             if let Some(flags) = parse_containment(value) {
                 style.containment = flags;
-                set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN,
-                    flags & (crate::CONTAIN_LAYOUT | crate::CONTAIN_PAINT) != 0);
+                set_containing_block_trigger(
+                    style,
+                    crate::CB_TRIGGER_CONTAIN,
+                    flags & (crate::CONTAIN_LAYOUT | crate::CONTAIN_PAINT) != 0,
+                );
             }
         }
         "will-change" => {
@@ -2748,9 +2754,7 @@ fn split_variable_arguments(arguments: &str) -> Option<(&str, Option<&str>)> {
         }
         index += 1;
     }
-    stack
-        .is_empty()
-        .then_some((arguments, None))
+    stack.is_empty().then_some((arguments, None))
 }
 
 fn has_top_level_variable_forbidden_token(value: &str) -> Option<bool> {
@@ -2811,7 +2815,11 @@ fn valid_custom_property_name(name: &str) -> bool {
             escaped = false;
         } else if character == '\\' {
             escaped = true;
-        } else if !(character.is_alphanumeric() || character == '-' || character == '_' || !character.is_ascii()) {
+        } else if !(character.is_alphanumeric()
+            || character == '-'
+            || character == '_'
+            || !character.is_ascii())
+        {
             return false;
         }
     }
@@ -4180,9 +4188,9 @@ pub(crate) fn resolve_grid_calc(value: *const (), basis: f32) -> f32 {
         f32::from_bits(calc.vh.load(Ordering::Relaxed)),
         basis,
     )
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0)
-        .max(0.0)
+    .filter(|value| value.is_finite())
+    .unwrap_or(0.0)
+    .max(0.0)
 }
 
 /// Parse a track list into taffy sizing functions plus the `[line-name]` map
@@ -4469,9 +4477,7 @@ fn apply_grid_auto_tracks(style: &mut LayoutStyle, value: &str, columns: bool) {
         // retained lower-origin/layer declaration for revert, so it follows
         // the existing non-inherited-property policy and uses the initial
         // automatic implicit track.
-        "initial" | "unset" | "revert" | "revert-layer" => {
-            (Vec::new(), false, Vec::new())
-        }
+        "initial" | "unset" | "revert" | "revert-layer" => (Vec::new(), false, Vec::new()),
         _ => {
             let Some((tracks, calc_expressions)) = parse_grid_auto_track_list(value) else {
                 return;
@@ -6044,7 +6050,9 @@ fn logical_border_single<T: Copy>(
     matches!(tokens.as_slice(), [one] if parse(one).is_some()).then(|| parse(tokens[0]).unwrap())
 }
 
-fn logical_border_sides(name: &str) -> Option<(crate::BorderCascadeSide, crate::BorderCascadeSide)> {
+fn logical_border_sides(
+    name: &str,
+) -> Option<(crate::BorderCascadeSide, crate::BorderCascadeSide)> {
     match name {
         "border-inline-width" | "border-inline-style" | "border-inline-color" => Some((
             crate::BorderCascadeSide::InlineStart,
@@ -6076,8 +6084,9 @@ fn apply_logical_border(style: &mut LayoutStyle, name: &str, value: &str) {
     let shorthand_side = match name {
         "border-inline" => Some(crate::BorderCascadeSide::Inline),
         "border-block" => Some(crate::BorderCascadeSide::Block),
-        "border-inline-start" | "border-inline-end" | "border-block-start"
-        | "border-block-end" => logical_border_single_side(name),
+        "border-inline-start" | "border-inline-end" | "border-block-start" | "border-block-end" => {
+            logical_border_single_side(name)
+        }
         _ => None,
     };
     if let Some(side) = shorthand_side {
@@ -6481,8 +6490,7 @@ pub(crate) fn functional_percentage_factor(value: &str) -> Option<f32> {
     }
     let at_zero = resolve_contextual_length(value, 16.0, 16.0, 1.0, 1.0, 0.0)?;
     let at_hundred = resolve_contextual_length(value, 16.0, 16.0, 1.0, 1.0, 100.0)?;
-    let at_two_hundred =
-        resolve_contextual_length(value, 16.0, 16.0, 1.0, 1.0, 200.0)?;
+    let at_two_hundred = resolve_contextual_length(value, 16.0, 16.0, 1.0, 1.0, 200.0)?;
     let tolerance = 0.0001;
     if at_zero.abs() > tolerance
         || (at_two_hundred - at_hundred * 2.0).abs() > tolerance
@@ -7128,7 +7136,10 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
 fn apply_word_spacing(style: &mut LayoutStyle, value: &str) {
     let value = value.trim();
     let lower = value.to_ascii_lowercase();
-    if matches!(lower.as_str(), "inherit" | "unset" | "revert" | "revert-layer") {
+    if matches!(
+        lower.as_str(),
+        "inherit" | "unset" | "revert" | "revert-layer"
+    ) {
         style.word_spacing = None;
         style.word_spacing_raw = None;
         return;
@@ -7162,7 +7173,9 @@ fn parse_word_spacing_length(value: &str) -> Option<crate::Dimension> {
         }
         _ => return None,
     };
-    if !parser.is_exhausted() { return None; }
+    if !parser.is_exhausted() {
+        return None;
+    }
     match length.resolve(16.0, 16.0, 1.0, 1.0) {
         crate::Dimension::Px(pixels) if pixels.is_finite() => Some(length),
         _ => None,
@@ -8434,9 +8447,7 @@ fn parse_flex_shorthand(style: &mut LayoutStyle, value: &str) {
 /// may appear in either order and each may appear at most once. Shorthand
 /// omission resets the other constituent to its initial value rather than
 /// retaining an earlier longhand winner.
-fn parse_flex_flow_shorthand(
-    value: &str,
-) -> Option<(taffy::FlexDirection, taffy::FlexWrap)> {
+fn parse_flex_flow_shorthand(value: &str) -> Option<(taffy::FlexDirection, taffy::FlexWrap)> {
     let lower = value.trim().to_ascii_lowercase();
     if matches!(
         lower.as_str(),
@@ -8853,7 +8864,10 @@ mod tests {
             ),
         );
         assert_eq!(later_logical.border.right, 12.0);
-        assert_eq!(later_logical.border_model.colors.right, Some([0x86, 0x2e, 0x9c, 255]));
+        assert_eq!(
+            later_logical.border_model.colors.right,
+            Some([0x86, 0x2e, 0x9c, 255])
+        );
 
         let later_physical = compute_style(
             "div",
@@ -8863,7 +8877,10 @@ mod tests {
             ),
         );
         assert_eq!(later_physical.border.right, 4.0);
-        assert_eq!(later_physical.border_model.colors.right, Some([0x0b, 0x72, 0x85, 255]));
+        assert_eq!(
+            later_physical.border_model.colors.right,
+            Some([0x0b, 0x72, 0x85, 255])
+        );
 
         let late_direction = compute_style(
             "div",
@@ -8889,7 +8906,10 @@ mod tests {
         assert_eq!(style.border_model.styles.left, crate::BorderStyle::Solid);
         assert_eq!(style.border_model.styles.top, crate::BorderStyle::Dashed);
         assert_eq!(style.border_model.colors.top, Some([0xe0, 0x31, 0x31, 255]));
-        assert_eq!(style.border_model.colors.bottom, Some([0x2f, 0x9e, 0x44, 255]));
+        assert_eq!(
+            style.border_model.colors.bottom,
+            Some([0x2f, 0x9e, 0x44, 255])
+        );
 
         for (property, value) in [
             ("border-inline", "1px solid red"),
@@ -8899,8 +8919,14 @@ mod tests {
         ] {
             assert!(supports_declaration(property, value), "{property}:{value}");
         }
-        assert!(!supports_declaration("border-inline-start-width", "1px 2px"));
-        assert!(!supports_declaration("border-block-color", "red blue green"));
+        assert!(!supports_declaration(
+            "border-inline-start-width",
+            "1px 2px"
+        ));
+        assert!(!supports_declaration(
+            "border-block-color",
+            "red blue green"
+        ));
         assert!(!supports_declaration("border-inline-style", "solid banana"));
     }
 
@@ -11108,20 +11134,14 @@ mod tests {
             assert!(!supports_declaration("flex-flow", value), "{value}");
         }
 
-        let direction_only = compute_style(
-            "div",
-            Some("flex-wrap:wrap;flex-flow:column"),
-        );
+        let direction_only = compute_style("div", Some("flex-wrap:wrap;flex-flow:column"));
         assert_eq!(
             direction_only.flex_direction,
             Some(taffy::FlexDirection::Column)
         );
         assert_eq!(direction_only.flex_wrap, Some(taffy::FlexWrap::NoWrap));
 
-        let wrap_only = compute_style(
-            "div",
-            Some("flex-direction:column;flex-flow:wrap"),
-        );
+        let wrap_only = compute_style("div", Some("flex-direction:column;flex-flow:wrap"));
         assert_eq!(wrap_only.flex_direction, Some(taffy::FlexDirection::Row));
         assert_eq!(wrap_only.flex_wrap, Some(taffy::FlexWrap::Wrap));
 
@@ -11132,10 +11152,8 @@ mod tests {
         );
         assert_eq!(reversed.flex_wrap, Some(taffy::FlexWrap::Wrap));
 
-        let invalid_later = compute_style(
-            "div",
-            Some("flex-flow:column wrap;flex-flow:row column"),
-        );
+        let invalid_later =
+            compute_style("div", Some("flex-flow:column wrap;flex-flow:row column"));
         assert_eq!(
             invalid_later.flex_direction,
             Some(taffy::FlexDirection::Column)

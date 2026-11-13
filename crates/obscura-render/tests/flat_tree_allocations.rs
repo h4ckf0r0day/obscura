@@ -20,9 +20,15 @@ fn fixed_coordinate_walk_does_not_copy_dom_payloads() {
     let child = tree.get_element_by_id("child").unwrap();
     let laid = layout_dom(&tree, (400.0, 300.0));
     let (actual, bytes) = allocations::measure(|| laid.viewport_fixed_nodes(&tree));
-    assert_eq!(actual, HashSet::from([fixed, child]),
-        "fixed descendants share viewport coordinates; closed details content does not render");
-    assert!(bytes < 16 * 1024, "fixed-coordinate traversal allocated {bytes} bytes");
+    assert_eq!(
+        actual,
+        HashSet::from([fixed, child]),
+        "fixed descendants share viewport coordinates; closed details content does not render"
+    );
+    assert!(
+        bytes < 16 * 1024,
+        "fixed-coordinate traversal allocated {bytes} bytes"
+    );
 }
 
 #[test]
@@ -47,6 +53,8 @@ fn layout_reads_do_not_copy_element_payloads() {
         assert_eq!(laid.rects[&nodes[31]].y, 310.0);
         assert_eq!(laid.rects[&nodes[31]].height, 10.0);
     }
-    assert!(large_bytes < small_bytes + 128 * 1024,
-        "read-only layout copied payloads: small={small_bytes}, large={large_bytes}");
+    assert!(
+        large_bytes < small_bytes + 128 * 1024,
+        "read-only layout copied payloads: small={small_bytes}, large={large_bytes}"
+    );
 }

@@ -62,7 +62,10 @@ fn serve(mut stream: TcpStream, paths: &Arc<Mutex<Vec<String>>>) {
     let (content_type, body) = if path == "/robots.txt" {
         ("text/plain", "User-agent: *\nDisallow: /private\n")
     } else {
-        ("text/html", "<!doctype html><title>target reached</title><p>private target</p>")
+        (
+            "text/html",
+            "<!doctype html><title>target reached</title><p>private target</p>",
+        )
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -119,7 +122,10 @@ fn obey_robots_reaches_scrape_worker_and_blocks_target_request() {
         &url,
     ]);
 
-    assert!(output.status.success(), "scrape reports per-URL errors as JSON");
+    assert!(
+        output.status.success(),
+        "scrape reports per-URL errors as JSON"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Blocked by robots.txt"), "stdout: {stdout}");
     assert_eq!(server.paths(), vec!["/robots.txt"]);

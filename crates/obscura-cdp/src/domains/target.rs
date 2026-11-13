@@ -96,9 +96,10 @@ pub async fn handle(
                     page.push_history(page.url_string());
                     None
                 } else {
-                    page.navigate(url).await.ok().map(|_| {
-                        (page.frame_id.clone(), page.url_string())
-                    })
+                    page.navigate(url)
+                        .await
+                        .ok()
+                        .map(|_| (page.frame_id.clone(), page.url_string()))
                 }
             } else {
                 None
@@ -232,7 +233,11 @@ pub async fn handle(
                     ctx.refresh_runtime_event_collection(&page_id);
                     let params = json!({"sessionId": session_id, "targetId": page_id});
                     let event = match parent_session_id {
-                        Some(parent) => CdpEvent::with_session("Target.detachedFromTarget", params, parent.clone()),
+                        Some(parent) => CdpEvent::with_session(
+                            "Target.detachedFromTarget",
+                            params,
+                            parent.clone(),
+                        ),
                         None => CdpEvent::new("Target.detachedFromTarget", params),
                     };
                     ctx.pending_events.push(event);
@@ -321,7 +326,8 @@ pub async fn handle(
 
 /// Detach the target's sessions, announce destruction, and release its state.
 pub(crate) fn close_target(ctx: &mut CdpContext, target_id: &str) {
-    let mut sessions = ctx.sessions
+    let mut sessions = ctx
+        .sessions
         .iter()
         .filter(|(_, page_id)| page_id.as_str() == target_id)
         .map(|(session_id, _)| session_id.clone())
@@ -426,17 +432,42 @@ mod tests {
         let mut ctx = CdpContext::new();
         for detach_second in [false, true] {
             let first = handle("attachToBrowserTarget", &json!({}), &mut ctx, &None)
-                .await.unwrap();
+                .await
+                .unwrap();
             let second = handle("attachToBrowserTarget", &json!({}), &mut ctx, &None)
-                .await.unwrap();
+                .await
+                .unwrap();
             assert_ne!(first["sessionId"], second["sessionId"]);
-            let (removed, retained) = if detach_second { (&second, &first) } else { (&first, &second) };
-            handle("detachFromTarget", &json!({"sessionId": removed["sessionId"]}), &mut ctx, &None)
-                .await.unwrap();
-            assert!(!ctx.sessions.contains_key(removed["sessionId"].as_str().unwrap()));
-            assert_eq!(ctx.sessions.get(retained["sessionId"].as_str().unwrap()).map(String::as_str), Some("browser"));
-            handle("detachFromTarget", &json!({"sessionId": retained["sessionId"]}), &mut ctx, &None)
-                .await.unwrap();
+            let (removed, retained) = if detach_second {
+                (&second, &first)
+            } else {
+                (&first, &second)
+            };
+            handle(
+                "detachFromTarget",
+                &json!({"sessionId": removed["sessionId"]}),
+                &mut ctx,
+                &None,
+            )
+            .await
+            .unwrap();
+            assert!(!ctx
+                .sessions
+                .contains_key(removed["sessionId"].as_str().unwrap()));
+            assert_eq!(
+                ctx.sessions
+                    .get(retained["sessionId"].as_str().unwrap())
+                    .map(String::as_str),
+                Some("browser")
+            );
+            handle(
+                "detachFromTarget",
+                &json!({"sessionId": retained["sessionId"]}),
+                &mut ctx,
+                &None,
+            )
+            .await
+            .unwrap();
             assert!(ctx.sessions.is_empty());
         }
     }
@@ -506,7 +537,10 @@ mod tests {
         .await
         .expect("detach should succeed");
         assert!(!ctx.sessions.contains_key(&session_id));
-        assert!(ctx.get_page(&page_id).is_some(), "detach must not destroy the target");
+        assert!(
+            ctx.get_page(&page_id).is_some(),
+            "detach must not destroy the target"
+        );
         assert_eq!(ctx.pending_events.len(), 1);
         let event = &ctx.pending_events[0];
         assert_eq!(event.method, "Target.detachedFromTarget");
@@ -525,13 +559,23 @@ mod tests {
             &json!({"targetId": page_id, "flatten": true}),
             &mut ctx,
             &parent_session,
-        ).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let second = handle(
             "attachToTarget",
             &json!({"targetId": page_id, "flatten": true}),
             &mut ctx,
             &parent_session,
-        ).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         ctx.pending_events.clear();
 
         handle(
@@ -539,9 +583,13 @@ mod tests {
             &json!({"targetId": page_id}),
             &mut ctx,
             &None,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
-        let detached = ctx.pending_events.iter()
+        let detached = ctx
+            .pending_events
+            .iter()
             .filter(|event| event.method == "Target.detachedFromTarget")
             .map(|event| event.params["sessionId"].as_str().unwrap())
             .collect::<Vec<_>>();

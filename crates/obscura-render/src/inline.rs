@@ -204,10 +204,7 @@ pub(crate) struct WebFont {
     pub italic: Option<bool>,
 }
 
-type FontDatabase = (
-    cosmic_text::fontdb::Database,
-    HashMap<String, LoadedFamily>,
-);
+type FontDatabase = (cosmic_text::fontdb::Database, HashMap<String, LoadedFamily>);
 type FontDeclaration = (
     cosmic_text::fontdb::ID,
     Option<String>,
@@ -309,8 +306,8 @@ fn register_loaded_faces(
         let shape_weight = face.weight.0;
         let metrics = font_metrics(database, id)
             .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
-        let italic = declared_italic
-            .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
+        let italic =
+            declared_italic.unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
         let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
         let declared_names: Vec<String> = declared_family
             .map(|name| vec![name])
@@ -343,19 +340,16 @@ fn base_font_database(load_emoji: bool) -> &'static FontDatabase {
             SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
             MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
         ] {
-            for id in database
-                .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)))
+            for id in
+                database.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)))
             {
                 declarations.push((id, None, None, None));
             }
         }
         declarations.extend(
-            load_font_directories(
-                &mut database,
-                FONT_DIRECTORIES.get_or_init(Vec::new),
-            )
-            .into_iter()
-            .map(|id| (id, None, None, None)),
+            load_font_directories(&mut database, FONT_DIRECTORIES.get_or_init(Vec::new))
+                .into_iter()
+                .map(|id| (id, None, None, None)),
         );
         let loaded_families = register_loaded_faces(&database, declarations);
         database.set_sans_serif_family(FAMILY);
@@ -407,10 +401,7 @@ fn web_font_signature(fonts: &[WebFont], load_emoji: bool) -> u64 {
     hasher.finish()
 }
 
-fn cached_web_font_database(
-    fonts: &[WebFont],
-    load_emoji: bool,
-) -> Option<Arc<CachedWebFontSet>> {
+fn cached_web_font_database(fonts: &[WebFont], load_emoji: bool) -> Option<Arc<CachedWebFontSet>> {
     let signature = web_font_signature(fonts, load_emoji);
     let candidates: Vec<_> = WEB_FONT_DATABASES
         .get_or_init(Default::default)
@@ -707,7 +698,13 @@ fn decoration_stroke(
         META_LINE_THROUGH => -size * 0.3,
         _ => (size * 0.12).max(1.0),
     };
-    (start, end, baseline + relative.1 + offset, (size / 14.0).max(1.0), color)
+    (
+        start,
+        end,
+        baseline + relative.1 + offset,
+        (size / 14.0).max(1.0),
+        color,
+    )
 }
 
 fn metadata_fill(metadata: usize) -> Option<usize> {
@@ -1104,7 +1101,10 @@ struct ReplacedItem {
 
 impl ReplacedItem {
     fn from_style(width: f32, height: f32, style: &LayoutStyle) -> Self {
-        Self::from_intrinsic(crate::ReplacedIntrinsic::from_dimensions(width, height), style)
+        Self::from_intrinsic(
+            crate::ReplacedIntrinsic::from_dimensions(width, height),
+            style,
+        )
     }
 
     fn from_intrinsic(intrinsic: crate::ReplacedIntrinsic, style: &LayoutStyle) -> Self {
@@ -1310,9 +1310,9 @@ impl TextEngine {
             let (mut db, mut loaded_families) = (*base_font_database(load_emoji)).clone();
             let mut declarations = Vec::new();
             for font in fonts {
-                for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(
-                    font.data.clone(),
-                )) {
+                for id in
+                    db.load_font_source(cosmic_text::fontdb::Source::Binary(font.data.clone()))
+                {
                     declarations.push((id, font.family.clone(), font.weight, font.italic));
                 }
             }
@@ -1915,7 +1915,10 @@ impl TextEngine {
     }
 
     pub(crate) fn register_native_control(
-        &mut self, width: f32, height: f32, style: &LayoutStyle,
+        &mut self,
+        width: f32,
+        height: f32,
+        style: &LayoutStyle,
     ) -> usize {
         let mut item = ReplacedItem::from_style(width, height, style);
         item.independent_axes = true;
@@ -1950,11 +1953,9 @@ impl TextEngine {
                 && replaced.preferred_width.is_none()
                 && replaced.preferred_height.is_none()
                 && known.width.is_none())
-            .then(|| {
-                match available.width {
-                    taffy::AvailableSpace::Definite(width) => Some(width.max(0.0)),
-                    _ => replaced.ratio_only_available_width,
-                }
+            .then(|| match available.width {
+                taffy::AvailableSpace::Definite(width) => Some(width.max(0.0)),
+                _ => replaced.ratio_only_available_width,
             })
             .flatten();
             let mut size = replaced.size(taffy::Size {
@@ -2205,32 +2206,55 @@ impl TextEngine {
         let base = styles.get(&parent)?;
         let mut collector = Collector::new();
         collector.caret_boundaries = Some(Vec::new());
-        let font = resolve_loaded_font(base.font_family.as_deref(),
-            crate::style::used_font_weight(base), base.font_style_italic.unwrap_or(false),
-            &self.loaded_families);
+        let font = resolve_loaded_font(
+            base.font_family.as_deref(),
+            crate::style::used_font_weight(base),
+            base.font_style_italic.unwrap_or(false),
+            &self.loaded_families,
+        );
         let ctx = base_span_ctx(base, font, &mut collector);
         let mut spans = Vec::new();
         if let Some((first, last)) = item.caret_run {
             let mut children = crate::dom::rendered_children(tree, parent);
             if !children.contains(&first) || !children.contains(&last) {
                 let mut flattened = Vec::new();
-                crate::dom::flatten_boxless_inline_children(tree, &children, styles, &mut flattened);
+                crate::dom::flatten_boxless_inline_children(
+                    tree,
+                    &children,
+                    styles,
+                    &mut flattened,
+                );
                 children = flattened;
             }
             let start = children.iter().position(|id| *id == first)?;
             let end = children.iter().position(|id| *id == last)?;
             for &id in children.get(start..=end)? {
-                collect_node_spans(tree, id, styles, ctx.clone(), &mut spans,
-                    &mut collector, &self.loaded_families);
+                collect_node_spans(
+                    tree,
+                    id,
+                    styles,
+                    ctx.clone(),
+                    &mut spans,
+                    &mut collector,
+                    &self.loaded_families,
+                );
             }
         } else {
-            collect_spans(tree, parent, styles, ctx, &mut spans,
-                &mut collector, &self.loaded_families);
+            collect_spans(
+                tree,
+                parent,
+                styles,
+                ctx,
+                &mut spans,
+                &mut collector,
+                &self.loaded_families,
+            );
         }
         let mut source: String = spans.into_iter().map(|(text, _)| text).collect();
-        if matches!(base.white_space.unwrap_or_default(),
-            crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine)
-            && source.ends_with(' ')
+        if matches!(
+            base.white_space.unwrap_or_default(),
+            crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine
+        ) && source.ends_with(' ')
         {
             source.pop();
         }
@@ -2253,22 +2277,44 @@ impl TextEngine {
     ) -> Option<(NodeId, usize, f32)> {
         let item = self.items.get(index)?;
         let (source, boundaries) = self.caret_source(index, parent, tree, styles)?;
-        if hit != parent && !boundaries.iter().any(|boundary|
-            boundary.node == hit || tree.ancestors(boundary.node).contains(&hit))
-        { return None; }
+        if hit != parent
+            && !boundaries.iter().any(|boundary| {
+                boundary.node == hit || tree.ancestors(boundary.node).contains(&hit)
+            })
+        {
+            return None;
+        }
         let starts = source_line_starts(&item.buffer, &source);
         let mut best: Option<(f32, usize, cosmic_text::Affinity)> = None;
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
-            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) {
+                break;
+            }
             let start = *starts.get(run.line_i)?;
             let end = start + run.text.len();
-            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            let indent = if line_index == 0 {
+                item.first_line_offset
+            } else {
+                0.0
+            };
             for glyph in run.glyphs {
-                if glyph.w <= 0.0 || item.marker.is_some_and(|marker|
-                    marker.line_index == line_index && glyph.x + indent + glyph.w > marker.content_end)
-                { continue; }
-                let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
-                let dx = item.origin.0 + indent + relative.0
+                if glyph.w <= 0.0
+                    || item.marker.is_some_and(|marker| {
+                        marker.line_index == line_index
+                            && glyph.x + indent + glyph.w > marker.content_end
+                    })
+                {
+                    continue;
+                }
+                let relative = glyph_relative_offset(
+                    &item.relative_owner_ranges,
+                    start,
+                    glyph.start,
+                    glyph.end,
+                );
+                let dx = item.origin.0
+                    + indent
+                    + relative.0
                     + line_edge_alignment_shift(item, start, end)
                     + line_advance_before_text(item, start + glyph.start, start, end);
                 let dy = item.origin.1 + relative.1;
@@ -2276,16 +2322,23 @@ impl TextEngine {
                 let top = dy + run.line_top;
                 let distance = (x - x.clamp(left, left + glyph.w)).powi(2)
                     + (y - y.clamp(top, top + run.line_height)).powi(2);
-                if best.as_ref().is_some_and(|(old, _, _)| *old <= distance) { continue; }
+                if best.as_ref().is_some_and(|(old, _, _)| *old <= distance) {
+                    continue;
+                }
                 // Buffer::hit already implements grapheme/ligature and bidi
                 // boundaries. Remove the extra offsets applied by paint.
                 let hit_x = (x - dx).clamp(glyph.x, glyph.x + glyph.w);
-                let cursor = item.buffer.hit(hit_x, run.line_top + run.line_height * 0.5)?;
+                let cursor = item
+                    .buffer
+                    .hit(hit_x, run.line_top + run.line_height * 0.5)?;
                 best = Some((distance, start + cursor.index, cursor.affinity));
             }
         }
         let (distance, byte, affinity) = best?;
-        let nearest = boundaries.iter().map(|boundary| boundary.byte.abs_diff(byte)).min()?;
+        let nearest = boundaries
+            .iter()
+            .map(|boundary| boundary.byte.abs_diff(byte))
+            .min()?;
         let matches = |boundary: &&CaretBoundary| boundary.byte.abs_diff(byte) == nearest;
         let boundary = if affinity == cosmic_text::Affinity::Before {
             boundaries.iter().find(matches)
@@ -2306,25 +2359,49 @@ impl TextEngine {
     ) -> Option<Rect> {
         let item = self.items.get(index)?;
         let (source, boundaries) = self.caret_source(index, parent, tree, styles)?;
-        let boundary = boundaries.iter().filter(|boundary| boundary.node == node)
+        let boundary = boundaries
+            .iter()
+            .filter(|boundary| boundary.node == node)
             .min_by_key(|boundary| boundary.offset.abs_diff(offset))?;
         let starts = source_line_starts(&item.buffer, &source);
-        let style = tree.with_node(node, |node| node.parent)
-            .flatten().and_then(|id| styles.get(&id)).or_else(|| styles.get(&parent))?;
+        let style = tree
+            .with_node(node, |node| node.parent)
+            .flatten()
+            .and_then(|id| styles.get(&id))
+            .or_else(|| styles.get(&parent))?;
         let (ascent, descent) = self.inline_font_box_metrics(style);
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
-            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) {
+                break;
+            }
             let start = *starts.get(run.line_i)?;
             let byte = boundary.byte.checked_sub(start)?;
-            let Some(glyph) = run.glyphs.iter().find(|glyph| glyph.start <= byte && byte <= glyph.end) else {
+            let Some(glyph) = run
+                .glyphs
+                .iter()
+                .find(|glyph| glyph.start <= byte && byte <= glyph.end)
+            else {
                 continue;
             };
-            let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
-            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            let relative =
+                glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+            let indent = if line_index == 0 {
+                item.first_line_offset
+            } else {
+                0.0
+            };
             return Some(Rect {
-                x: item.origin.0 + run_cursor_x(&run, byte) + indent + relative.0
+                x: item.origin.0
+                    + run_cursor_x(&run, byte)
+                    + indent
+                    + relative.0
                     + line_edge_alignment_shift(item, start, start + run.text.len())
-                    + line_advance_before_text(item, start + glyph.start, start, start + run.text.len()),
+                    + line_advance_before_text(
+                        item,
+                        start + glyph.start,
+                        start,
+                        start + run.text.len(),
+                    ),
                 y: item.origin.1 + run.line_y + relative.1 - ascent,
                 width: 0.0,
                 height: ascent + descent,
@@ -2702,7 +2779,15 @@ fn collect_node_spans(
                 overflow_wrap: ctx.overflow_wrap,
                 word_break: ctx.word_break,
             };
-            push_text(contents, ctx.transform, ctx.white_space, &attrs, out, c, Some(cid));
+            push_text(
+                contents,
+                ctx.transform,
+                ctx.white_space,
+                &attrs,
+                out,
+                c,
+                Some(cid),
+            );
         }
         _ => {
             let Some(elem) = node.as_element() else {
@@ -2812,7 +2897,8 @@ fn collect_node_spans(
                 // descendant text; an element only sets its own via CSS.
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
                 overline: ctx.overline || style.and_then(|style| style.overline).unwrap_or(false),
-                line_through: ctx.line_through || style.and_then(|style| style.line_through).unwrap_or(false),
+                line_through: ctx.line_through
+                    || style.and_then(|style| style.line_through).unwrap_or(false),
                 transform: style
                     .and_then(|s| s.text_transform)
                     .unwrap_or(ctx.transform),
@@ -2843,15 +2929,34 @@ fn push_text(
 ) {
     let start = c.text_len;
     let buf = if let (Some(boundaries), Some(node)) = (&mut c.caret_boundaries, node) {
-        normalize_text(raw, transform, white_space, &mut c.last_was_space, |byte, offset| {
-            // Pre-line normalization can remove the space before a newline.
-            while boundaries.last().is_some_and(|boundary| boundary.byte > start + byte) {
-                boundaries.pop();
-            }
-            boundaries.push(CaretBoundary { byte: start + byte, node, offset });
-        })
+        normalize_text(
+            raw,
+            transform,
+            white_space,
+            &mut c.last_was_space,
+            |byte, offset| {
+                // Pre-line normalization can remove the space before a newline.
+                while boundaries
+                    .last()
+                    .is_some_and(|boundary| boundary.byte > start + byte)
+                {
+                    boundaries.pop();
+                }
+                boundaries.push(CaretBoundary {
+                    byte: start + byte,
+                    node,
+                    offset,
+                });
+            },
+        )
     } else {
-        normalize_text(raw, transform, white_space, &mut c.last_was_space, |_, _| {})
+        normalize_text(
+            raw,
+            transform,
+            white_space,
+            &mut c.last_was_space,
+            |_, _| {},
+        )
     };
     if buf.is_empty() {
         return;
@@ -3699,13 +3804,7 @@ impl TextEngine {
             return;
         };
         let clip = clip_override.or(item.clip);
-        if !inline_item_may_intersect_surface(
-            item,
-            offset,
-            clip,
-            pixmap.height(),
-            raster_scale,
-        ) {
+        if !inline_item_may_intersect_surface(item, offset, clip, pixmap.height(), raster_scale) {
             return;
         }
         let (ox, oy) = (
@@ -3802,7 +3901,10 @@ impl TextEngine {
                     continue;
                 }
                 active_decorations = decoration_flags;
-                for (index, flag) in [META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH].into_iter().enumerate() {
+                for (index, flag) in [META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH]
+                    .into_iter()
+                    .enumerate()
+                {
                     let segment = &mut segments[index];
                     if decoration_flags & flag != 0 {
                         match segment {
@@ -3830,7 +3932,11 @@ impl TextEngine {
                     }
                 }
             }
-            for (segment, flag) in segments.into_iter().zip([META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH]) {
+            for (segment, flag) in
+                segments
+                    .into_iter()
+                    .zip([META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH])
+            {
                 if let Some(previous) = segment {
                     underlines.push(decoration_stroke(previous, base_y, flag));
                 }
@@ -4196,10 +4302,7 @@ mod tests {
         ] {
             let actual = engine.measure_text_with_wrap(item, width, wrap);
             let cached_entries = engine.items[item].measured.len();
-            assert_eq!(
-                engine.measure_text_with_wrap(item, width, wrap),
-                actual
-            );
+            assert_eq!(engine.measure_text_with_wrap(item, width, wrap), actual);
             assert_eq!(engine.items[item].measured.len(), cached_entries);
 
             let mut fresh = TextEngine::new();
@@ -4253,13 +4356,7 @@ mod tests {
 
         engine.items[item].origin.1 = -60.0;
         assert!(
-            inline_item_may_intersect_surface(
-                &engine.items[item],
-                (0.0, 0.0),
-                None,
-                100,
-                1.0,
-            ),
+            inline_item_may_intersect_surface(&engine.items[item], (0.0, 0.0), None, 100, 1.0,),
             "the four-em ink guard must preserve unusual glyph overhang"
         );
         engine.items[item].origin.1 = -500.0;
@@ -4279,13 +4376,7 @@ mod tests {
             1.0,
         ));
         assert!(
-            inline_item_may_intersect_surface(
-                &engine.items[item],
-                (0.0, -490.0),
-                None,
-                100,
-                1.0,
-            ),
+            inline_item_may_intersect_surface(&engine.items[item], (0.0, -490.0), None, 100, 1.0,),
             "the transform/layer translation must be applied before culling"
         );
 
@@ -4297,13 +4388,7 @@ mod tests {
                 offset: (0.0, -490.0),
             });
         assert!(
-            inline_item_may_intersect_surface(
-                &engine.items[item],
-                (0.0, 0.0),
-                None,
-                100,
-                1.0,
-            ),
+            inline_item_may_intersect_surface(&engine.items[item], (0.0, 0.0), None, 100, 1.0,),
             "a relatively positioned inline may move visible ink into the surface"
         );
         assert!(!inline_item_may_intersect_surface(
@@ -4549,9 +4634,7 @@ mod tests {
             height: None,
         };
         let measure =
-            |style: &LayoutStyle| {
-                ReplacedItem::from_style(512.0, 323.0, style).size(unknown)
-            };
+            |style: &LayoutStyle| ReplacedItem::from_style(512.0, 323.0, style).size(unknown);
 
         let max_height = LayoutStyle {
             max_height: Dimension::Px(128.0),
@@ -4995,8 +5078,7 @@ mod tests {
         let mut engine = TextEngine::new_with_web_fonts(&[
             WebFont {
                 data: Arc::new(
-                    include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf")
-                        .to_vec(),
+                    include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf").to_vec(),
                 ),
                 family: Some("Static Primary".to_string()),
                 weight: Some((400, 400)),

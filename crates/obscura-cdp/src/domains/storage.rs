@@ -9,7 +9,10 @@ fn cookie_jar_for(
     params: &Value,
     session_id: &Option<String>,
 ) -> Result<std::sync::Arc<obscura_net::CookieJar>, String> {
-    match params.get("browserContextId").and_then(|value| value.as_str()) {
+    match params
+        .get("browserContextId")
+        .and_then(|value| value.as_str())
+    {
         Some(id) => ctx
             .browser_context(id)
             .map(|context| context.cookie_jar.clone())

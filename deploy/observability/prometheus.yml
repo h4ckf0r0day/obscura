@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: control-plane
+    static_configs:
+      - targets: ["control-plane:9091"]
+  - job_name: scheduler
+    static_configs:
+      - targets: ["scheduler:9092"]
+  - job_name: worker-agent
+    static_configs:
+      - targets: ["worker-agent:9093"]

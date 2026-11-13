@@ -13,9 +13,7 @@
 pub(crate) fn url_is_file_scheme(raw: &str) -> bool {
     url::Url::parse(raw)
         .map(|u| u.scheme().eq_ignore_ascii_case("file"))
-        .unwrap_or_else(|_| {
-            raw.trim_start().to_ascii_lowercase().starts_with("file:")
-        })
+        .unwrap_or_else(|_| raw.trim_start().to_ascii_lowercase().starts_with("file:"))
 }
 
 /// Embed an objectId as a JS string literal, quotes included.
@@ -157,14 +155,20 @@ mod tests {
         // falls inside the '€'. This is exactly the shape of a malformed CDP
         // frame that would reach the `warn!("Invalid CDP: ...")` preview.
         let s = format!("{}€tail", "a".repeat(199));
-        assert!(!s.is_char_boundary(200), "setup: byte 200 splits the € char");
+        assert!(
+            !s.is_char_boundary(200),
+            "setup: byte 200 splits the € char"
+        );
 
         // The old logging code did `&s[..s.len().min(200)]`, which panics here —
         // a single crafted frame would take down the CDP processor task.
         let naive = std::panic::catch_unwind(|| {
             let _ = &s[..s.len().min(200)];
         });
-        assert!(naive.is_err(), "raw byte slice at a non-char-boundary must panic");
+        assert!(
+            naive.is_err(),
+            "raw byte slice at a non-char-boundary must panic"
+        );
 
         // The helper truncates on the boundary before the € instead.
         let safe = truncate_on_char_boundary(&s, 200);

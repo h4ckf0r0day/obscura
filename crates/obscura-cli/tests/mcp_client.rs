@@ -10,15 +10,21 @@ const OBSCURA: &str = env!("CARGO_BIN_EXE_obscura");
 
 #[test]
 fn mcp_font_directory_is_validated_before_either_transport_starts() {
-    let missing = std::env::temp_dir().join(format!("obscura-missing-fonts-{}", std::process::id()));
+    let missing =
+        std::env::temp_dir().join(format!("obscura-missing-fonts-{}", std::process::id()));
     assert!(!missing.exists());
     for http in [false, true] {
         let mut command = Command::new(OBSCURA);
-        command.args(["mcp", "--font-dir"]).arg(&missing).stdin(Stdio::null());
+        command
+            .args(["mcp", "--font-dir"])
+            .arg(&missing)
+            .stdin(Stdio::null());
         if http {
             command.args(["--http", "--port", "0"]);
         }
-        let output = command.output().expect("start MCP with invalid font directory");
+        let output = command
+            .output()
+            .expect("start MCP with invalid font directory");
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("Font directory does not exist"));
     }
@@ -33,10 +39,15 @@ fn mcp_font_directory_respects_render_feature() {
         .output()
         .expect("start MCP with existing font directory");
     if cfg!(feature = "render") {
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     } else {
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("--font-dir requires a render-enabled build"));
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("--font-dir requires a render-enabled build"));
     }
 }
 
@@ -80,7 +91,9 @@ impl TestPageServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         // Accepted sockets inherit nonblocking mode on macOS.
-                        stream.set_nonblocking(false).expect("blocking fixture client");
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking fixture client");
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         let mut request = [0u8; 2048];
                         let _ = stream.read(&mut request);
@@ -194,7 +207,10 @@ impl McpClient {
     }
 
     fn tool(&mut self, name: &str, args: serde_json::Value) -> serde_json::Value {
-        self.call("tools/call", serde_json::json!({ "name": name, "arguments": args }))
+        self.call(
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": args }),
+        )
     }
 
     fn write_msg(&mut self, msg: &serde_json::Value) {
@@ -221,9 +237,7 @@ impl Drop for McpClient {
 
 // helper: extract first content text from a tools/call response
 fn content_text(resp: &serde_json::Value) -> &str {
-    resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or("")
+    resp["result"]["content"][0]["text"].as_str().unwrap_or("")
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -261,7 +275,10 @@ fn snapshot_preserves_whitespace_between_inline_spans() {
         text.contains("Hello world.\n\nHello, world!"),
         "snapshot mangled inline text: {text}"
     );
-    assert!(!text.contains("H e l l o"), "snapshot inserted spaces: {text}");
+    assert!(
+        !text.contains("H e l l o"),
+        "snapshot inserted spaces: {text}"
+    );
 }
 
 #[test]
@@ -343,9 +360,15 @@ fn test_navigate_and_snapshot() {
     assert!(text.contains("127.0.0.1"), "unexpected nav text: {text}");
 
     let snap = c.tool("browser_snapshot", serde_json::json!({}));
-    assert!(snap["result"]["isError"].is_null(), "snapshot failed: {snap}");
+    assert!(
+        snap["result"]["isError"].is_null(),
+        "snapshot failed: {snap}"
+    );
     let text = content_text(&snap);
-    assert!(text.contains("Example Domain"), "unexpected snapshot: {text}");
+    assert!(
+        text.contains("Example Domain"),
+        "unexpected snapshot: {text}"
+    );
     assert!(text.contains("URL:"), "snapshot missing URL line");
 }
 
@@ -422,7 +445,10 @@ fn test_wait_for_selector() {
         "browser_wait_for",
         serde_json::json!({"selector": "h1", "timeout": 5}),
     );
-    assert!(resp["result"]["isError"].is_null(), "wait_for failed: {resp}");
+    assert!(
+        resp["result"]["isError"].is_null(),
+        "wait_for failed: {resp}"
+    );
     assert!(content_text(&resp).contains("Found"));
 }
 

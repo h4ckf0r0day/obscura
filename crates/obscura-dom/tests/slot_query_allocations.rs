@@ -22,19 +22,34 @@ fn slot_queries_do_not_copy_unrelated_attributes_or_text() {
     tree.append_child(root, named);
     tree.append_child(root, default);
 
-    let (result, bytes) = allocations::measure(|| (
-        tree.is_html_slot_element(named),
-        tree.is_html_slot_element(outside),
-        tree.assigned_slot(outside),
-        tree.assigned_slot(light),
-        tree.assigned_slot(text),
-        tree.assigned_nodes(named),
-        tree.assigned_nodes(default),
-    ));
-    assert_eq!(result, (true, false, None, Some(named), Some(default),
-        Some(vec![light]), Some(vec![text])));
+    let (result, bytes) = allocations::measure(|| {
+        (
+            tree.is_html_slot_element(named),
+            tree.is_html_slot_element(outside),
+            tree.assigned_slot(outside),
+            tree.assigned_slot(light),
+            tree.assigned_slot(text),
+            tree.assigned_nodes(named),
+            tree.assigned_nodes(default),
+        )
+    });
+    assert_eq!(
+        result,
+        (
+            true,
+            false,
+            None,
+            Some(named),
+            Some(default),
+            Some(vec![light]),
+            Some(vec![text])
+        )
+    );
     // Small traversal/result vectors are allowed, copying a 64KiB DOM payload is not.
-    assert!(bytes < 4096, "slot queries allocated {bytes} bytes for a two-slot tree");
+    assert!(
+        bytes < 4096,
+        "slot queries allocated {bytes} bytes for a two-slot tree"
+    );
 }
 
 #[test]

@@ -329,7 +329,10 @@ async fn a_rejected_child_frame_does_not_leave_js_references() {
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
 
-    assert!(page.frame_urls().is_empty(), "the frame cap was not applied");
+    assert!(
+        page.frame_urls().is_empty(),
+        "the frame cap was not applied"
+    );
     for registry in [
         "__obscura_frameObjects",
         "__obscura_frameWindows",
@@ -356,7 +359,10 @@ async fn navigating_blank_releases_child_realms() {
     assert_eq!(page.frame_urls().len(), 1);
 
     page.goto("about:blank").await.unwrap();
-    assert!(page.frame_urls().is_empty(), "old frame realm survived navigation");
+    assert!(
+        page.frame_urls().is_empty(),
+        "old frame realm survived navigation"
+    );
 }
 
 #[tokio::test]
@@ -369,7 +375,10 @@ async fn changing_iframe_src_releases_the_previous_realm() {
     page.goto(&base).await.unwrap();
     page.settle(1000).await;
 
-    assert!(page.frame_urls().is_empty(), "old src realm survived replacement");
+    assert!(
+        page.frame_urls().is_empty(),
+        "old src realm survived replacement"
+    );
     for registry in ["__obscura_frameWindows", "__obscura_frameElements"] {
         assert_eq!(
             page.evaluate(&format!("Object.keys(globalThis.{registry}).length"))

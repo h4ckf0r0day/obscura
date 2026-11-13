@@ -1,56 +1,172 @@
-version: "3.8"
-
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: obscura
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set postgres password}
+      POSTGRES_DB: obscura
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obscura -d obscura"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [obscura-net]
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222", "-sd", "/data"]
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [obscura-net]
+
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.control-plane
+    environment:
+      DATABASE_URL: postgres://obscura:${POSTGRES_PASSWORD}@postgres:5432/obscura
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [obscura-net]
+
+  scheduler:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.scheduler
+    environment:
+      DATABASE_URL: postgres://obscura:${POSTGRES_PASSWORD}@postgres:5432/obscura
+      NATS_URL: nats://nats:4222
+      OBSCURA_SERVICE_BOOTSTRAP_SECRET: ${OBSCURA_SERVICE_BOOTSTRAP_SECRET:?set bootstrap secret}
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8082/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [obscura-net]
+
+  worker-agent:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.worker-agent
+    environment:
+      DATABASE_URL: postgres://obscura:${POSTGRES_PASSWORD}@postgres:5432/obscura
+      NATS_URL: nats://nats:4222
+      OBSCURA_WORKER_BIN: /usr/local/bin/obscura-runtime-worker
+      OBSCURA_SERVICE_BOOTSTRAP_SECRET: ${OBSCURA_SERVICE_BOOTSTRAP_SECRET:?set bootstrap secret}
+      OBSCURA_ALLOW_PRIVATE_NETWORK: "false"
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8083/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [obscura-net]
+
   obscura-supervisor:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.worker
-    command: ["serve", "--port", "9222", "--host", "0.0.0.0", "--workers", "4"]
+    command: ["serve", "--port", "9222", "--host", "0.0.0.0", "--workers", "2"]
     ports:
-      - "9222:9222"
-      - "9100:9100"
+      - "127.0.0.1:9222:9222"
     environment:
-      - OBSCURA_STEALTH=1
-      - RUST_LOG=info
-      - OBSCURA_METRICS_PORT=9100
-      - OBSCURA_CDP_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789
+      OBSCURA_STEALTH: "1"
+      RUST_LOG: info
+      OBSCURA_METRICS_PORT: "9100"
+      OBSCURA_CDP_TOKEN: ${OBSCURA_CDP_TOKEN:?set a 32+ byte secret}
+      OBSCURA_METRICS_TOKEN: ${OBSCURA_METRICS_TOKEN:?set metrics token}
+    depends_on:
+      worker-agent:
+        condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "kill -0 1"]
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $OBSCURA_CDP_TOKEN\" http://127.0.0.1:9222/json/version || exit 1"]
       interval: 10s
-      timeout: 3s
-      retries: 3
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: 2G
           cpus: '2.0'
+    networks: [obscura-net]
 
-  nats:
-    image: nats:2.10-alpine
-    command: ["-js", "-m", "8222"]
-    ports:
-      - "4222:4222"
-      - "8222:8222"
-    volumes:
-      - nats_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-    restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus:v2.45.0
+    image: prom/prometheus:v2.55.0
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
-    depends_on:
-      obscura-supervisor:
-        condition: service_healthy
+      - "127.0.0.1:9090:9090"
+    networks: [obscura-net]
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.111.0
+    command: ["--config=/etc/otel-collector-config.yml"]
+    volumes:
+      - ../observability/otel-collector-config.yml:/etc/otel-collector-config.yml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    networks: [obscura-net]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set grafana password}
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [obscura-net]
+    restart: unless-stopped
+
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"
+    networks: [obscura-net]
     restart: unless-stopped
 
 volumes:
+  postgres_data:
   nats_data:
+
+networks:
+  obscura-net:
+    driver: bridge

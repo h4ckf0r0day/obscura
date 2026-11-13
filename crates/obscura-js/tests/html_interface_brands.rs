@@ -38,5 +38,5 @@ fn html_interface_brands_follow_tag_namespace_and_real_prototypes() {
           document.querySelector('td') instanceof HTMLTableCellElement,HTMLBaseElement!==HTMLTableCellElement,
           HTMLBaseElement.prototype!==HTMLTableCellElement.prototype];
     })()"#).unwrap();
-    assert_eq!(result,json!([[],true,true,true,true,true]));
+    assert_eq!(result, json!([[], true, true, true, true, true]));
 }

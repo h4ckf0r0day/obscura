@@ -119,7 +119,10 @@ fn build_ax_node(
     ax_node["nodeId"] = json!(ax_id);
     ax_node["ignored"] = json!(false);
     if let Some(ref pid) = parent_id {
-        ax_node.as_object_mut().unwrap().insert("parentId".into(), json!(pid));
+        ax_node
+            .as_object_mut()
+            .unwrap()
+            .insert("parentId".into(), json!(pid));
     }
     Some(ax_node)
 }
@@ -199,8 +202,7 @@ fn map_role(data: &NodeData) -> &'static str {
                 "textarea" => "textbox",
                 "select" => {
                     if attrs.iter().any(|a| {
-                        a.name.local.as_ref() == "multiple"
-                            || a.name.local.as_ref() == "size"
+                        a.name.local.as_ref() == "multiple" || a.name.local.as_ref() == "size"
                     }) {
                         "listbox"
                     } else {
@@ -227,17 +229,16 @@ fn map_role(data: &NodeData) -> &'static str {
                 "section" => "region",
                 "figure" => "figure",
                 "figcaption" => "StaticText",
-                "p" | "div" | "span" | "pre" | "blockquote" | "code"
-                | "em" | "strong" | "b" | "i" | "u" | "s" | "small"
-                | "sub" | "sup" | "mark" | "del" | "ins" => "generic",
+                "p" | "div" | "span" | "pre" | "blockquote" | "code" | "em" | "strong" | "b"
+                | "i" | "u" | "s" | "small" | "sub" | "sup" | "mark" | "del" | "ins" => "generic",
                 "iframe" => "Iframe",
                 _ => "generic",
             }
         }
         NodeData::Text { .. } => "StaticText",
-        NodeData::Doctype { .. } | NodeData::Comment { .. } | NodeData::ProcessingInstruction { .. } => {
-            ""
-        }
+        NodeData::Doctype { .. }
+        | NodeData::Comment { .. }
+        | NodeData::ProcessingInstruction { .. } => "",
     }
 }
 
@@ -263,15 +264,25 @@ impl AccessibilityContext {
 
     /// Describe only the requested visible node; CDP adds tree links separately.
     pub fn describe_node(&self, dom: &DomTree, id: NodeId) -> Option<Value> {
-        if self.is_hidden(id) { return None; }
+        if self.is_hidden(id) {
+            return None;
+        }
         let node = dom.get_node(id)?;
         let role = map_role(&node.data);
-        if role.is_empty() { return None; }
+        if role.is_empty() {
+            return None;
+        }
         let mut result = json!({"backendDOMNodeId":id.raw(),"role":ax_value_role(role)});
-        if let Some(name) = compute_name(dom, &node, self) { result["name"] = ax_value_string(&name); }
-        if let Some(value) = compute_value(dom, &node) { result["value"] = ax_value_string(&value); }
+        if let Some(name) = compute_name(dom, &node, self) {
+            result["name"] = ax_value_string(&name);
+        }
+        if let Some(value) = compute_value(dom, &node) {
+            result["value"] = ax_value_string(&value);
+        }
         let properties = compute_properties(dom, &node);
-        if !properties.is_empty() { result["properties"] = json!(properties); }
+        if !properties.is_empty() {
+            result["properties"] = json!(properties);
+        }
         Some(result)
     }
 
@@ -484,7 +495,11 @@ fn content_name(
 }
 
 /// Compute the accessible name for a node.
-fn compute_name(dom: &DomTree, node: &obscura_dom::Node, context: &AccessibilityContext) -> Option<String> {
+fn compute_name(
+    dom: &DomTree,
+    node: &obscura_dom::Node,
+    context: &AccessibilityContext,
+) -> Option<String> {
     if let NodeData::Text { contents } = &node.data {
         return nonempty(contents);
     }
@@ -566,7 +581,10 @@ fn compute_value(dom: &DomTree, node: &obscura_dom::Node) -> Option<String> {
             if tag == "input" && input_type(node) == "password" {
                 return None;
             }
-            if let Some(value) = dom.form_control_state(node.id).and_then(|state| state.value) {
+            if let Some(value) = dom
+                .form_control_state(node.id)
+                .and_then(|state| state.value)
+            {
                 return Some(value);
             }
             return attrs
@@ -643,7 +661,8 @@ fn compute_properties(dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         }
 
         // editable
-        if tag == "input" || tag == "textarea"
+        if tag == "input"
+            || tag == "textarea"
             || attrs
                 .iter()
                 .any(|a| a.name.local.as_ref() == "contenteditable" && a.value != "false")
@@ -652,11 +671,14 @@ fn compute_properties(dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         }
 
         if tag == "input" && matches!(input_type(node).as_str(), "checkbox" | "radio") {
-            let checked = if input_type(node) == "checkbox" && dom.form_control_indeterminate(node.id) {
-                json!("mixed")
-            } else {
-                json!(dom.form_control_checked(node.id).unwrap_or_else(|| node.get_attribute("checked").is_some()))
-            };
+            let checked =
+                if input_type(node) == "checkbox" && dom.form_control_indeterminate(node.id) {
+                    json!("mixed")
+                } else {
+                    json!(dom
+                        .form_control_checked(node.id)
+                        .unwrap_or_else(|| node.get_attribute("checked").is_some()))
+                };
             props.push(json!({"name":"checked","value":{"type":"tristate","value":checked}}));
         } else if let Some(checked) = node.get_attribute("aria-checked") {
             let value = match checked {
@@ -673,11 +695,21 @@ fn compute_properties(dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         // disabled
         if node.get_attribute("disabled").is_some() {
             props.push(json!({"name": "disabled", "value": ax_value_boolean(true)}));
-        } else if let Some(value) = node.get_attribute("aria-disabled").filter(|value| matches!(*value, "true" | "false")) {
+        } else if let Some(value) = node
+            .get_attribute("aria-disabled")
+            .filter(|value| matches!(*value, "true" | "false"))
+        {
             props.push(json!({"name":"disabled","value":ax_value_boolean(value == "true")}));
         }
-        for (property, attribute) in [("expanded", "aria-expanded"), ("selected", "aria-selected"), ("pressed", "aria-pressed")] {
-            if let Some(value) = node.get_attribute(attribute).filter(|value| matches!(*value, "true" | "false")) {
+        for (property, attribute) in [
+            ("expanded", "aria-expanded"),
+            ("selected", "aria-selected"),
+            ("pressed", "aria-pressed"),
+        ] {
+            if let Some(value) = node
+                .get_attribute(attribute)
+                .filter(|value| matches!(*value, "true" | "false"))
+            {
                 props.push(json!({"name":property,"value":ax_value_boolean(value == "true")}));
             }
         }
@@ -692,7 +724,10 @@ fn compute_properties(dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         // required
         if node.get_attribute("required").is_some() {
             props.push(json!({"name": "required", "value": ax_value_boolean(true)}));
-        } else if let Some(value) = node.get_attribute("aria-required").filter(|value| matches!(*value, "true" | "false")) {
+        } else if let Some(value) = node
+            .get_attribute("aria-required")
+            .filter(|value| matches!(*value, "true" | "false"))
+        {
             props.push(json!({"name":"required","value":ax_value_boolean(value == "true")}));
         }
 
@@ -717,17 +752,28 @@ mod tests {
         let dom = parse_html("<input id=c type=checkbox checked><input id=f value=old><input id=p type=password value=secret>");
         let checkbox = dom.get_element_by_id("c").unwrap();
         dom.update_form_control_state(checkbox, |state| state.checked = Some(false));
-        dom.update_form_control_state(dom.get_element_by_id("f").unwrap(), |state| state.value = Some("fresh".into()));
+        dom.update_form_control_state(dom.get_element_by_id("f").unwrap(), |state| {
+            state.value = Some("fresh".into())
+        });
         let nodes = build_ax_nodes(&dom);
         let node = ax_node_for(&nodes, checkbox);
-        let checked = node["properties"].as_array().unwrap().iter().find(|property| property["name"] == "checked").unwrap();
+        let checked = node["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|property| property["name"] == "checked")
+            .unwrap();
         assert_eq!(checked["value"]["value"], json!(false));
         assert_ax_value(&nodes, &dom, "f", Some("fresh"));
         assert_ax_value(&nodes, &dom, "p", None);
         dom.update_form_control_state(checkbox, |state| state.indeterminate = true);
         let nodes = build_ax_nodes(&dom);
-        let mixed = ax_node_for(&nodes, checkbox)["properties"].as_array().unwrap().iter()
-            .find(|property| property["name"] == "checked").unwrap();
+        let mixed = ax_node_for(&nodes, checkbox)["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|property| property["name"] == "checked")
+            .unwrap();
         assert_eq!(mixed["value"]["value"], json!("mixed"));
     }
 
@@ -735,9 +781,20 @@ mod tests {
     fn aria_control_states_preserve_false_and_mixed_values() {
         let dom = parse_html("<div id=tab role=tab aria-selected=true></div><div id=field role=textbox aria-required=false></div><button id=exp aria-expanded=false aria-pressed=true aria-disabled=false></button><div id=mixed role=checkbox aria-checked=mixed></div>");
         let nodes = build_ax_nodes(&dom);
-        for (id, name, expected) in [("tab", "selected", json!(true)), ("field", "required", json!(false)), ("exp", "expanded", json!(false)), ("exp", "pressed", json!(true)), ("exp", "disabled", json!(false)), ("mixed", "checked", json!("mixed"))] {
+        for (id, name, expected) in [
+            ("tab", "selected", json!(true)),
+            ("field", "required", json!(false)),
+            ("exp", "expanded", json!(false)),
+            ("exp", "pressed", json!(true)),
+            ("exp", "disabled", json!(false)),
+            ("mixed", "checked", json!("mixed")),
+        ] {
             let node = ax_node_for(&nodes, dom.get_element_by_id(id).unwrap());
-            let property = node["properties"].as_array().unwrap().iter().find(|property| property["name"] == name)
+            let property = node["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|property| property["name"] == name)
                 .unwrap_or_else(|| panic!("missing {name} for #{id}"));
             assert_eq!(property["value"]["value"], expected, "#{id}: {name}");
         }

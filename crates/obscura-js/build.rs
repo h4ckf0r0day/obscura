@@ -27,7 +27,9 @@ fn main() {
         // Solution: use the target-specific `mksnapshot` tool (built by V8's GN
         // build system) which runs on the host but generates snapshots for the
         // target architecture. Then wrap the raw blob in deno_core's format.
-        eprintln!("[obscura-js build.rs] Cross-compilation detected (host={host}, target={target})");
+        eprintln!(
+            "[obscura-js build.rs] Cross-compilation detected (host={host}, target={target})"
+        );
         eprintln!("[obscura-js build.rs] Using cross-mksnapshot for target-compatible snapshot");
 
         // Locate the cross-mksnapshot binary.
@@ -51,7 +53,10 @@ fn main() {
         let cross_mksnapshot = find_cross_mksnapshot(target_dir, &target, profile);
         let cross_mksnapshot = match cross_mksnapshot {
             Some(p) => {
-                eprintln!("[obscura-js build.rs] Found cross-mksnapshot: {}", p.display());
+                eprintln!(
+                    "[obscura-js build.rs] Found cross-mksnapshot: {}",
+                    p.display()
+                );
                 p
             }
             None => {
@@ -88,11 +93,8 @@ fn main() {
         // Decompose the host snapshot: [v8_blob][sidecar][8-byte v8_blob_len]
         let host_data = &*host_output.output;
         let ulen = std::mem::size_of::<usize>();
-        let v8_blob_len = usize::from_le_bytes(
-            host_data[host_data.len() - ulen..]
-                .try_into()
-                .unwrap(),
-        );
+        let v8_blob_len =
+            usize::from_le_bytes(host_data[host_data.len() - ulen..].try_into().unwrap());
         let sidecar = &host_data[v8_blob_len..host_data.len() - ulen];
 
         // Step 2: Run cross-mksnapshot to generate the target-architecture raw blob.
@@ -108,20 +110,20 @@ fn main() {
             .arg(&bootstrap_path)
             .status()
             .expect("Failed to run cross-mksnapshot");
-        assert!(status.success(), "cross-mksnapshot failed with status: {status}");
+        assert!(
+            status.success(),
+            "cross-mksnapshot failed with status: {status}"
+        );
 
-        let mut raw_blob = std::fs::read(&raw_blob_path).expect("Failed to read cross-mksnapshot output");
+        let mut raw_blob =
+            std::fs::read(&raw_blob_path).expect("Failed to read cross-mksnapshot output");
 
         // Step 3: Patch the snapshot version in the raw blob header.
         // mksnapshot produces version 1 (no external refs), but the target V8
         // (built with SnapshotCreator) expects version 2 (with external refs).
         // The actual serialized heap data is compatible; only the version tag differs.
-        let expected_version: u32 = u32::from_le_bytes(
-            host_data[0..4].try_into().unwrap(),
-        );
-        let raw_version: u32 = u32::from_le_bytes(
-            raw_blob[0..4].try_into().unwrap(),
-        );
+        let expected_version: u32 = u32::from_le_bytes(host_data[0..4].try_into().unwrap());
+        let raw_version: u32 = u32::from_le_bytes(raw_blob[0..4].try_into().unwrap());
         if raw_version != expected_version {
             eprintln!(
                 "[obscura-js build.rs] Patching snapshot version: {} -> {}",
@@ -159,7 +161,10 @@ fn main() {
 
 /// Generate a snapshot using the host V8 (for native builds or as fallback).
 fn generate_host_snapshot(bootstrap_js: &str, snapshot_path: &PathBuf) {
-    assert!(bootstrap_js.is_ascii(), "bootstrap source must be ASCII; use Unicode escapes in literals");
+    assert!(
+        bootstrap_js.is_ascii(),
+        "bootstrap source must be ASCII; use Unicode escapes in literals"
+    );
     // Compiler intrinsics are confined to this build process and an unretained hook.
     deno_core::v8::V8::set_flags_from_string("--allow-natives-syntax");
     let compiler = r#""use strict";
@@ -228,7 +233,11 @@ Object.defineProperty(globalThis, '__obscura_snapshot_compile', {
 }
 
 /// Find the cross-mksnapshot binary for the target architecture.
-fn find_cross_mksnapshot(target_dir: &std::path::Path, target: &str, profile: &str) -> Option<PathBuf> {
+fn find_cross_mksnapshot(
+    target_dir: &std::path::Path,
+    target: &str,
+    profile: &str,
+) -> Option<PathBuf> {
     let gn_out = target_dir.join(profile).join("gn_out");
 
     // Determine the cross directory name based on host and target architectures.

@@ -130,7 +130,10 @@ pub struct Slot {
 
 impl Slot {
     pub fn new(first: Arc<Worker>, wake: Arc<Notify>) -> Arc<Self> {
-        Arc::new(Slot { current: Mutex::new(first), wake })
+        Arc::new(Slot {
+            current: Mutex::new(first),
+            wake,
+        })
     }
 
     pub fn current(&self) -> Arc<Worker> {
@@ -148,7 +151,10 @@ pub fn pick(slots: &[Arc<Slot>], next: &mut usize) -> Option<Connection> {
     (0..slots.len()).find_map(|_| {
         let worker = slots[*next % slots.len()].current();
         *next = next.wrapping_add(1);
-        worker.ready.load(Ordering::Relaxed).then(|| worker.connection())
+        worker
+            .ready
+            .load(Ordering::Relaxed)
+            .then(|| worker.connection())
     })
 }
 
@@ -162,7 +168,9 @@ mod tests {
     fn default_policy_never_recycles() {
         let policy = RecyclePolicy::default();
         assert!(!policy.enabled());
-        assert!(policy.reason(usize::MAX, Some(u64::MAX), S * 100_000).is_none());
+        assert!(policy
+            .reason(usize::MAX, Some(u64::MAX), S * 100_000)
+            .is_none());
     }
 
     #[test]
@@ -173,7 +181,10 @@ mod tests {
             max_age: Some(S * 60),
         };
         assert!(policy.reason(2, Some(499), S * 59).is_none());
-        assert!(policy.reason(3, Some(0), S).unwrap().contains("connections"));
+        assert!(policy
+            .reason(3, Some(0), S)
+            .unwrap()
+            .contains("connections"));
         assert!(policy.reason(0, Some(500), S).unwrap().contains("rss"));
         assert!(policy.reason(0, Some(0), S * 60).unwrap().contains("age"));
         // An unreadable RSS never triggers the RSS limit.
@@ -193,7 +204,9 @@ mod tests {
     fn pick_round_robins_and_skips_unready() {
         let slots = pool(3, None);
         let mut next = 0;
-        let ports: Vec<u16> = (0..3).map(|_| pick(&slots, &mut next).unwrap().port()).collect();
+        let ports: Vec<u16> = (0..3)
+            .map(|_| pick(&slots, &mut next).unwrap().port())
+            .collect();
         assert_eq!(ports, [9000, 9001, 9002]);
         slots[1].current().set_ready(false);
         for _ in 0..6 {
@@ -250,9 +263,14 @@ mod tests {
     }
 
     fn notified_now(wake: &Notify) -> Option<()> {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
         rt.block_on(async {
-            tokio::time::timeout(Duration::from_millis(20), wake.notified()).await.ok()
+            tokio::time::timeout(Duration::from_millis(20), wake.notified())
+                .await
+                .ok()
         })
     }
 

@@ -107,3 +107,10 @@ hosted service so that one session cannot affect another.
 
 Security fixes land on `main` and ship in the next release. Please test reports
 against the latest release or `main`.
+
+## Configuration security
+
+- `OBSCURA_SERVICE_BOOTSTRAP_SECRET` must be set to a non-empty, non-`testsecret` value of at least 32 bytes.
+- `OBSCURA_CDP_TOKEN` must be at least 32 bytes when CDP is exposed beyond loopback.
+- `OBSCURA_METRICS_TOKEN` optionally protects `/metrics`.
+- Never commit real secrets; use `.env.example`.

@@ -65,15 +65,16 @@ impl RobotsCache {
         // wins when both rules have the same length.
         let mut best: Option<(usize, bool)> = None;
         for pattern in &rules.allowed {
-            if path_matches(path, pattern)
-                && best.is_none_or(|(length, _)| pattern.len() >= length)
+            if path_matches(path, pattern) && best.is_none_or(|(length, _)| pattern.len() >= length)
             {
                 best = Some((pattern.len(), true));
             }
         }
         for pattern in &rules.disallowed {
             if path_matches(path, pattern)
-                && best.is_none_or(|(length, allow)| pattern.len() > length || (pattern.len() == length && !allow))
+                && best.is_none_or(|(length, allow)| {
+                    pattern.len() > length || (pattern.len() == length && !allow)
+                })
             {
                 best = Some((pattern.len(), false));
             }
@@ -169,19 +170,24 @@ fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
             .iter()
             .any(|agent| agent != "*" && our_tokens.iter().any(|token| token == agent))
     };
-    let specific = groups
-        .iter()
-        .any(&matches);
+    let specific = groups.iter().any(&matches);
     let mut disallowed = Vec::new();
     let mut allowed = Vec::new();
     for group in groups.iter().filter(|group| {
-        if specific { matches(group) } else { group.agents.iter().any(|agent| agent == "*") }
+        if specific {
+            matches(group)
+        } else {
+            group.agents.iter().any(|agent| agent == "*")
+        }
     }) {
         disallowed.extend(group.disallowed.iter().cloned());
         allowed.extend(group.allowed.iter().cloned());
     }
 
-    RobotsRules { disallowed, allowed }
+    RobotsRules {
+        disallowed,
+        allowed,
+    }
 }
 
 fn path_matches(path: &str, pattern: &str) -> bool {
@@ -218,13 +224,29 @@ mod tests {
         let chrome = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
         let cache = RobotsCache::new();
         cache.parse_and_store("a.test", "User-agent: Moz\nDisallow: /\n", chrome);
-        assert!(cache.is_allowed("a.test", "/page"), "a token prefix is not a match");
+        assert!(
+            cache.is_allowed("a.test", "/page"),
+            "a token prefix is not a match"
+        );
         cache.parse_and_store("b.test", "User-agent: chrome\nDisallow: /\n", chrome);
-        assert!(!cache.is_allowed("b.test", "/page"), "an exact token still matches, case-insensitively");
+        assert!(
+            !cache.is_allowed("b.test", "/page"),
+            "an exact token still matches, case-insensitively"
+        );
         cache.parse_and_store("c.test", "User-agent: ObscuraBot\nDisallow: /\n", "Obscura");
-        assert!(cache.is_allowed("c.test", "/page"), "our token being a substring of theirs is not a match");
-        cache.parse_and_store("d.test", "User-agent: Obscura\nDisallow: /\n", "Obscura/1.0 (+https://example.test)");
-        assert!(!cache.is_allowed("d.test", "/page"), "a product token followed by a version matches");
+        assert!(
+            cache.is_allowed("c.test", "/page"),
+            "our token being a substring of theirs is not a match"
+        );
+        cache.parse_and_store(
+            "d.test",
+            "User-agent: Obscura\nDisallow: /\n",
+            "Obscura/1.0 (+https://example.test)",
+        );
+        assert!(
+            !cache.is_allowed("d.test", "/page"),
+            "a product token followed by a version matches"
+        );
     }
 
     #[test]
@@ -263,10 +285,18 @@ mod tests {
     fn unrelated_agents_in_wildcard_groups_do_not_select_specific_rules() {
         let cache = RobotsCache::new();
         let mixed = "User-agent: *\nUser-agent: OtherBot\nDisallow: /mixed\n\n";
-        cache.parse_and_store("wildcard.test", &format!("{mixed}User-agent: *\nDisallow: /fallback\n"), "Obscura");
+        cache.parse_and_store(
+            "wildcard.test",
+            &format!("{mixed}User-agent: *\nDisallow: /fallback\n"),
+            "Obscura",
+        );
         assert!(!cache.is_allowed("wildcard.test", "/mixed"));
         assert!(!cache.is_allowed("wildcard.test", "/fallback"));
-        cache.parse_and_store("specific.test", &format!("{mixed}User-agent: Obscura\nDisallow: /own\n"), "Obscura");
+        cache.parse_and_store(
+            "specific.test",
+            &format!("{mixed}User-agent: Obscura\nDisallow: /own\n"),
+            "Obscura",
+        );
         assert!(cache.is_allowed("specific.test", "/mixed"));
         assert!(!cache.is_allowed("specific.test", "/own"));
     }

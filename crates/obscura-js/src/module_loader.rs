@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use deno_core::error::ModuleLoaderError;
 use deno_core::ModuleLoadOptions;
@@ -17,7 +17,10 @@ use deno_core::ModuleSpecifier;
 use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
-use crate::ops::{ObscuraState, JsNetworkEvent, StoredNetworkResponseBody, FetchNetworkGuard, record_network_completion};
+use crate::ops::{
+    record_network_completion, FetchNetworkGuard, JsNetworkEvent, ObscuraState,
+    StoredNetworkResponseBody,
+};
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -170,9 +173,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                 .map_err(|error| io_err(error.to_string()));
         }
 
-        let base = if referrer.is_empty()
-            || referrer.starts_with('<')
-            || referrer == "about:blank"
+        let base = if referrer.is_empty() || referrer.starts_with('<') || referrer == "about:blank"
         {
             &self.base_url
         } else {
@@ -200,8 +201,8 @@ impl ModuleLoader for ObscuraModuleLoader {
         // the HTTP referrer for a dependency; keeping these URLs distinct
         // prevents a cross-origin parent module from gaining CDN cookies when
         // it imports a sibling on that CDN.
-        let document_url = ModuleSpecifier::parse(&self.base_url)
-            .unwrap_or_else(|_| module_specifier.clone());
+        let document_url =
+            ModuleSpecifier::parse(&self.base_url).unwrap_or_else(|_| module_specifier.clone());
         let referrer = maybe_referrer
             .map(|referrer| referrer.specifier.clone())
             .unwrap_or_else(|| document_url.clone());
@@ -272,32 +273,41 @@ impl ModuleLoader for ObscuraModuleLoader {
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(1);
-                    let request_id = format!("module-{}", NEXT_MODULE_REQUEST_ID.fetch_add(
-                        1, std::sync::atomic::Ordering::Relaxed,
-                    ));
+                    let request_id = format!(
+                        "module-{}",
+                        NEXT_MODULE_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed,)
+                    );
                     // Keep failed and cancelled graph fetches visible to the
                     // same Network listeners as ordinary fetch/XHR failures.
                     let mut network_guard = page_state.as_ref().map(|state| FetchNetworkGuard {
-                        state: state.clone(), cancel: None,
+                        state: state.clone(),
+                        cancel: None,
                         event: Some(JsNetworkEvent {
-                            request_id: request_id.clone(), intercepted: false,
-                            url: url.clone(), method: "GET".to_string(),
-                            resource_type: "Script".to_string(), status: 0,
-                            response_headers: Default::default(), body_size: 0,
-                            timestamp: 0.0, error_text: None,
+                            request_id: request_id.clone(),
+                            intercepted: false,
+                            url: url.clone(),
+                            method: "GET".to_string(),
+                            resource_type: "Script".to_string(),
+                            status: 0,
+                            response_headers: Default::default(),
+                            body_size: 0,
+                            timestamp: 0.0,
+                            error_text: None,
                         }),
                     });
                     let request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
                     #[cfg(feature = "stealth")]
                     let resp = match stealth {
-                        Some(stealth) => stealth
-                            .fetch_resource_with_callbacks(
-                                &requested,
-                                request,
-                                callbacks.as_deref(),
-                            )
-                            .await,
+                        Some(stealth) => {
+                            stealth
+                                .fetch_resource_with_callbacks(
+                                    &requested,
+                                    request,
+                                    callbacks.as_deref(),
+                                )
+                                .await
+                        }
                         None => {
                             client
                                 .fetch_resource_with_callbacks(
@@ -323,7 +333,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                     };
                     // A response (including the blocked-tracker sentinel) is
                     // not a transport failure, even if evaluation later fails.
-                    if let Some(guard) = &mut network_guard { guard.event = None; }
+                    if let Some(guard) = &mut network_guard {
+                        guard.event = None;
+                    }
                     // A module response belongs to the owning page regardless
                     // of whether graph preparation or evaluation later fails.
                     // Status 0 is the transport's blocked-tracker sentinel.
@@ -332,23 +344,34 @@ impl ModuleLoader for ObscuraModuleLoader {
                             let mut state = state.try_borrow_mut().map_err(|_| {
                                 io_err("Module loader page state is already borrowed".to_string())
                             })?;
-                            record_network_completion(&mut state, JsNetworkEvent {
-                                request_id, intercepted: false,
-                                url: resp.url.to_string(), method: "GET".to_string(),
-                                resource_type: "Script".to_string(), status: resp.status,
-                                response_headers: resp.headers.clone(), body_size: resp.body.len(),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default().as_secs_f64(),
-                                error_text: None,
-                            }, || match std::str::from_utf8(&resp.body) {
-                                Ok(body) => StoredNetworkResponseBody {
-                                    body: body.to_string(), base64_encoded: false,
+                            record_network_completion(
+                                &mut state,
+                                JsNetworkEvent {
+                                    request_id,
+                                    intercepted: false,
+                                    url: resp.url.to_string(),
+                                    method: "GET".to_string(),
+                                    resource_type: "Script".to_string(),
+                                    status: resp.status,
+                                    response_headers: resp.headers.clone(),
+                                    body_size: resp.body.len(),
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs_f64(),
+                                    error_text: None,
                                 },
-                                Err(_) => StoredNetworkResponseBody {
-                                    body: BASE64.encode(&resp.body), base64_encoded: true,
+                                || match std::str::from_utf8(&resp.body) {
+                                    Ok(body) => StoredNetworkResponseBody {
+                                        body: body.to_string(),
+                                        base64_encoded: false,
+                                    },
+                                    Err(_) => StoredNetworkResponseBody {
+                                        body: BASE64.encode(&resp.body),
+                                        base64_encoded: true,
+                                    },
                                 },
-                            });
+                            );
                         }
                     }
                     if !(200..=299).contains(&resp.status) {
@@ -361,9 +384,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                         io_err(format!("Invalid final module URL {}: {}", resp.url, e))
                     })?;
                     if found.as_str() != requested.as_str() {
-                        loaded_specifiers
-                            .borrow_mut()
-                            .push(found.to_string());
+                        loaded_specifiers.borrow_mut().push(found.to_string());
                     }
                     let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
                     Ok(ModuleSource::new_with_redirect(

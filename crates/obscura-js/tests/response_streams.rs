@@ -5,7 +5,12 @@ async fn evaluate(source: &str) -> Value {
     let mut runtime = ObscuraJsRuntime::new();
     runtime.set_dom(obscura_dom::parse_html("<!doctype html><body></body>"));
     runtime.run_page_init();
-    runtime.evaluate_for_cdp(source, true, true).await.unwrap().value.unwrap()
+    runtime
+        .evaluate_for_cdp(source, true, true)
+        .await
+        .unwrap()
+        .value
+        .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -24,7 +29,10 @@ async fn response_streams_preserve_bytes_errors_and_clone_consumption() {
         try { binary.clone(); } catch(e) { consumed=e instanceof TypeError; }
         return {json,a,b,unused,badChunk,sourceError,consumed};
     })()"#).await;
-    assert_eq!(value, json!({"json":{"ok":true},"a":[0,255,128],"b":[0,255,128],"unused":[false,false],"badChunk":true,"sourceError":true,"consumed":true}));
+    assert_eq!(
+        value,
+        json!({"json":{"ok":true},"a":[0,255,128],"b":[0,255,128],"unused":[false,false],"badChunk":true,"sourceError":true,"consumed":true})
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -42,7 +50,10 @@ async fn response_streams_keep_demand_and_cancellation_with_the_source() {
         const bytes=await new Response(new ReadableStream({pull(c){count++;if(count<=3)c.enqueue(new Uint8Array([count]));else c.close();}})).arrayBuffer();
         return {lazy,same,unused,cancelled,used:response.bodyUsed,rejected,bytes:[...new Uint8Array(bytes)]};
     })()"#).await;
-    assert_eq!(value, json!({"lazy":true,"same":true,"unused":true,"cancelled":"stop","used":true,"rejected":true,"bytes":[1,2,3]}));
+    assert_eq!(
+        value,
+        json!({"lazy":true,"same":true,"unused":true,"cancelled":"stop","used":true,"rejected":true,"bytes":[1,2,3]})
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -63,7 +74,10 @@ async fn response_streams_reject_locked_bytes_and_forward_tee_failures() {
         const settled=await Promise.allSettled(cancellations.map(b=>b.cancel()));
         return {cloneRejected,textRejected,text,closed:sourceClosed,readError,cancelRejected:settled.every(s=>s.status==='rejected'&&s.reason.message==='cancel failed')};
     })()"#).await;
-    assert_eq!(value, json!({"cloneRejected":true,"textRejected":true,"text":"locked bytes","closed":true,"readError":true,"cancelRejected":true}));
+    assert_eq!(
+        value,
+        json!({"cloneRejected":true,"textRejected":true,"text":"locked bytes","closed":true,"readError":true,"cancelRejected":true})
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

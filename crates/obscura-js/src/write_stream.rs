@@ -102,13 +102,19 @@ impl DocumentWriteStream {
         let handed_over = &mut self.handed_over;
         let staging = &mut self.staging;
 
-        let root = if self.document { source.document() } else { source.fragment_root() };
+        let root = if self.document {
+            source.document()
+        } else {
+            source.fragment_root()
+        };
         let mut placements = Vec::new();
         // Only look at what is new. A walk over all children would cost as much per call as
         // the input stream written so far is long, so quadratic over a thousand calls. Measured at
         // 5000 calls: 852 ms versus 4130 ms.
         let mut stack: Vec<(NodeId, Option<NodeId>)> = fresh_children(source, root, handed_over)
-            .into_iter().map(|id| (id, None)).collect();
+            .into_iter()
+            .map(|id| (id, None))
+            .collect();
 
         while let Some((current, before)) = stack.pop() {
             let node = match source.get_node(current) {
@@ -121,9 +127,13 @@ impl DocumentWriteStream {
                 // as a stable anchor, and stop at the first already-copied predecessor.
                 let mut previous = node.prev_sibling;
                 while let Some(id) = previous {
-                    let Some(sibling) = source.get_node(id) else { break; };
+                    let Some(sibling) = source.get_node(id) else {
+                        break;
+                    };
                     if handed_over.contains_key(&id) {
-                        if sibling.is_text() { stack.push((id, None)); }
+                        if sibling.is_text() {
+                            stack.push((id, None));
+                        }
                         break;
                     }
                     stack.push((id, Some(copy)));
@@ -133,8 +143,11 @@ impl DocumentWriteStream {
                 // same node, including immediately before a foster-parenting anchor.
                 if node.is_text() {
                     let text = source.text_content(current);
-                    if dom.with_node(copy, |n| matches!(&n.data,
-                        NodeData::Text { contents } if contents == &text)) != Some(true) {
+                    if dom.with_node(copy, |n| {
+                        matches!(&n.data,
+                        NodeData::Text { contents } if contents == &text)
+                    }) != Some(true)
+                    {
                         dom.with_node_mut(copy, |n| {
                             if let NodeData::Text { contents } = &mut n.data {
                                 *contents = text;
@@ -168,7 +181,11 @@ impl DocumentWriteStream {
                 };
                 dom.detach(copy);
                 map_subtree(source, current, dom, copy, handed_over);
-                placements.push(Placement { parent, node: copy, before });
+                placements.push(Placement {
+                    parent,
+                    node: copy,
+                    before,
+                });
                 continue;
             }
 
@@ -176,7 +193,11 @@ impl DocumentWriteStream {
             // never closed appear at once instead of never.
             let copy = dom.new_node(node.data.clone());
             handed_over.insert(current, copy);
-            placements.push(Placement { parent, node: copy, before });
+            placements.push(Placement {
+                parent,
+                node: copy,
+                before,
+            });
             for child in fresh_children(source, current, handed_over) {
                 stack.push((child, None));
             }

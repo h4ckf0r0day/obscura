@@ -41,14 +41,20 @@ async fn page_callbacks_progress_without_more_http_tool_calls() {
         reader.read_line(&mut request).await.unwrap();
         loop {
             let mut header = String::new();
-            if reader.read_line(&mut header).await.unwrap() == 0 || header == "\r\n" { break; }
+            if reader.read_line(&mut header).await.unwrap() == 0 || header == "\r\n" {
+                break;
+            }
         }
         reader.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n").await.unwrap();
         let _ = sent.send(request);
     });
     let local = LocalSet::new();
     let server = local.spawn_local(obscura_mcp::http::run(
-        "127.0.0.1".into(), port, None, None, false,
+        "127.0.0.1".into(),
+        port,
+        None,
+        None,
+        false,
     ));
     local.run_until(async {
         for _ in 0..100 {

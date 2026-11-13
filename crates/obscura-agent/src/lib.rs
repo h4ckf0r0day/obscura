@@ -119,20 +119,22 @@ impl SemanticDistiller {
     }
 
     fn distill_node(dom: &DomTree, node_id: NodeId, counter: &mut usize) -> Option<SemanticNode> {
-        let (tag_lower, attrs) = dom.with_node(node_id, |n| {
-            let tag = n.as_element().map(|name| name.local.to_string())?;
-            let mut attrs = HashMap::new();
-            if let Some(id_attr) = n.get_attribute("id") {
-                attrs.insert("id".to_string(), id_attr.to_string());
-            }
-            if let Some(href) = n.get_attribute("href") {
-                attrs.insert("href".to_string(), href.to_string());
-            }
-            if let Some(role) = n.get_attribute("role") {
-                attrs.insert("role".to_string(), role.to_string());
-            }
-            Some((tag.to_ascii_lowercase(), attrs))
-        }).flatten()?;
+        let (tag_lower, attrs) = dom
+            .with_node(node_id, |n| {
+                let tag = n.as_element().map(|name| name.local.to_string())?;
+                let mut attrs = HashMap::new();
+                if let Some(id_attr) = n.get_attribute("id") {
+                    attrs.insert("id".to_string(), id_attr.to_string());
+                }
+                if let Some(href) = n.get_attribute("href") {
+                    attrs.insert("href".to_string(), href.to_string());
+                }
+                if let Some(role) = n.get_attribute("role") {
+                    attrs.insert("role".to_string(), role.to_string());
+                }
+                Some((tag.to_ascii_lowercase(), attrs))
+            })
+            .flatten()?;
 
         // Skip non-visible, non-semantic tags
         if matches!(

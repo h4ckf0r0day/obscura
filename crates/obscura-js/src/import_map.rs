@@ -232,11 +232,18 @@ impl SpecifierMap {
             return Ok(None);
         }
 
+        // Select the longest matching prefix per import-map resolution rules.
+        let mut best_key: Option<&String> = None;
         for key in self
             .prefixes
             .iter()
             .filter(|key| normalized.starts_with(key.as_str()))
         {
+            if best_key.map_or(true, |best| key.len() > best.len()) {
+                best_key = Some(key);
+            }
+        }
+        if let Some(key) = best_key {
             let address = self
                 .entries
                 .get(key)

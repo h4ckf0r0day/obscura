@@ -1,4 +1,3 @@
-
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page, WaitUntil};
@@ -62,10 +61,18 @@ struct WorkerResponse {
 
 impl WorkerResponse {
     fn success(result: serde_json::Value) -> Self {
-        WorkerResponse { ok: true, result: Some(result), error: None }
+        WorkerResponse {
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
     }
     fn error(msg: String) -> Self {
-        WorkerResponse { ok: false, result: None, error: Some(msg) }
+        WorkerResponse {
+            ok: false,
+            result: None,
+            error: Some(msg),
+        }
     }
 }
 
@@ -137,11 +144,14 @@ async fn main() {
                         // Document response before scripts and child frames.
                         // Its status is the final response after HTTP redirects.
                         // Zero denotes a blocked request, not an HTTP response.
-                        let status = page.network_events.iter()
+                        let status = page
+                            .network_events
+                            .iter()
                             .find(|event| event.resource_type == "Document")
                             .filter(|event| {
                                 event.status != 0
-                                    && (event.url.starts_with("http://") || event.url.starts_with("https://"))
+                                    && (event.url.starts_with("http://")
+                                        || event.url.starts_with("https://"))
                             })
                             .map(|event| event.status);
                         WorkerResponse::success(serde_json::json!({
@@ -149,7 +159,7 @@ async fn main() {
                             "url": page.url_string(),
                             "status": status,
                         }))
-                    },
+                    }
                     Err(e) => WorkerResponse::error(e.to_string()),
                 }
             }
@@ -172,27 +182,29 @@ async fn main() {
                 };
                 WorkerResponse::success(result)
             }
-            WorkerCommand::Title => {
-                WorkerResponse::success(serde_json::json!(page.title))
-            }
+            WorkerCommand::Title => WorkerResponse::success(serde_json::json!(page.title)),
             WorkerCommand::DumpHtml => {
-                let html = page.with_dom(|dom| {
-                    if let Ok(Some(html_node)) = dom.query_selector("html") {
-                        dom.outer_html(html_node)
-                    } else {
-                        dom.inner_html(dom.document())
-                    }
-                }).unwrap_or_default();
+                let html = page
+                    .with_dom(|dom| {
+                        if let Ok(Some(html_node)) = dom.query_selector("html") {
+                            dom.outer_html(html_node)
+                        } else {
+                            dom.inner_html(dom.document())
+                        }
+                    })
+                    .unwrap_or_default();
                 WorkerResponse::success(serde_json::json!(html))
             }
             WorkerCommand::DumpText => {
-                let text = page.with_dom(|dom| {
-                    if let Ok(Some(body)) = dom.query_selector("body") {
-                        dom.text_content(body)
-                    } else {
-                        String::new()
-                    }
-                }).unwrap_or_default();
+                let text = page
+                    .with_dom(|dom| {
+                        if let Ok(Some(body)) = dom.query_selector("body") {
+                            dom.text_content(body)
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .unwrap_or_default();
                 WorkerResponse::success(serde_json::json!(text))
             }
             WorkerCommand::Shutdown => {

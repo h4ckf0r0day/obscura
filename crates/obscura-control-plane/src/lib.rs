@@ -46,6 +46,11 @@ impl ControlPlane {
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())
     }
+
+    pub async fn health_check(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
 }
 
 // --- Domain models ---
@@ -95,6 +100,7 @@ impl ControlPlane {
         })
     }
 
+    #[tracing::instrument(skip(self, principal))]
     pub async fn submit_job(
         &self,
         principal: &Principal,
@@ -410,6 +416,14 @@ impl NatsClient {
 
     pub fn jetstream(&self) -> &async_nats::jetstream::Context {
         &self.jetstream
+    }
+
+    pub async fn ping(&self) -> Result<()> {
+        self.client
+            .flush()
+            .await
+            .map_err(|e| ControlPlaneError::Conflict(format!("nats ping: {e}")))?;
+        Ok(())
     }
 
     pub async fn ensure_stream(&self, name: &str, subjects: Vec<String>) -> Result<()> {

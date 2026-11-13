@@ -56,7 +56,10 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
-            let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
+            let ua = params
+                .get("userAgent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Some(page) = ctx.get_session_page(session_id) {
                 page.http_client.set_user_agent(ua).await;
             }
@@ -131,7 +134,9 @@ pub async fn handle(
             let body = if let Some(page) = ctx.get_session_page(session_id) {
                 page.get_response_body(request_id)
             } else {
-                ctx.pages.iter().find_map(|page| page.get_response_body(request_id))
+                ctx.pages
+                    .iter()
+                    .find_map(|page| page.get_response_body(request_id))
             };
 
             match body {
@@ -139,7 +144,10 @@ pub async fn handle(
                     "body": body.cdp_body(),
                     "base64Encoded": body.base64_encoded,
                 })),
-                None => Err(format!("No response body found for requestId {}", request_id)),
+                None => Err(format!(
+                    "No response body found for requestId {}",
+                    request_id
+                )),
             }
         }
         _ => Err(format!("Unknown Network method: {}", method)),
@@ -178,7 +186,11 @@ mod tests {
             .expect("setCookie must succeed without a session");
         assert_eq!(resp["success"], json!(true));
         let cookies = ctx.default_context.cookie_jar.get_all_cookies();
-        assert_eq!(cookies.len(), 1, "default cookie jar must receive the cookie");
+        assert_eq!(
+            cookies.len(),
+            1,
+            "default cookie jar must receive the cookie"
+        );
         assert_eq!(cookies[0].name, "sid");
     }
 
@@ -213,10 +225,9 @@ mod tests {
     #[tokio::test]
     async fn get_all_cookies_returns_every_cookie_in_jar() {
         let mut ctx = CdpContext::new();
-        ctx.default_context.cookie_jar.set_cookies_from_cdp(vec![
-            sample_cookie("a"),
-            sample_cookie("b"),
-        ]);
+        ctx.default_context
+            .cookie_jar
+            .set_cookies_from_cdp(vec![sample_cookie("a"), sample_cookie("b")]);
         let resp = handle("getAllCookies", &json!({}), &mut ctx, &None)
             .await
             .expect("getAllCookies must succeed");
@@ -255,7 +266,8 @@ mod tests {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
-        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
 
         handle(
             "setBlockedURLs",
@@ -313,7 +325,8 @@ mod tests {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
-        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
 
         handle(
             "setBlockedURLs",
@@ -343,7 +356,8 @@ mod tests {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
-        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
 
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.navigate("data:text/html,<html><body>hello body</body></html>")
@@ -384,7 +398,8 @@ mod tests {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
-        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
 
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.navigate("data:text/html,<html><body>temporary body</body></html>")

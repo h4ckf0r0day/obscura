@@ -86,13 +86,7 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
             // IPv4/IPv6 translation prefix (RFC 6052). Only /96 has a fixed
             // embedded-address position; the local-use /48 is therefore
             // blocked outright below.
-            if s[0] == 0x64
-                && s[1] == 0xff9b
-                && s[2] == 0
-                && s[3] == 0
-                && s[4] == 0
-                && s[5] == 0
-            {
+            if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
                 return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
                     (s[6] >> 8) as u8,
                     s[6] as u8,
@@ -114,12 +108,8 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
             // last 32 bits. Either one embedding a forbidden address is
             // refused, like the other IPv4-in-IPv6 forms above.
             if s[0] == 0x2001 && s[1] == 0 {
-                let server = Ipv4Addr::new(
-                    (s[2] >> 8) as u8,
-                    s[2] as u8,
-                    (s[3] >> 8) as u8,
-                    s[3] as u8,
-                );
+                let server =
+                    Ipv4Addr::new((s[2] >> 8) as u8, s[2] as u8, (s[3] >> 8) as u8, s[3] as u8);
                 let client = Ipv4Addr::new(
                     !(s[6] >> 8) as u8,
                     !s[6] as u8,
@@ -135,5 +125,49 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || (s[0] == 0x2001 && s[1] == 0x0db8)
                 || (s[0] == 0x3fff && s[1] & 0xf000 == 0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn loopback_forbidden() {
+        assert!(is_forbidden_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_forbidden_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn private_ranges_forbidden() {
+        assert!(is_forbidden_ip("10.0.0.1".parse().unwrap()));
+        assert!(is_forbidden_ip("172.16.0.1".parse().unwrap()));
+        assert!(is_forbidden_ip("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn metadata_forbidden() {
+        assert!(is_forbidden_ip("169.254.169.254".parse().unwrap()));
+    }
+
+    #[test]
+    fn mapped_ipv6_forbidden() {
+        assert!(is_forbidden_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_forbidden_ip("::ffff:169.254.169.254".parse().unwrap()));
+    }
+
+    #[test]
+    fn public_allowed() {
+        assert!(!is_forbidden_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_forbidden_ip("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn env_allows_private_network_parses() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "true");
+        assert!(env_allows_private_network());
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "0");
+        assert!(!env_allows_private_network());
     }
 }

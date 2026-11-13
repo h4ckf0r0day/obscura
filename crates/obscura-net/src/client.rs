@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use std::net::{IpAddr, SocketAddr};
@@ -9,7 +9,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{watch, RwLock};
 use url::Url;
 
 use crate::cookies::{same_site, CookieJar, SameSiteContext};
@@ -125,7 +125,11 @@ impl Response {
 /// `Set-Cookie` is the exception (RFC 6265 forbids folding it): it is captured
 /// individually by the cookie jar via `get_all`, so the map keeps it only as a
 /// presence signal and last-wins there is fine.
-pub(crate) fn merge_response_header(map: &mut HashMap<String, String>, name: String, value: String) {
+pub(crate) fn merge_response_header(
+    map: &mut HashMap<String, String>,
+    name: String,
+    value: String,
+) {
     if name == "set-cookie" {
         map.insert(name, value);
         return;
@@ -366,11 +370,7 @@ pub(crate) fn serialized_request_origin(
         .unwrap_or_else(|| "null".to_string())
 }
 
-pub(crate) fn redirect_taints_origin(
-    request: &ResourceRequest,
-    current: &Url,
-    next: &Url,
-) -> bool {
+pub(crate) fn redirect_taints_origin(request: &ResourceRequest, current: &Url, next: &Url) -> bool {
     current.origin() != next.origin()
         && request
             .initiator
@@ -417,9 +417,7 @@ pub(crate) fn validate_cors_response(
             target, allow_origin, serialized_origin
         )));
     }
-    if request.credentials == RequestCredentials::Include
-        && allow_credentials != Some("true")
-    {
+    if request.credentials == RequestCredentials::Include && allow_credentials != Some("true") {
         return Err(ObscuraNetError::Cors(format!(
             "credentialed response from {} requires Access-Control-Allow-Credentials: true",
             target
@@ -467,10 +465,7 @@ pub(crate) fn same_site_context(
 }
 
 pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
-    let source = request
-        .referrer
-        .as_ref()
-        .or(request.initiator.as_ref())?;
+    let source = request.referrer.as_ref().or(request.initiator.as_ref())?;
     if !matches!(source.scheme(), "http" | "https")
         || !matches!(target.scheme(), "http" | "https")
         || (source.scheme() == "https" && target.scheme() == "http")
@@ -640,7 +635,11 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
-pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
+pub(crate) fn validate_url(
+    url: &Url,
+    allow_private_network: bool,
+    allow_file_access: bool,
+) -> Result<(), ObscuraNetError> {
     let allow_private_network = allow_private_network || env_allows_private_network();
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
@@ -650,7 +649,16 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
         )));
     }
 
-    if scheme == "file" || allow_private_network {
+    if scheme == "file" {
+        if !allow_file_access {
+            return Err(ObscuraNetError::Network(format!(
+                "file:// access is disabled: {url}"
+            )));
+        }
+        return Ok(());
+    }
+
+    if allow_private_network {
         return Ok(());
     }
 
@@ -765,9 +773,10 @@ fn response_header_value<'a>(
             url, name
         )));
     }
-    first.to_str().map(Some).map_err(|_| {
-        ObscuraNetError::Cors(format!("{} returned an invalid {} header", url, name))
-    })
+    first
+        .to_str()
+        .map(Some)
+        .map_err(|_| ObscuraNetError::Cors(format!("{} returned an invalid {} header", url, name)))
 }
 
 fn validate_reqwest_cors_response(
@@ -779,16 +788,9 @@ fn validate_reqwest_cors_response(
     if !cors_required(request, target) {
         return Ok(());
     }
-    let allow_origin = response_header_value(
-        headers,
-        "access-control-allow-origin",
-        target,
-    )?;
-    let allow_credentials = response_header_value(
-        headers,
-        "access-control-allow-credentials",
-        target,
-    )?;
+    let allow_origin = response_header_value(headers, "access-control-allow-origin", target)?;
+    let allow_credentials =
+        response_header_value(headers, "access-control-allow-credentials", target)?;
     validate_cors_response(
         request,
         target,
@@ -1013,7 +1015,14 @@ fn chrome_client_hints(ua: &str) -> (String, String) {
         .unwrap_or(145);
     const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
     const GREASE_VER: [&str; 3] = ["8", "99", "24"];
-    const PERMS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    const PERMS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
     let grease_brand = format!(
         "Not{}A{}Brand",
         GREASE_CHARS[major % 11],
@@ -1086,34 +1095,35 @@ impl ObscuraHttpClient {
     }
 
     async fn get_client(&self) -> &Client {
-        self.client.get_or_init(|| async {
-            let mut builder = Client::builder()
-                .redirect(Policy::none())
-                .timeout(self.timeout)
-                .danger_accept_invalid_certs(false)
-                // Read a folded header line (obs-fold) as browsers do instead of
-                // failing the response.
-                .http1_allow_obsolete_multiline_headers_in_responses(true)
-                // SSRF guard: reject hostnames that resolve to a private/loopback IP.
-                .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
-;
+        self.client
+            .get_or_init(|| async {
+                let mut builder = Client::builder()
+                    .redirect(Policy::none())
+                    .timeout(self.timeout)
+                    .danger_accept_invalid_certs(false)
+                    // Read a folded header line (obs-fold) as browsers do instead of
+                    // failing the response.
+                    .http1_allow_obsolete_multiline_headers_in_responses(true)
+                    // SSRF guard: reject hostnames that resolve to a private/loopback IP.
+                    .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)));
 
-            if std::env::var_os("SSL_CERT_FILE").is_some()
-                || std::env::var_os("SSL_CERT_DIR").is_some()
-            {
-                for certificate in configured_root_certificates() {
-                    builder = builder.add_root_certificate(certificate.clone());
+                if std::env::var_os("SSL_CERT_FILE").is_some()
+                    || std::env::var_os("SSL_CERT_DIR").is_some()
+                {
+                    for certificate in configured_root_certificates() {
+                        builder = builder.add_root_certificate(certificate.clone());
+                    }
                 }
-            }
 
-            if let Some(ref proxy) = self.proxy_url {
-                if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
-                    builder = builder.proxy(p);
+                if let Some(ref proxy) = self.proxy_url {
+                    if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
+                        builder = builder.proxy(p);
+                    }
                 }
-            }
 
-            builder.build().expect("failed to build HTTP client")
-        }).await
+                builder.build().expect("failed to build HTTP client")
+            })
+            .await
     }
 
     /// Clone the request client owned by this browser context.
@@ -1145,11 +1155,13 @@ impl ObscuraHttpClient {
         url: &Url,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_method(Method::GET, url, None, callbacks).await
+        self.fetch_with_method(Method::GET, url, None, callbacks)
+            .await
     }
 
     pub async fn post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()), None).await
+        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()), None)
+            .await
     }
 
     /// `post_form` variant of `fetch_with_callbacks`.
@@ -1399,25 +1411,42 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request_uncached(initial_method, url, initial_body, callbacks, request, None).await
+        self.fetch_request_uncached(initial_method, url, initial_body, callbacks, request, None)
+            .await
     }
 
     /// A navigation continued by an interceptor uses request-local overrides.
     pub async fn fetch_navigation_request(
-        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
-        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+        &self,
+        url: &Url,
+        method: &str,
+        body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>,
+        callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
-        self.fetch_request_uncached(method, url, body, callbacks, ResourceRequest::navigation(), headers).await
+        self.fetch_request_uncached(
+            method,
+            url,
+            body,
+            callbacks,
+            ResourceRequest::navigation(),
+            headers,
+        )
+        .await
     }
 
     async fn fetch_request_uncached(
-        &self, initial_method: Method, url: &Url, initial_body: Option<Vec<u8>>,
-        callbacks: Option<&CallbackRegistry>, request: ResourceRequest,
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
+        request: ResourceRequest,
         mut request_headers: Option<HashMap<String, String>>,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url, self.allow_private_network)?;
+        validate_url(url, self.allow_private_network, self.allow_file_access())?;
         validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
@@ -1457,7 +1486,10 @@ impl ObscuraHttpClient {
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
-                headers: match request_headers.as_ref() { Some(headers) => headers.clone(), None => self.extra_headers.read().await.clone() },
+                headers: match request_headers.as_ref() {
+                    Some(headers) => headers.clone(),
+                    None => self.extra_headers.read().await.clone(),
+                },
                 resource_type: request.resource_type.clone(),
             };
 
@@ -1495,14 +1527,20 @@ impl ObscuraHttpClient {
                 HeaderValue::from_str(&sec_ch_ua)
                     .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
             );
-            headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
+            headers.insert(
+                HeaderName::from_static("sec-ch-ua-mobile"),
+                HeaderValue::from_static("?0"),
+            );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua-platform"),
                 HeaderValue::from_str(&sec_ch_ua_platform)
                     .unwrap_or_else(|_| HeaderValue::from_static("\"Windows\"")),
             );
             if request.mode == RequestMode::Navigate {
-                headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+                headers.insert(
+                    HeaderName::from_static("upgrade-insecure-requests"),
+                    HeaderValue::from_static("1"),
+                );
             }
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
                 HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
@@ -1520,7 +1558,10 @@ impl ObscuraHttpClient {
                 HeaderValue::from_static(request.mode.header_value()),
             );
             if request.mode == RequestMode::Navigate {
-                headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
+                headers.insert(
+                    HeaderName::from_static("sec-fetch-user"),
+                    HeaderValue::from_static("?1"),
+                );
             }
             headers.insert(
                 HeaderName::from_static("sec-fetch-dest"),
@@ -1575,7 +1616,8 @@ impl ObscuraHttpClient {
                         }
                         tracing::debug!(
                             "Cookie header invalid chars, filtered {} -> {} bytes",
-                            cookie_header.len(), filtered.len(),
+                            cookie_header.len(),
+                            filtered.len(),
                         );
                     }
                 }
@@ -1602,8 +1644,12 @@ impl ObscuraHttpClient {
             }
 
             drop(extra_headers);
-            let default_form_type = method == Method::POST && !headers.contains_key(reqwest::header::CONTENT_TYPE);
-            let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
+            let default_form_type =
+                method == Method::POST && !headers.contains_key(reqwest::header::CONTENT_TYPE);
+            let mut req_builder = self
+                .get_client()
+                .await
+                .request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
@@ -1654,10 +1700,13 @@ impl ObscuraHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, self.allow_private_network)?;
+                    validate_url(
+                        &next_url,
+                        self.allow_private_network,
+                        self.allow_file_access(),
+                    )?;
                     validate_request_mode(&request, &next_url)?;
-                    redirect_tainted |=
-                        redirect_taints_origin(&request, &current_url, &next_url);
+                    redirect_tainted |= redirect_taints_origin(&request, &current_url, &next_url);
                     if next_url.origin() != current_url.origin() {
                         if let Some(headers) = request_headers.as_mut() {
                             headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
@@ -1665,26 +1714,34 @@ impl ObscuraHttpClient {
                     }
                     redirects.push(current_url.clone());
                     current_url = next_url;
-                    if ((status == reqwest::StatusCode::MOVED_PERMANENTLY || status == reqwest::StatusCode::FOUND) && method == Method::POST)
-                        || (status == reqwest::StatusCode::SEE_OTHER && method != Method::GET && method != Method::HEAD)
+                    if ((status == reqwest::StatusCode::MOVED_PERMANENTLY
+                        || status == reqwest::StatusCode::FOUND)
+                        && method == Method::POST)
+                        || (status == reqwest::StatusCode::SEE_OTHER
+                            && method != Method::GET
+                            && method != Method::HEAD)
                     {
                         method = Method::GET;
                         body = None;
                         if let Some(headers) = request_headers.as_mut() {
-                            headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(),
-                                "content-type" | "content-encoding" | "content-language" | "content-location" | "content-length"));
+                            headers.retain(|name, _| {
+                                !matches!(
+                                    name.to_ascii_lowercase().as_str(),
+                                    "content-type"
+                                        | "content-encoding"
+                                        | "content-language"
+                                        | "content-location"
+                                        | "content-length"
+                                )
+                            });
                         }
                     }
                     continue;
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
-                resp,
-                &current_url,
-                request.max_response_bytes,
-            )
-            .await?;
+            let body_bytes =
+                read_reqwest_body_limited(resp, &current_url, request.max_response_bytes).await?;
             drop(in_flight);
 
             let response = Response {
@@ -1771,8 +1828,10 @@ pub enum ObscuraNetError {
 
 #[cfg(test)]
 mod resource_cache_tests {
-    use super::{ResourceCache, ResourceCacheKey, ResourceType, RequestMode,
-        RequestCredentials, Response, RESOURCE_CACHE_MAX_ENTRIES};
+    use super::{
+        RequestCredentials, RequestMode, ResourceCache, ResourceCacheKey, ResourceType, Response,
+        RESOURCE_CACHE_MAX_ENTRIES,
+    };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
     use url::Url;
@@ -1838,7 +1897,6 @@ mod resource_cache_tests {
         assert_eq!(cache.insertion_order.len(), RESOURCE_CACHE_MAX_ENTRIES);
         assert_eq!(cache.body_bytes, RESOURCE_CACHE_MAX_ENTRIES);
     }
-
 }
 
 #[cfg(test)]
@@ -1853,8 +1911,8 @@ mod ssrf_tests {
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::str::FromStr;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use url::Url;
 
@@ -1994,8 +2052,8 @@ mod ssrf_tests {
     fn public_ipv6_is_allowed() {
         for s in [
             "2606:4700:4700::1111", // Cloudflare DNS
-            "3ffe::1",               // below 3fff::/20
-            "3fff:1000::1",          // above 3fff:fff::/20
+            "3ffe::1",              // below 3fff::/20
+            "3fff:1000::1",         // above 3fff:fff::/20
         ] {
             assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
         }
@@ -2004,13 +2062,13 @@ mod ssrf_tests {
     #[test]
     fn ipv6_translation_cannot_hide_forbidden_ipv4() {
         for s in [
-            "2002:7f00:1::",       // 6to4 loopback
-            "2002:a9fe:a9fe::",    // 6to4 link-local metadata
-            "2002:6464:64c8::",    // 6to4 CGNAT metadata
-            "64:ff9b::7f00:1",     // NAT64 loopback
-            "64:ff9b::a9fe:a9fe",  // NAT64 link-local metadata
-            "64:ff9b::6464:64c8",  // NAT64 CGNAT metadata
-            "64:ff9b:1::1",        // local-use translation prefix
+            "2002:7f00:1::",      // 6to4 loopback
+            "2002:a9fe:a9fe::",   // 6to4 link-local metadata
+            "2002:6464:64c8::",   // 6to4 CGNAT metadata
+            "64:ff9b::7f00:1",    // NAT64 loopback
+            "64:ff9b::a9fe:a9fe", // NAT64 link-local metadata
+            "64:ff9b::6464:64c8", // NAT64 CGNAT metadata
+            "64:ff9b:1::1",       // local-use translation prefix
         ] {
             assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
         }
@@ -2038,11 +2096,11 @@ mod ssrf_tests {
     #[test]
     fn native_non_global_ipv6_ranges_are_forbidden() {
         for s in [
-            "100::1",       // discard-only
-            "2001:db8::1",  // documentation
-            "3fff::1",      // documentation
-            "ff02::1",      // link-local multicast
-            "ff0e::1",      // global-scope multicast
+            "100::1",      // discard-only
+            "2001:db8::1", // documentation
+            "3fff::1",     // documentation
+            "ff02::1",     // link-local multicast
+            "ff0e::1",     // global-scope multicast
         ] {
             assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
         }
@@ -2051,21 +2109,33 @@ mod ssrf_tests {
     #[test]
     fn validate_url_blocks_unspecified_and_allows_public() {
         // 0.0.0.0 previously slipped through validate_url's literal-host check.
-        assert!(validate_url(&Url::parse("http://0.0.0.0:8080/").unwrap(), false).is_err());
-        assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), false).is_err());
-        assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false).is_ok());
-        assert!(
-            validate_url(&Url::parse("http://[64:ff9b::7f00:1]/").unwrap(), false).is_err()
-        );
-        assert!(
-            validate_url(&Url::parse("http://[2002:a9fe:a9fe::]/").unwrap(), false).is_err()
-        );
-        assert!(validate_url(&Url::parse("http://192.0.0.9/").unwrap(), false).is_ok());
-        assert!(
-            validate_url(&Url::parse("http://[64:ff9b::808:808]/").unwrap(), false).is_ok()
-        );
+        assert!(validate_url(&Url::parse("http://0.0.0.0:8080/").unwrap(), false, false).is_err());
+        assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), false, false).is_err());
+        assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false, false).is_ok());
+        assert!(validate_url(
+            &Url::parse("http://[64:ff9b::7f00:1]/").unwrap(),
+            false,
+            false
+        )
+        .is_err());
+        assert!(validate_url(
+            &Url::parse("http://[2002:a9fe:a9fe::]/").unwrap(),
+            false,
+            false
+        )
+        .is_err());
+        assert!(validate_url(&Url::parse("http://192.0.0.9/").unwrap(), false, false).is_ok());
+        assert!(validate_url(
+            &Url::parse("http://[64:ff9b::808:808]/").unwrap(),
+            false,
+            false
+        )
+        .is_ok());
         // The allow flag bypasses the guard (local-dev escape hatch).
-        assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true).is_ok());
+        assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true, false).is_ok());
+        // file:// rejected unless explicitly allowed.
+        assert!(validate_url(&Url::parse("file:///tmp/x").unwrap(), false, false).is_err());
+        assert!(validate_url(&Url::parse("file:///tmp/x").unwrap(), false, true).is_ok());
     }
 
     #[test]
@@ -2087,15 +2157,9 @@ mod ssrf_tests {
         assert_eq!(font.destination(), "font");
         assert_eq!(font.accept(), "*/*");
 
-        assert!(image.sends_credentials_to(
-            &Url::parse("https://cdn.example/image.png").unwrap()
-        ));
-        assert!(font.sends_credentials_to(
-            &Url::parse("https://app.example/font.woff2").unwrap()
-        ));
-        assert!(!font.sends_credentials_to(
-            &Url::parse("https://cdn.example/font.woff2").unwrap()
-        ));
+        assert!(image.sends_credentials_to(&Url::parse("https://cdn.example/image.png").unwrap()));
+        assert!(font.sends_credentials_to(&Url::parse("https://app.example/font.woff2").unwrap()));
+        assert!(!font.sends_credentials_to(&Url::parse("https://cdn.example/font.woff2").unwrap()));
 
         let module = ResourceRequest::module_script(&document, &document);
         assert_eq!(module.resource_type, ResourceType::Script);
@@ -2103,12 +2167,8 @@ mod ssrf_tests {
         assert_eq!(module.credentials, RequestCredentials::SameOrigin);
         assert_eq!(module.destination(), "script");
         assert_eq!(module.accept(), "*/*");
-        assert!(module.sends_credentials_to(
-            &Url::parse("https://app.example/chunk.js").unwrap()
-        ));
-        assert!(!module.sends_credentials_to(
-            &Url::parse("https://cdn.example/chunk.js").unwrap()
-        ));
+        assert!(module.sends_credentials_to(&Url::parse("https://app.example/chunk.js").unwrap()));
+        assert!(!module.sends_credentials_to(&Url::parse("https://cdn.example/chunk.js").unwrap()));
     }
 
     #[test]
@@ -2221,7 +2281,10 @@ mod ssrf_tests {
             .fetch(&target)
             .await
             .expect_err("the 21st redirect must be too many");
-        assert!(matches!(err, ObscuraNetError::TooManyRedirects(_)), "got {err:?}");
+        assert!(
+            matches!(err, ObscuraNetError::TooManyRedirects(_)),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2377,11 +2440,7 @@ mod ssrf_tests {
     #[tokio::test]
     async fn accept_language_override_reaches_the_wire() {
         let (target, mut received) = http_fixture(vec![ok_response("", "ok")]).await;
-        let client = ObscuraHttpClient::with_full_options(
-            Arc::new(CookieJar::new()),
-            None,
-            true,
-        );
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         client.set_accept_language("de-DE,de;q=0.9").await;
 
         client.fetch(&target).await.unwrap();
@@ -2400,11 +2459,7 @@ mod ssrf_tests {
         let advertised = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
         let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n";
         let (target, _) = http_fixture(vec![advertised.to_string(), chunked.to_string()]).await;
-        let client = ObscuraHttpClient::with_full_options(
-            Arc::new(CookieJar::new()),
-            None,
-            true,
-        );
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let initiator = target.clone();
         let request = ResourceRequest::subresource(ResourceType::Image, &initiator)
             .with_max_response_bytes(6);
@@ -2586,11 +2641,8 @@ mod ssrf_tests {
     #[tokio::test]
     async fn transport_timeout_returns_active_requests_to_zero() {
         let (target, started) = hanging_fixture().await;
-        let mut client = ObscuraHttpClient::with_full_options(
-            Arc::new(CookieJar::new()),
-            None,
-            true,
-        );
+        let mut client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         client.timeout = std::time::Duration::from_millis(25);
         let fetch = client.fetch(&target);
         let (_, result) = tokio::join!(started, fetch);
@@ -2602,11 +2654,7 @@ mod ssrf_tests {
     async fn callbacks_fire_once_across_redirects() {
         let redirect = "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let (target, _) = http_fixture(vec![redirect.to_string(), ok_response("", "done")]).await;
-        let client = ObscuraHttpClient::with_full_options(
-            Arc::new(CookieJar::new()),
-            None,
-            true,
-        );
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let callbacks = CallbackRegistry::new();
         let requests = Arc::new(AtomicUsize::new(0));
         let responses = Arc::new(AtomicUsize::new(0));
@@ -2713,11 +2761,8 @@ mod ssrf_tests {
 
     #[tokio::test]
     async fn cacheable_identical_module_scripts_share_one_in_flight_request() {
-        let (url, network_requests) = cacheable_resource_fixture(
-            200,
-            "Cache-Control: public, max-age=3600\r\n",
-        )
-        .await;
+        let (url, network_requests) =
+            cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
         let initiator = url.join("/app.js").unwrap();
         let client = Arc::new(ObscuraHttpClient::with_full_options(
             Arc::new(CookieJar::new()),
@@ -2878,17 +2923,14 @@ mod ssrf_tests {
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
         let leaf_key = rcgen::KeyPair::generate().unwrap();
-        let leaf_params =
-            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
         let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
 
         let certs = vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
             leaf_cert.der().to_vec(),
         )];
         let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
-            tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(
-                leaf_key.serialize_der(),
-            ),
+            tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()),
         );
         let config = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -2934,10 +2976,12 @@ mod ssrf_tests {
         std::fs::write(ca_file.path(), ca_pem).unwrap();
         std::env::set_var("SSL_CERT_FILE", ca_file.path());
 
-        let client =
-            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
-        let resp = client.fetch(&url).await.expect("private CA in SSL_CERT_FILE must be trusted");
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("private CA in SSL_CERT_FILE must be trusted");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), "private ca ok");
     }
@@ -2949,8 +2993,7 @@ mod ssrf_tests {
         std::fs::write(ca_dir.path().join("private-ca.pem"), ca_pem).unwrap();
         std::env::set_var("SSL_CERT_DIR", ca_dir.path());
 
-        let client =
-            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
         let resp = client
             .fetch(&url)
@@ -2965,10 +3008,12 @@ mod ssrf_tests {
         // The same fixture that the SSL_CERT_FILE test trusts must fail here. The
         // listener is reachable (same setup), so an Err can only be TLS.
         let (port, _ca_pem) = https_fixture_with_private_ca().await;
-        let client =
-            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
-        let error = client.fetch(&url).await.expect_err("unknown CA must be rejected");
+        let error = client
+            .fetch(&url)
+            .await
+            .expect_err("unknown CA must be rejected");
         // The message must carry the TLS cause, not only "error sending request".
         let message = error.to_string();
         assert!(message.contains("invalid peer certificate"), "{message}");

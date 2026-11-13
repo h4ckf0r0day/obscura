@@ -100,7 +100,11 @@ async fn xhr_arraybuffer_returns_the_response_bytes_unchanged() {
     let result: serde_json::Value =
         serde_json::from_str(raw.as_str().unwrap_or("")).unwrap_or(serde_json::Value::Null);
 
-    assert!(result["error"].is_null(), "probe reported {:?}", result["error"]);
+    assert!(
+        result["error"].is_null(),
+        "probe reported {:?}",
+        result["error"]
+    );
     assert_eq!(
         result["length"].as_u64(),
         Some(256),

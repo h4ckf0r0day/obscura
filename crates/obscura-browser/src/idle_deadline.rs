@@ -3,11 +3,7 @@
 use std::future::Future;
 use tokio::time::Instant;
 
-pub(crate) async fn wait_for_activity(
-    deadline: Instant,
-    final_check: bool,
-    activity: impl Future,
-) {
+pub(crate) async fn wait_for_activity(deadline: Instant, final_check: bool, activity: impl Future) {
     #[cfg(target_os = "macos")]
     if final_check {
         let mut activity = std::pin::pin!(activity);
@@ -56,11 +52,21 @@ mod macos {
     unsafe extern "C" {
         static _dispatch_source_type_timer: u8;
         fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
-        fn dispatch_source_create(kind: *const c_void, handle: usize, mask: usize,
-            queue: *mut c_void) -> *mut c_void;
+        fn dispatch_source_create(
+            kind: *const c_void,
+            handle: usize,
+            mask: usize,
+            queue: *mut c_void,
+        ) -> *mut c_void;
         fn dispatch_set_context(object: *mut c_void, context: *mut c_void);
-        fn dispatch_source_set_event_handler_f(source: *mut c_void, handler: extern "C" fn(*mut c_void));
-        fn dispatch_source_set_cancel_handler_f(source: *mut c_void, handler: extern "C" fn(*mut c_void));
+        fn dispatch_source_set_event_handler_f(
+            source: *mut c_void,
+            handler: extern "C" fn(*mut c_void),
+        );
+        fn dispatch_source_set_cancel_handler_f(
+            source: *mut c_void,
+            handler: extern "C" fn(*mut c_void),
+        );
         fn dispatch_source_set_timer(source: *mut c_void, start: u64, interval: u64, leeway: u64);
         fn dispatch_time(when: u64, delta: i64) -> u64;
         fn dispatch_resume(object: *mut c_void);
@@ -91,12 +97,19 @@ mod macos {
     }
 
     fn arm(source: NonNull<c_void>, deadline: Instant) {
-        let nanos = deadline.saturating_duration_since(Instant::now()).as_nanos()
+        let nanos = deadline
+            .saturating_duration_since(Instant::now())
+            .as_nanos()
             .min(i64::MAX as u128) as i64;
         // SAFETY: the caller owns a live source or runs its event handler.
         // This is a one-shot uptime timer; no periodic wake remains armed.
         unsafe {
-            dispatch_source_set_timer(source.as_ptr(), dispatch_time(TIME_NOW, nanos), TIME_FOREVER, 0);
+            dispatch_source_set_timer(
+                source.as_ptr(),
+                dispatch_time(TIME_NOW, nanos),
+                TIME_FOREVER,
+                0,
+            );
         }
     }
 
@@ -119,7 +132,9 @@ mod macos {
         }));
         // SAFETY: the source retains its handler until this callback returns;
         // cancellation is asynchronous and does not join the page/V8 thread.
-        unsafe { dispatch_source_cancel(callback.source.as_ptr()); }
+        unsafe {
+            dispatch_source_cancel(callback.source.as_ptr());
+        }
     }
 
     extern "C" fn cancelled(context: *mut c_void) {
@@ -147,12 +162,18 @@ mod macos {
             // are installed. The returned owned reference belongs to Self.
             let source = unsafe {
                 NonNull::new(dispatch_source_create(
-                    (&raw const _dispatch_source_type_timer).cast(), 0, TIMER_STRICT,
+                    (&raw const _dispatch_source_type_timer).cast(),
+                    0,
+                    TIMER_STRICT,
                     dispatch_get_global_queue(0, 0),
                 ))?
             };
             let (sender, receiver) = oneshot::channel();
-            let callback = Box::new(Callback { source, deadline, sender: Some(sender) });
+            let callback = Box::new(Callback {
+                source,
+                deadline,
+                sender: Some(sender),
+            });
             #[cfg(test)]
             LIVE_CALLBACKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             unsafe {
@@ -162,11 +183,16 @@ mod macos {
                 arm(source, deadline);
                 dispatch_resume(source.as_ptr());
             }
-            Some(Self { source, receiver: Some(receiver) })
+            Some(Self {
+                source,
+                receiver: Some(receiver),
+            })
         }
 
         pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> bool {
-            let Some(receiver) = &mut self.receiver else { return false; };
+            let Some(receiver) = &mut self.receiver else {
+                return false;
+            };
             if let Poll::Ready(result) = Pin::new(receiver).poll(cx) {
                 self.receiver = None;
                 return result.is_ok();
@@ -192,7 +218,10 @@ mod macos {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
         use std::task::{Wake, Waker};
         use std::time::Duration;
 
@@ -201,16 +230,27 @@ mod macos {
                 while LIVE_CALLBACKS.load(Ordering::SeqCst) != 0 {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-            }).await.expect("cancelled timer context must be released");
+            })
+            .await
+            .expect("cancelled timer context must be released");
         }
 
         #[tokio::test(flavor = "current_thread")]
         async fn precise_idle_timer_reaches_deadline_without_early_readiness() {
             let deadline = Instant::now() + Duration::from_millis(20);
             let mut wake = PreciseWake::new(deadline).unwrap();
-            tokio::time::timeout(Duration::from_secs(2), std::future::poll_fn(|cx| {
-                if wake.poll(cx) { Poll::Ready(()) } else { Poll::Pending }
-            })).await.expect("dispatch timer must notify independently of the fallback");
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                std::future::poll_fn(|cx| {
+                    if wake.poll(cx) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .expect("dispatch timer must notify independently of the fallback");
             assert!(Instant::now() >= deadline);
             drop(wake);
             drained().await;
@@ -220,12 +260,16 @@ mod macos {
         async fn precise_idle_timer_rechecks_and_rearms_an_early_event() {
             let mut wake = PreciseWake::new(Instant::now() + Duration::from_secs(5)).unwrap();
             // Exercise the real C handler with an intentionally early event.
-            unsafe { dispatch_source_set_timer(wake.source.as_ptr(), TIME_NOW, TIME_FOREVER, 0); }
+            unsafe {
+                dispatch_source_set_timer(wake.source.as_ptr(), TIME_NOW, TIME_FOREVER, 0);
+            }
             tokio::time::timeout(Duration::from_secs(2), async {
                 while EARLY_WAKES.load(Ordering::SeqCst) == 0 {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-            }).await.expect("early event must reach the deadline recheck");
+            })
+            .await
+            .expect("early event must reach the deadline recheck");
             assert!(!wake.poll(&mut Context::from_waker(Waker::noop())));
             drop(wake);
             drained().await;
@@ -233,7 +277,9 @@ mod macos {
 
         struct CountWakes(AtomicUsize);
         impl Wake for CountWakes {
-            fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
 
         #[tokio::test(flavor = "current_thread")]
@@ -271,8 +317,15 @@ mod macos {
         #[tokio::test(flavor = "current_thread")]
         async fn precise_idle_activity_is_polled_before_creating_a_timer() {
             let mut polled = false;
-            super::super::wait_for_activity(tokio::time::Instant::now() + Duration::from_secs(5), true,
-                std::future::poll_fn(|_| { polled = true; Poll::Ready(()) })).await;
+            super::super::wait_for_activity(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                true,
+                std::future::poll_fn(|_| {
+                    polled = true;
+                    Poll::Ready(())
+                }),
+            )
+            .await;
             assert!(polled);
             assert_eq!(LIVE_CALLBACKS.load(Ordering::SeqCst), 0);
         }
@@ -282,7 +335,10 @@ mod macos {
             tokio::time::pause();
             let started = tokio::time::Instant::now();
             let mut wait = Box::pin(super::super::wait_for_activity(
-                started + Duration::from_millis(25), true, std::future::pending::<()>()));
+                started + Duration::from_millis(25),
+                true,
+                std::future::pending::<()>(),
+            ));
             let mut cx = Context::from_waker(Waker::noop());
             assert!(wait.as_mut().poll(&mut cx).is_pending());
             tokio::time::advance(Duration::from_millis(24)).await;
@@ -305,8 +361,11 @@ mod tests {
     async fn idle_intermediate_check_keeps_the_existing_timeout() {
         tokio::time::pause();
         let started = Instant::now();
-        let mut wait = Box::pin(wait_for_activity(started + Duration::from_millis(50), false,
-            std::future::pending::<()>()));
+        let mut wait = Box::pin(wait_for_activity(
+            started + Duration::from_millis(50),
+            false,
+            std::future::pending::<()>(),
+        ));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(wait.as_mut().poll(&mut cx).is_pending());
         tokio::time::advance(Duration::from_millis(49)).await;
@@ -318,12 +377,24 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn idle_deadline_wait_preserves_ready_activity_and_cancellation() {
         let mut polled = false;
-        wait_for_activity(Instant::now(), true,
-            std::future::poll_fn(|_| { polled = true; std::task::Poll::Ready(()) })).await;
-        assert!(polled, "an expired deadline must still poll page activity first");
+        wait_for_activity(
+            Instant::now(),
+            true,
+            std::future::poll_fn(|_| {
+                polled = true;
+                std::task::Poll::Ready(())
+            }),
+        )
+        .await;
+        assert!(
+            polled,
+            "an expired deadline must still poll page activity first"
+        );
         let (sender, mut receiver) = tokio::sync::oneshot::channel::<()>();
         wait_for_activity(Instant::now(), true, &mut receiver).await;
-        sender.send(()).expect("cancelling the wait must not consume unrelated work");
+        sender
+            .send(())
+            .expect("cancelling the wait must not consume unrelated work");
         receiver.await.unwrap();
     }
 }

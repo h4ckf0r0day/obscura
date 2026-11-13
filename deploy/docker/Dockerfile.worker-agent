@@ -1,0 +1,21 @@
+FROM rust:latest AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake clang python3 pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p obscura-worker --bin obscura-runtime-worker && \
+    cargo build --release -p obscura-worker-agent
+
+FROM debian:trixie-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
+RUN groupadd -g 10004 obscura && useradd -u 10004 -g obscura -s /bin/false -m obscura
+COPY --from=builder /src/target/release/obscura-runtime-worker /usr/local/bin/obscura-runtime-worker
+COPY --from=builder /src/target/release/obscura-worker-agent /usr/local/bin/obscura-worker-agent
+RUN ln -sf /usr/local/bin/obscura-runtime-worker /usr/local/bin/obscura-worker
+USER obscura:obscura
+WORKDIR /home/obscura
+ENV RUST_LOG=warn
+ENV OBSCURA_WORKER_BIN=/usr/local/bin/obscura-runtime-worker
+ENV OBSCURA_METRICS_PORT=9100
+EXPOSE 9100
+HEALTHCHECK --interval=10s --timeout=3s --retries=5 CMD curl -fsS http://127.0.0.1:8083/ || exit 1
+ENTRYPOINT ["/usr/local/bin/obscura-worker-agent"]

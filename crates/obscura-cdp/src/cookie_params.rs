@@ -24,7 +24,11 @@ pub fn parse_cdp_cookie(value: &Value) -> Option<ParsedCookie> {
     let explicit_domain = value.get("domain").and_then(|v| v.as_str());
     let domain = explicit_domain
         .map(str::to_string)
-        .or_else(|| url_parsed.as_ref().and_then(|u| u.host_str().map(str::to_string)))
+        .or_else(|| {
+            url_parsed
+                .as_ref()
+                .and_then(|u| u.host_str().map(str::to_string))
+        })
         .unwrap_or_default();
 
     if domain.is_empty() {
@@ -42,14 +46,23 @@ pub fn parse_cdp_cookie(value: &Value) -> Option<ParsedCookie> {
         })
         .unwrap_or_else(|| DEFAULT_COOKIE_PATH.to_string());
 
-    let secure = value.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
-    let http_only = value.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false);
+    let secure = value
+        .get("secure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let http_only = value
+        .get("httpOnly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let same_site = value
         .get("sameSite")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let expires = value.get("expires").and_then(|v| v.as_f64()).map(|f| f as i64);
+    let expires = value
+        .get("expires")
+        .and_then(|v| v.as_f64())
+        .map(|f| f as i64);
 
     Some(ParsedCookie {
         cookie: CookieInfo {
@@ -87,7 +100,11 @@ pub fn parse_delete_cookies_params(params: &Value) -> Option<DeleteCookiesFilter
         .get("domain")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| url_parsed.as_ref().and_then(|u| u.host_str().map(|h| h.to_string())))
+        .or_else(|| {
+            url_parsed
+                .as_ref()
+                .and_then(|u| u.host_str().map(|h| h.to_string()))
+        })
         .unwrap_or_default();
 
     let path = params

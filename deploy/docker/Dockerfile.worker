@@ -35,7 +35,7 @@ EXPOSE 9222
 EXPOSE 9100
 
 HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
-  CMD kill -0 1 || exit 1
+  CMD curl -fsS -H "Authorization: Bearer $OBSCURA_CDP_TOKEN" http://127.0.0.1:9222/json/version || exit 1
 
 ENTRYPOINT ["/usr/local/bin/obscura"]
 CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]

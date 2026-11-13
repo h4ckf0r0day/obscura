@@ -48,26 +48,48 @@ impl CssMediaType {
     }
 
     pub fn with_dark_color_scheme(self, dark: bool) -> Self {
-        let medium = if self.is_print() { Self::Print } else { Self::Screen };
+        let medium = if self.is_print() {
+            Self::Print
+        } else {
+            Self::Screen
+        };
         let medium = if dark {
-            if medium.is_print() { Self::PrintDark } else { Self::ScreenDark }
-        } else { medium };
+            if medium.is_print() {
+                Self::PrintDark
+            } else {
+                Self::ScreenDark
+            }
+        } else {
+            medium
+        };
         medium.with_reduced_motion(self.reduced_motion())
     }
 
     pub fn reduced_motion(self) -> bool {
-        matches!(self, Self::ScreenReducedMotion | Self::PrintReducedMotion
-            | Self::ScreenDarkReducedMotion | Self::PrintDarkReducedMotion)
+        matches!(
+            self,
+            Self::ScreenReducedMotion
+                | Self::PrintReducedMotion
+                | Self::ScreenDarkReducedMotion
+                | Self::PrintDarkReducedMotion
+        )
     }
 
     pub fn dark_color_scheme(self) -> bool {
-        matches!(self, Self::ScreenDark | Self::PrintDark
-            | Self::ScreenDarkReducedMotion | Self::PrintDarkReducedMotion)
+        matches!(
+            self,
+            Self::ScreenDark
+                | Self::PrintDark
+                | Self::ScreenDarkReducedMotion
+                | Self::PrintDarkReducedMotion
+        )
     }
 
     pub fn is_print(self) -> bool {
-        matches!(self, Self::Print | Self::PrintReducedMotion
-            | Self::PrintDark | Self::PrintDarkReducedMotion)
+        matches!(
+            self,
+            Self::Print | Self::PrintReducedMotion | Self::PrintDark | Self::PrintDarkReducedMotion
+        )
     }
 }
 
@@ -164,18 +186,18 @@ fn relational_key_may_match(
     let quirks = tree.is_quirks();
     match key {
         None => true,
-        Some(RelationalSelectorKey::Id(expected)) => dom_node
-            .get_attribute("id")
-            .is_some_and(|actual| {
+        Some(RelationalSelectorKey::Id(expected)) => {
+            dom_node.get_attribute("id").is_some_and(|actual| {
                 actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
-            }),
-        Some(RelationalSelectorKey::Class(expected)) => dom_node
-            .get_attribute("class")
-            .is_some_and(|classes| {
+            })
+        }
+        Some(RelationalSelectorKey::Class(expected)) => {
+            dom_node.get_attribute("class").is_some_and(|classes| {
                 classes.split_whitespace().any(|actual| {
                     actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
                 })
-            }),
+            })
+        }
         Some(RelationalSelectorKey::Attribute(expected)) => {
             dom_node.get_attribute(expected).is_some()
         }
@@ -199,18 +221,18 @@ impl RelationalInvalidation {
         };
         let quirks = tree.is_quirks();
         self.relative_keys.iter().any(|key| match key {
-            RelationalSelectorKey::Id(expected) => dom_node
-                .get_attribute("id")
-                .is_some_and(|actual| {
+            RelationalSelectorKey::Id(expected) => {
+                dom_node.get_attribute("id").is_some_and(|actual| {
                     actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
-                }),
-            RelationalSelectorKey::Class(expected) => dom_node
-                .get_attribute("class")
-                .is_some_and(|classes| {
+                })
+            }
+            RelationalSelectorKey::Class(expected) => {
+                dom_node.get_attribute("class").is_some_and(|classes| {
                     classes.split_whitespace().any(|actual| {
                         actual == expected || (quirks && actual.eq_ignore_ascii_case(expected))
                     })
-                }),
+                })
+            }
             RelationalSelectorKey::Attribute(expected) => dom_node.attrs().is_some_and(|attrs| {
                 attrs
                     .iter()
@@ -319,11 +341,7 @@ impl InvalidationMap {
         self.general_sibling_selectors
     }
 
-    pub(crate) fn node_may_start_sibling_selector(
-        &self,
-        tree: &DomTree,
-        node: NodeId,
-    ) -> bool {
+    pub(crate) fn node_may_start_sibling_selector(&self, tree: &DomTree, node: NodeId) -> bool {
         if self.unkeyed_sibling_selectors
             || (tree.is_quirks()
                 && (self.adjacent_sibling_selectors || self.general_sibling_selectors))
@@ -334,9 +352,9 @@ impl InvalidationMap {
             return false;
         };
         let reaches_sibling = |dependencies: &[InvalidationDependency]| {
-            dependencies.iter().any(|dependency| {
-                dependency.reaches.contains(InvalidationReaches::SIBLINGS)
-            })
+            dependencies
+                .iter()
+                .any(|dependency| dependency.reaches.contains(InvalidationReaches::SIBLINGS))
         };
         if node
             .get_attribute("id")
@@ -473,9 +491,7 @@ fn compose_invalidation_reach(
         // A sibling traversal nested under an ancestor traversal (or vice
         // versa) cannot be represented by the three simple phase-1 reaches.
         map.mark_conservative(rule_order);
-        inner
-            .union(outer)
-            .union(InvalidationReaches::CONSERVATIVE)
+        inner.union(outer).union(InvalidationReaches::CONSERVATIVE)
     }
 }
 
@@ -489,10 +505,7 @@ fn consume_css_identifier(chars: &[char], mut index: usize) -> (String, usize) {
             };
             if escaped.is_ascii_hexdigit() {
                 let start = index;
-                while index < chars.len()
-                    && index - start < 6
-                    && chars[index].is_ascii_hexdigit()
-                {
+                while index < chars.len() && index - start < 6 && chars[index].is_ascii_hexdigit() {
                     index += 1;
                 }
                 let digits: String = chars[start..index].iter().collect();
@@ -798,9 +811,9 @@ fn relative_selector_subject_has_key(selector: &str) -> bool {
                 let arguments = chars[next + 1..close].iter().collect::<String>();
                 let alternatives = split_selector_list(&arguments);
                 if !alternatives.is_empty()
-                    && alternatives.iter().all(|alternative| {
-                        relative_selector_subject_has_key(alternative.trim())
-                    })
+                    && alternatives
+                        .iter()
+                        .all(|alternative| relative_selector_subject_has_key(alternative.trim()))
                 {
                     return true;
                 }
@@ -894,10 +907,7 @@ fn relational_anchor_key(compound: &str) -> Option<RelationalSelectorKey> {
     None
 }
 
-fn push_relational_selector_key(
-    keys: &mut Vec<RelationalSelectorKey>,
-    key: RelationalSelectorKey,
-) {
+fn push_relational_selector_key(keys: &mut Vec<RelationalSelectorKey>, key: RelationalSelectorKey) {
     if !keys.contains(&key) {
         keys.push(key);
     }
@@ -907,10 +917,7 @@ fn push_relational_selector_key(
 /// child-list insertion which contains none of these keys cannot make the path
 /// start matching.  This is an early rejection only: each key is treated as an
 /// alternative trigger, so compounds requiring several keys remain sound.
-fn collect_relational_selector_keys(
-    selector: &str,
-    keys: &mut Vec<RelationalSelectorKey>,
-) {
+fn collect_relational_selector_keys(selector: &str, keys: &mut Vec<RelationalSelectorKey>) {
     let selector = selector.trim();
     let selector = selector
         .chars()
@@ -924,10 +931,7 @@ fn collect_relational_selector_keys(
     }
 }
 
-fn collect_relational_compound_keys(
-    compound: &str,
-    keys: &mut Vec<RelationalSelectorKey>,
-) {
+fn collect_relational_compound_keys(compound: &str, keys: &mut Vec<RelationalSelectorKey>) {
     if let Some(local_name) = compound_local_name(compound) {
         push_relational_selector_key(keys, RelationalSelectorKey::LocalName(local_name));
     }
@@ -1255,11 +1259,7 @@ fn note_compound_dependencies(
                     "has" => {
                         // Relative selectors invalidate anchors upwards, which
                         // Self/Descendants/Siblings cannot express soundly.
-                        map.push_state(
-                            name.clone(),
-                            rule_order,
-                            InvalidationReaches::CONSERVATIVE,
-                        );
+                        map.push_state(name.clone(), rule_order, InvalidationReaches::CONSERVATIVE);
                         map.mark_conservative(rule_order);
                         let alternatives = split_selector_list(&arguments);
                         let mut relative_keys = Vec::new();
@@ -1273,11 +1273,9 @@ fn note_compound_dependencies(
                             !relative_selector_subject_has_key(alternative.trim())
                         });
                         map.mark_relational(rule_order, unkeyed);
-                        let sibling_side_effect = alternatives
-                            .iter()
-                            .any(|alternative| {
-                                selector_contains_adjacent_combinator(alternative.trim())
-                            });
+                        let sibling_side_effect = alternatives.iter().any(|alternative| {
+                            selector_contains_adjacent_combinator(alternative.trim())
+                        });
                         let structural_side_effect = alternatives.iter().any(|alternative| {
                             selector_contains_pseudo(
                                 alternative.trim(),
@@ -1351,11 +1349,7 @@ fn note_compound_dependencies(
                         // observe language/direction resolved above the
                         // mutated node. Keep the dependency keyed, but require
                         // the retained planner's sound full fallback.
-                        map.push_state(
-                            name,
-                            rule_order,
-                            InvalidationReaches::CONSERVATIVE,
-                        );
+                        map.push_state(name, rule_order, InvalidationReaches::CONSERVATIVE);
                         map.mark_conservative(rule_order);
                     }
                     "host" => {
@@ -1416,28 +1410,12 @@ fn note_selector_dependencies(
             map.mark_conservative(rule_order);
         }
         let reaches = compose_invalidation_reach(map, local_reaches, outer_reaches, rule_order);
-        note_compound_dependencies(
-            map,
-            &compound,
-            reaches,
-            rule_order,
-            !record_tree_siblings,
-        );
+        note_compound_dependencies(map, &compound, reaches, rule_order, !record_tree_siblings);
     }
 }
 
-fn note_selector_for_invalidation(
-    map: &mut InvalidationMap,
-    selector: &str,
-    rule_order: usize,
-) {
-    note_selector_dependencies(
-        map,
-        selector,
-        InvalidationReaches::SELF,
-        rule_order,
-        true,
-    );
+fn note_selector_for_invalidation(map: &mut InvalidationMap, selector: &str, rule_order: usize) {
+    note_selector_dependencies(map, selector, InvalidationReaches::SELF, rule_order, true);
 }
 
 /// Record element attributes read from declaration values.
@@ -1450,12 +1428,17 @@ fn note_selector_for_invalidation(
 /// spelling would retain stale computed values.
 #[cfg(feature = "paint")]
 pub(crate) fn declaration_value_reads_attribute(value: &str, attribute: &str) -> bool {
-    if !value.as_bytes().windows(4).any(|part| part.eq_ignore_ascii_case(b"attr")) {
+    if !value
+        .as_bytes()
+        .windows(4)
+        .any(|part| part.eq_ignore_ascii_case(b"attr"))
+    {
         return false;
     }
     let mut dependencies = InvalidationMap::default();
     note_declaration_attribute_dependencies(&mut dependencies, value, 0);
-    dependencies.has_dynamic_attribute_reads() || !dependencies.attribute_dependencies(attribute).is_empty()
+    dependencies.has_dynamic_attribute_reads()
+        || !dependencies.attribute_dependencies(attribute).is_empty()
 }
 
 fn note_declaration_attribute_dependencies(
@@ -1496,9 +1479,7 @@ fn note_declaration_attribute_dependencies(
         }
         if ch == '/' && chars.get(index + 1) == Some(&'*') {
             index += 2;
-            while index + 1 < chars.len()
-                && !(chars[index] == '*' && chars[index + 1] == '/')
-            {
+            while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
                 index += 1;
             }
             index = (index + 2).min(chars.len());
@@ -1526,10 +1507,7 @@ fn note_declaration_attribute_dependencies(
             break;
         };
         let mut name_start = open + 1;
-        while chars
-            .get(name_start)
-            .is_some_and(|ch| ch.is_whitespace())
-        {
+        while chars.get(name_start).is_some_and(|ch| ch.is_whitespace()) {
             name_start += 1;
         }
         let (attribute, name_end) = consume_css_identifier(&chars, name_start);
@@ -1812,12 +1790,7 @@ impl PseudoRuleMap {
                     nid,
                 ))
                 || node.get_attribute("id").is_some_and(|id| {
-                    self.bucket_matches_container_query_rule(
-                        self.by_id.get(id),
-                        tree,
-                        matcher,
-                        nid,
-                    )
+                    self.bucket_matches_container_query_rule(self.by_id.get(id), tree, matcher, nid)
                 })
                 || node.get_attribute("class").is_some_and(|classes| {
                     classes.split_whitespace().any(|class| {
@@ -2022,40 +1995,16 @@ impl AnimatedProperty {
     fn effect_impact(self) -> crate::AnimationEffectImpact {
         use AnimatedProperty::*;
         match self {
-            Opacity
-            | Color
-            | BackgroundColor
-            | BorderTopColor
-            | BorderRightColor
-            | BorderBottomColor
-            | BorderLeftColor
-            | BackgroundPosition
-            | Visibility => crate::AnimationEffectImpact::Paint,
-            Transform
-            | Translate
-            | Rotate
-            | Scale
-            | Width
-            | Height
-            | MinWidth
-            | MinHeight
-            | MaxWidth
-            | MaxHeight
-            | Top
-            | Right
-            | Bottom
-            | Left
-            | MarginTop
-            | MarginRight
-            | MarginBottom
-            | MarginLeft
-            | PaddingTop
-            | PaddingRight
-            | PaddingBottom
-            | PaddingLeft
-            | RowGap
-            | ColumnGap
-            | FlexBasis => crate::AnimationEffectImpact::Geometry,
+            Opacity | Color | BackgroundColor | BorderTopColor | BorderRightColor
+            | BorderBottomColor | BorderLeftColor | BackgroundPosition | Visibility => {
+                crate::AnimationEffectImpact::Paint
+            }
+            Transform | Translate | Rotate | Scale | Width | Height | MinWidth | MinHeight
+            | MaxWidth | MaxHeight | Top | Right | Bottom | Left | MarginTop | MarginRight
+            | MarginBottom | MarginLeft | PaddingTop | PaddingRight | PaddingBottom
+            | PaddingLeft | RowGap | ColumnGap | FlexBasis => {
+                crate::AnimationEffectImpact::Geometry
+            }
         }
     }
 }
@@ -2515,7 +2464,8 @@ impl StylesheetCache {
     ) -> Option<Arc<Stylesheet>> {
         let entry = self.entry.as_ref()?;
         (entry.viewport_bits == (viewport.0.to_bits(), viewport.1.to_bits())
-            && entry.media_type == media_type && entry.sources == sources)
+            && entry.media_type == media_type
+            && entry.sources == sources)
             .then(|| Arc::clone(&entry.sheet))
     }
 
@@ -2534,10 +2484,7 @@ impl StylesheetCache {
 
         self.misses = self.misses.saturating_add(1);
         let sheet = Arc::new(Stylesheet::parse_for_viewport_and_media(
-            tree,
-            sources,
-            viewport,
-            media_type,
+            tree, sources, viewport, media_type,
         ));
         let source_bytes = sources
             .iter()
@@ -2604,10 +2551,15 @@ impl Stylesheet {
     pub(crate) fn animation_affects_non_geometric_style(&self, name: &str) -> bool {
         // Only tracks exposed by the partial CSSOM snapshot require live sampling.
         self.keyframes.get(name).is_some_and(|keyframes| {
-            keyframes.tracks.keys().any(|property| matches!(property,
-                AnimatedProperty::Opacity | AnimatedProperty::Color
-                    | AnimatedProperty::BackgroundColor | AnimatedProperty::Visibility
-            ))
+            keyframes.tracks.keys().any(|property| {
+                matches!(
+                    property,
+                    AnimatedProperty::Opacity
+                        | AnimatedProperty::Color
+                        | AnimatedProperty::BackgroundColor
+                        | AnimatedProperty::Visibility
+                )
+            })
         })
     }
 
@@ -2673,12 +2625,7 @@ impl Stylesheet {
                     nid,
                 ))
                 || node.get_attribute("id").is_some_and(|id| {
-                    self.bucket_matches_container_query_rule(
-                        self.by_id.get(id),
-                        tree,
-                        matcher,
-                        nid,
-                    )
+                    self.bucket_matches_container_query_rule(self.by_id.get(id), tree, matcher, nid)
                 })
                 || node.get_attribute("class").is_some_and(|classes| {
                     classes.split_whitespace().any(|class| {
@@ -2707,9 +2654,9 @@ impl Stylesheet {
                     nid,
                 )
         });
-        let supports_placeholder = node.as_element().is_some_and(|element| {
-            matches!(element.local.as_ref(), "input" | "textarea")
-        });
+        let supports_placeholder = node
+            .as_element()
+            .is_some_and(|element| matches!(element.local.as_ref(), "input" | "textarea"));
         normal_match
             || self
                 .before_rules
@@ -2751,12 +2698,7 @@ impl Stylesheet {
     /// fixed desktop width made responsive frameworks build one DOM while the
     /// renderer applied another breakpoint.
     pub fn parse_for_viewport(tree: &DomTree, sources: &[String], viewport: (f32, f32)) -> Self {
-        Self::parse_for_viewport_and_media(
-            tree,
-            sources,
-            viewport,
-            CssMediaType::Screen,
-        )
+        Self::parse_for_viewport_and_media(tree, sources, viewport, CssMediaType::Screen)
     }
 
     pub fn parse_for_viewport_and_media(
@@ -2878,11 +2820,7 @@ impl Stylesheet {
                 let sel_trim = selector.trim();
                 if let Some(base) = strip_pseudo_element(sel_trim, "before") {
                     if let Some(sel) = tree.compile_rule_selector(base) {
-                        note_selector_for_invalidation(
-                            &mut sheet.invalidation_map,
-                            base,
-                            order,
-                        );
+                        note_selector_for_invalidation(&mut sheet.invalidation_map, base, order);
                         note_declaration_attribute_dependencies(
                             &mut sheet.invalidation_map,
                             &decls,
@@ -2910,22 +2848,14 @@ impl Stylesheet {
                         // syntax that the current selector matcher cannot yet
                         // compile. Once matcher support lands, phase 2 must not
                         // silently treat the rule as locally invalidatable.
-                        note_selector_for_invalidation(
-                            &mut sheet.invalidation_map,
-                            base,
-                            order,
-                        );
+                        note_selector_for_invalidation(&mut sheet.invalidation_map, base, order);
                     }
                     order += 1;
                     continue;
                 }
                 if let Some(base) = strip_pseudo_element(sel_trim, "after") {
                     if let Some(sel) = tree.compile_rule_selector(base) {
-                        note_selector_for_invalidation(
-                            &mut sheet.invalidation_map,
-                            base,
-                            order,
-                        );
+                        note_selector_for_invalidation(&mut sheet.invalidation_map, base, order);
                         note_declaration_attribute_dependencies(
                             &mut sheet.invalidation_map,
                             &decls,
@@ -2949,22 +2879,14 @@ impl Stylesheet {
                             layer,
                         });
                     } else if selector_requires_conservative_tracking(base) {
-                        note_selector_for_invalidation(
-                            &mut sheet.invalidation_map,
-                            base,
-                            order,
-                        );
+                        note_selector_for_invalidation(&mut sheet.invalidation_map, base, order);
                     }
                     order += 1;
                     continue;
                 }
                 if let Some(base) = strip_pseudo_element(sel_trim, "placeholder") {
                     if let Some(sel) = tree.compile_rule_selector(base) {
-                        note_selector_for_invalidation(
-                            &mut sheet.invalidation_map,
-                            base,
-                            order,
-                        );
+                        note_selector_for_invalidation(&mut sheet.invalidation_map, base, order);
                         note_declaration_attribute_dependencies(
                             &mut sheet.invalidation_map,
                             &decls,
@@ -2988,11 +2910,7 @@ impl Stylesheet {
                             layer,
                         });
                     } else if selector_requires_conservative_tracking(base) {
-                        note_selector_for_invalidation(
-                            &mut sheet.invalidation_map,
-                            base,
-                            order,
-                        );
+                        note_selector_for_invalidation(&mut sheet.invalidation_map, base, order);
                     }
                     order += 1;
                     continue;
@@ -3008,16 +2926,8 @@ impl Stylesheet {
                     }
                     continue;
                 };
-                note_selector_for_invalidation(
-                    &mut sheet.invalidation_map,
-                    &selector,
-                    order,
-                );
-                note_declaration_attribute_dependencies(
-                    &mut sheet.invalidation_map,
-                    &decls,
-                    order,
-                );
+                note_selector_for_invalidation(&mut sheet.invalidation_map, &selector, order);
+                note_declaration_attribute_dependencies(&mut sheet.invalidation_map, &decls, order);
                 let (normal_decls, important_decls) = crate::style::partition_declarations(&decls);
                 let specificity = sel.specificity();
                 let normal_flags = declaration_stream_flags(&normal_decls);
@@ -3316,13 +3226,10 @@ impl Stylesheet {
                 None
             }
         };
-        let supports_placeholder = tree
-            .borrow_node(nid)
-            .is_some_and(|node| {
-                node.as_element().is_some_and(|element| {
-                    matches!(element.local.as_ref(), "input" | "textarea")
-                })
-            });
+        let supports_placeholder = tree.borrow_node(nid).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|element| matches!(element.local.as_ref(), "input" | "textarea"))
+        });
         (
             build(&self.before_rules, matcher, false),
             build(&self.after_rules, matcher, false),
@@ -3700,10 +3607,7 @@ impl Stylesheet {
         // the host's own (innermost) tree through outer slot scopes toward the
         // document. Important declarations reverse that order.
         for declarations in slotted_declarations.iter().rev() {
-            append_declaration_stream(
-                &mut shadow_scope_declarations.normal,
-                &declarations.normal,
-            );
+            append_declaration_stream(&mut shadow_scope_declarations.normal, &declarations.normal);
         }
         for declarations in &slotted_declarations {
             append_declaration_stream(
@@ -3865,17 +3769,18 @@ impl Stylesheet {
         // Detect the uncommon transition before cloning the potentially large
         // custom-property map. This follows the browser rule-tree model where
         // unchanged computed values are shared down the tree.
-        let registrations_change_parent = self.registered_custom_properties.iter().any(
-            |(name, registration)| {
-                if registration.inherits && parent_props.contains_key(name) {
-                    return false;
-                }
-                match &registration.initial_value {
-                    Some(initial) => parent_props.get(name) != Some(initial),
-                    None => parent_props.contains_key(name),
-                }
-            },
-        );
+        let registrations_change_parent =
+            self.registered_custom_properties
+                .iter()
+                .any(|(name, registration)| {
+                    if registration.inherits && parent_props.contains_key(name) {
+                        return false;
+                    }
+                    match &registration.initial_value {
+                        Some(initial) => parent_props.get(name) != Some(initial),
+                        None => parent_props.contains_key(name),
+                    }
+                });
         let effective = if !has_own_custom_properties && !registrations_change_parent {
             None
         } else {
@@ -4116,14 +4021,19 @@ impl Stylesheet {
             for &(_, _, i) in &important_matched {
                 let rule = &self.rules[i];
                 let expanded = substitute_declarations(
-                    &rule.important_decls, props, rule.important_flags.has_var,
+                    &rule.important_decls,
+                    props,
+                    rule.important_flags.has_var,
                 );
                 crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             }
-            let expanded = substitute_declarations(&inline_important, props, inline_important_flags.has_var);
+            let expanded =
+                substitute_declarations(&inline_important, props, inline_important_flags.has_var);
             crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             let expanded = substitute_declarations(
-                &shadow_scope_declarations.important, props, shadow_important_flags.has_var,
+                &shadow_scope_declarations.important,
+                props,
+                shadow_important_flags.has_var,
             );
             crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             if ancestor_display_none || animation_style.display == crate::Display::None {
@@ -4203,15 +4113,14 @@ impl Stylesheet {
             shadow_important_flags.has_var,
         );
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
-        style.waapi_sample_state =
-            waapi_underlying_transform_ops.map(|underlying_transform_ops| {
-                Box::new(crate::WaapiSampleState {
-                    underlying_transform_ops,
-                    underlying_opacity: waapi_underlying_opacity,
-                    transform_fast_path: !important_has_transform,
-                    opacity_fast_path: !important_has_opacity,
-                })
-            });
+        style.waapi_sample_state = waapi_underlying_transform_ops.map(|underlying_transform_ops| {
+            Box::new(crate::WaapiSampleState {
+                underlying_transform_ops,
+                underlying_opacity: waapi_underlying_opacity,
+                transform_fast_path: !important_has_transform,
+                opacity_fast_path: !important_has_opacity,
+            })
+        });
         effective
     }
 }
@@ -4241,10 +4150,16 @@ pub(crate) fn resample_visual_waapi(
         return None;
     }
     let has_transform_effect = animations.iter().any(|(animation, _)| {
-        animation.keyframes.iter().any(|frame| frame.transform.is_some())
+        animation
+            .keyframes
+            .iter()
+            .any(|frame| frame.transform.is_some())
     });
     let has_opacity_effect = animations.iter().any(|(animation, _)| {
-        animation.keyframes.iter().any(|frame| frame.opacity.is_some())
+        animation
+            .keyframes
+            .iter()
+            .any(|frame| frame.opacity.is_some())
     });
     let all_effects_supported = animations.iter().all(|(animation, _)| {
         animation
@@ -4273,8 +4188,7 @@ pub(crate) fn resample_visual_waapi(
         opacity: sampled.opacity,
         has_transform_effect,
         has_opacity_effect,
-        establishes_transform_cb: sampled.containing_block_triggers
-            & crate::CB_TRIGGER_TRANSFORM
+        establishes_transform_cb: sampled.containing_block_triggers & crate::CB_TRIGGER_TRANSFORM
             != 0,
     })
 }
@@ -4301,11 +4215,9 @@ fn sample_waapi_properties(
             .iter()
             .filter_map(|frame| frame.opacity.map(|value| (frame.offset, value)))
             .collect::<Vec<_>>();
-        if let Some(value) = sample_numeric_waapi_track(
-            &opacity_track,
-            underlying.opacity.unwrap_or(1.0),
-            progress,
-        ) {
+        if let Some(value) =
+            sample_numeric_waapi_track(&opacity_track, underlying.opacity.unwrap_or(1.0), progress)
+        {
             style.opacity = Some(value.clamp(0.0, 1.0));
         }
 
@@ -4367,11 +4279,7 @@ fn sample_cubic_bezier(points: [f32; 4], progress: f32) -> f32 {
     component((low + high) * 0.5, y1, y2).clamp(0.0, 1.0)
 }
 
-fn sample_numeric_waapi_track(
-    track: &[(f32, f32)],
-    underlying: f32,
-    progress: f32,
-) -> Option<f32> {
+fn sample_numeric_waapi_track(track: &[(f32, f32)], underlying: f32, progress: f32) -> Option<f32> {
     sample_waapi_track(track, underlying, progress, |from, to, position| {
         from + (to - from) * position
     })
@@ -6933,7 +6841,9 @@ fn single_media_query_applies_for_viewport(
     }
     let compact = compact.strip_prefix("only").unwrap_or(&compact);
 
-    let medium = compact.split_once("and").map_or(compact, |(medium, _)| medium);
+    let medium = compact
+        .split_once("and")
+        .map_or(compact, |(medium, _)| medium);
     let medium_matches = match medium {
         "all" => true,
         "screen" => !media_type.is_print(),
@@ -6950,7 +6860,11 @@ fn single_media_query_applies_for_viewport(
     for feature in compact.split('(') {
         if let Some(value) = feature.strip_prefix("prefers-color-scheme:") {
             let value = value.split(')').next().unwrap_or(value);
-            let expected = if media_type.dark_color_scheme() { "dark" } else { "light" };
+            let expected = if media_type.dark_color_scheme() {
+                "dark"
+            } else {
+                "light"
+            };
             if value != expected {
                 return false;
             }
@@ -7196,11 +7110,8 @@ fn denest(
                 if let Some(at) = pre.strip_prefix('@') {
                     // A nested at-rule keeps the enclosing selector for its body.
                     if let Some(prelude) = at_rule_prelude(at, "media") {
-                        if media_query_applies_for_viewport_and_type(
-                            prelude,
-                            viewport,
-                            media_type,
-                        ) {
+                        if media_query_applies_for_viewport_and_type(prelude, viewport, media_type)
+                        {
                             denest(
                                 sel,
                                 &inner,
@@ -7597,8 +7508,7 @@ mod tests {
         assert!(map.has_adjacent_sibling_selectors());
         assert!(map.has_general_sibling_selectors());
 
-        let relational_only =
-            test_invalidation_map(".host:has(.inside + .peer){color:red}");
+        let relational_only = test_invalidation_map(".host:has(.inside + .peer){color:red}");
         assert!(!relational_only.has_adjacent_sibling_selectors());
         assert!(!relational_only.has_general_sibling_selectors());
     }
@@ -7721,10 +7631,7 @@ mod tests {
         assert!(!map.state_dependencies("nth-child").is_empty());
         assert!(!map.state_dependencies("nth-of-type").is_empty());
         let trigger = map.class_dependencies("trigger");
-        assert!(dependencies_reach(
-            trigger,
-            InvalidationReaches::SIBLINGS,
-        ));
+        assert!(dependencies_reach(trigger, InvalidationReaches::SIBLINGS,));
         assert!(!dependencies_reach(
             trigger,
             InvalidationReaches::CONSERVATIVE,
@@ -7799,14 +7706,8 @@ mod tests {
         let tree = obscura_dom::parse_html(
             "<section id=host class=host></section><section id=other class=other></section>",
         );
-        assert!(entries[0].anchor_may_match(
-            &tree,
-            tree.get_element_by_id("host").unwrap(),
-        ));
-        assert!(!entries[0].anchor_may_match(
-            &tree,
-            tree.get_element_by_id("other").unwrap(),
-        ));
+        assert!(entries[0].anchor_may_match(&tree, tree.get_element_by_id("host").unwrap(),));
+        assert!(!entries[0].anchor_may_match(&tree, tree.get_element_by_id("other").unwrap(),));
     }
 
     #[test]
@@ -8473,8 +8374,10 @@ mod tests {
         };
 
         assert_eq!(
-            sampled("opacity:.5;color:red;background-color:blue;border-color:green;\
-                     background-position:20% 30%;visibility:hidden"),
+            sampled(
+                "opacity:.5;color:red;background-color:blue;border-color:green;\
+                     background-position:20% 30%;visibility:hidden"
+            ),
             crate::AnimationEffectImpact::Paint,
         );
         for declarations in [
@@ -8656,8 +8559,16 @@ mod tests {
             id: 1,
             node: target,
             keyframes: vec![
-                crate::WaapiKeyframe { offset: 0.0, opacity: Some(0.2), transform: Some("translateX(0px)".into()) },
-                crate::WaapiKeyframe { offset: 1.0, opacity: Some(1.0), transform: Some("translateX(100px)".into()) },
+                crate::WaapiKeyframe {
+                    offset: 0.0,
+                    opacity: Some(0.2),
+                    transform: Some("translateX(0px)".into()),
+                },
+                crate::WaapiKeyframe {
+                    offset: 1.0,
+                    opacity: Some(1.0),
+                    transform: Some("translateX(100px)".into()),
+                },
             ],
             timing: crate::AnimationTiming {
                 duration_ms: 100.0,
@@ -8691,17 +8602,24 @@ mod tests {
         assert!(matches!(style.transform_ops.as_slice(),
             [crate::TransformOp::Translate(x, _)] if x.value == crate::Dimension::Px(50.0)));
 
-        let important_tree = obscura_dom::parse_html(
-            r#"<div id="target" style="opacity:.2 !important"></div>"#,
-        );
+        let important_tree =
+            obscura_dom::parse_html(r#"<div id="target" style="opacity:.2 !important"></div>"#);
         let target = important_tree.get_element_by_id("target").unwrap();
         let sheet = Stylesheet::parse_for_viewport(&important_tree, &[], (800.0, 600.0));
         let mut timeline = crate::AnimationTimelineState::default();
         timeline.register_waapi(crate::WaapiAnimation {
             id: 2,
             node: target,
-            keyframes: vec![crate::WaapiKeyframe { offset: 1.0, opacity: Some(1.0), transform: None }],
-            timing: crate::AnimationTiming { duration_ms: 100.0, fill_mode: crate::AnimationFillMode::Both, ..Default::default() },
+            keyframes: vec![crate::WaapiKeyframe {
+                offset: 1.0,
+                opacity: Some(1.0),
+                transform: None,
+            }],
+            timing: crate::AnimationTiming {
+                duration_ms: 100.0,
+                fill_mode: crate::AnimationFillMode::Both,
+                ..Default::default()
+            },
             easing: None,
             linear_easing: None,
             start_time_ms: 0.0,
@@ -8712,9 +8630,17 @@ mod tests {
         let mut matcher = important_tree.matcher();
         let mut style = LayoutStyle::default();
         sheet.apply_at_animation_time(
-            &important_tree, &mut matcher, target, node.get_attribute("id"), &[], "div",
-            &mut style, &HashMap::new(), node.get_attribute("style"),
-            crate::AnimationSample::document(100.0), &mut timeline,
+            &important_tree,
+            &mut matcher,
+            target,
+            node.get_attribute("id"),
+            &[],
+            "div",
+            &mut style,
+            &HashMap::new(),
+            node.get_attribute("style"),
+            crate::AnimationSample::document(100.0),
+            &mut timeline,
         );
         assert_opacity(style.opacity.unwrap(), 0.2);
     }
@@ -8781,15 +8707,17 @@ mod tests {
             .transform_ops;
             let mut fresh_timeline = make_timeline();
             let fresh = apply(time, &mut fresh_timeline);
-            assert_eq!(format!("{resampled:?}"), format!("{:?}", fresh.transform_ops));
+            assert_eq!(
+                format!("{resampled:?}"),
+                format!("{:?}", fresh.transform_ops)
+            );
         }
 
         let important_tree = obscura_dom::parse_html(
             r#"<div id="target" style="transform:translateX(10px) !important"></div>"#,
         );
         let important_target = important_tree.get_element_by_id("target").unwrap();
-        let important_sheet =
-            Stylesheet::parse_for_viewport(&important_tree, &[], (800.0, 600.0));
+        let important_sheet = Stylesheet::parse_for_viewport(&important_tree, &[], (800.0, 600.0));
         let mut important_timeline = crate::AnimationTimelineState::default();
         important_timeline.register_waapi(crate::WaapiAnimation {
             id: 2,
@@ -9071,9 +8999,15 @@ mod tests {
         let track = [(0.0, 0.0), (0.5, 10.0), (0.5, 20.0), (1.0, 30.0)];
         assert_eq!(sample_numeric_waapi_track(&track, -1.0, 0.5), Some(20.0));
         let before = sample_numeric_waapi_track(&track, -1.0, 0.499).unwrap();
-        assert!(before < 10.0, "incoming segment must end at the first duplicate");
+        assert!(
+            before < 10.0,
+            "incoming segment must end at the first duplicate"
+        );
         let after = sample_numeric_waapi_track(&track, -1.0, 0.501).unwrap();
-        assert!(after > 20.0, "outgoing segment must start at the later duplicate");
+        assert!(
+            after > 20.0,
+            "outgoing segment must start at the later duplicate"
+        );
     }
 
     #[test]
@@ -10315,8 +10249,7 @@ mod tests {
             "@media (width > calc(60em - 1px))",
             (900.0, 1000.0)
         ));
-        let two_sidebar_breakpoint =
-            "@media (width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))";
+        let two_sidebar_breakpoint = "@media (width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))";
         assert!(media_query_applies_for_viewport(
             two_sidebar_breakpoint,
             (1000.0, 900.0)
@@ -10325,8 +10258,7 @@ mod tests {
             two_sidebar_breakpoint,
             (1440.0, 1000.0)
         ));
-        let left_width_calc =
-            "@media (calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem) <= width)";
+        let left_width_calc = "@media (calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem) <= width)";
         assert!(!media_query_applies_for_viewport(
             left_width_calc,
             (1000.0, 900.0)
@@ -10351,20 +10283,34 @@ mod tests {
         for medium in [CssMediaType::Screen, CssMediaType::Print] {
             for reduce in [false, true] {
                 for dark in [false, true] {
-                    let media = medium.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+                    let media = medium
+                        .with_reduced_motion(reduce)
+                        .with_dark_color_scheme(dark);
                     assert_eq!(media.reduced_motion(), reduce);
                     assert_eq!(media.is_print(), medium.is_print());
                     assert_eq!(media.dark_color_scheme(), dark);
-                    let applies = |q| media_query_applies_for_viewport_and_type(q, (800.0, 600.0), media);
+                    let applies =
+                        |q| media_query_applies_for_viewport_and_type(q, (800.0, 600.0), media);
                     assert_eq!(applies("(prefers-color-scheme:dark)"), dark);
                     assert_eq!(applies("(prefers-color-scheme:light)"), !dark);
                     assert!(!applies("(prefers-color-scheme:no-preference)"));
                     assert!(!applies("(prefers-color-scheme:invalid)"));
                     assert!(applies("(prefers-color-scheme)"));
                     assert_eq!(applies("not all and (prefers-color-scheme:dark)"), !dark);
-                    assert_eq!(applies("(prefers-color-scheme:dark) and (prefers-reduced-motion:reduce)"), dark && reduce);
-                    assert!(applies("(prefers-color-scheme:light), (prefers-color-scheme:dark)"));
-                    assert_eq!(media.with_dark_color_scheme(!dark).with_reduced_motion(!reduce).is_print(), medium.is_print());
+                    assert_eq!(
+                        applies("(prefers-color-scheme:dark) and (prefers-reduced-motion:reduce)"),
+                        dark && reduce
+                    );
+                    assert!(applies(
+                        "(prefers-color-scheme:light), (prefers-color-scheme:dark)"
+                    ));
+                    assert_eq!(
+                        media
+                            .with_dark_color_scheme(!dark)
+                            .with_reduced_motion(!reduce)
+                            .is_print(),
+                        medium.is_print()
+                    );
                 }
             }
         }
@@ -10373,9 +10319,8 @@ mod tests {
     #[test]
     fn media_type_selects_screen_print_negation_and_query_lists() {
         let viewport = (800.0, 600.0);
-        let applies = |query, media| {
-            media_query_applies_for_viewport_and_type(query, viewport, media)
-        };
+        let applies =
+            |query, media| media_query_applies_for_viewport_and_type(query, viewport, media);
 
         assert!(applies("screen", CssMediaType::Screen));
         assert!(!applies("screen", CssMediaType::Print));
@@ -10387,10 +10332,7 @@ mod tests {
         assert!(!applies("not screen", CssMediaType::Screen));
         assert!(applies("speech, print", CssMediaType::Print));
         assert!(!applies("speech, print", CssMediaType::Screen));
-        assert!(applies(
-            "print and (min-width: 700px)",
-            CssMediaType::Print
-        ));
+        assert!(applies("print and (min-width: 700px)", CssMediaType::Print));
         assert!(!applies(
             "print and (min-width: 900px)",
             CssMediaType::Print

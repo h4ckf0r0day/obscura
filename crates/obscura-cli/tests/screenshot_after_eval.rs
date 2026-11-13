@@ -49,9 +49,7 @@ fn screenshot_is_captured_after_eval_scrolls_the_live_page() {
 
     let scrolled_output = run(
         &scrolled,
-        Some(
-            "(()=>{window.scrollTo(0,80);return JSON.stringify({y:window.scrollY})})()",
-        ),
+        Some("(()=>{window.scrollTo(0,80);return JSON.stringify({y:window.scrollY})})()"),
     );
     assert!(
         scrolled_output.status.success(),
@@ -241,10 +239,7 @@ fn paired_capture_evaluates_state_after_final_scroll_reassert() {
         Some("immediately-before-capture-state-and-screenshot")
     );
     assert_eq!(report["resourceWarmup"]["performed"].as_bool(), Some(true));
-    assert_eq!(
-        report["resourceWarmup"]["discardedShots"].as_u64(),
-        Some(1)
-    );
+    assert_eq!(report["resourceWarmup"]["discardedShots"].as_u64(), Some(1));
     assert_eq!(
         report["resourceWarmup"]["phase"].as_str(),
         Some("before-final-scroll-reassert-and-state-sample")

@@ -42,7 +42,8 @@ async fn main() {
         std::process::exit(0);
     }
 
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| "http://otel-collector:4317".to_string());
+    obscura_telemetry::init_tracing("obscura-worker-agent", &endpoint);
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
@@ -135,6 +136,34 @@ async fn main() {
         .expect("consumer");
 
     tracing::info!(worker_id = %worker_id, "worker agent started");
+    let ms = obscura_telemetry::MetricsServer::new("0.0.0.0:9093", obscura_telemetry::global_metrics().clone());
+    let _keep = ms.spawn().await.ok();
+
+    // Readiness/health endpoint.
+    let nats_health = nats.clone();
+    if let Ok(std_listener) = std::net::TcpListener::bind("0.0.0.0:8083") {
+        let _ = std_listener.set_nonblocking(true);
+        if let Ok(listener) = tokio::net::TcpListener::from_std(std_listener) {
+            tokio::spawn(async move {
+                loop {
+                    if let Ok((mut stream, _)) = listener.accept().await {
+                        let nats = nats_health.clone();
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut buf = [0u8; 256];
+                            let _ = stream.read(&mut buf).await;
+                            let ok = nats.ping().await.is_ok();
+                            if ok {
+                                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                            } else {
+                                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").await;
+                            }
+                        });
+                    }
+                }
+            });
+        }
+    }
 
     loop {
         match consumer.next_message().await {

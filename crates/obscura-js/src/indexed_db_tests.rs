@@ -47,12 +47,16 @@ async fn indexeddb_upgrade_precedes_open_and_requests_precede_commit() {
         const value = await requested(db.transaction('items').objectStore('items').get(1));
         return {events, value, schema:db.objectStoreNames.contains('items')};
     "#).await;
-    assert_eq!(out, json!({"events":["upgrade","open","put","complete"],"value":"kept","schema":true}));
+    assert_eq!(
+        out,
+        json!({"events":["upgrade","open","put","complete"],"value":"kept","schema":true})
+    );
 }
 
 #[tokio::test]
 async fn indexeddb_abort_rolls_back_and_readonly_writes_throw() {
-    let out = probe(r#"
+    let out = probe(
+        r#"
         const db = await opened('abort');
         const tx = db.transaction('items', 'readwrite');
         const done = finished(tx);
@@ -67,8 +71,13 @@ async fn indexeddb_abort_rolls_back_and_readonly_writes_throw() {
         try { db.transaction('items').objectStore('items').put('bad', 2); }
         catch (e) { readonly = e.name; }
         return {terminal, requestError, missing:value === undefined, readonly};
-    "#).await;
-    assert_eq!(out, json!({"terminal":"abort","requestError":"AbortError","missing":true,"readonly":"ReadOnlyError"}));
+    "#,
+    )
+    .await;
+    assert_eq!(
+        out,
+        json!({"terminal":"abort","requestError":"AbortError","missing":true,"readonly":"ReadOnlyError"})
+    );
 }
 
 #[tokio::test]
@@ -91,12 +100,16 @@ async fn indexeddb_values_are_cloned_and_duplicate_add_aborts_atomically() {
         return [cloned.n, cloned.date.getTime(), Array.from(cloned.bytes), cloned.map.get('a'),
             cloned.self === cloned, error, terminal, missing === undefined];
     "#).await;
-    assert_eq!(out, json!([1,123,[0,255],2,true,"ConstraintError","abort",true]));
+    assert_eq!(
+        out,
+        json!([1, 123, [0, 255], 2, true, "ConstraintError", "abort", true])
+    );
 }
 
 #[tokio::test]
 async fn indexeddb_typed_keys_ranges_and_request_callbacks_share_transaction() {
-    let out = probe(r#"
+    let out = probe(
+        r#"
         const db = await opened('keys');
         const tx = db.transaction('items', 'readwrite'), done = finished(tx);
         const s = tx.objectStore('items');
@@ -111,8 +124,21 @@ async fn indexeddb_typed_keys_ranges_and_request_callbacks_share_transaction() {
             await requested(r.get(new Uint8Array([1]))),
             await requested(r.getAll(IDBKeyRange.bound(1,2))),
             await requested(r.count())];
-    "#).await;
-    assert_eq!(out, json!(["number","string","date","array","binary",["number","callback"],6]));
+    "#,
+    )
+    .await;
+    assert_eq!(
+        out,
+        json!([
+            "number",
+            "string",
+            "date",
+            "array",
+            "binary",
+            ["number", "callback"],
+            6
+        ])
+    );
 }
 
 #[tokio::test]
@@ -128,12 +154,13 @@ async fn indexeddb_failed_upgrade_keeps_previous_version_and_schema() {
         const old = await requested(indexedDB.open('upgrade'));
         return [error, old.version, old.objectStoreNames.contains('items'), old.objectStoreNames.contains('discard')];
     "#).await;
-    assert_eq!(out, json!(["AbortError",1,true,false]));
+    assert_eq!(out, json!(["AbortError", 1, true, false]));
 }
 
 #[tokio::test]
 async fn indexeddb_request_error_can_be_canceled_without_aborting() {
-    let out = probe(r#"
+    let out = probe(
+        r#"
         const db = await opened('handled');
         const tx = db.transaction('items','readwrite'), done = finished(tx);
         const s = tx.objectStore('items'); s.add('first',1);
@@ -141,8 +168,10 @@ async fn indexeddb_request_error_can_be_canceled_without_aborting() {
         s.put('second',2);
         const terminal = await done;
         return [terminal,await requested(db.transaction('items').objectStore('items').getAll())];
-    "#).await;
-    assert_eq!(out, json!(["complete",["first","second"]]));
+    "#,
+    )
+    .await;
+    assert_eq!(out, json!(["complete", ["first", "second"]]));
 }
 
 #[tokio::test]
@@ -168,7 +197,10 @@ async fn indexeddb_unique_indexes_and_cursors_use_generated_keys() {
         bad.objectStore('users').add({email:'a@test'});
         return [keys,found.id,rows,await badDone];
     "#).await;
-    assert_eq!(out, json!([[1,2],1,[["a@test",2,2],["b@test",1,1]],"abort"]));
+    assert_eq!(
+        out,
+        json!([[1, 2], 1, [["a@test", 2, 2], ["b@test", 1, 1]], "abort"])
+    );
 }
 
 #[tokio::test]
@@ -183,12 +215,13 @@ async fn indexeddb_waiting_upgrade_notifies_and_respects_closed_connections() {
         });
         return [events,upgraded.version,upgraded.objectStoreNames.contains('second')];
     "#).await;
-    assert_eq!(out, json!([[[1,2],"upgrade"],2,true]));
+    assert_eq!(out, json!([[[1, 2], "upgrade"], 2, true]));
 }
 
 #[tokio::test]
 async fn indexeddb_transaction_is_inactive_in_unrelated_timer_tasks() {
-    let out = probe(r#"
+    let out = probe(
+        r#"
         const db = await opened('inactive');
         const tx = db.transaction('items','readwrite');
         const s = tx.objectStore('items');
@@ -196,18 +229,23 @@ async fn indexeddb_transaction_is_inactive_in_unrelated_timer_tasks() {
         return await new Promise(resolve => setTimeout(() => {
             try {s.put('late',2);resolve('accepted');}catch(e){resolve(e.name);}
         },0));
-    "#).await;
+    "#,
+    )
+    .await;
     assert_eq!(out, json!("TransactionInactiveError"));
 }
 
 #[tokio::test]
 async fn indexeddb_rejects_dom_nodes_instead_of_storing_a_plain_object() {
-    let out = probe(r#"
+    let out = probe(
+        r#"
         const db = await opened('uncloneable');
         const tx = db.transaction('items','readwrite');
         try {tx.objectStore('items').put({nested:document.body},1);return 'accepted';}
         catch(e){return e.name;}
-    "#).await;
+    "#,
+    )
+    .await;
     assert_eq!(out, json!("DataCloneError"));
 }
 
@@ -223,19 +261,29 @@ async fn indexeddb_cross_document_versionchange_is_delivered_by_the_event_loop()
         rt
     };
     let mut first = setup(storage.clone());
-    first.execute_script("first", r#"
+    first
+        .execute_script(
+            "first",
+            r#"
         globalThis.notified = false;
         const request = indexedDB.open('cross-document',1);
         request.onsuccess = () => { const db = request.result;
             db.onversionchange = () => {notified = true; db.close();}; };
-    "#).unwrap();
+    "#,
+        )
+        .unwrap();
     first.run_event_loop_bounded(100).await.unwrap();
     let mut second = setup(storage);
-    second.execute_script("second", r#"
+    second
+        .execute_script(
+            "second",
+            r#"
         globalThis.version = 0;
         const request = indexedDB.open('cross-document',2);
         request.onsuccess = () => version = request.result.version;
-    "#).unwrap();
+    "#,
+        )
+        .unwrap();
     second.run_event_loop_bounded(10).await.unwrap();
     first.run_event_loop_bounded(100).await.unwrap();
     assert_eq!(first.evaluate("notified").unwrap(), json!(true));
@@ -256,19 +304,25 @@ async fn indexeddb_failed_unique_insert_does_not_consume_an_auto_increment_key()
         const key = await requested(s.add({x:2})); await done;
         return key;
     "#).await;
-    assert_eq!(out.as_f64(),Some(2.0));
+    assert_eq!(out.as_f64(), Some(2.0));
 }
 
 #[tokio::test]
 async fn indexeddb_handlers_keep_listener_registration_order() {
-    let out = probe(r#"
+    let out = probe(
+        r#"
         const r = indexedDB.open('listeners',1), events = [];
         r.addEventListener('success', () => events.push('listener'));
         r.onsuccess = () => events.push('handler');
         await new Promise(resolve => r.addEventListener('success',resolve));
         return [events,r instanceof EventTarget,Object.prototype.toString.call(r)];
-    "#).await;
-    assert_eq!(out,json!([["listener","handler"],true,"[object IDBOpenDBRequest]"]));
+    "#,
+    )
+    .await;
+    assert_eq!(
+        out,
+        json!([["listener", "handler"], true, "[object IDBOpenDBRequest]"])
+    );
 }
 
 #[tokio::test]
@@ -277,19 +331,31 @@ async fn indexeddb_new_javascript_task_cannot_add_to_an_existing_transaction() {
     rt.set_dom(obscura_dom::parse_html("<!doctype html>"));
     rt.set_url("https://idb.test/");
     rt.run_page_init();
-    rt.execute_script("open",r#"
+    rt.execute_script(
+        "open",
+        r#"
         globalThis.db = null;
         const request = indexedDB.open('task',1);
         request.onupgradeneeded = () => request.result.createObjectStore('items');
         request.onsuccess = () => db = request.result;
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     rt.run_event_loop_bounded(100).await.unwrap();
-    rt.execute_script("first-task",r#"
+    rt.execute_script(
+        "first-task",
+        r#"
         globalThis.store = db.transaction('items','readwrite').objectStore('items');
         store.put('first',1);
-    "#).unwrap();
-    let result = rt.evaluate("(() => {try {store.put('late',2);return 'accepted';}catch(e){return e.name;}})()").unwrap();
-    assert_eq!(result,json!("TransactionInactiveError"));
+    "#,
+    )
+    .unwrap();
+    let result = rt
+        .evaluate(
+            "(() => {try {store.put('late',2);return 'accepted';}catch(e){return e.name;}})()",
+        )
+        .unwrap();
+    assert_eq!(result, json!("TransactionInactiveError"));
 }
 
 #[tokio::test]
@@ -303,7 +369,18 @@ async fn indexeddb_clones_files_and_blob_aliases_without_losing_their_interfaces
         return [copy.file instanceof File,copy.file.name,copy.file.type,copy.file.lastModified,
             Array.from(new Uint8Array(await copy.file.arrayBuffer())),copy.alias === copy.file,copy.map.get('file') === copy.file];
     "#).await;
-    assert_eq!(out,json!([true,"fixture.bin","application/octet-stream",123,[0,255,117],true,true]));
+    assert_eq!(
+        out,
+        json!([
+            true,
+            "fixture.bin",
+            "application/octet-stream",
+            123,
+            [0, 255, 117],
+            true,
+            true
+        ])
+    );
 }
 
 #[tokio::test]
@@ -321,7 +398,7 @@ async fn indexeddb_cloned_nonextractable_crypto_keys_keep_their_material_and_per
         return [copy instanceof CryptoKey,copy.extractable,copy.usages,actual.length,
             actual.every((b,i) => b === expected[i]),rejected];
     "#).await;
-    assert_eq!(out,json!([true,false,["sign"],32,true,true]));
+    assert_eq!(out, json!([true, false, ["sign"], 32, true, true]));
 }
 
 #[tokio::test]
@@ -338,5 +415,5 @@ async fn indexeddb_empty_upgrade_completes_and_index_metadata_outlives_transacti
         await done;
         return [empty.version,empty.objectStoreNames.length,index.keyPath,index.unique,index.multiEntry];
     "#).await;
-    assert_eq!(out,json!([1,0,"email",true,false]));
+    assert_eq!(out, json!([1, 0, "email", true, false]));
 }

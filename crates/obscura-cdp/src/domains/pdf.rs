@@ -85,9 +85,7 @@ fn parse_page_ranges(value: &str) -> Result<Vec<obscura_browser::RasterPdfPageRa
                 .ok()
                 .filter(|page| *page > 0)
                 .map(Some)
-                .ok_or_else(|| {
-                    format!("Invalid parameters: pageRanges has invalid page {text:?}")
-                })
+                .ok_or_else(|| format!("Invalid parameters: pageRanges has invalid page {text:?}"))
         };
         let (start, end) = match part.split_once('-') {
             Some((start, end)) if !end.contains('-') => (page(start)?, page(end)?),

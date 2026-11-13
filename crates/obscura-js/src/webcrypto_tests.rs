@@ -50,17 +50,21 @@ async fn aes_kw_wraps_and_unwraps_raw_keys() {
             hmac16Back.algorithm.length,
         ];
     "#).await;
-    assert_eq!(out, json!([
-        "1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5",
-        "AES-GCM", "00112233445566778899aabbccddeeff",
-        "00112233445566778899aabbccddeeff",
-        "OperationError",
-        "NotSupportedError",
-        "OperationError",
-        "OperationError",
-        "OperationError",
-        128,
-    ]));
+    assert_eq!(
+        out,
+        json!([
+            "1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5",
+            "AES-GCM",
+            "00112233445566778899aabbccddeeff",
+            "00112233445566778899aabbccddeeff",
+            "OperationError",
+            "NotSupportedError",
+            "OperationError",
+            "OperationError",
+            "OperationError",
+            128,
+        ])
+    );
 }
 
 #[tokio::test]
@@ -91,12 +95,15 @@ async fn wrapped_jwks_ignore_the_pages_json() {
             await errorName(() => s.unwrapKey('jwk', notJson, wrapper, gcm, {name: 'HMAC', hash: 'SHA-256'}, true, ['sign'])),
         ];
     "#).await;
-    assert_eq!(out, json!([
-        r#"{"alg":"HS256","ext":true,"k":"AQID","key_ops":["sign","verify"],"kty":"oct"}"#,
-        true,
-        "010203",
-        "DataError",
-    ]));
+    assert_eq!(
+        out,
+        json!([
+            r#"{"alg":"HS256","ext":true,"k":"AQID","key_ops":["sign","verify"],"kty":"oct"}"#,
+            true,
+            "010203",
+            "DataError",
+        ])
+    );
 }
 
 #[tokio::test]
@@ -121,12 +128,27 @@ async fn key_wrapping_checks_the_wrapping_keys_algorithm_and_usage() {
         }
         return results;
     "#).await;
-    assert_eq!(out, json!([
-        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", true,
-        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", true,
-        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", true,
-        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", true,
-    ]));
+    assert_eq!(
+        out,
+        json!([
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            true,
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            true,
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            true,
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            true,
+        ])
+    );
 }
 
 #[tokio::test]
@@ -154,12 +176,27 @@ async fn key_unwrapping_checks_the_unwrapping_keys_algorithm_and_usage() {
         }
         return results;
     "#).await;
-    assert_eq!(out, json!([
-        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", "00000000000000000000000000000000",
-        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", "00000000000000000000000000000000",
-        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", "00000000000000000000000000000000",
-        "InvalidAccessError", "InvalidAccessError", "InvalidAccessError", "00000000000000000000000000000000",
-    ]));
+    assert_eq!(
+        out,
+        json!([
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "00000000000000000000000000000000",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "00000000000000000000000000000000",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "00000000000000000000000000000000",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "InvalidAccessError",
+            "00000000000000000000000000000000",
+        ])
+    );
 }
 
 #[tokio::test]
@@ -185,5 +222,8 @@ async fn cloned_wrapping_keys_keep_their_internal_algorithm() {
         const restored = await s.unwrapKey('raw', wrapped, copy.first, 'AES-KW', 'AES-GCM', true, ['encrypt']);
         return [copy.first.algorithm.name, copy.first === copy.second, hex(await s.exportKey('raw', restored))];
     "#).await;
-    assert_eq!(out, json!(["AES-KW", true, "00000000000000000000000000000000"]));
+    assert_eq!(
+        out,
+        json!(["AES-KW", true, "00000000000000000000000000000000"])
+    );
 }

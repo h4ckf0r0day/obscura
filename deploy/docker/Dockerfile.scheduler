@@ -1,0 +1,16 @@
+FROM rust:latest AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake clang python3 pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p obscura-scheduler --bin obscura-scheduler
+
+FROM debian:trixie-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
+RUN groupadd -g 10003 obscura && useradd -u 10003 -g obscura -s /bin/false -m obscura
+COPY --from=builder /src/target/release/obscura-scheduler /usr/local/bin/obscura-scheduler
+USER obscura:obscura
+WORKDIR /home/obscura
+ENV RUST_LOG=warn
+EXPOSE 8082
+HEALTHCHECK --interval=10s --timeout=3s --retries=5 CMD curl -fsS http://127.0.0.1:8082/ || exit 1
+ENTRYPOINT ["/usr/local/bin/obscura-scheduler"]

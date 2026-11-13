@@ -62,12 +62,20 @@ impl CookieJar {
     /// (in any thread, for any reason) must not turn every later cookie
     /// operation in the process into a panic: the jar's state is a plain map
     /// that is valid at every point a guard can be dropped.
-    fn read_jar(&self) -> RwLockReadGuard<'_, HashMap<String, HashMap<(String, String), CookieEntry>>> {
-        self.cookies.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn read_jar(
+        &self,
+    ) -> RwLockReadGuard<'_, HashMap<String, HashMap<(String, String), CookieEntry>>> {
+        self.cookies
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn write_jar(&self) -> RwLockWriteGuard<'_, HashMap<String, HashMap<(String, String), CookieEntry>>> {
-        self.cookies.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn write_jar(
+        &self,
+    ) -> RwLockWriteGuard<'_, HashMap<String, HashMap<(String, String), CookieEntry>>> {
+        self.cookies
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn new() -> Self {
@@ -142,9 +150,11 @@ impl CookieJar {
         if !cookie_prefix_allows(&name, secure, domain_attr.is_some(), path_attr) {
             return;
         }
-        let path = path_attr.map(str::to_string)
+        let path = path_attr
+            .map(str::to_string)
             .unwrap_or_else(|| default_cookie_path(url.path()));
-        let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref()) {
+        let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref())
+        {
             Some(d) => d,
             None => return,
         };
@@ -184,7 +194,10 @@ impl CookieJar {
             same_site,
         };
 
-        cookies.entry(domain).or_default().insert((name, path), entry);
+        cookies
+            .entry(domain)
+            .or_default()
+            .insert((name, path), entry);
     }
 
     /// Return cookies for a same-site request.
@@ -328,9 +341,10 @@ impl CookieJar {
             if !cookie_prefix_allows(&cookie.name, cookie.secure, !host_only, Some(&cookie.path)) {
                 continue;
             }
-            if cookie.expires.is_some_and(|expires| {
-                expires == 0 || (expires > 0 && expires <= now)
-            }) {
+            if cookie
+                .expires
+                .is_some_and(|expires| expires == 0 || (expires > 0 && expires <= now))
+            {
                 if let Some(domain_cookies) = jar.get_mut(&domain) {
                     domain_cookies.retain(|_key, entry| {
                         entry.name != cookie.name || entry.path != cookie.path
@@ -343,7 +357,9 @@ impl CookieJar {
             } else {
                 normalize_same_site(&cookie.same_site)
             };
-            let expires = cookie.expires.and_then(|e| if e > 0 { Some(e as u64) } else { None });
+            let expires = cookie
+                .expires
+                .and_then(|e| if e > 0 { Some(e as u64) } else { None });
             let entry = CookieEntry {
                 name: cookie.name.clone(),
                 value: cookie.value,
@@ -355,7 +371,9 @@ impl CookieJar {
                 expires,
                 same_site,
             };
-            jar.entry(domain).or_default().insert((cookie.name, cookie.path), entry);
+            jar.entry(domain)
+                .or_default()
+                .insert((cookie.name, cookie.path), entry);
         }
     }
 
@@ -462,9 +480,11 @@ impl CookieJar {
         if !cookie_prefix_allows(&name, secure, domain_attr.is_some(), path_attr) {
             return;
         }
-        let path = path_attr.map(str::to_string)
+        let path = path_attr
+            .map(str::to_string)
             .unwrap_or_else(|| default_cookie_path(url.path()));
-        let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref()) {
+        let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref())
+        {
             Some(d) => d,
             None => return,
         };
@@ -587,15 +607,13 @@ impl CookieJar {
             }
         }
 
-        let json = serde_json::to_string_pretty(&all).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let json = serde_json::to_string_pretty(&all)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut tmp = tempfile::NamedTempFile::new_in(
-            path.parent().unwrap_or(std::path::Path::new(".")),
-        )?;
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(path.parent().unwrap_or(std::path::Path::new(".")))?;
         tmp.write_all(json.as_bytes())?;
         tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
@@ -654,16 +672,23 @@ struct PersistedCookie {
 }
 
 fn parse_http_date(s: &str) -> Result<u64, ()> {
-    let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    let months = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
 
     let s = s.replace('-', " ");
     let parts: Vec<&str> = s.split_whitespace().collect();
 
-    if parts.len() < 5 { return Err(()); }
+    if parts.len() < 5 {
+        return Err(());
+    }
 
     let day: u64 = parts[1].parse().map_err(|_| ())?;
-    let month = months.iter().position(|m| parts[2].to_lowercase().starts_with(m))
-        .ok_or(())? as u64 + 1;
+    let month = months
+        .iter()
+        .position(|m| parts[2].to_lowercase().starts_with(m))
+        .ok_or(())? as u64
+        + 1;
     let year: u64 = parts[3].parse().map_err(|_| ())?;
 
     let time_parts: Vec<&str> = parts[4].split(':').collect();
@@ -685,7 +710,11 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
 
     let mut days_total: u64 = 0;
     for y in 1970..year {
-        days_total += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        days_total += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
     }
     let days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
@@ -739,7 +768,12 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
 /// host cannot plant. Chrome matches the prefixes case-insensitively.
 /// Header and JS setters pass None when Path was omitted, even if the
 /// default path would be /. CDP and file imports already carry a resolved path.
-fn cookie_prefix_allows(name: &str, secure: bool, has_domain_attr: bool, path: Option<&str>) -> bool {
+fn cookie_prefix_allows(
+    name: &str,
+    secure: bool,
+    has_domain_attr: bool,
+    path: Option<&str>,
+) -> bool {
     let has_prefix = |prefix: &str| {
         name.get(..prefix.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
@@ -862,10 +896,18 @@ fn domain_matches(host: &str, domain: &str) -> bool {
     // domain = "example.com". The byte before the suffix in host
     // must be '.'.
     let prefix_len = host.len() - domain.len();
-    if prefix_len < 1 { return false; }
-    if !host.is_char_boundary(prefix_len) { return false; }
-    if host.as_bytes()[prefix_len - 1] != b'.' { return false; }
-    if !host[prefix_len..].eq_ignore_ascii_case(domain) { return false; }
+    if prefix_len < 1 {
+        return false;
+    }
+    if !host.is_char_boundary(prefix_len) {
+        return false;
+    }
+    if host.as_bytes()[prefix_len - 1] != b'.' {
+        return false;
+    }
+    if !host[prefix_len..].eq_ignore_ascii_case(domain) {
+        return false;
+    }
     // Only a would-be match pays for the parse: an IP address never
     // suffix-matches (RFC 6265 5.1.3), whatever the jar stored it under.
     !host_is_ip_address(host) && !host_is_ip_address(domain)
@@ -917,8 +959,11 @@ mod tests {
                         set(&jar, &format!("{value}; {attrs}"), &url);
                         // Inspect storage, not just path-filtered lookup: a
                         // rejected cookie must not survive on another path.
-                        assert_eq!(jar.get_all_cookies().len(), usize::from(accepted),
-                            "setter {source}, {request_path}, {prefix}, {attrs}");
+                        assert_eq!(
+                            jar.get_all_cookies().len(),
+                            usize::from(accepted),
+                            "setter {source}, {request_path}, {prefix}, {attrs}"
+                        );
                         if accepted {
                             assert_eq!(jar.get_cookie_header_same_site(&url), value);
                         }
@@ -954,11 +999,17 @@ mod tests {
                 "__Host-sid=; Secure; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
             ] {
                 set(&jar, invalid, &url);
-                assert_eq!(jar.get_cookie_header_same_site(&url), "__Host-sid=kept",
-                    "a rejected cookie changed the jar: {invalid}");
+                assert_eq!(
+                    jar.get_cookie_header_same_site(&url),
+                    "__Host-sid=kept",
+                    "a rejected cookie changed the jar: {invalid}"
+                );
             }
             set(&jar, "__Host-sid=; Secure; Path=/; Max-Age=0", &url);
-            assert!(jar.get_all_cookies().is_empty(), "valid deletion must still work");
+            assert!(
+                jar.get_all_cookies().is_empty(),
+                "valid deletion must still work"
+            );
         }
     }
 
@@ -972,7 +1023,10 @@ mod tests {
         // than a raw Set-Cookie attribute list. Preserve their validation.
         let imported = CookieJar::new();
         imported.set_cookies_from_cdp_with_scope(
-            source.get_all_cookies().into_iter().map(|cookie| (cookie, true)),
+            source
+                .get_all_cookies()
+                .into_iter()
+                .map(|cookie| (cookie, true)),
         );
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cookies.json");
@@ -997,7 +1051,8 @@ mod tests {
         jar.set_cookie_from_js("session=attacker_value", &url);
 
         assert!(
-            jar.get_cookie_header(&url).contains("session=server_secret"),
+            jar.get_cookie_header(&url)
+                .contains("session=server_secret"),
             "JS must not overwrite an HttpOnly cookie"
         );
         assert!(
@@ -1016,7 +1071,8 @@ mod tests {
         jar.set_cookie_from_js("session=; Max-Age=0", &url);
 
         assert!(
-            jar.get_cookie_header(&url).contains("session=server_secret"),
+            jar.get_cookie_header(&url)
+                .contains("session=server_secret"),
             "JS must not delete an HttpOnly cookie"
         );
     }
@@ -1138,10 +1194,22 @@ mod tests {
 
         let header_a = jar.get_cookie_header(&Url::parse("https://example.com/a/page").unwrap());
         let header_b = jar.get_cookie_header(&Url::parse("https://example.com/b/page").unwrap());
-        assert!(header_a.contains("id=1"), "/a must see the Path=/a cookie, got: {header_a:?}");
-        assert!(header_b.contains("id=2"), "/b must see the Path=/b cookie, got: {header_b:?}");
-        assert!(!header_a.contains("id=2"), "Path=/b cookie leaked to /a: {header_a:?}");
-        assert!(!header_b.contains("id=1"), "Path=/a cookie leaked to /b: {header_b:?}");
+        assert!(
+            header_a.contains("id=1"),
+            "/a must see the Path=/a cookie, got: {header_a:?}"
+        );
+        assert!(
+            header_b.contains("id=2"),
+            "/b must see the Path=/b cookie, got: {header_b:?}"
+        );
+        assert!(
+            !header_a.contains("id=2"),
+            "Path=/b cookie leaked to /a: {header_a:?}"
+        );
+        assert!(
+            !header_b.contains("id=1"),
+            "Path=/a cookie leaked to /b: {header_b:?}"
+        );
     }
 
     #[test]
@@ -1154,7 +1222,10 @@ mod tests {
         jar.set_cookie("id=2; Path=/a", &url);
         let header = jar.get_cookie_header_same_site(&url);
         assert!(header.contains("id=2"), "newer value must win: {header:?}");
-        assert!(!header.contains("id=1"), "old value must be replaced: {header:?}");
+        assert!(
+            !header.contains("id=1"),
+            "old value must be replaced: {header:?}"
+        );
     }
 
     #[test]
@@ -1169,8 +1240,14 @@ mod tests {
 
         let header_a = jar.get_cookie_header(&Url::parse("https://example.com/a/page").unwrap());
         let header_b = jar.get_cookie_header(&Url::parse("https://example.com/b/page").unwrap());
-        assert!(header_a.is_empty(), "Path=/a cookie should be deleted: {header_a:?}");
-        assert!(header_b.contains("id=2"), "Path=/b cookie must survive: {header_b:?}");
+        assert!(
+            header_a.is_empty(),
+            "Path=/a cookie should be deleted: {header_a:?}"
+        );
+        assert!(
+            header_b.contains("id=2"),
+            "Path=/b cookie must survive: {header_b:?}"
+        );
     }
 
     #[test]
@@ -1196,10 +1273,7 @@ mod tests {
         let jar = CookieJar::new();
         let url = Url::parse("https://example.com/").unwrap();
         jar.set_cookie_from_js("old=current", &url);
-        jar.set_cookie_from_js(
-            "old=gone; Expires=Thu, 01 Jan 2020 00:00:00 GMT",
-            &url,
-        );
+        jar.set_cookie_from_js("old=gone; Expires=Thu, 01 Jan 2020 00:00:00 GMT", &url);
         assert!(jar.get_all_cookies().is_empty());
     }
 
@@ -1299,7 +1373,10 @@ mod tests {
     }
 
     fn marker(jar: &CookieJar) -> Vec<CookieInfo> {
-        jar.get_all_cookies().into_iter().filter(|c| c.name == "marker").collect()
+        jar.get_all_cookies()
+            .into_iter()
+            .filter(|c| c.name == "marker")
+            .collect()
     }
 
     #[test]
@@ -1311,10 +1388,18 @@ mod tests {
         jar.set_cookies_from_cdp(vec![cdp("marker", "stale", ".example.com", "/")]);
         jar.set_cookie("marker=fresh; Domain=example.com; Path=/", &url);
 
-        assert_eq!(marker(&jar).len(), 1, "one cookie, one entry, got: {:?}", marker(&jar));
+        assert_eq!(
+            marker(&jar).len(),
+            1,
+            "one cookie, one entry, got: {:?}",
+            marker(&jar)
+        );
         let header = jar.get_cookie_header(&url);
         assert_eq!(header.matches("marker=").count(), 1, "header: {header:?}");
-        assert!(header.contains("marker=fresh"), "newer value must win: {header:?}");
+        assert!(
+            header.contains("marker=fresh"),
+            "newer value must win: {header:?}"
+        );
     }
 
     #[test]
@@ -1327,7 +1412,11 @@ mod tests {
 
         let all = marker(&jar);
         assert_eq!(all.len(), 1, "both spellings collapse, got: {all:?}");
-        assert_eq!(all[0].domain, "example.com", "entry.domain is canonical, got: {:?}", all[0].domain);
+        assert_eq!(
+            all[0].domain, "example.com",
+            "entry.domain is canonical, got: {:?}",
+            all[0].domain
+        );
         assert_eq!(all[0].value, "two", "newer value must win");
     }
 
@@ -1357,7 +1446,11 @@ mod tests {
             let mut gone = cdp("marker", "", deleted, "/");
             gone.expires = Some(0);
             jar.set_cookies_from_cdp(vec![gone]);
-            assert!(marker(&jar).is_empty(), "stored {stored:?}, deleted {deleted:?}: {:?}", marker(&jar));
+            assert!(
+                marker(&jar).is_empty(),
+                "stored {stored:?}, deleted {deleted:?}: {:?}",
+                marker(&jar)
+            );
         }
     }
 
@@ -1367,12 +1460,20 @@ mod tests {
             let jar = CookieJar::new();
             jar.set_cookies_from_cdp(vec![cdp("marker", "current", "Example.COM", "/")]);
             jar.delete_cookie("marker", spelling);
-            assert!(marker(&jar).is_empty(), "delete_cookie({spelling:?}): {:?}", marker(&jar));
+            assert!(
+                marker(&jar).is_empty(),
+                "delete_cookie({spelling:?}): {:?}",
+                marker(&jar)
+            );
 
             let jar = CookieJar::new();
             jar.set_cookies_from_cdp(vec![cdp("marker", "current", "Example.COM", "/")]);
             jar.delete_cookies_filtered("marker", spelling, Some("/"));
-            assert!(marker(&jar).is_empty(), "delete_cookies_filtered({spelling:?}): {:?}", marker(&jar));
+            assert!(
+                marker(&jar).is_empty(),
+                "delete_cookies_filtered({spelling:?}): {:?}",
+                marker(&jar)
+            );
         }
     }
 
@@ -1514,7 +1615,11 @@ mod tests {
         }]);
         let url = Url::parse("https://www.xiaohongshu.com/explore").unwrap();
         let header = jar.get_cookie_header(&url);
-        assert!(header.contains("session=abc"), "Cookie header was: '{}'", header);
+        assert!(
+            header.contains("session=abc"),
+            "Cookie header was: '{}'",
+            header
+        );
     }
 
     #[test]
@@ -1522,22 +1627,26 @@ mod tests {
         // Simulate what happens: load cookies from file → navigate → cookie should be in request
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cookies.json");
-        
+
         // Write cookies like we exported from Chrome
         let cookies = serde_json::json!([
             {"name": "a1", "value": "testval", "domain": "xiaohongshu.com", "path": "/", "secure": false, "httpOnly": false},
             {"name": "web_session", "value": "sess123", "domain": "xiaohongshu.com", "path": "/", "secure": false, "httpOnly": true},
         ]);
         std::fs::write(&path, serde_json::to_string(&cookies).unwrap()).unwrap();
-        
+
         let jar = CookieJar::new();
         let count = jar.load_from_file(&path).unwrap();
         assert_eq!(count, 2, "Should load 2 cookies");
-        
+
         let url = Url::parse("https://www.xiaohongshu.com/explore").unwrap();
         let header = jar.get_cookie_header_same_site(&url);
         assert!(header.contains("a1=testval"), "Missing a1 in: '{}'", header);
-        assert!(header.contains("web_session=sess123"), "Missing web_session in: '{}'", header);
+        assert!(
+            header.contains("web_session=sess123"),
+            "Missing web_session in: '{}'",
+            header
+        );
     }
 
     #[test]
@@ -1584,7 +1693,10 @@ mod tests {
         // Through the public path the cookie degrades to a session cookie.
         let jar = CookieJar::new();
         let url = Url::parse("http://example.test/").unwrap();
-        jar.set_cookie("sid=abc; Expires=Thu, 01 Jan 99999999999 00:00:00 GMT", &url);
+        jar.set_cookie(
+            "sid=abc; Expires=Thu, 01 Jan 99999999999 00:00:00 GMT",
+            &url,
+        );
         assert!(jar.get_cookie_header_same_site(&url).contains("sid=abc"));
     }
 
@@ -1598,12 +1710,14 @@ mod tests {
         jar.set_cookie("sid=planted; Domain=168.1.100; Path=/", &server);
         let victim = Url::parse("http://10.168.1.100/").unwrap();
         assert!(
-            !jar.get_cookie_header_same_site(&victim).contains("sid=planted"),
+            !jar.get_cookie_header_same_site(&victim)
+                .contains("sid=planted"),
             "cookie leaked to an unrelated address: {}",
             jar.get_cookie_header_same_site(&victim)
         );
         assert!(
-            !jar.get_cookie_header_same_site(&server).contains("sid=planted"),
+            !jar.get_cookie_header_same_site(&server)
+                .contains("sid=planted"),
             "an invalid Domain attribute rejects the cookie"
         );
 
@@ -1771,7 +1885,10 @@ mod tests {
         let jar = CookieJar::new();
         let sub = Url::parse("https://sub.example.test/").unwrap();
         let parent = Url::parse("https://example.test/").unwrap();
-        jar.set_cookie("__Host-session=evil; Domain=example.test; Secure; Path=/", &sub);
+        jar.set_cookie(
+            "__Host-session=evil; Domain=example.test; Secure; Path=/",
+            &sub,
+        );
         jar.set_cookie("__Host-a=1; Secure; Path=/admin", &sub);
         jar.set_cookie("__Host-b=1; Path=/", &sub);
         jar.set_cookie_from_js("__Host-c=1; Secure; Domain=example.test", &sub);
@@ -1825,10 +1942,14 @@ mod tests {
             },
             true,
         )]);
-        assert!(!jar.get_cookie_header_same_site(&origin).contains("__Secure-"));
+        assert!(!jar
+            .get_cookie_header_same_site(&origin)
+            .contains("__Secure-"));
 
         jar.set_cookie("__Secure-token=ok; Secure", &origin);
-        assert!(jar.get_cookie_header_same_site(&origin).contains("__Secure-token=ok"));
+        assert!(jar
+            .get_cookie_header_same_site(&origin)
+            .contains("__Secure-token=ok"));
     }
 
     #[test]
@@ -1847,7 +1968,10 @@ mod tests {
         assert!(jar.cookies.is_poisoned());
         jar.set_cookie("after=2", &url);
         let header = jar.get_cookie_header_same_site(&url);
-        assert!(header.contains("before=1") && header.contains("after=2"), "{header}");
+        assert!(
+            header.contains("before=1") && header.contains("after=2"),
+            "{header}"
+        );
     }
 
     #[test]

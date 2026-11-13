@@ -271,9 +271,15 @@ impl BorderRadii {
         };
         let scale = 1.0f32
             .min(ratio(width, resolved.top_left.0 + resolved.top_right.0))
-            .min(ratio(width, resolved.bottom_left.0 + resolved.bottom_right.0))
+            .min(ratio(
+                width,
+                resolved.bottom_left.0 + resolved.bottom_right.0,
+            ))
             .min(ratio(height, resolved.top_left.1 + resolved.bottom_left.1))
-            .min(ratio(height, resolved.top_right.1 + resolved.bottom_right.1));
+            .min(ratio(
+                height,
+                resolved.top_right.1 + resolved.bottom_right.1,
+            ));
         if scale < 1.0 {
             resolved = resolved.scaled(scale);
         }
@@ -342,11 +348,7 @@ impl ResolvedBorderRadii {
         Self {
             top_left: shrink_corner(self.top_left, widths.left, widths.top),
             top_right: shrink_corner(self.top_right, widths.right, widths.top),
-            bottom_right: shrink_corner(
-                self.bottom_right,
-                widths.right,
-                widths.bottom,
-            ),
+            bottom_right: shrink_corner(self.bottom_right, widths.right, widths.bottom),
             bottom_left: shrink_corner(self.bottom_left, widths.left, widths.bottom),
         }
     }
@@ -356,11 +358,7 @@ impl ResolvedBorderRadii {
         Self {
             top_left: grow_corner(self.top_left, amounts.left, amounts.top),
             top_right: grow_corner(self.top_right, amounts.right, amounts.top),
-            bottom_right: grow_corner(
-                self.bottom_right,
-                amounts.right,
-                amounts.bottom,
-            ),
+            bottom_right: grow_corner(self.bottom_right, amounts.right, amounts.bottom),
             bottom_left: grow_corner(self.bottom_left, amounts.left, amounts.bottom),
         }
     }

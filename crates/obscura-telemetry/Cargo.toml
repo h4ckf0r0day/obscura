@@ -9,6 +9,10 @@ description = "Prometheus instrumentation and OpenTelemetry tracing for Obscura 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 parking_lot = "0.12"
 tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util", "macros"] }

@@ -31,7 +31,10 @@ impl DomTree {
     // is the node itself.
     fn content_source(&self, node_id: NodeId) -> NodeId {
         self.with_node(node_id, |n| match &n.data {
-            NodeData::Element { template_contents: Some(contents), .. } => Some(*contents),
+            NodeData::Element {
+                template_contents: Some(contents),
+                ..
+            } => Some(*contents),
             _ => None,
         })
         .flatten()
@@ -53,10 +56,7 @@ impl DomTree {
         // items bound a valid walk. Exceeding it means the graph is cyclic (the
         // append_child / insert_before guards prevent that); stop rather than
         // spin forever. On a valid tree this bound is never reached.
-        let max_steps = self
-            .node_slot_count()
-            .saturating_mul(2)
-            .saturating_add(16);
+        let max_steps = self.node_slot_count().saturating_mul(2).saturating_add(16);
         let mut steps = 0usize;
 
         while let Some(work) = stack.pop() {
@@ -92,7 +92,12 @@ impl DomTree {
                     buf.push_str(name);
                     buf.push('>');
                 }
-                NodeData::Element { name, attrs, template_contents, .. } => {
+                NodeData::Element {
+                    name,
+                    attrs,
+                    template_contents,
+                    ..
+                } => {
                     let tag = name.local.as_ref();
                     if include_self {
                         buf.push('<');
@@ -128,7 +133,8 @@ impl DomTree {
                     }
                 }
                 NodeData::Text { contents } => {
-                    let parent_is_raw = node.parent
+                    let parent_is_raw = node
+                        .parent
                         .and_then(|pid| {
                             self.with_node(pid, |p| {
                                 p.as_element()
@@ -200,8 +206,20 @@ fn escape_attr(s: &str, buf: &mut String) {
 fn is_void_element(tag: &str) -> bool {
     matches!(
         tag,
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
-            | "param" | "source" | "track" | "wbr"
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
     )
 }
 
@@ -282,7 +300,9 @@ mod tests {
         for payload in payloads {
             let tree = parse_html(r#"<div id="host"></div>"#);
             let host = tree.get_element_by_id("host").unwrap();
-            let comment = tree.new_node(NodeData::Comment { contents: payload.to_string() });
+            let comment = tree.new_node(NodeData::Comment {
+                contents: payload.to_string(),
+            });
             tree.append_child(host, comment);
 
             let serialized = tree.outer_html(host);

@@ -1,13 +1,12 @@
 #[macro_use]
 extern crate html5ever;
 
-pub mod tree;
-pub mod tree_sink;
 pub mod selector;
 pub mod serialize;
+pub mod tree;
+pub mod tree_sink;
 
 pub use tree::{
-    AttachShadowError, Attribute, DomTree, Node, NodeData, NodeId, ShadowRoot,
-    ShadowRootMode,
+    AttachShadowError, Attribute, DomTree, Node, NodeData, NodeId, ShadowRoot, ShadowRootMode,
 };
 pub use tree_sink::{parse_fragment, parse_fragment_with_context, parse_html, parse_srcdoc};

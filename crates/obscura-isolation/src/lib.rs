@@ -94,9 +94,8 @@ impl IsolationPolicy {
 
     /// Validates an outbound URL against this policy.
     pub fn validate_url(&self, raw_url: &str) -> Result<Url, IsolationError> {
-        let url = Url::parse(raw_url).map_err(|_| {
-            IsolationError::SsrfBlocked(format!("Unparseable URL: {raw_url}"))
-        })?;
+        let url = Url::parse(raw_url)
+            .map_err(|_| IsolationError::SsrfBlocked(format!("Unparseable URL: {raw_url}")))?;
 
         let scheme = url.scheme().to_ascii_lowercase();
 
@@ -106,7 +105,10 @@ impl IsolationPolicy {
         }
 
         // 2. Private network SSRF check
-        if (scheme == "http" || scheme == "https") && !self.allow_private_network {
+        if (scheme == "http" || scheme == "https")
+            && !self.allow_private_network
+            && !obscura_ssrf::env_allows_private_network()
+        {
             if let Some(host) = url.host_str() {
                 let host_lower = host.to_ascii_lowercase();
                 if host_lower == "localhost" || host_lower.ends_with(".localhost") {
@@ -190,7 +192,9 @@ mod tests {
 
         // Loopback
         assert!(matches!(
-            policy.validate_url("http://127.0.0.1:8080/test").unwrap_err(),
+            policy
+                .validate_url("http://127.0.0.1:8080/test")
+                .unwrap_err(),
             IsolationError::SsrfBlocked(_)
         ));
         assert!(matches!(
@@ -200,7 +204,9 @@ mod tests {
 
         // AWS / Cloud Metadata IP
         assert!(matches!(
-            policy.validate_url("http://169.254.169.254/latest/meta-data").unwrap_err(),
+            policy
+                .validate_url("http://169.254.169.254/latest/meta-data")
+                .unwrap_err(),
             IsolationError::SsrfBlocked(_)
         ));
 
@@ -210,7 +216,9 @@ mod tests {
             IsolationError::SsrfBlocked(_)
         ));
         assert!(matches!(
-            policy.validate_url("http://192.168.1.1/router").unwrap_err(),
+            policy
+                .validate_url("http://192.168.1.1/router")
+                .unwrap_err(),
             IsolationError::SsrfBlocked(_)
         ));
 

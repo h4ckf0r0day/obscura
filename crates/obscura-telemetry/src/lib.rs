@@ -183,7 +183,9 @@ impl MetricsRegistry {
         self.register_histogram(
             "obscura_worker_request_duration_seconds",
             "Worker request handling duration in seconds",
-            vec![0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0],
+            vec![
+                0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0,
+            ],
         );
         self.register_gauge(
             "obscura_worker_memory_rss_bytes",
@@ -213,33 +215,81 @@ impl MetricsRegistry {
             "obscura_ipc_requests_total",
             "Total count of IPC requests dispatched between supervisor and workers",
         );
-        self.register_counter("obscura_scheduler_jobs_received_total", "Total scheduler jobs received");
-        self.register_counter("obscura_scheduler_jobs_scheduled_total", "Total scheduler jobs scheduled");
-        self.register_counter("obscura_scheduler_jobs_dispatched_total", "Total scheduler jobs dispatched");
-        self.register_counter("obscura_scheduler_jobs_rejected_total", "Total scheduler jobs rejected");
-        self.register_counter("obscura_scheduler_dispatch_errors_total", "Total scheduler dispatch errors");
+        self.register_counter(
+            "obscura_scheduler_jobs_received_total",
+            "Total scheduler jobs received",
+        );
+        self.register_counter(
+            "obscura_scheduler_jobs_scheduled_total",
+            "Total scheduler jobs scheduled",
+        );
+        self.register_counter(
+            "obscura_scheduler_jobs_dispatched_total",
+            "Total scheduler jobs dispatched",
+        );
+        self.register_counter(
+            "obscura_scheduler_jobs_rejected_total",
+            "Total scheduler jobs rejected",
+        );
+        self.register_counter(
+            "obscura_scheduler_dispatch_errors_total",
+            "Total scheduler dispatch errors",
+        );
         self.register_gauge("obscura_scheduler_queue_depth", "Scheduler queue depth");
         self.register_gauge("obscura_scheduler_active_jobs", "Scheduler active jobs");
-        self.register_histogram("obscura_scheduler_dispatch_duration_seconds", "Scheduler dispatch duration", vec![0.001,0.005,0.01,0.05,0.1,0.5,1.0,5.0]);
-        self.register_histogram("obscura_scheduler_job_wait_duration_seconds", "Job wait duration", vec![0.01,0.05,0.1,0.5,1.0,5.0,30.0]);
+        self.register_histogram(
+            "obscura_scheduler_dispatch_duration_seconds",
+            "Scheduler dispatch duration",
+            vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+        );
+        self.register_histogram(
+            "obscura_scheduler_job_wait_duration_seconds",
+            "Job wait duration",
+            vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0],
+        );
         self.register_counter("obscura_scheduler_retries_total", "Total scheduler retries");
-        self.register_counter("obscura_scheduler_worker_selection_total", "Total worker selections");
+        self.register_counter(
+            "obscura_scheduler_worker_selection_total",
+            "Total worker selections",
+        );
         self.register_gauge("obscura_worker_active", "Active workers");
         self.register_counter("obscura_worker_restarts_total", "Worker restarts");
-        self.register_gauge("obscura_worker_heartbeat_age_seconds", "Worker heartbeat age");
+        self.register_gauge(
+            "obscura_worker_heartbeat_age_seconds",
+            "Worker heartbeat age",
+        );
         self.register_counter("obscura_lease_acquisitions_total", "Lease acquisitions");
         self.register_counter("obscura_lease_expirations_total", "Lease expirations");
-        self.register_counter("obscura_stale_worker_rejections_total", "Stale worker rejections");
+        self.register_counter(
+            "obscura_stale_worker_rejections_total",
+            "Stale worker rejections",
+        );
 
         self.register_gauge("obscura_outbox_pending", "Number of pending outbox events");
-        self.register_counter("obscura_outbox_published_total", "Total outbox events published");
-        self.register_counter("obscura_outbox_failed_total", "Total outbox publish failures");
+        self.register_counter(
+            "obscura_outbox_published_total",
+            "Total outbox events published",
+        );
+        self.register_counter(
+            "obscura_outbox_failed_total",
+            "Total outbox publish failures",
+        );
         self.register_counter("obscura_outbox_retries_total", "Total outbox retries");
-        self.register_histogram("obscura_outbox_publish_duration_seconds", "Outbox publish duration", vec![0.001,0.005,0.01,0.05,0.1,0.5,1.0,5.0]);
+        self.register_histogram(
+            "obscura_outbox_publish_duration_seconds",
+            "Outbox publish duration",
+            vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+        );
         self.register_counter("obscura_nats_publish_ack_total", "Total NATS publish acks");
-        self.register_counter("obscura_nats_publish_errors_total", "Total NATS publish errors");
+        self.register_counter(
+            "obscura_nats_publish_errors_total",
+            "Total NATS publish errors",
+        );
         self.register_counter("obscura_nats_redeliveries_total", "Total NATS redeliveries");
-        self.register_gauge("obscura_nats_connection_status", "NATS connection status (1=connected)");
+        self.register_gauge(
+            "obscura_nats_connection_status",
+            "NATS connection status (1=connected)",
+        );
 
         self.register_counter(
             "obscura_worker_requests_total",
@@ -451,7 +501,11 @@ impl MetricsServer {
     }
 }
 
-async fn handle_http_connection(mut stream: TcpStream, registry: MetricsRegistry, started_at: Instant) {
+async fn handle_http_connection(
+    mut stream: TcpStream,
+    registry: MetricsRegistry,
+    started_at: Instant,
+) {
     let mut buf = [0u8; 2048];
     let n = match stream.read(&mut buf).await {
         Ok(n) if n > 0 => n,
@@ -462,7 +516,9 @@ async fn handle_http_connection(mut stream: TcpStream, registry: MetricsRegistry
     let first_line = req_str.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 {
-        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n").await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            .await;
         return;
     }
 
@@ -470,12 +526,40 @@ async fn handle_http_connection(mut stream: TcpStream, registry: MetricsRegistry
     let path = parts[1];
 
     if method != "GET" && method != "HEAD" {
-        let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n").await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+            .await;
         return;
     }
 
     match path {
         "/metrics" => {
+            if let Ok(expected) = std::env::var("OBSCURA_METRICS_TOKEN") {
+                if !expected.is_empty() {
+                    let auth_header = req_str
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                        .and_then(|line| line.split_once(':'))
+                        .map(|(_, v)| v.trim());
+                    let authorized = auth_header
+                        .and_then(|value| value.strip_prefix("Bearer "))
+                        .map(|provided| {
+                            expected.len() == provided.len()
+                                && expected
+                                    .bytes()
+                                    .zip(provided.bytes())
+                                    .fold(0u8, |d, (a, b)| d | (a ^ b))
+                                    == 0
+                        })
+                        .unwrap_or(false);
+                    if !authorized {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                }
+            }
             let body = registry.to_prometheus_text();
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -490,8 +574,14 @@ async fn handle_http_connection(mut stream: TcpStream, registry: MetricsRegistry
             let uptime = started_at.elapsed().as_secs();
             let body = format!(
                 r#"{{"status":"healthy","uptime_seconds":{uptime},"active_sessions":{},"workers":{}}}"#,
-                registry.gauge("obscura_sessions_active").map(|g| g.get()).unwrap_or(0),
-                registry.gauge("obscura_worker_processes_count").map(|g| g.get()).unwrap_or(0),
+                registry
+                    .gauge("obscura_sessions_active")
+                    .map(|g| g.get())
+                    .unwrap_or(0),
+                registry
+                    .gauge("obscura_worker_processes_count")
+                    .map(|g| g.get())
+                    .unwrap_or(0),
             );
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -572,25 +662,39 @@ mod tests {
 
         // Test /metrics
         let mut stream = TcpStream::connect(addr).await.expect("connect");
-        stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
         let mut resp = String::new();
         let mut buf = [0u8; 1024];
         while let Ok(n) = stream.read(&mut buf).await {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             resp.push_str(&String::from_utf8_lossy(&buf[..n]));
-            if resp.contains("obscura_sessions_total 7") { break; }
+            if resp.contains("obscura_sessions_total 7") {
+                break;
+            }
         }
         assert!(resp.contains("HTTP/1.1 200 OK"));
         assert!(resp.contains("obscura_sessions_total 7"));
 
         // Test /health
         let mut stream = TcpStream::connect(addr).await.expect("connect");
-        stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
         let mut resp = String::new();
         while let Ok(n) = stream.read(&mut buf).await {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             resp.push_str(&String::from_utf8_lossy(&buf[..n]));
-            if resp.contains(r#""status":"healthy""#) { break; }
+            if resp.contains(r#""status":"healthy""#) {
+                break;
+            }
         }
         assert!(resp.contains("HTTP/1.1 200 OK"));
         assert!(resp.contains(r#""status":"healthy""#));
@@ -600,3 +704,37 @@ mod tests {
     }
 }
 
+
+/// Initialize OpenTelemetry tracing with OTLP export.
+pub fn init_tracing(service_name: &str, otlp_endpoint: &str) {
+    use opentelemetry::global;
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(otlp_endpoint)
+        .build()
+        .expect("otlp exporter");
+
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+         .with_simple_exporter(exporter)
+        .with_resource(opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )]))
+        .build();
+
+    let tracer = provider.tracer(service_name.to_string());
+    global::set_tracer_provider(provider);
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let _ = tracing_subscriber::registry()
+        .with(telemetry_layer)
+        .with(tracing_subscriber::fmt::layer().json())
+        .try_init();
+}

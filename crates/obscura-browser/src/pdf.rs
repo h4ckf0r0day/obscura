@@ -311,7 +311,8 @@ impl Page {
             return Err(RasterPdfError::NoRenderableDocument);
         }
         let previous_media = js.set_render_media(
-            obscura_js::CssMediaType::Print.with_reduced_motion(js.prefers_reduced_motion())
+            obscura_js::CssMediaType::Print
+                .with_reduced_motion(js.prefers_reduced_motion())
                 .with_dark_color_scheme(js.prefers_dark_color_scheme()),
         );
         let result = (|| {
@@ -574,7 +575,9 @@ mod tests {
             let stream_start = digits_end
                 + find_bytes(&pdf[digits_end..], b"stream\n").expect("image stream")
                 + b"stream\n".len();
-            let stream_end = stream_start.checked_add(length).expect("bounded stream end");
+            let stream_end = stream_start
+                .checked_add(length)
+                .expect("bounded stream end");
             let raster = image::load_from_memory_with_format(
                 &pdf[stream_start..stream_end],
                 image::ImageFormat::Jpeg,
@@ -690,8 +693,7 @@ mod tests {
 
         let base = pagination_plan(800.0, 2_000.0, printable_width, printable_height, 1.0)
             .expect("base geometry");
-        let impossible_height =
-            base.css_page_height * (MAX_PDF_DOCUMENT_PAGES as f32 + 16.0);
+        let impossible_height = base.css_page_height * (MAX_PDF_DOCUMENT_PAGES as f32 + 16.0);
         assert_eq!(
             pagination_plan(
                 800.0,
@@ -720,8 +722,7 @@ mod tests {
         assert_eq!(enlarged.css_page_height, normal.css_page_height / 2.0);
         assert!(enlarged.page_count >= normal.page_count);
         assert_eq!(
-            pagination_plan(800.0, 2_000.0, printable_width, printable_height, 0.09,)
-                .unwrap_err(),
+            pagination_plan(800.0, 2_000.0, printable_width, printable_height, 0.09,).unwrap_err(),
             RasterPdfError::InvalidScale
         );
     }
@@ -944,14 +945,16 @@ mod tests {
         let mut page = crate::Page::new("pdf-color-page".into(), context);
         page.set_viewport((100.0, 80.0));
         let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
-        runtime.set_dom(obscura_dom::parse_html(r#"<!doctype html><style>
+        runtime.set_dom(obscura_dom::parse_html(
+            r#"<!doctype html><style>
             html,body { margin:0 }
             #probe { width:100px;height:80px;background:#ffffff }
             @media (prefers-color-scheme:dark) { #probe { background:#e02020 } }
             @media print and (prefers-color-scheme:dark) and (prefers-reduced-motion:reduce) {
                 #probe { background:#2050e0 }
             }
-        </style><body><div id="probe"></div></body>"#));
+        </style><body><div id="probe"></div></body>"#,
+        ));
         runtime.set_url("https://example.test/pdf-color");
         page.url = Some(url::Url::parse("https://example.test/pdf-color").unwrap());
         runtime.set_viewport(100.0, 80.0);
@@ -969,15 +972,20 @@ mod tests {
             print_background: true,
             paper_width_in: 100.0 / POINTS_PER_INCH,
             paper_height_in: 80.0 / POINTS_PER_INCH,
-            margin_top_in: 0.0, margin_bottom_in: 0.0,
-            margin_left_in: 0.0, margin_right_in: 0.0,
+            margin_top_in: 0.0,
+            margin_bottom_in: 0.0,
+            margin_left_in: 0.0,
+            margin_right_in: 0.0,
             ..RasterPdfOptions::default()
         };
         let pages = pdf_page_rasters(&page.raster_pdf(options).unwrap());
         assert_eq!(pages.len(), 1);
         assert!(channel_near(*pages[0].get_pixel(50, 60), [32, 80, 224]));
         assert_eq!(page.screenshot((100.0, 80.0)).unwrap(), before);
-        assert_eq!(page.evaluate("return matchMedia('(prefers-color-scheme:dark)').matches;"), serde_json::json!(true));
+        assert_eq!(
+            page.evaluate("return matchMedia('(prefers-color-scheme:dark)').matches;"),
+            serde_json::json!(true)
+        );
     }
 
     #[test]
