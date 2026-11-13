@@ -116,6 +116,12 @@ pub enum PseudoClass {
     /// same fallback real browsers use when history-based styling is
     /// suppressed for privacy. `:link`/unvisited styling wins by default.
     Visited,
+    /// `:target`: the element whose id matches the document URL's fragment.
+    /// Drives tab/accordion/anchor-highlight styling on many sites; the
+    /// fragment is carried on the DOM tree (set on navigation and on
+    /// same-document fragment changes) and resolved through the same id
+    /// lookup `getElementById` uses.
+    Target,
 }
 
 impl parser::NonTSPseudoClass for PseudoClass {
@@ -157,6 +163,7 @@ impl ToCss for PseudoClass {
             PseudoClass::Checked => dest.write_str(":checked"),
             PseudoClass::Link => dest.write_str(":link"),
             PseudoClass::Visited => dest.write_str(":visited"),
+            PseudoClass::Target => dest.write_str(":target"),
         }
     }
 }
@@ -206,6 +213,17 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
         true
     }
 
+    // Allow the selector list of `:nth-child(An+B of S)` /
+    // `:nth-last-child(An+B of S)`. The selectors crate gates parsing the `of`
+    // clause on this hook (default false), so without it a modern reset or
+    // component rule like `li:nth-child(2 of .a)` failed to parse and was
+    // dropped, silently matching nothing. Matching is built into the crate
+    // (Component::NthOf), and DomElement's sibling traversal above provides the
+    // tree walk it needs, so enabling parsing is sufficient.
+    fn parse_nth_child_of(&self) -> bool {
+        true
+    }
+
     // `:host` is parsed by the selectors crate itself. Ordinary document
     // matching still cannot match it because those contexts deliberately have
     // no `current_host`.
@@ -236,6 +254,7 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "checked" => Ok(PseudoClass::Checked),
             "link" | "any-link" => Ok(PseudoClass::Link),
             "visited" => Ok(PseudoClass::Visited),
+            "target" => Ok(PseudoClass::Target),
             _ => Err(cssparser::ParseError {
                 kind: cssparser::ParseErrorKind::Custom(
                     SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
@@ -506,11 +525,20 @@ impl<'a> Element for DomElement<'a> {
                     .unwrap_or_else(|| self.has_boolean_attr("checked") || self.has_boolean_attr("selected"))
             }
             PseudoClass::Hover => self.tree.is_hovered(self.node_id),
-            // These dynamic states are not tracked yet.
-            PseudoClass::Active
-            | PseudoClass::Focus
-            | PseudoClass::FocusVisible
-            | PseudoClass::FocusWithin => false,
+            // :focus matches the focused area; :focus-within adds every
+            // flat-tree ancestor of it (shadow hosts included). Both read the
+            // tree state that JS focus()/blur() keep current, so querySelector,
+            // the cascade, and getComputedStyle see the same answer.
+            PseudoClass::Focus => self.tree.is_focused(self.node_id),
+            PseudoClass::FocusWithin => self.tree.is_focused_within(self.node_id),
+            // :target is not a user-action state; it resolves from the document
+            // URL fragment against the id index.
+            PseudoClass::Target => self.tree.is_target(self.node_id),
+            // Not tracked: :active needs a press-and-hold interaction model,
+            // and :focus-visible needs heuristics for "focus that should be
+            // visible" (keyboard vs mouse). They parse and stay inert, matching
+            // how an engine without interaction state has to treat them.
+            PseudoClass::Active | PseudoClass::FocusVisible => false,
         }
     }
 
@@ -1330,6 +1358,75 @@ mod tests {
         assert_eq!(element(a).first_element_child(), None);
         assert_eq!(element(a).next_sibling_element(), None);
         assert_eq!(element(a).prev_sibling_element(), None);
+    }
+
+    #[test]
+    fn nth_child_of_s_matches_among_filtered_siblings() {
+        let tree = parse_html("<!doctype html><ul><li id=l1 class=a>1</li><li id=l2 class=b>2</li><li id=l3 class=a>3</li></ul>");
+        let l1 = tree.get_element_by_id("l1").unwrap();
+        let l3 = tree.get_element_by_id("l3").unwrap();
+        // The second of the `.a` siblings is l3 (l1 is the first), not l2.
+        assert_eq!(tree.query_selector_all("li:nth-child(2 of .a)").unwrap(), vec![l3]);
+        assert!(tree.matches_selector(l3, "li:nth-child(2 of .a)").unwrap());
+        assert!(!tree.matches_selector(l1, "li:nth-child(2 of .a)").unwrap());
+        assert!(tree.matches_selector(l1, "li:nth-child(1 of .a)").unwrap());
+        assert!(tree.matches_selector(l3, "li:nth-last-child(1 of .a)").unwrap());
+    }
+
+    #[test]
+    fn focus_and_focus_within_read_the_tree_focused_state() {
+        let tree = parse_html("<!doctype html><div id=w><input id=t2></div><p id=p>");
+        let w = tree.get_element_by_id("w").unwrap();
+        let t2 = tree.get_element_by_id("t2").unwrap();
+        let p = tree.get_element_by_id("p").unwrap();
+        assert_eq!(tree.query_selector_all(":focus").unwrap(), Vec::new());
+        assert_eq!(tree.query_selector_all("#w:focus-within").unwrap(), Vec::new());
+
+        assert!(tree.set_focused(Some(t2)));
+        assert!(tree.matches_selector(t2, ":focus").unwrap());
+        assert!(!tree.matches_selector(p, ":focus").unwrap());
+        // The focused element and every flat-tree ancestor match :focus-within.
+        assert!(tree.matches_selector(t2, ":focus-within").unwrap());
+        assert!(tree.matches_selector(w, "#w:focus-within").unwrap());
+        assert!(!tree.matches_selector(p, "#w:focus-within").unwrap());
+
+        assert!(tree.set_focused(None));
+        assert_eq!(tree.query_selector_all(":focus").unwrap(), Vec::new());
+        assert_eq!(tree.query_selector_all("#w:focus-within").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn focus_within_crosses_the_shadow_boundary_to_the_host() {
+        let tree = parse_html("<!doctype html><x-card id=host>");
+        let host = tree.get_element_by_id("host").unwrap();
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let inner = shadow_element(&tree, "input", &[("type", "text")]);
+        tree.append_child(root, inner);
+
+        tree.set_focused(Some(inner));
+        assert!(tree.matches_selector(inner, ":focus").unwrap());
+        assert!(tree.matches_selector(host, ":focus-within").unwrap());
+    }
+
+    #[test]
+    fn target_matches_the_element_named_by_the_url_fragment() {
+        let tree = parse_html("<!doctype html><div id=pane-x>x</div><section id=pane-y>y</section>");
+        let px = tree.get_element_by_id("pane-x").unwrap();
+        let py = tree.get_element_by_id("pane-y").unwrap();
+        assert_eq!(tree.query_selector_all(":target").unwrap(), Vec::new());
+
+        assert!(tree.set_target_fragment(Some("pane-x")));
+        assert_eq!(tree.query_selector_all(":target").unwrap(), vec![px]);
+        assert!(tree.matches_selector(px, ":target").unwrap());
+        assert!(!tree.matches_selector(py, ":target").unwrap());
+
+        // The fragment is percent-decoded before the id lookup.
+        assert!(tree.set_target_fragment(Some("pane%2Dy")));
+        assert!(tree.matches_selector(py, ":target").unwrap());
+
+        // Clearing the fragment (the `#` empty form) matches nothing.
+        assert!(tree.set_target_fragment(Some("")));
+        assert_eq!(tree.query_selector_all(":target").unwrap(), Vec::new());
     }
 
     fn shadow_element(
