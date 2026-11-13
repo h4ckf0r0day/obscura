@@ -12,6 +12,17 @@ from unittest.mock import Mock, patch
 import perf_smoke
 
 
+class ShippingArtifactTests(unittest.TestCase):
+    def test_candidate_is_staged_before_workspace_test_features_are_enabled(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
+        build = workflow.index("- name: Build render release")
+        stage = workflow.index("- name: Stage candidate binary for comparison")
+        tests = workflow.index("- name: Test render configuration")
+        self.assertLess(build, stage)
+        self.assertLess(stage, tests,
+                        "workspace nextest can overwrite the CLI with dev-dependency features")
+
+
 class ProcessMeasurementTests(unittest.TestCase):
     def test_exit_wait_is_not_polled_and_keeps_limits_and_cleanup(self):
         process = Mock(pid=12345, returncode=0)
