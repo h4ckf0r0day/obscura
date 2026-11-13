@@ -27191,6 +27191,211 @@ mod tests {
         );
     }
 
+    /// Media-surface fingerprint completeness (issue #1548): mediaDevices
+    /// must expose the members real Chrome has — getSupportedConstraints
+    /// (36 keys captured from Chrome 143), ondevicechange,
+    /// setCaptureHandleConfig — plus the legacy callback-style
+    /// getUserMedia/webkitGetUserMedia on the Navigator prototype. Rejections
+    /// must carry the named NotAllowedError, not a message-only DOMException.
+    #[tokio::test]
+    async fn media_devices_surface_matches_chrome() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate_for_cdp_with_timeout(
+                r#"
+                (async () => {
+                    const gsc = navigator.mediaDevices.getSupportedConstraints();
+                    let gumErr = null;
+                    try { await navigator.mediaDevices.getUserMedia(); }
+                    catch (e) { gumErr = e; }
+                    let cbErr = null;
+                    navigator.getUserMedia({ audio: true }, () => {}, e => { cbErr = e; });
+                    await new Promise(r => setTimeout(r, 0));
+                    return {
+                        gscType: typeof navigator.mediaDevices.getSupportedConstraints,
+                        gscKeys: Object.keys(gsc).length,
+                        gscAllTrue: Object.values(gsc).every(v => v === true),
+                        gscHasTorch: 'torch' in gsc && 'voiceIsolation' in gsc && 'zoom' in gsc,
+                        onDeviceChange: navigator.mediaDevices.ondevicechange,
+                        captureHandle: typeof navigator.mediaDevices.setCaptureHandleConfig,
+                        legacyGUM: typeof navigator.getUserMedia,
+                        legacyWebkit: typeof navigator.webkitGetUserMedia,
+                        gumName: gumErr.name,
+                        gumMsg: gumErr.message,
+                        cbName: cbErr && cbErr.name,
+                    };
+                })()
+                "#,
+                true,
+                true,
+                1000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(result["gscType"], "function");
+        assert_eq!(result["gscKeys"], serde_json::json!(36));
+        assert_eq!(result["gscAllTrue"], serde_json::json!(true));
+        assert_eq!(result["gscHasTorch"], serde_json::json!(true));
+        assert_eq!(result["onDeviceChange"], serde_json::json!(null));
+        assert_eq!(result["captureHandle"], "function");
+        assert_eq!(result["legacyGUM"], "function");
+        assert_eq!(result["legacyWebkit"], "function");
+        assert_eq!(result["gumName"], "NotAllowedError");
+        assert_eq!(result["gumMsg"], "Permission denied");
+        // Legacy callback path receives the same named error.
+        assert_eq!(result["cbName"], "NotAllowedError");
+    }
+
+    /// MediaRecorder fingerprint surface (issue #1548): typeof, static
+    /// isTypeSupported table (webm/vp8/vp9/opus true, mp4/h264 false, '' true,
+    /// case/whitespace tolerant, null/undefined false), constructor defaults
+    /// (state/stream/mimeType/bitrates/audioBitrateMode), no own instance
+    /// properties, and verbatim Chrome error messages.
+    #[test]
+    fn media_recorder_surface_matches_chrome() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                const types = [
+                    'video/webm;codecs=vp8', 'video/webm;codecs=vp9',
+                    'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus',
+                    'video/webm', 'audio/webm;codecs=opus', 'audio/webm',
+                    'audio/ogg;codecs=opus', 'video/mp4;codecs=avc1.42E01E',
+                    'video/mp4', 'audio/mp4', 'video/webm;codecs=h264',
+                    '', 'VIDEO/WEBM;CODECS=VP8', ' video/webm ; codecs= vp8 ',
+                    'nonsense', null, undefined,
+                ];
+                const rec = new MediaRecorder(new MediaStream());
+                const errors = {};
+                const capture = (key, fn) => {
+                    try { fn(); errors[key] = 'no-throw'; }
+                    catch (e) { errors[key] = e.name + '|' + e.message; }
+                };
+                capture('noArgs', () => new MediaRecorder());
+                capture('badStream', () => new MediaRecorder({}));
+                capture('badOpts', () => new MediaRecorder(new MediaStream(), 42));
+                capture('badMime', () => new MediaRecorder(new MediaStream(), { mimeType: 'nonsense' }));
+                capture('requestDataInactive', () => rec.requestData());
+                capture('stopInactive', () => rec.stop());
+                return {
+                    type: typeof MediaRecorder,
+                    table: types.map(t => MediaRecorder.isTypeSupported(t)),
+                    state: rec.state,
+                    streamIsMediaStream: rec.stream instanceof MediaStream,
+                    mimeType: rec.mimeType,
+                    bits: rec.audioBitsPerSecond + ',' + rec.videoBitsPerSecond,
+                    bitrateMode: rec.audioBitrateMode,
+                    onDA: rec.ondataavailable,
+                    ownProps: Object.getOwnPropertyNames(rec).length,
+                    protoKeys: Object.keys(MediaRecorder.prototype).sort().join(','),
+                    errors,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result["type"], "function");
+        // webm family true, mp4/h264/ogg false, '' true, case/space tolerant,
+        // garbage/null/undefined false — matches Chrome 143 minus proprietary codecs.
+        assert_eq!(
+            result["table"],
+            serde_json::json!([true, true, true, true, true, true, true, false, false, false, false, false, true, true, true, false, false, false])
+        );
+        assert_eq!(result["state"], "inactive");
+        assert_eq!(result["streamIsMediaStream"], serde_json::json!(true));
+        assert_eq!(result["mimeType"], "");
+        assert_eq!(result["bits"], "128000,2500000");
+        assert_eq!(result["bitrateMode"], "variable");
+        assert_eq!(result["onDA"], serde_json::json!(null));
+        assert_eq!(result["ownProps"], serde_json::json!(0));
+        assert_eq!(
+            result["protoKeys"],
+            "audioBitrateMode,audioBitsPerSecond,mimeType,ondataavailable,onerror,onpause,onresume,onstart,onstop,pause,requestData,resume,start,state,stop,stream,videoBitsPerSecond"
+        );
+        assert_eq!(
+            result["errors"]["noArgs"],
+            "TypeError|Failed to construct 'MediaRecorder': 1 argument required, but only 0 present."
+        );
+        assert_eq!(
+            result["errors"]["badStream"],
+            "TypeError|Failed to construct 'MediaRecorder': parameter 1 is not of type 'MediaStream'."
+        );
+        assert_eq!(
+            result["errors"]["badOpts"],
+            "TypeError|Failed to construct 'MediaRecorder': The provided value is not of type 'MediaRecorderOptions'."
+        );
+        assert_eq!(
+            result["errors"]["badMime"],
+            "NotSupportedError|Failed to construct 'MediaRecorder': Failed to initialize native MediaRecorder the type provided (nonsense) is not supported."
+        );
+        assert_eq!(
+            result["errors"]["requestDataInactive"],
+            "InvalidStateError|Failed to execute 'requestData' on 'MediaRecorder': The MediaRecorder's state is 'inactive'."
+        );
+        // stop() on an inactive recorder is a silent no-op in Chrome (verified
+        // on 143) — it must not throw.
+        assert_eq!(result["errors"]["stopInactive"], "no-throw");
+    }
+
+    /// MediaRecorder functional path: start() on a trackless stream throws the
+    /// verbatim Chrome NotSupportedError (including the upstream "becausethere"
+    /// typo — kept deliberately); with a track it transitions inactive →
+    /// recording → inactive and fires start / dataavailable / stop in order;
+    /// pause/resume round-trip through 'paused'.
+    #[tokio::test]
+    async fn media_recorder_state_machine_and_events() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate_for_cdp_with_timeout(
+                r#"
+                (async () => {
+                    const errors = {};
+                    try { new MediaRecorder(new MediaStream()).start(); }
+                    catch (e) { errors.emptyStart = e.name + '|' + e.message; }
+                    const stream = new MediaStream();
+                    stream.addTrack(new MediaStreamTrack('video'));
+                    const rec = new MediaRecorder(stream);
+                    const events = [];
+                    rec.addEventListener('start', () => events.push('start'));
+                    rec.addEventListener('dataavailable', e => events.push('da:' + e.data.size + ':' + e.data.type));
+                    rec.addEventListener('stop', () => events.push('stop'));
+                    rec.addEventListener('pause', () => events.push('pause'));
+                    rec.addEventListener('resume', () => events.push('resume'));
+                    rec.start();
+                    const stateAfterStart = rec.state;
+                    rec.pause();
+                    const stateAfterPause = rec.state;
+                    rec.resume();
+                    rec.stop();
+                    const stateAfterStop = rec.state;
+                    rec.stop(); // silent no-op
+                    await new Promise(r => setTimeout(r, 0)); // let queued events fire
+                    return { errors, events, stateAfterStart, stateAfterPause, stateAfterStop };
+                })()
+                "#,
+                true,
+                true,
+                1000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result["errors"]["emptyStart"],
+            "NotSupportedError|Failed to execute 'start' on 'MediaRecorder': The MediaRecorder cannot start becausethere are no audio or video tracks available."
+        );
+        assert_eq!(result["stateAfterStart"], "recording");
+        assert_eq!(result["stateAfterPause"], "paused");
+        assert_eq!(result["stateAfterStop"], "inactive");
+        assert_eq!(
+            result["events"],
+            serde_json::json!(["start", "pause", "resume", "da:0:video/webm;codecs=vp8", "stop"])
+        );
+    }
+
     #[test]
     fn text_codec_streams_expose_browser_shape() {
         let mut rt = setup_runtime("<div></div>");

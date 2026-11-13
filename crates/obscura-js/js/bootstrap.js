@@ -8442,9 +8442,19 @@ globalThis.navigator = {
         {deviceId:"",kind:"videoinput",label:"",groupId:""},
       ]);
     },
-    getUserMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
-    getDisplayMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
-    addEventListener(){}, removeEventListener(){},
+    // Chrome rejects with a named NotAllowedError (message "Permission denied"),
+    // not a message-only DOMException -- scripts key on e.name.
+    getUserMedia() { return Promise.reject(new DOMException("Permission denied", "NotAllowedError")); },
+    getDisplayMedia() { return Promise.reject(new DOMException("Permission denied", "NotAllowedError")); },
+    // Static constraint dictionary; keys captured from Chrome 143 (36 entries,
+    // all true). getSupportedConstraints is a pure introspection surface that
+    // fingerprint suites enumerate.
+    getSupportedConstraints() {
+      return { aspectRatio: true, autoGainControl: true, brightness: true, channelCount: true, colorTemperature: true, contrast: true, deviceId: true, displaySurface: true, echoCancellation: true, exposureCompensation: true, exposureMode: true, exposureTime: true, facingMode: true, focusDistance: true, focusMode: true, frameRate: true, groupId: true, height: true, iso: true, latency: true, noiseSuppression: true, pan: true, pointsOfInterest: true, resizeMode: true, restrictOwnAudio: true, sampleRate: true, sampleSize: true, saturation: true, sharpness: true, suppressLocalAudioPlayback: true, tilt: true, torch: true, voiceIsolation: true, whiteBalanceMode: true, width: true, zoom: true };
+    },
+    setCaptureHandleConfig() {},
+    ondevicechange: null,
+    addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;},
   },
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
   permissions: { query(params){
@@ -8555,6 +8565,20 @@ globalThis.navigator = {
   });
   _navProto.canShare = _markNative(function canShare() { return false; });
 
+  // Legacy callback-style getUserMedia stays on Navigator.prototype in Chrome
+  // (sannysoft calls it; missing there throws and skips that check block).
+  var _legacyGetUserMedia = _markNative(function getUserMedia(constraints, success, error) {
+    var p = navigator.mediaDevices.getUserMedia(constraints);
+    if (typeof success === 'function' || typeof error === 'function') {
+      p.then(
+        typeof success === 'function' ? success : function () {},
+        typeof error === 'function' ? error : function () {}
+      );
+    }
+    return p;
+  });
+  _navProto.getUserMedia = _legacyGetUserMedia;
+  _navProto.webkitGetUserMedia = _legacyGetUserMedia;
   Object.setPrototypeOf(globalThis.navigator, _navProto);
 })();
 
@@ -17507,6 +17531,254 @@ globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { construct
 
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
 globalThis.MediaStreamTrack = class MediaStreamTrack { constructor(){this.kind='';this.enabled=true;this.readyState='live';} stop(){} clone(){return new MediaStreamTrack();} };
+var _mediaStreamTrackSlots = new WeakMap();
+globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;_mediaStreamTrackSlots.set(this,[]);} getTracks(){return _mediaStreamTrackSlots.get(this)||[];} getAudioTracks(){return this.getTracks().filter(function(t){return t.kind==='audio';});} getVideoTracks(){return this.getTracks().filter(function(t){return t.kind==='video';});} addTrack(t){_mediaStreamTrackSlots.get(this).push(t);} removeTrack(t){var l=_mediaStreamTrackSlots.get(this);var i=l.indexOf(t);if(i!==-1)l.splice(i,1);} clone(){return new MediaStream();} };
+globalThis.MediaStreamTrack = class MediaStreamTrack { constructor(kind){this.kind=kind||'';this.enabled=true;this.readyState='live';} stop(){} clone(){return new MediaStreamTrack(this.kind);} };
+
+// MediaRecorder: typeof + isTypeSupported are probed directly by fingerprint
+// suites (fp-collect et al.), so the surface must exist and the codec table
+// must match a Chromium build without proprietary codecs -- H.264/MP4 report
+// false, consistent with the engine having no H.264 path (canPlayType reports
+// "" there too). Event names, state transitions and error messages are
+// captured verbatim from Chrome 143. Recorder slots and listeners live in
+// WeakMaps so instances carry no own properties, like real Chrome.
+var _mediaRecorderSlots = new WeakMap();
+var _mediaRecorderListeners = new WeakMap();
+
+function _mediaRecorderParseType(t) {
+  if (t === null || t === undefined) return null;
+  var s = String(t).trim().toLowerCase();
+  if (s === '') return { container: '', codecs: null };
+  var semi = s.indexOf(';');
+  var container = (semi === -1 ? s : s.slice(0, semi)).trim();
+  var codecs = null;
+  if (semi !== -1) {
+    var params = s.slice(semi + 1).split(';');
+    for (var i = 0; i < params.length; i++) {
+      var kv = params[i].split('=');
+      if (kv[0].trim() === 'codecs') { codecs = kv.slice(1).join('=').trim(); break; }
+    }
+  }
+  if (codecs === null) return { container: container, codecs: null };
+  return { container: container, codecs: codecs === '' ? [] : codecs.split(',').map(function (c) { return c.trim(); }) };
+}
+
+function _mediaRecorderIsSupported(t) {
+  var parsed = _mediaRecorderParseType(t);
+  if (!parsed) return false;
+  var c = parsed.container;
+  if (c === '') return true;
+  if (c === 'video/webm') {
+    if (parsed.codecs === null) return true;
+    if (parsed.codecs.length === 0) return false;
+    return parsed.codecs.every(function (x) { return x === 'vp8' || x === 'vp9' || x === 'opus'; });
+  }
+  if (c === 'audio/webm') {
+    if (parsed.codecs === null) return true;
+    if (parsed.codecs.length === 0) return false;
+    return parsed.codecs.every(function (x) { return x === 'opus'; });
+  }
+  return false;
+}
+
+function _mediaRecorderDispatch(rec, type, extra) {
+  var event = new Event(type);
+  event.target = rec;
+  event.currentTarget = rec;
+  if (extra) { for (var k in extra) { event[k] = extra[k]; } }
+  var listeners = _mediaRecorderListeners.get(rec);
+  var handlers = (listeners && listeners[type]) || [];
+  for (var i = 0; i < handlers.length; i++) {
+    try { handlers[i].call(rec, event); } catch (e) {}
+  }
+  if (typeof rec['on' + type] === 'function') {
+    try { rec['on' + type].call(rec, event); } catch (e) {}
+  }
+}
+
+function _mediaRecorderFireData(rec) {
+  var slots = _mediaRecorderSlots.get(rec);
+  _mediaRecorderDispatch(rec, 'dataavailable', { data: new Blob([], { type: slots.mimeType !== '' ? slots.mimeType : 'video/webm;codecs=vp8' }) });
+}
+
+// EventTarget base kept in this closure (Chrome inherits these from
+// EventTarget.prototype; exporting a class here would add a non-standard
+// global). MediaRecorder.prototype therefore keeps exactly Chrome's key set.
+class MediaRecorderEventTargetBase {
+  addEventListener(type, handler) {
+    var listeners = _mediaRecorderListeners.get(this);
+    if (!listeners || typeof handler !== 'function') return;
+    if (!listeners[type]) listeners[type] = [];
+    if (listeners[type].indexOf(handler) === -1) listeners[type].push(handler);
+  }
+  removeEventListener(type, handler) {
+    var listeners = _mediaRecorderListeners.get(this);
+    if (!listeners || !listeners[type]) return;
+    var i = listeners[type].indexOf(handler);
+    if (i !== -1) listeners[type].splice(i, 1);
+  }
+  dispatchEvent(event) {
+    if (!event || !event.type) return false;
+    _mediaRecorderDispatch(this, event.type);
+    return true;
+  }
+}
+
+globalThis.MediaRecorder = class MediaRecorder extends MediaRecorderEventTargetBase {
+  constructor(stream, options) {
+    super();
+    if (arguments.length === 0) {
+      throw new TypeError("Failed to construct 'MediaRecorder': 1 argument required, but only 0 present.");
+    }
+    if (!(stream instanceof MediaStream)) {
+      throw new TypeError("Failed to construct 'MediaRecorder': parameter 1 is not of type 'MediaStream'.");
+    }
+    if (options !== undefined && options !== null &&
+        typeof options !== 'object' && typeof options !== 'function') {
+      throw new TypeError("Failed to construct 'MediaRecorder': The provided value is not of type 'MediaRecorderOptions'.");
+    }
+    var slots = {
+      stream: stream, mimeType: '', state: 'inactive',
+      audioBitsPerSecond: 128000, videoBitsPerSecond: 2500000,
+      audioBitrateMode: 'variable', timesliceTimer: null,
+    };
+    if (options) {
+      if (options.audioBitsPerSecond !== undefined && options.audioBitsPerSecond !== null) {
+        slots.audioBitsPerSecond = Number(options.audioBitsPerSecond) || 0;
+      }
+      if (options.videoBitsPerSecond !== undefined && options.videoBitsPerSecond !== null) {
+        slots.videoBitsPerSecond = Number(options.videoBitsPerSecond) || 0;
+      }
+      if (options.audioBitrateMode !== undefined && options.audioBitrateMode !== null) {
+        var mode = String(options.audioBitrateMode);
+        slots.audioBitrateMode = (mode === 'constant') ? 'constant' : 'variable';
+      }
+      if (options.mimeType !== undefined && options.mimeType !== null && options.mimeType !== '') {
+        var mime = String(options.mimeType);
+        if (!MediaRecorder.isTypeSupported(mime)) {
+          throw new DOMException(
+            "Failed to construct 'MediaRecorder': Failed to initialize native MediaRecorder the type provided (" + mime + ") is not supported.",
+            "NotSupportedError"
+          );
+        }
+        slots.mimeType = mime;
+      }
+    }
+    _mediaRecorderSlots.set(this, slots);
+    _mediaRecorderListeners.set(this, {});
+  }
+  start(timeslice) {
+    var slots = _mediaRecorderSlots.get(this);
+    if (slots.state !== 'inactive') {
+      throw new DOMException("Failed to execute 'start' on 'MediaRecorder': The MediaRecorder has already started and the state is 'recording'.", 'InvalidStateError');
+    }
+    if (slots.stream.getTracks().length === 0) {
+      throw new DOMException("Failed to execute 'start' on 'MediaRecorder': The MediaRecorder cannot start becausethere are no audio or video tracks available.", 'NotSupportedError');
+    }
+    if (timeslice !== undefined && timeslice !== null && (!Number.isFinite(Number(timeslice)) || Number(timeslice) < 0)) {
+      throw new TypeError("Failed to execute 'start' on 'MediaRecorder': The provided value is not of type '(unsigned long or MediaRecorderOptions)'.");
+    }
+    slots.state = 'recording';
+    var self = this;
+    Promise.resolve().then(function () {
+      // Spec queues the start task when start() succeeds -- never re-check the
+      // state at dispatch time (a sync stop() right after start() still
+      // delivers start, then dataavailable + stop, like Chrome).
+      _mediaRecorderDispatch(self, 'start');
+    });
+    if (timeslice !== undefined && timeslice !== null && Number(timeslice) > 0) {
+      slots.timesliceTimer = setInterval(function () {
+        if (_mediaRecorderSlots.get(self).state === 'recording') _mediaRecorderFireData(self);
+      }, Number(timeslice));
+    }
+  }
+  stop() {
+    var slots = _mediaRecorderSlots.get(this);
+    if (slots.state === 'inactive') return;
+    slots.state = 'inactive';
+    if (slots.timesliceTimer != null) { clearInterval(slots.timesliceTimer); slots.timesliceTimer = null; }
+    var self = this;
+    Promise.resolve().then(function () {
+      _mediaRecorderFireData(self);
+      _mediaRecorderDispatch(self, 'stop');
+    });
+  }
+  pause() {
+    var slots = _mediaRecorderSlots.get(this);
+    if (slots.state === 'inactive') {
+      throw new DOMException("Failed to execute 'pause' on 'MediaRecorder': The MediaRecorder's state is 'inactive'.", 'InvalidStateError');
+    }
+    if (slots.state === 'recording') {
+      slots.state = 'paused';
+      var self = this;
+      Promise.resolve().then(function () {
+        _mediaRecorderDispatch(self, 'pause');
+      });
+    }
+  }
+  resume() {
+    var slots = _mediaRecorderSlots.get(this);
+    if (slots.state === 'inactive') {
+      throw new DOMException("Failed to execute 'resume' on 'MediaRecorder': The MediaRecorder's state is 'inactive'.", 'InvalidStateError');
+    }
+    if (slots.state === 'paused') {
+      slots.state = 'recording';
+      var self = this;
+      Promise.resolve().then(function () {
+        _mediaRecorderDispatch(self, 'resume');
+      });
+    }
+  }
+  requestData() {
+    var slots = _mediaRecorderSlots.get(this);
+    if (slots.state === 'inactive') {
+      throw new DOMException("Failed to execute 'requestData' on 'MediaRecorder': The MediaRecorder's state is 'inactive'.", 'InvalidStateError');
+    }
+    _mediaRecorderFireData(this);
+  }
+};
+
+(function () {
+  // Re-define the five operations as enumerable own prototype props: Chrome 143
+  // lists them in Object.keys(MediaRecorder.prototype) (captured), while class
+  // syntax would make them non-enumerable.
+  var methods = ['start', 'stop', 'pause', 'resume', 'requestData'];
+  for (var i = 0; i < methods.length; i++) {
+    (function (key) {
+      Object.defineProperty(MediaRecorder.prototype, key, {
+        value: _markNative(MediaRecorder.prototype[key]),
+        writable: true, enumerable: true, configurable: true,
+      });
+    })(methods[i]);
+  }
+  var proto = MediaRecorder.prototype;
+  var getters = {
+    state: function () { return _mediaRecorderSlots.get(this).state; },
+    stream: function () { return _mediaRecorderSlots.get(this).stream; },
+    mimeType: function () { return _mediaRecorderSlots.get(this).mimeType; },
+    audioBitsPerSecond: function () { return _mediaRecorderSlots.get(this).audioBitsPerSecond; },
+    videoBitsPerSecond: function () { return _mediaRecorderSlots.get(this).videoBitsPerSecond; },
+    audioBitrateMode: function () { return _mediaRecorderSlots.get(this).audioBitrateMode; },
+  };
+  for (var name in getters) {
+    (function (key, fn) {
+      Object.defineProperty(proto, key, {
+        get: _markNativeAs(fn, 'function get ' + key + '() { [native code] }'),
+        enumerable: true, configurable: true,
+      });
+    })(name, getters[name]);
+  }
+  var onProps = ['onstart', 'onstop', 'ondataavailable', 'onerror', 'onpause', 'onresume'];
+  for (var i = 0; i < onProps.length; i++) {
+    (function (key) {
+      Object.defineProperty(proto, key, { value: null, writable: true, enumerable: true, configurable: true });
+    })(onProps[i]);
+  }
+})();
+
+MediaRecorder.isTypeSupported = function isTypeSupported(mimeType) { return _mediaRecorderIsSupported(mimeType); };
+_markNative(MediaRecorder.isTypeSupported);
+
 globalThis.RTCPeerConnection = class RTCPeerConnection {
   constructor(){this.localDescription=null;this.remoteDescription=null;this.iceConnectionState='new';this.iceGatheringState='new';this.signalingState='stable';this.connectionState='new';}
   createOffer(){return Promise.resolve({type:'offer',sdp:''});}
@@ -17530,6 +17802,7 @@ globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candida
 _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
+_markNative(MediaRecorder);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
 // Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
