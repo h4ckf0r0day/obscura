@@ -16920,6 +16920,7 @@ class _Canvas2D {
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
     this._stateStack = [];
+    this._clipRegions = null;
   }
   _resizeFromCanvas() {
     const requestedWidth = this._canvasDimension('width', 300);
@@ -16970,6 +16971,7 @@ class _Canvas2D {
   _setPixel(x, y, r, g, b, a) {
     x = Math.round(x); y = Math.round(y);
     if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
+    if (this._clipRegions && !this._isInsideClip(x, y)) return;
     const idx = (y * this._w + x) * 4;
     const alpha = (a / 255) * this.globalAlpha;
     if (this.globalCompositeOperation === 'multiply') {
@@ -16997,8 +16999,10 @@ class _Canvas2D {
   }
   clearRect(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
+    const clipped = !!this._clipRegions;
     for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
       for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
+        if (clipped && !this._isInsideClip(px, py)) continue;
         const idx = (py * this._w + px) * 4;
         this._buf[idx] = this._buf[idx+1] = this._buf[idx+2] = this._buf[idx+3] = 0;
       }
@@ -17113,7 +17117,13 @@ class _Canvas2D {
   bezierCurveTo() {} quadraticCurveTo() {}
   arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
   arcTo() {}
-  rect(x, y, w, h) { this.fillRect(x, y, w, h); }
+  rect(x, y, w, h) {
+    // A path operation, not an immediate fill: `beginPath(); rect(); clip()`
+    // (what Chart.js clips its chart area with) must not paint, and rect must
+    // join the current subpath so fill()/stroke()/clip() can see it.
+    if (!this._path) this._path = [];
+    this._path.push({t:'M',x,y},{t:'L',x:x+w,y},{t:'L',x:x+w,y:y+h},{t:'L',x,y:y+h},{t:'Z'});
+  }
   fill() {
     if (!this._path) return;
     const style = this._resolvePaint(this.fillStyle);
@@ -17210,8 +17220,42 @@ class _Canvas2D {
     }
     this._markPaintDamage();
   }
-  clip() {}
-  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
+  clip() {
+    if (!this._path || !this._path.length) return;
+    // Snapshot the current path as a new region. Regions only ever accumulate
+    // (each clip() intersects), and save() stores the array reference, so this
+    // must replace the array rather than mutate it.
+    const regions = this._clipRegions ? this._clipRegions.slice() : [];
+    regions.push({
+      poly: this._path.filter((s) => s.t === 'M' || s.t === 'L'),
+      arcs: this._path.filter((s) => s.t === 'A'),
+    });
+    this._clipRegions = regions;
+  }
+  // Even-odd hit test per region: M/L vertices as a polygon, arc segments as
+  // filled discs -- the same approximation fill() paints with.
+  _isInsideClip(x, y) {
+    const regions = this._clipRegions;
+    if (!regions || regions.length === 0) return true;
+    for (const region of regions) {
+      const poly = region.poly;
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const a = poly[i], b = poly[j];
+        if ((a.y > y) !== (b.y > y) &&
+            x < ((b.x - a.x) * (y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+      }
+      if (!inside) {
+        for (const arc of region.arcs) {
+          const dx = x - arc.x, dy = y - arc.y;
+          if (dx * dx + dy * dy <= arc.r * arc.r) { inside = true; break; }
+        }
+      }
+      if (!inside) return false;
+    }
+    return true;
+  }
+  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth, _clipRegions: this._clipRegions}); }
   restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
   translate() {} rotate() {} scale() {}
   setTransform() {} resetTransform() {} transform() {}
