@@ -11631,6 +11631,18 @@ function _ioMargins(value) {
 function _ioClipsOverflow(value) {
   return /^(?:auto|clip|hidden|overlay|scroll)$/.test(String(value || ""));
 }
+// Whether a box clips a descendant with the given position: overflow applies
+// only to the boxes a container is the containing block of, so a fixed box
+// passes through every ancestor without a transform (or similar), and an
+// absolute box through every unpositioned one.
+function _ioContainsBox(style, position) {
+  if (position !== "fixed" && position !== "absolute") return true;
+  const transformed = typeof style.containsPositioned === "boolean"
+    ? style.containsPositioned
+    : [style.transform, style.perspective, style.filter].some(value => value && value !== "none");
+  if (transformed || position === "fixed") return transformed;
+  return !!style.position && style.position !== "static";
+}
 function _ioMeasurements(elements) {
   const measurements = new Map();
   if (!elements.length) return measurements;
@@ -11783,11 +11795,28 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     // loading viewports. Use each ancestor's padding box, independently by
     // axis, matching Chromium's rectangular overflow clip chain.
     let ancestor = target.parentNode || target.host || null;
+    // The position of the box being mapped up the tree. It is read at the
+    // first clipping ancestor, so a target with none costs no style read.
+    let position;
+    const passed = [];
     while (inRootTree && ancestor && ancestor !== this._root && ancestor.nodeType !== 9) {
       if (ancestor instanceof Element) {
         const style = _ioElementStyle(ancestor, measurements);
-        const clipX = _ioClipsOverflow(style.overflowX);
-        const clipY = _ioClipsOverflow(style.overflowY);
+        let clipX = _ioClipsOverflow(style.overflowX);
+        let clipY = _ioClipsOverflow(style.overflowY);
+        if (position === undefined && (clipX || clipY)) {
+          position = _ioElementStyle(target, measurements).position || "static";
+          for (const below of passed) {
+            if (_ioContainsBox(below, position)) position = below.position;
+          }
+        }
+        if (position === undefined) {
+          passed.push(style);
+        } else if (_ioContainsBox(style, position)) {
+          position = style.position;
+        } else {
+          clipX = clipY = false;
+        }
         if (clipX || clipY) {
           const clip = _ioElementPaddingBox(ancestor, style, measurements);
           if (clipX) {

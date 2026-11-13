@@ -10011,6 +10011,11 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
                 "borderLeftWidth": style_value(&snapshot, "border-left-width"),
                 "overflowX": style_value(&snapshot, "overflow-x"),
                 "overflowY": style_value(&snapshot, "overflow-y"),
+                "position": style_value(&snapshot, "position"),
+                // A transform, filter or similar makes the box the containing
+                // block of its fixed and absolute descendants.
+                "containsPositioned": prepared.layout().styles.get(&nid)
+                    .is_some_and(|style| style.containing_block_triggers != 0),
             }))
         })
         .collect::<Vec<_>>();
