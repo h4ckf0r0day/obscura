@@ -10303,6 +10303,71 @@ mod tests {
     }
 
     #[test]
+    fn svg_ancestry_getters_ignore_authored_dom_accessors() {
+        let mut rt = setup_runtime(r#"<svg id=outer><svg id=inner><rect id=shape></rect></svg></svg>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const outer = document.getElementById('outer');
+            const inner = document.getElementById('inner');
+            const shape = document.getElementById('shape');
+            const get = Object.getOwnPropertyDescriptor(SVGElement.prototype, 'ownerSVGElement').get;
+            const matches = () => {
+                try { return shape.ownerSVGElement === inner && shape.viewportElement === inner; }
+                catch (_) { return false; }
+            };
+            const results = [];
+            for (const [target, property, value] of [
+                [shape, 'parentNode', null],
+                [shape, 'namespaceURI', 'http://www.w3.org/1999/xhtml'],
+                [inner, 'localName', 'g'], [inner, 'nodeType', 9],
+                [inner, 'namespaceURI', 'http://www.w3.org/1999/xhtml']
+            ]) {
+                Object.defineProperty(target, property, {value, configurable:true});
+                results.push(matches()); delete target[property];
+            }
+            Object.defineProperty(document.body, 'namespaceURI', {
+                value:'http://www.w3.org/2000/svg', configurable:true
+            });
+            try { get.call(document.body); results.push(false); }
+            catch (error) { results.push(error instanceof TypeError); }
+            delete document.body.namespaceURI;
+            return results;
+        })()"#).unwrap(), serde_json::json!([true,true,true,true,true,true]));
+    }
+
+    #[test]
+    fn svg_ancestry_getters_accept_elements_from_other_frame_realms() {
+        let mut rt = setup_runtime("<body><svg id=outer><rect id=shape></rect></svg></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            const child = frame.contentDocument;
+            child.body.innerHTML = '<svg id="inner"><rect id="shape"></rect></svg>';
+            const shape = document.getElementById('shape');
+            const childShape = child.getElementById('shape');
+            const results = [];
+            for (const name of ['ownerSVGElement', 'viewportElement']) {
+                const parentGet = Object.getOwnPropertyDescriptor(SVGElement.prototype, name).get;
+                const childGet = Object.getOwnPropertyDescriptor(frame.contentWindow.SVGElement.prototype, name).get;
+                try { results.push(parentGet.call(childShape) === child.getElementById('inner')); }
+                catch (_) { results.push(false); }
+                try { results.push(childGet.call(shape) === document.getElementById('outer')); }
+                catch (_) { results.push(false); }
+                Object.defineProperty(childShape, 'parentNode', {value:null, configurable:true});
+                try { results.push(parentGet.call(childShape) === child.getElementById('inner')); }
+                catch (_) { results.push(false); }
+                delete childShape.parentNode;
+                Object.defineProperty(child.body, 'namespaceURI', {
+                    value:'http://www.w3.org/2000/svg', configurable:true
+                });
+                try { parentGet.call(child.body); results.push(false); }
+                catch (error) { results.push(error.name === 'TypeError'); }
+                delete child.body.namespaceURI;
+            }
+            return results;
+        })()"#).unwrap(), serde_json::json!([true,true,true,true,true,true,true,true]));
+    }
+
+    #[test]
     fn svg_owner_and_viewport_elements_are_read_only_prototype_accessors() {
         let mut rt = setup_runtime(r#"<html><body><svg id="root"><rect id="r"></rect></svg></body></html>"#);
         let result = rt

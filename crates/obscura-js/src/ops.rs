@@ -3105,6 +3105,35 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // The tree builder already assigns foreign content (an <svg>/<math>
         // subtree) its own namespace; expose it so JS does not have to guess
         // the namespace from the tag name.
+        "svg_ancestor" => {
+            let node = NodeId::new(arg1.parse::<u32>().unwrap_or(u32::MAX));
+            let svg_name = |id| dom.with_node(id, |node| {
+                node.as_element().filter(|name| name.ns == html5ever::ns!(svg))
+                    .map(|name| name.local.clone())
+            }).flatten();
+            let Some(name) = svg_name(node) else { return "-2".into() };
+            let parent = |id| dom.with_node(id, |node| node.parent).flatten();
+            let viewport = arg2 == "viewport";
+            if !viewport && name.as_ref() == "svg"
+                && parent(node).and_then(svg_name)
+                    .is_none_or(|name| name.as_ref() == "foreignObject")
+            {
+                return "-1".into();
+            }
+            let parent_or_host = |id| parent(id)
+                .or_else(|| dom.shadow_root_info(id).map(|root| root.host));
+            let mut current = parent_or_host(node);
+            for _ in 0..=dom.len() {
+                let Some(id) = current else { break };
+                if svg_name(id).is_some_and(|name| name.as_ref() == "svg"
+                    || viewport && matches!(name.as_ref(), "symbol" | "image"))
+                {
+                    return id.index().to_string();
+                }
+                current = parent_or_host(id);
+            }
+            "-1".into()
+        }
         "namespace_uri" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let ns = dom
