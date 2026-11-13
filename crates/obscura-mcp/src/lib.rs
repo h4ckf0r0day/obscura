@@ -1149,6 +1149,38 @@ async fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, Str
     }
 }
 
+/// Build the in-page script for a key press.
+///
+/// The Enter form-submit logic is injected ONLY when `key == "Enter"`, so every
+/// other key emits the minimal keydown/keyup script with zero added parse/exec
+/// cost. (The earlier version shipped the submit block on every call behind a
+/// JS-side `if`, so even non-Enter hot paths paid to parse it each time.)
+fn build_press_key_js(target: &str, key: &str) -> String {
+    let enter_submit = if key == "Enter" {
+        r#"
+            var el = t.nodeType === 9 ? document.activeElement : t;
+            if (el && el.localName !== "textarea") {
+                var form = el.form || (el.closest ? el.closest("form") : null);
+                if (form) { try { if (typeof form.requestSubmit === "function") { form.requestSubmit(); } else { form.submit(); } } catch(e) {} }
+            }"#
+    } else {
+        ""
+    };
+
+    format!(
+        r#"(function(){{
+            var t = {target};
+            if (!t) return "error:element not found";
+            t.dispatchEvent(new KeyboardEvent("keydown", {{key:{key},bubbles:true}}));{enter_submit}
+            t.dispatchEvent(new KeyboardEvent("keyup", {{key:{key},bubbles:true}}));
+            return "ok";
+        }})()"#,
+        target = target,
+        key = serde_json::to_string(key).unwrap(),
+        enter_submit = enter_submit,
+    )
+}
+
 async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let key = args.get("key").and_then(Value::as_str)
         .ok_or("Missing key parameter")?;
@@ -1159,24 +1191,7 @@ async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String
         None => "document".to_string(),
     };
 
-    let js = format!(
-        r#"(function(){{
-            var t = {target};
-            if (!t) return "error:element not found";
-            t.dispatchEvent(new KeyboardEvent("keydown", {{key:{key},bubbles:true}}));
-            if ({key} === "Enter") {{
-                var el = t.nodeType === 9 ? document.activeElement : t;
-                if (el && el.localName !== "textarea") {{
-                    var form = el.form || (el.closest ? el.closest("form") : null);
-                    if (form) {{ try {{ if (typeof form.requestSubmit === "function") {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}
-                }}
-            }}
-            t.dispatchEvent(new KeyboardEvent("keyup", {{key:{key},bubbles:true}}));
-            return "ok";
-        }})()"#,
-        target = target,
-        key = serde_json::to_string(key).unwrap()
-    );
+    let js = build_press_key_js(&target, key);
 
     let result = evaluate_tool_script(state.page_mut(), &js)?;
     if result.as_str() == Some("error:element not found") {
@@ -2445,6 +2460,51 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Empirical proof (re-runnable, no reliance on reasoning) that the Enter
+    // form-submit injection is gated: non-Enter keys get a script with none of
+    // the form-submit code, so hot non-Enter paths carry zero added cost.
+    #[test]
+    fn press_key_non_enter_has_no_form_submit_code() {
+        for key in ["a", "ArrowDown", "Tab", "Escape", " ", "Backspace"] {
+            let js = build_press_key_js("document", key);
+            assert!(!js.contains("requestSubmit"), "non-Enter '{key}' leaked requestSubmit");
+            assert!(!js.contains("form"), "non-Enter '{key}' leaked form lookup");
+            assert!(!js.contains("closest"), "non-Enter '{key}' leaked closest()");
+            assert!(!js.contains("activeElement"), "non-Enter '{key}' leaked activeElement");
+            // Still a well-formed keydown+keyup script.
+            assert!(js.contains("keydown") && js.contains("keyup"));
+        }
+    }
+
+    #[test]
+    fn press_key_enter_injects_guarded_form_submit() {
+        let js = build_press_key_js("document", "Enter");
+        assert!(js.contains("requestSubmit"), "Enter must attempt form.requestSubmit()");
+        assert!(js.contains("\"textarea\""), "Enter submit must keep the textarea guard");
+        assert!(js.contains("form.submit()"), "Enter must fall back to form.submit()");
+    }
+
+    #[test]
+    fn press_key_non_enter_is_byte_identical_to_the_pre_feature_script() {
+        // The pre-feature script was exactly keydown then keyup. Reconstruct it
+        // the same way the generator does and assert equality for a non-Enter key
+        // — this is the regression guarantee for every non-Enter press_key call.
+        let key = "a";
+        let key_json = serde_json::to_string(key).unwrap();
+        let expected = format!(
+            r#"(function(){{
+            var t = {target};
+            if (!t) return "error:element not found";
+            t.dispatchEvent(new KeyboardEvent("keydown", {{key:{key},bubbles:true}}));
+            t.dispatchEvent(new KeyboardEvent("keyup", {{key:{key},bubbles:true}}));
+            return "ok";
+        }})()"#,
+            target = "document",
+            key = key_json,
+        );
+        assert_eq!(build_press_key_js("document", key), expected);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn tab_switch_preserves_globals_listeners_and_pending_promises() {
