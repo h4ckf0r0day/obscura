@@ -1192,9 +1192,9 @@ fn accept_dispatch(
         .and_then(|target| url::Url::parse(target).ok());
     let path = absolute.as_ref().map(url::Url::path).or(target);
     let endpoint = match path.map(|path| path.split('?').next().unwrap_or(path)) {
-        Some("/json/version") => Some("version"),
-        Some("/json" | "/json/list") => Some("list"),
-        Some("/json/protocol") => Some("protocol"),
+        Some("/json/version" | "/json/version/") => Some("version"),
+        Some("/json" | "/json/" | "/json/list" | "/json/list/") => Some("list"),
+        Some("/json/protocol" | "/json/protocol/") => Some("protocol"),
         _ => None,
     };
 
@@ -2673,6 +2673,11 @@ mod tests {
         for (target, extra, endpoint) in [
             ("/json/version", "", Some("Browser")),
             ("/json/version?client=test", "", Some("Browser")),
+            ("/json/version/", "", Some("Browser")),
+            ("/json/version/?client=test", "", Some("Browser")),
+            ("/json/list/", "", Some("webSocketDebuggerUrl")),
+            ("/json/", "", Some("webSocketDebuggerUrl")),
+            ("/json/protocol/", "", Some("version")),
             ("/json/list", "", Some("webSocketDebuggerUrl")),
             ("/json", "", Some("webSocketDebuggerUrl")),
             ("/json/protocol", "", Some("version")),
@@ -2680,6 +2685,9 @@ mod tests {
             ("/devtools/browser?next=/json/version", "", None),
             ("/json/versionify", "", None),
             ("/json/list-extra", "", None),
+            ("/json/version/extra", "", None),
+            ("/json/list/extra", "", None),
+            ("http://{authority}/json/version/?client=test", "", Some("Browser")),
             ("http://{authority}/json/version", "", Some("Browser")),
             ("http://{authority}/json/list?client=test", "", Some("webSocketDebuggerUrl")),
             ("http://{authority}/devtools/browser?next=/json/version", "", None),
