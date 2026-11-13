@@ -82,7 +82,7 @@ repo [`obscura-benchmark`](https://github.com/h4ckf0r0day/obscura-benchmark)
 (33 capability and speed stages, must stay 33/33):
 
 ```bash
-OBSCURA_BIN=./target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
+OBSCURA_BIN=./target/release/obscura python3 benchmarks/obstacle-course/run.py --runs 1 --warmup 0
 ```
 
 It serves local fixtures, so it is deterministic and offline.

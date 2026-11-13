@@ -11,5 +11,5 @@ if [ ! -f "$BIN" ]; then
 fi
 
 echo "Running Obscura Obstacle Course Gate against $BIN..."
-OBSCURA_BIN="$BIN" python3 "${ROOT_DIR}/obstacle-course/run.py" --runs 1 --warmup 0
+OBSCURA_BIN="$BIN" python3 "${ROOT_DIR}/benchmarks/obstacle-course/run.py" --runs 1 --warmup 0
 

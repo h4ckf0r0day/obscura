@@ -29,7 +29,7 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 
 # 3. Verify Obstacle Course (Authoritative Gate)
 echo "--> Running 33-Stage Obstacle Course Gate..."
-OBSCURA_BIN="${ROOT_DIR}/target/release/obscura" python3 obstacle-course/run.py --runs 1 --warmup 0
+OBSCURA_BIN="${ROOT_DIR}/target/release/obscura" python3 benchmarks/obstacle-course/run.py --runs 1 --warmup 0
 
 echo "=========================================================="
 echo "    Obscura Next Bootstrap & Verification COMPLETE!       "

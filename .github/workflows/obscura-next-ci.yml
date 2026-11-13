@@ -41,7 +41,7 @@ jobs:
 
       - name: Run 33-Stage Obstacle Course Gate
         run: |
-          OBSCURA_BIN=./target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
+          OBSCURA_BIN=./target/release/obscura python3 benchmarks/obstacle-course/run.py --runs 1 --warmup 0
 
       - name: Run Security Regression Suite
         run: |
