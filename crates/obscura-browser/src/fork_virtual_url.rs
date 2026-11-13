@@ -13,6 +13,7 @@
 //! `self.sync_virtual_url()`.
 
 use url::Url;
+use obscura_js::runtime::HistoryUpdate;
 
 use crate::page::Page;
 
@@ -24,25 +25,44 @@ impl Page {
         let Some(js) = self.js.as_mut() else {
             return false;
         };
-        let Ok(virtual_url) = js.evaluate("globalThis.__virtualUrl || ''") else {
+        let Ok(value) = js.take_history_update() else {
             return false;
         };
-        let Some(virtual_url) = virtual_url.as_str().filter(|url| !url.is_empty()) else {
+        self.adopt_virtual_url(value)
+    }
+
+    /// Flush history mutations before replacing a document, without adopting
+    /// a Location setter's uncommitted navigation preview.
+    pub fn sync_history_updates(&mut self) -> bool {
+        let Some(js) = self.js.as_mut() else { return false; };
+        let Ok(value) = js.take_history_update() else { return false; };
+        if !matches!(&value, HistoryUpdate::Entries { .. }) { return false; }
+        self.adopt_virtual_url(value)
+    }
+
+    fn adopt_virtual_url(&mut self, value: HistoryUpdate) -> bool {
+        let virtual_url = match &value {
+            HistoryUpdate::Url(url) | HistoryUpdate::Entries { url, .. } => url,
+        };
+        if virtual_url.is_empty() {
             return false;
         };
         let Ok(parsed) = Url::parse(virtual_url) else {
             return false;
         };
-        if self.url.as_ref() == Some(&parsed) {
-            return false;
-        }
-        // A web document must not become a file:// page without loading one:
         // page.url keys the file:// sub-resource gate (#1069).
         if crate::page::cross_scheme_to_file(&self.url_string(), virtual_url) {
             return false;
         }
-        self.url = Some(parsed);
-        self.push_same_document_history(self.url_string());
-        true
+        let changed = self.url.as_ref() != Some(&parsed);
+        if matches!(&value, HistoryUpdate::Entries { .. }) {
+            self.apply_history_update(value);
+            self.url = Some(parsed);
+            self.sync_js_session_history();
+        } else if changed {
+            self.url = Some(parsed);
+            self.push_same_document_history(self.url_string());
+        }
+        changed
     }
 }
