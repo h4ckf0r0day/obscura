@@ -78,7 +78,7 @@ edit instead.
 
 ## Architecture
 
-- **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy`, `--stealth`, and `--allow-private-network` are global flags: valid before or after the subcommand and applied to `fetch`, `serve`, `scrape`, and `mcp` (a `scrape` run forwards `--stealth` to each worker via `OBSCURA_STEALTH`).
+- **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy`, `--stealth`, `--allow-private-network`, and `--ignore-certificate-errors` are global flags: valid before or after the subcommand and applied to `fetch`, `serve`, `scrape`, and `mcp` (a `scrape` run forwards `--stealth` to each worker via `OBSCURA_STEALTH`).
 - **obscura-cdp** — Chrome DevTools Protocol server (WebSocket). Managed page
   sessions use `"{targetId}-session"`; explicit flattened attachments receive
   distinct session ids so Playwright and Puppeteer can open raw page sessions.

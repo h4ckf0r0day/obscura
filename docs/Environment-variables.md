@@ -30,6 +30,18 @@ OBSCURA_ALLOW_PRIVATE_NETWORK=1 obscura fetch http://localhost:8080
 
 Per-process equivalent: `--allow-private-network` on any subcommand.
 
+### `OBSCURA_IGNORE_CERTIFICATE_ERRORS`
+
+Skip TLS certificate verification for page loads: navigations, subresources, iframes, ES modules, and JS `fetch()`/XHR, with or without `--stealth`. Self-signed, expired, wrong-host, and incomplete-chain certificates are accepted, and so is the certificate of an `https://` proxy. Off by default. With it on, anything on the network path can read and alter HTTPS traffic, so use it for testing or for misconfigured hosts you trust. To trust one private CA instead, point `SSL_CERT_FILE` or `SSL_CERT_DIR` at it.
+
+Truthy values: `1`, `true`, `yes`, `on`.
+
+```bash
+OBSCURA_IGNORE_CERTIFICATE_ERRORS=1 obscura fetch https://self-signed.badssl.com
+```
+
+Per-process equivalent: `--ignore-certificate-errors` on any subcommand.
+
 ### `OBSCURA_NAV_TIMEOUT_MS`
 
 Hard ceiling on a single navigation. Default 30000 (30 seconds). Applies to `Page.navigate` and the CLI `fetch` command.

@@ -78,6 +78,26 @@ pub(crate) fn custom_cert_store_requested(
     cert_file.is_some_and(|v| !v.is_empty()) || cert_dir.is_some_and(|v| !v.is_empty())
 }
 
+/// Process-wide opt-out of TLS certificate verification, set by
+/// `--ignore-certificate-errors` or `OBSCURA_IGNORE_CERTIFICATE_ERRORS`. It is
+/// an env var, like `OBSCURA_ALLOW_PRIVATE_NETWORK`, so the `serve --workers`
+/// and `scrape` child processes inherit it. Every client that opens TLS
+/// connections reads it: this reqwest client, the stealth (wreq) client, and
+/// the JS fetch/XHR client in obscura-js.
+pub fn env_ignores_certificate_errors() -> bool {
+    ignore_certificate_errors_enabled(
+        std::env::var("OBSCURA_IGNORE_CERTIFICATE_ERRORS").ok().as_deref(),
+    )
+}
+
+/// Only the same truthy values as `OBSCURA_ALLOW_PRIVATE_NETWORK` turn
+/// verification off; anything else, including a typo, keeps it on.
+fn ignore_certificate_errors_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Response {
     pub url: Url,
@@ -1173,7 +1193,7 @@ impl ObscuraHttpClient {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
                 .timeout(self.timeout)
-                .danger_accept_invalid_certs(false)
+                .danger_accept_invalid_certs(env_ignores_certificate_errors())
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
                 .http1_allow_obsolete_multiline_headers_in_responses(true)
@@ -2073,7 +2093,7 @@ mod resource_cache_tests {
 }
 
 #[cfg(test)]
-mod ssrf_tests {
+pub(crate) mod ssrf_tests {
     use super::{
         is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
         CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
@@ -3279,7 +3299,13 @@ mod ssrf_tests {
     /// Mint a throwaway CA plus a 127.0.0.1 leaf it signed, and serve one
     /// canned HTTPS response with the leaf on an ephemeral port. Returns the
     /// port and the CA certificate as PEM.
-    async fn https_fixture_with_private_ca() -> (u16, String) {
+    pub(crate) async fn https_fixture_with_private_ca() -> (u16, String) {
+        https_fixture_with_leaf_for("127.0.0.1").await
+    }
+
+    /// As above, but the leaf names `san`, so a 127.0.0.1 connection is also
+    /// a hostname mismatch.
+    pub(crate) async fn https_fixture_with_leaf_for(san: &str) -> (u16, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let ca_key = rcgen::KeyPair::generate().unwrap();
@@ -3289,7 +3315,7 @@ mod ssrf_tests {
 
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let leaf_params =
-            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+            rcgen::CertificateParams::new(vec![san.to_string()]).unwrap();
         let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
 
         let certs = vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
@@ -3332,8 +3358,9 @@ mod ssrf_tests {
         (port, ca_cert.pem())
     }
 
-    // The two configured-roots tests set/rely on SSL_CERT_FILE, which is
-    // cached once per process at client build. They are only correct under
+    // The configured-roots and ignore-certificate-errors tests set
+    // SSL_CERT_FILE, SSL_CERT_DIR, or OBSCURA_IGNORE_CERTIFICATE_ERRORS, which
+    // are read once per process at client build. They are only correct under
     // `cargo nextest` (one process per test), the same constraint the whole
     // workspace already has.
 
@@ -3384,6 +3411,21 @@ mod ssrf_tests {
         assert!(message.contains("invalid peer certificate"), "{message}");
     }
 
+    #[tokio::test]
+    async fn ignore_certificate_errors_accepts_an_unknown_ca() {
+        let (port, _ca_pem) = https_fixture_with_private_ca().await;
+        std::env::set_var("OBSCURA_IGNORE_CERTIFICATE_ERRORS", "1");
+
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("--ignore-certificate-errors must accept an unknown CA");
+        assert_eq!(resp.text(), "private ca ok");
+    }
+
     #[test]
     fn error_chain_appends_each_source_once() {
         use std::fmt;
@@ -3415,7 +3457,7 @@ mod ssrf_tests {
 
 #[cfg(test)]
 mod cert_env_tests {
-    use super::custom_cert_store_requested;
+    use super::{custom_cert_store_requested, ignore_certificate_errors_enabled};
     use std::ffi::OsStr;
 
     #[test]
@@ -3440,6 +3482,17 @@ mod cert_env_tests {
             None,
             Some(OsStr::new("/etc/ssl/certs"))
         ));
+    }
+
+    #[test]
+    fn ignore_certificate_errors_is_opt_in() {
+        for value in [Some("1"), Some("true"), Some(" TRUE "), Some("yes"), Some("On")] {
+            assert!(ignore_certificate_errors_enabled(value), "{value:?}");
+        }
+        let off = [None, Some(""), Some("0"), Some("false"), Some("off"), Some("2"), Some("ture")];
+        for value in off {
+            assert!(!ignore_certificate_errors_enabled(value), "{value:?}");
+        }
     }
 }
 

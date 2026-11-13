@@ -236,7 +236,9 @@ impl StealthHttpClient {
             // `--allow-private-network` reaches this transport (#793); the
             // resolver still honours OBSCURA_ALLOW_PRIVATE_NETWORK on its own.
             .dns_resolver(Arc::new(SsrfGuardResolver::new(allow_private_network)))
-            .redirect(wreq::redirect::Policy::none());
+            .redirect(wreq::redirect::Policy::none())
+            // A separate config field, so `emulation()` does not reset it.
+            .tls_cert_verification(!crate::client::env_ignores_certificate_errors());
 
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
         //
@@ -923,6 +925,45 @@ mod tests {
             attempts
         });
         (port, server)
+    }
+
+    #[tokio::test]
+    async fn stealth_ignore_certificate_errors_accepts_an_unknown_ca() {
+        let (port, _ca_pem) = crate::client::ssrf_tests::https_fixture_with_private_ca().await;
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+
+        let strict = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let error = strict
+            .fetch(&url)
+            .await
+            .expect_err("unknown CA must be rejected by default");
+        // Fail on TLS, not on an unrelated error such as an SSRF block.
+        let message = error.to_string();
+        assert!(message.contains("CERTIFICATE_VERIFY_FAILED"), "{message}");
+
+        std::env::set_var("OBSCURA_IGNORE_CERTIFICATE_ERRORS", "1");
+        let lax = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let resp = lax
+            .fetch(&url)
+            .await
+            .expect("--ignore-certificate-errors must accept an unknown CA");
+        assert_eq!(resp.text(), "private ca ok");
+    }
+
+    #[tokio::test]
+    async fn stealth_ignore_certificate_errors_accepts_a_wrong_host_cert() {
+        // wreq has a separate hostname knob (tls_verify_hostname). Turning
+        // certificate verification off must cover a name mismatch too.
+        let (port, _ca_pem) =
+            crate::client::ssrf_tests::https_fixture_with_leaf_for("example.invalid").await;
+        std::env::set_var("OBSCURA_IGNORE_CERTIFICATE_ERRORS", "1");
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("--ignore-certificate-errors must accept a wrong-host leaf");
+        assert_eq!(resp.text(), "private ca ok");
     }
 
     #[tokio::test]
