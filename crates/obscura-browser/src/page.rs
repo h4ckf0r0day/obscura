@@ -3386,15 +3386,20 @@ impl Page {
         let Some(index) = fields.get(2).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
         let Some(old_length) = fields.get(3).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
         let Some(truncate_forward) = fields.get(4).and_then(|value| value.as_bool()) else { return; };
-        let Some(urls) = fields.get(5).and_then(|value| value.as_array()) else { return; };
+        let Some(first) = fields.get(5).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
+        let Some(urls) = fields.get(6).and_then(|value| value.as_array()) else { return; };
         let Some(urls) = urls.iter().map(|value| value.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>() else { return; };
-        if index >= urls.len() || urls.iter().any(|url| cross_scheme_to_file(&self.url_string(), url)) { return; }
+        let Some(end) = first.checked_add(urls.len()) else { return; };
+        let length = if truncate_forward { end } else { old_length };
+        if first > old_length || index >= length || (!truncate_forward && end > old_length) { return; }
+        let current_url = self.url_string();
+        if urls.iter().any(|url| cross_scheme_to_file(&current_url, url)) { return; }
         if self.history.is_empty() && start == 0 {
-            self.history.push(self.url_string());
+            self.history.push(current_url);
         }
-        let Some(end) = start.checked_add(old_length).filter(|&end| end <= self.history.len()) else { return; };
-        let length = urls.len();
-        self.history.splice(start..end, urls);
+        let Some(document_end) = start.checked_add(old_length).filter(|&end| end <= self.history.len()) else { return; };
+        let Some(changed_end) = start.checked_add(end) else { return; };
+        self.history.splice(start + first..changed_end.min(document_end), urls);
         self.document_history_start = start;
         self.history_index = start + index;
         if truncate_forward {
@@ -6762,6 +6767,47 @@ mod tests {
         page.sync_virtual_url();
         assert_eq!(page.history, vec![format!("{url}#last")]);
         assert_eq!(page.history_index, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_does_not_transfer_unchanged_entries() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-incremental-sync");
+        page.navigate(url).await.unwrap();
+        for index in 0..1000 {
+            page.evaluate(&format!("history.pushState({index}, '', '#{index}')"));
+            page.sync_virtual_url();
+        }
+        page.evaluate("history.replaceState(null, '', '#last')");
+        let update = page.js.as_mut().unwrap().take_history_update().unwrap();
+        assert!(update.to_string().len() < 512, "one changed entry must not transfer the unchanged history");
+        page.evaluate("history.replaceState(null, '', '#verified')");
+        page.sync_virtual_url();
+        assert_eq!(page.history.len(), 1001);
+        assert_eq!(page.history[0], url);
+        assert_eq!(page.history[1000], format!("{url}#verified"));
+        page.evaluate("history.go(-500)");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 500);
+        assert_eq!(page.url_string(), format!("{url}#499"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_keeps_only_surviving_batched_changes() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-batched-changes");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState(1, '', '#one'); history.pushState(2, '', '#two'); history.pushState(3, '', '#three'); })()");
+        page.sync_virtual_url();
+        page.evaluate("(() => { history.replaceState(4, '', '#discarded'); history.go(-2); history.pushState(5, '', '#last'); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one"), format!("{url}#last")]);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("(() => { history.back(); history.replaceState(6, '', '#changed'); history.forward(); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#changed"), format!("{url}#last")]);
+        assert_eq!(page.history_index, 2);
+        assert_eq!(page.url_string(), format!("{url}#last"));
     }
 
     #[tokio::test(flavor = "current_thread")]

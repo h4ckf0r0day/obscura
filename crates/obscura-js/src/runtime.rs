@@ -2723,7 +2723,7 @@ impl ObscuraJsRuntime {
         if value.is_string() {
             return Ok(serde_json::Value::String(value.to_rust_string_lossy(scope)));
         }
-        let update: (String, usize, usize, usize, bool, Vec<String>) =
+        let update: (String, usize, usize, usize, bool, usize, Vec<String>) =
             deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string())?;
         serde_json::to_value(update).map_err(|error| error.to_string())
     }

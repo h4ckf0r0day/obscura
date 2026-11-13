@@ -13630,6 +13630,8 @@ globalThis.atob = globalThis.atob || ((s) => {
   let dirty = false;
   let syncedLength = 1;
   let truncateForward = false;
+  let changedStart = Infinity;
+  let changedEnd = 0;
   const setPrototypeOf = Object.setPrototypeOf;
   // The page owns the tab's session history. `stack` covers only this
   // document's entries; entries before it and after the current one come
@@ -13683,7 +13685,14 @@ globalThis.atob = globalThis.atob || ((s) => {
     const entry = stack[idx];
     globalThis.__virtualUrl = entry.url ?? null;
     dirty = true;
-    if (action === 'push') truncateForward = true;
+    if (action !== 'traverse') {
+      if (idx < changedStart) changedStart = idx;
+      if (idx + 1 > changedEnd) changedEnd = idx + 1;
+    }
+    if (action === 'push') {
+      truncateForward = true;
+      if (changedEnd > stack.length) changedEnd = stack.length;
+    }
   };
   // Same-document fragment navigation, reached from the Location setters and
   // `<a href="#x">` activation. Per the HTML spec it adds a history entry
@@ -13792,10 +13801,13 @@ globalThis.atob = globalThis.atob || ((s) => {
       take() {
         if (!dirty) return null;
         const urls = setPrototypeOf([], null);
-        for (let i = 0; i < stack.length; i++) urls[i] = stack[i].url ?? _domParse('document_url');
-        const result = [urls[idx], session().start, idx, syncedLength, truncateForward, urls];
+        const first = changedEnd ? changedStart : syncedLength;
+        for (let i = first; i < changedEnd; i++) urls[i - first] = stack[i].url ?? _domParse('document_url');
+        const url = stack[idx].url ?? _domParse('document_url');
+        const result = [url, session().start, idx, syncedLength, truncateForward, first, urls];
         syncedLength = stack.length;
         dirty = false; truncateForward = false;
+        changedStart = Infinity; changedEnd = 0;
         return result;
       },
       traverse(index, url) {
@@ -13810,6 +13822,7 @@ globalThis.atob = globalThis.atob || ((s) => {
         stack.length = 1; stack[0] = entry; idx = 0;
         dirty = false; syncedLength = 1;
         truncateForward = false; forwardCleared = false;
+        changedStart = Infinity; changedEnd = 0;
         globalThis.__virtualUrl = url;
       },
     }),
