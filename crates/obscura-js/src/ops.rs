@@ -5191,6 +5191,21 @@ async fn stealth_fetch_all(
 
     let status = response.status;
     let resp_headers = response.headers;
+    // A tracker-blocked request short-circuits in the stealth client with
+    // status 0 and no headers (wreq_client send_single_headers_with_context).
+    // That is a blocked request, not a CORS failure: letting it fall into the
+    // cross-origin CORS gate below reads an absent Access-Control-Allow-Origin
+    // as "" and reports a spurious `... Access-Control-Allow-Origin ''` error.
+    // Surface it as blocked, matching the JS `blocked` path and the
+    // browser-observable outcome of a request the client refused to send.
+    if status == 0 && resp_headers.is_empty() {
+        return Ok(serde_json::json!({
+            "status": 0, "body": "", "url": current_url, "headers": {},
+            "blocked": true,
+            "error": "net::ERR_BLOCKED_BY_CLIENT",
+        })
+        .to_string());
+    }
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
