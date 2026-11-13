@@ -7830,6 +7830,43 @@ mod tests {
         assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
     }
 
+    /// A child realm's node ids index its own document. Native ops that
+    /// resolved the page's document instead left a frame's `<img>` without a
+    /// load or error event, returned a null 2D context for a frame's canvas,
+    /// and silently dropped every script that frame code inserted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_realm_node_ops_resolve_the_frame_document() {
+        let mut page = import_map_test_page("frame-node-ops", "https://parent.test",
+            "<body><p>parent</p></body>");
+        page.evaluate_script(r#"(() => {
+            const frame = document.createElement('iframe'); frame.id = 'child';
+            frame.srcdoc = `<body><script>
+                globalThis.results = {};
+                const ctx = document.createElement('canvas').getContext('2d');
+                results.canvas = ctx ? 'context' : 'null';
+                const inserted = document.createElement('script');
+                inserted.textContent = 'results.script = "ran"';
+                document.head.appendChild(inserted);
+                const image = new Image();
+                image.onload = () => { results.image = 'load'; };
+                image.onerror = () => { results.image = 'error'; };
+                image.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+            <\/script></body>`;
+            document.body.appendChild(frame);
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        let mut value = serde_json::Value::Null;
+        for _ in 0..20 {
+            value = page.evaluate_script(
+                "JSON.stringify(document.getElementById('child').contentWindow.results)").unwrap();
+            if value.as_str().is_some_and(|json| json.contains("image")) { break; }
+            page.js.as_mut().unwrap().run_event_loop_bounded(20).await.unwrap();
+        }
+        let results: serde_json::Value = serde_json::from_str(value.as_str().unwrap()).unwrap();
+        assert_eq!(results, serde_json::json!({"canvas": "context", "script": "ran", "image": "load"}));
+    }
+
     /// A page script can call a frame's own Location methods (lazy-load
     /// scripts do `iframe.contentWindow.location.replace(src)`). The running
     /// context is then the page's, so the navigation was queued on the top
