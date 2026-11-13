@@ -14980,7 +14980,7 @@ function _svgAncestorElement(receiver, viewport) {
     if (member) return Reflect.apply(member, receiver, [viewport]);
     throw new TypeError('Illegal invocation');
   }
-  const ancestor = +_dom("svg_ancestor", receiver._nid, viewport ? "viewport" : "owner");
+  const ancestor = __obscuraCore.ops.op_svg_ancestor(receiver._nid, viewport, _realmFrameId);
   if (ancestor === -2) throw new TypeError('Illegal invocation');
   return _wrapEl(ancestor);
 }

@@ -2395,6 +2395,44 @@ fn window_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] 
 }
 
 #[op2(fast)]
+fn op_svg_ancestor(state: &OpState, nid: u32, viewport: bool, frame_id: u32) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let state = shared.borrow();
+        let Some(dom) = state.dom.as_ref() else { return -2.0 };
+        let node = NodeId::new(nid);
+        let svg_name = |id| dom.with_node(id, |node| {
+            node.as_element().filter(|name| name.ns == html5ever::ns!(svg))
+                .map(|name| name.local.clone())
+        }).flatten();
+        let Some(name) = svg_name(node) else { return -2.0 };
+        let parent = |id| dom.with_node(id, |node| node.parent).flatten();
+        if !viewport && name.as_ref() == "svg"
+            && parent(node).and_then(svg_name)
+                .is_none_or(|name| name.as_ref() == "foreignObject")
+        {
+            return -1.0;
+        }
+        let parent_or_host = |id| parent(id)
+            .or_else(|| dom.shadow_root_info(id).map(|root| root.host));
+        let mut current = parent_or_host(node);
+        for _ in 0..=dom.len() {
+            let Some(id) = current else { break };
+            if svg_name(id).is_some_and(|name| name.as_ref() == "svg"
+                || viewport && matches!(name.as_ref(), "symbol" | "image"))
+            {
+                return id.index() as f64;
+            }
+            current = parent_or_host(id);
+        }
+        -1.0
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_svg_ancestor panicked; returning null");
+        -1.0
+    })
+}
+
+#[op2(fast)]
 fn op_form_owner(state: &OpState, nid: u32, frame_id: u32) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         frame_state(state, frame_id).borrow().dom.as_ref()
@@ -3105,35 +3143,6 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // The tree builder already assigns foreign content (an <svg>/<math>
         // subtree) its own namespace; expose it so JS does not have to guess
         // the namespace from the tag name.
-        "svg_ancestor" => {
-            let node = NodeId::new(arg1.parse::<u32>().unwrap_or(u32::MAX));
-            let svg_name = |id| dom.with_node(id, |node| {
-                node.as_element().filter(|name| name.ns == html5ever::ns!(svg))
-                    .map(|name| name.local.clone())
-            }).flatten();
-            let Some(name) = svg_name(node) else { return "-2".into() };
-            let parent = |id| dom.with_node(id, |node| node.parent).flatten();
-            let viewport = arg2 == "viewport";
-            if !viewport && name.as_ref() == "svg"
-                && parent(node).and_then(svg_name)
-                    .is_none_or(|name| name.as_ref() == "foreignObject")
-            {
-                return "-1".into();
-            }
-            let parent_or_host = |id| parent(id)
-                .or_else(|| dom.shadow_root_info(id).map(|root| root.host));
-            let mut current = parent_or_host(node);
-            for _ in 0..=dom.len() {
-                let Some(id) = current else { break };
-                if svg_name(id).is_some_and(|name| name.as_ref() == "svg"
-                    || viewport && matches!(name.as_ref(), "symbol" | "image"))
-                {
-                    return id.index().to_string();
-                }
-                current = parent_or_host(id);
-            }
-            "-1".into()
-        }
         "namespace_uri" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let ns = dom
@@ -8720,6 +8729,7 @@ fn op_frame_name(state: &OpState, context_id: u32, #[string] value: Option<Strin
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_svg_ancestor(),
         op_form_owner(),
         op_form_cache_buffer(),
         op_create_select_allocator(),
