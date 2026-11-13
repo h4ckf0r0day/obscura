@@ -323,7 +323,14 @@ impl BrowserContext {
             return;
         }
         let root = dir.join("localStorage");
-        if let Err(e) = std::fs::create_dir_all(&root) {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        if let Err(e) = builder.create(&root) {
             tracing::warn!("Failed to create {}: {}", root.display(), e);
             return;
         }
@@ -417,6 +424,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_dirty_web_storage_keeps_a_new_profile_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = temp_storage_dir("private-profile");
+        let dir = parent.join("profile");
+        let context = BrowserContext::with_storage("private-profile".into(), Some(dir.clone()));
+        assert!(context.local_storage.set("https://example.com", "token".into(), "private".into()));
+        context.save_storage();
+        for path in [&dir, &dir.join("localStorage")] {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0, "{}", path.display());
+        }
+        assert_eq!(std::fs::metadata(dir.join("cookies.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        let restored = BrowserContext::with_storage("restored".into(), Some(dir));
+        assert_eq!(restored.local_storage.get("https://example.com", "token").as_deref(), Some("private"));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_web_storage_preserves_existing_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_storage_dir("existing-private-profile");
+        let root = dir.join("localStorage");
+        std::fs::create_dir(&root).unwrap();
+        for path in [&dir, &root] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let context = BrowserContext::with_storage("existing-private-profile".into(), Some(dir.clone()));
+        assert!(context.local_storage.set("https://example.com", "key".into(), "value".into()));
+        context.save_storage();
+        for path in [&dir, &root] {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o750);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// --storage-dir has to survive a restart, which is the whole point of a
