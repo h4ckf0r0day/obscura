@@ -1187,14 +1187,15 @@ fn accept_dispatch(
         refuse_control_connection(stream, refusal);
         return Ok(());
     }
-    let endpoint = if head.contains("/json/version") {
-        Some("version")
-    } else if head.contains("/json/list") || head.contains("/json\r\n") || head.contains("/json HTTP") {
-        Some("list")
-    } else if head.contains("/json/protocol") {
-        Some("protocol")
-    } else {
-        None
+    let target = head.lines().next().and_then(|line| line.split_whitespace().nth(1));
+    let absolute = target.filter(|target| !target.starts_with('/'))
+        .and_then(|target| url::Url::parse(target).ok());
+    let path = absolute.as_ref().map(url::Url::path).or(target);
+    let endpoint = match path.map(|path| path.split('?').next().unwrap_or(path)) {
+        Some("/json/version") => Some("version"),
+        Some("/json" | "/json/list") => Some("list"),
+        Some("/json/protocol") => Some("protocol"),
+        _ => None,
     };
 
     if let Some(ep) = endpoint {
@@ -2664,6 +2665,45 @@ mod tests {
         format!(
             "GET /devtools/browser HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
         )
+    }
+
+    #[test]
+    fn control_endpoints_only_match_the_request_target() {
+        use std::io::{Read, Write};
+        for (target, extra, endpoint) in [
+            ("/json/version", "", Some("Browser")),
+            ("/json/version?client=test", "", Some("Browser")),
+            ("/json/list", "", Some("webSocketDebuggerUrl")),
+            ("/json", "", Some("webSocketDebuggerUrl")),
+            ("/json/protocol", "", Some("version")),
+            ("/devtools/browser", "X-Route: /json/list\r\n", None),
+            ("/devtools/browser?next=/json/version", "", None),
+            ("/json/versionify", "", None),
+            ("/json/list-extra", "", None),
+            ("http://{authority}/json/version", "", Some("Browser")),
+            ("http://{authority}/json/list?client=test", "", Some("webSocketDebuggerUrl")),
+            ("http://{authority}/devtools/browser?next=/json/version", "", None),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut client = std::net::TcpStream::connect(address).unwrap();
+            client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let target = target.replace("{authority}", &address.to_string());
+            let head = format!("GET {target} HTTP/1.1\r\nHost: {address}\r\n{extra}\r\n");
+            client.write_all(head.as_bytes()).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            super::accept_dispatch(server, address.ip(), address.port(), None, None, None, &tx, &head).unwrap();
+            if let Some(key) = endpoint {
+                assert!(rx.try_recv().is_err(), "HTTP endpoint must not be forwarded: {target}");
+                let mut response = String::new();
+                client.read_to_string(&mut response).unwrap();
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                assert!(response.contains(key), "{target}: {response}");
+            } else {
+                assert!(rx.try_recv().is_ok(), "WebSocket request must not match a header or partial endpoint: {target}");
+            }
+        }
     }
 
     #[test]
