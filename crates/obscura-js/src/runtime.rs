@@ -17259,6 +17259,65 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_clips_only_through_containing_blocks() {
+        // Every target is a 40x40 box outside the 10x10 overflow:hidden box
+        // that is its DOM ancestor.
+        let clip = "width:10px;height:10px;overflow:hidden";
+        let boxed = "left:20px;top:20px;width:40px;height:40px";
+        let dom = parse_html(&format!(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div style="{clip}"><button id="fixed" style="position:fixed;{boxed}"></button></div>
+                <div style="{clip};position:absolute;left:0;top:0"><button id="fixed-in-positioned" style="position:fixed;{boxed}"></button></div>
+                <div style="{clip};position:absolute;left:0;top:0;transform:translateX(0)"><button id="fixed-in-transformed" style="position:fixed;{boxed}"></button></div>
+                <div style="{clip}"><button id="absolute" style="position:absolute;{boxed}"></button></div>
+                <div style="{clip};position:absolute;left:0;top:0"><button id="absolute-in-positioned" style="position:absolute;{boxed}"></button></div>
+                <div style="{clip};position:absolute;left:0;top:0"><div><button id="absolute-below-static" style="position:absolute;{boxed}"></button></div></div>
+                <div style="{clip};position:absolute;left:0;top:0"><div style="position:relative"><button id="fixed-below-relative" style="position:fixed;{boxed}"></button></div></div>
+                <div style="{clip}"><div style="position:relative;left:20px;top:20px;width:40px;height:40px"><button id="in-flow" style="display:block;width:40px;height:40px"></button></div></div>
+            </body></html>"#,
+        ));
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(300.0, 200.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const observer = new IntersectionObserver(entries => {
+                        observer.disconnect();
+                        resolve(Object.fromEntries(entries.map(entry => [
+                            entry.target.id,
+                            [entry.intersectionRatio, entry.boundingClientRect.x, entry.boundingClientRect.y],
+                        ])));
+                    });
+                    for (const button of document.querySelectorAll("button")) observer.observe(button);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "fixed": [1, 20, 20],
+                "fixed-in-positioned": [1, 20, 20],
+                "fixed-in-transformed": [0, 20, 20],
+                "absolute": [1, 20, 20],
+                "absolute-in-positioned": [0, 20, 20],
+                "absolute-below-static": [0, 20, 20],
+                "fixed-below-relative": [1, 20, 20],
+                // Two unpositioned clip boxes precede this one in the flow.
+                "in-flow": [0, 20, 40],
+            })
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_clips_through_intermediate_overflow_ancestors() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
