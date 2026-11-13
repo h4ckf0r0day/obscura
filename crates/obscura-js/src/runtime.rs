@@ -4472,6 +4472,9 @@ impl ObscuraJsRuntime {
         }
     }
 
+    // A NodeList is reported as an array, as in Chrome: clients such as go-rod
+    // read element lists only from an array handle. This source is compiled on
+    // every evaluation, so keep it short.
     fn meta_extract_js(var_name: &str) -> String {
         format!(
             r#"(function(v) {{
@@ -4490,6 +4493,7 @@ impl ObscuraJsRuntime {
                     else if (v.nodeType === 1) cn = 'HTML' + (v.tagName || 'Element').charAt(0) + (v.tagName || 'Element').slice(1).toLowerCase() + 'Element';
                     desc = v.tagName ? v.tagName.toLowerCase() : (v.nodeName || 'node');
                 }}
+                else if (v[Symbol.toStringTag] === 'NodeList') {{ st = 'array'; cn = 'NodeList'; desc = 'NodeList(' + (v.length >>> 0) + ')'; }}
                 else if (t === 'function') {{
                     cn = 'Function';
                     desc = v.name ? 'function ' + v.name + '()' : 'function()';

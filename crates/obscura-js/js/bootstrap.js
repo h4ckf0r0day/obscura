@@ -913,6 +913,9 @@ const _consoleRemoteObject = (value) => {
   if (Array.isArray(value)) {
     remote.subtype = "array";
     remote.description = "Array(" + value.length + ")";
+  } else if (type === "object" && value[Symbol.toStringTag] === "NodeList") {
+    remote.subtype = "array";
+    remote.description = "NodeList(" + (value.length >>> 0) + ")";
   } else if (type === "object" && typeof value._nid === "number") {
     remote.subtype = "node";
     remote.description = value.tagName ? value.tagName.toLowerCase() : (value.nodeName || "node");
