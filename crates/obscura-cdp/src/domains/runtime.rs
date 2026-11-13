@@ -448,6 +448,10 @@ pub async fn handle(
                                 item.subtype = 'array';\
                                 item.className = 'Array';\
                                 item.description = 'Array(' + v.length + ')';\
+                            }} else if (v[Symbol.toStringTag] === 'NodeList') {{\
+                                item.subtype = 'array';\
+                                item.className = 'NodeList';\
+                                item.description = 'NodeList(' + (v.length >>> 0) + ')';\
                             }} else {{\
                                 item.className = (v.constructor && v.constructor.name) || 'Object';\
                                 item.description = item.className;\
