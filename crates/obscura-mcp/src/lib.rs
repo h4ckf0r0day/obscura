@@ -1088,9 +1088,9 @@ async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, St
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
-        // A click can navigate or rewrite the DOM; the old ref table may
-        // no longer match. Conservative: invalidate. Next snapshot rebuilds.
-        state.interactive_refs.clear();
+        // Refs outlive a click that stays on the page, so an agent can click
+        // and then fill from one listing. A navigation wipes the table below,
+        // and `ref_to_selector` rejects a ref whose node the click replaced.
         state.settle_synthetic_navigation().await?;
         Ok(format!("Clicked '{selector}'"))
     }
@@ -1804,7 +1804,6 @@ async fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String
         if result.as_str() != Some("ok") {
             return Err(format!("Submit target not found: {sel}"));
         }
-        state.interactive_refs.clear();
     }
 
     state.settle_synthetic_navigation().await?;
@@ -1857,8 +1856,6 @@ fn tool_scroll(args: &Value, state: &mut BrowserState) -> Result<String, String>
         amt = amt,
     );
     let res = evaluate_tool_script(state.page_mut(), &js)?;
-    // A scroll can reveal new DOM (infinite scroll); invalidate refs.
-    state.interactive_refs.clear();
     Ok(format!("Scrolled {direction}. {}", res.as_str().unwrap_or("")))
 }
 
@@ -2829,6 +2826,37 @@ mod tests {
         }), &mut state).await.expect("reorder same node");
         tool_click(&json!({"ref": reference}), &mut state).await.expect("same node ref");
         assert_eq!(state.page_mut().evaluate("window.clicked"), json!("target"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_survive_actions_that_stay_on_the_page() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(concat!(
+            "data:text/html,<button id=more onclick=\"window.clicks=(window.clicks||0)+1\">More</button>",
+            "<input id=quantity><a id=next href=\"data:text/html,<button id=landed>Landed</button>\">Next</a>",
+        )).await.expect("test page");
+        tool_interactive_elements(&json!({}), &mut state).expect("listing");
+        let reference = |state: &BrowserState, id: &str| {
+            let selector = format!("#{id}");
+            state.interactive_refs.iter().find(|(_, node)| {
+                state.tabs[state.active_tab.as_ref().unwrap()]
+                    .with_dom(|dom| dom.query_selector(&selector).ok().flatten()) == Some(Some(**node))
+            }).map(|(reference, _)| reference.clone()).expect("ref for element")
+        };
+        let (more, quantity, next) = (reference(&state, "more"), reference(&state, "quantity"), reference(&state, "next"));
+
+        // The flow from #1532: click, then fill another ref from the same listing.
+        tool_click(&json!({"ref": more}), &mut state).await.expect("first click");
+        tool_fill(&json!({"ref": quantity, "value": "3"}), &mut state).await.expect("ref must survive a click that does not navigate");
+        tool_scroll(&json!({"direction": "down"}), &mut state).expect("scroll");
+        tool_click(&json!({"ref": more}), &mut state).await.expect("ref must survive a scroll");
+        assert_eq!(state.page_mut().evaluate("[window.clicks, document.getElementById('quantity').value]"), json!([2, "3"]));
+
+        // A click that navigates still retires every ref.
+        tool_click(&json!({"ref": next}), &mut state).await.expect("navigating click");
+        assert_eq!(state.page_mut().evaluate("!!document.getElementById('landed')"), json!(true));
+        let error = tool_click(&json!({"ref": more}), &mut state).await.expect_err("refs must not outlive their document");
+        assert!(error.contains("unknown ref"), "{error}");
     }
 
     #[tokio::test(flavor = "current_thread")]
