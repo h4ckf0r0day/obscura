@@ -7297,7 +7297,13 @@ class DocumentFragment extends Node {
   constructor(nid) {
     const created = nid === undefined;
     super(created ? +_dom("create_document_fragment") : nid);
-    if (created) _seedDetachedTreeState(this);
+    if (created) {
+      _seedDetachedTreeState(this);
+      // Register the wrapper like createDocumentFragment() does. The native
+      // node reports node_type 9, so an unregistered fragment is re-wrapped
+      // as a Document the first time a child's parentNode misses the cache.
+      _cache.set(this._nid, this);
+    }
   }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
