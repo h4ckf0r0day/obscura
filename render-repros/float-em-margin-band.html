@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>float em margin band</title>
+  <style>
+    html, body { margin: 0; }
+    #container { width: 900px; }
+    /* The float's font-relative margin must not force the in-flow block
+       beside it into a narrowed column: an ordinary block keeps its border
+       box at the containing block's inline size minus its own margin, and
+       only its line boxes shorten around the float. */
+    #float {
+      float: right;
+      width: 250px;
+      height: 400px;
+      margin-left: 2em;
+      background: #1971c2;
+    }
+    #main {
+      height: 100px;
+      margin-right: 20em;
+      background: #087f5b;
+    }
+    #cleared {
+      clear: both;
+      width: 900px;
+      height: 50px;
+      background: #a61e4d;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <aside id="float"></aside>
+    <div id="main"></div>
+    <div id="cleared"></div>
+  </div>
+</body>
+</html>

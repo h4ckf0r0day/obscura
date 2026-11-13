@@ -14646,10 +14646,18 @@ fn clear_matches_float_sides(clear: crate::Clear, has_left: bool, has_right: boo
         && (!has_right || matches!(clear, crate::Clear::Right | crate::Clear::Both))
 }
 
+/// Margins whose final pixels may still change after the pre-layout pass.
+///
+/// Font- and viewport-relative margins (`margin_relative`: em/rem/vw/vh) are
+/// resolved exactly before the taffy tree is built, so a float carrying them
+/// is safe to hand to the native float band. Percentage and calc-style
+/// margins re-resolve against the containing block's width and stay deferred,
+/// as do auto margins (issue #1496: an em `margin-left` on a float used to
+/// force the legacy flex-row band, which shrinks the in-flow block sibling's
+/// border box instead of only its line boxes).
 fn has_deferred_or_auto_margin(style: &crate::LayoutStyle) -> bool {
     style.margin_auto.iter().any(|value| *value)
         || style.margin_percent.iter().any(Option::is_some)
-        || style.margin_relative.iter().any(Option::is_some)
         || style.margin_expressions.iter().any(Option::is_some)
 }
 
