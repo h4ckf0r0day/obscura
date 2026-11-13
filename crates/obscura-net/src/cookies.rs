@@ -315,19 +315,21 @@ impl CookieJar {
             // RFC 6265 4.1.2.3: the leading dot is ignored. The Set-Cookie path already strips
             // it, but this code did not, which is why one cookie became two entries.
             let domain = canonical_domain(&cookie.domain);
-            if domain.is_empty()
-                || (is_public_suffix(&domain)
-                    && domain != "localhost"
-                    && domain.parse::<std::net::IpAddr>().is_err())
-            {
+            if domain.is_empty() {
                 continue;
             }
+            let suffix_host = is_public_suffix(&domain)
+                && domain != "localhost"
+                && domain.parse::<std::net::IpAddr>().is_err();
             if cookie.same_site == "None" && !cookie.secure {
                 continue;
             }
-            if !cookie_prefix_allows(&cookie.name, cookie.secure, !host_only, Some(&cookie.path)) {
+            // Trusted suffix imports are host-only, but an explicit dotted Domain still invalidates __Host-.
+            let prefix_host_only = host_only || (suffix_host && !cookie.domain.trim().starts_with('.'));
+            if !cookie_prefix_allows(&cookie.name, cookie.secure, !prefix_host_only, Some(&cookie.path)) {
                 continue;
             }
+            let host_only = host_only || suffix_host;
             if cookie.expires.is_some_and(|expires| {
                 expires == 0 || (expires > 0 && expires <= now)
             }) {
@@ -1781,6 +1783,56 @@ mod tests {
         assert!(jar
             .get_cookie_header_same_site(&Url::parse("https://sub.github.io/").unwrap())
             .is_empty());
+    }
+
+    #[test]
+    fn imported_public_suffix_cookies_are_host_only() {
+        for domain in ["httpbin.org", ".httpbin.org", "com", ".co.uk"] {
+            let jar = CookieJar::new();
+            jar.set_cookies_from_cdp(vec![CookieInfo {
+                name: "session".into(), value: "restored".into(), domain: domain.into(),
+                path: "/".into(), secure: true, http_only: true,
+                same_site: "Lax".into(), expires: None,
+            }]);
+            let host = canonical_domain(domain);
+            let cookies = jar.get_all_cookies();
+            assert_eq!(cookies.len(), 1, "trusted cookie import for {domain}");
+            assert_eq!(cookies[0].domain, host);
+            assert!(jar.get_cookie_header_same_site(&Url::parse(&format!("https://{host}/")).unwrap()).contains("session=restored"));
+            assert!(jar.get_cookie_header_same_site(&Url::parse(&format!("https://sub.{host}/")).unwrap()).is_empty(), "public suffix import must not reach subdomains: {domain}");
+            let profile = tempfile::tempdir().unwrap();
+            let file = profile.path().join("cookies.json");
+            jar.save_to_file(&file).unwrap();
+            let reloaded = CookieJar::new();
+            assert_eq!(reloaded.load_from_file(&file).unwrap(), 1);
+            assert!(reloaded.get_cookie_header_same_site(&Url::parse(&format!("https://{host}/")).unwrap()).contains("session=restored"));
+            assert!(reloaded.get_cookie_header_same_site(&Url::parse(&format!("https://sub.{host}/")).unwrap()).is_empty());
+        }
+    }
+
+    #[test]
+    fn imported_public_suffix_host_prefixes_preserve_scope_after_reload() {
+        for (domain, secure, path, accepted) in [
+            ("httpbin.org", true, "/", true),
+            (".httpbin.org", true, "/", false),
+            ("httpbin.org", false, "/", false),
+            ("httpbin.org", true, "/admin", false),
+        ] {
+            let jar = CookieJar::new();
+            jar.set_cookies_from_cdp(vec![CookieInfo {
+                name: "__Host-session".into(), value: "restored".into(), domain: domain.into(),
+                path: path.into(), secure, http_only: true,
+                same_site: "Lax".into(), expires: None,
+            }]);
+            assert_eq!(!jar.get_all_cookies().is_empty(), accepted, "{domain} secure={secure} path={path}");
+            let profile = tempfile::tempdir().unwrap();
+            let file = profile.path().join("cookies.json");
+            jar.save_to_file(&file).unwrap();
+            let reloaded = CookieJar::new();
+            assert_eq!(reloaded.load_from_file(&file).unwrap(), usize::from(accepted));
+            assert_eq!(reloaded.get_cookie_header_same_site(&Url::parse("https://httpbin.org/").unwrap()).contains("__Host-session=restored"), accepted);
+            assert!(reloaded.get_cookie_header_same_site(&Url::parse("https://sub.httpbin.org/").unwrap()).is_empty());
+        }
     }
 
     #[test]
