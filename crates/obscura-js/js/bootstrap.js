@@ -17597,6 +17597,27 @@ const WORKER_GLOBALS = [
   'TransformStream', 'XMLHttpRequest', 'WebSocket', 'indexedDB', 'navigator', 'DOMException',
 ];
 
+// Direct eval preserves script directives and resolves bare handler names
+// against the worker scope. Build the function per call: one built while the
+// bootstrap snapshot is taken crashes V8 on its first eval.
+function _runWorkerSource(scope, source) {
+  new Function('scope', 'source', 'with (scope) { eval(source); }').call(scope, scope, source);
+}
+
+// String-literal URLs passed to importScripts() in a worker or imported script.
+// They resolve against the worker's own URL, as in Chrome.
+function _importScriptsTargets(source, base) {
+  const targets = [];
+  if (typeof source !== 'string' || !source.includes('importScripts')) return targets;
+  for (const call of source.matchAll(/\bimportScripts\s*\(([^)]*)\)/g)) {
+    for (const [, , text] of call[1].matchAll(/(["'`])((?:\\.|(?!\1)[^\\\n])*)\1/g)) {
+      if (text.includes('${')) continue;
+      try { targets.push(new URL(text.replace(/\\(.)/g, '$1'), base).href); } catch (e) {}
+    }
+  }
+  return targets;
+}
+
 globalThis.Worker = class Worker {
   constructor(url) {
     this.onmessage = null;
@@ -17613,7 +17634,7 @@ globalThis.Worker = class Worker {
       if (blob) {
         worker._code = blob;
         // Auto-start on next tick so caller can set onmessage first.
-        setTimeout(() => worker._autoRun(), 0);
+        setTimeout(() => worker._start(url), 0);
         return;
       }
       // Resolve relative URLs against the current page.
@@ -17624,10 +17645,43 @@ globalThis.Worker = class Worker {
         try {
           const resp = await fetch(resolvedUrl);
           worker._code = await resp.text();
-          if (!worker._terminated) worker._autoRun();
+          if (!worker._terminated) worker._start(resolvedUrl);
         } catch(e) { if (worker.onerror) worker.onerror(e); }
       })();
     }
+  }
+  // importScripts() is synchronous, but the runtime has no synchronous fetch.
+  // Fetch the string-literal targets in the worker source before it runs, then
+  // the targets of those, a few levels deep; the call runs them from this cache.
+  // A target that was not preloaded or failed to load throws Chrome's
+  // NetworkError at the call (issue #827).
+  async _start(base) {
+    this._baseURL = base;
+    this._imports = new Map();
+    let sources = [this._code];
+    for (let depth = 0; depth < 3 && sources.length && !this._terminated; depth++) {
+      const wave = [];
+      for (const source of sources) {
+        for (const url of _importScriptsTargets(source, base)) {
+          if (this._imports.has(url)) continue;
+          this._imports.set(url, null);
+          wave.push(url);
+        }
+      }
+      sources = [];
+      if (wave.length) {
+        await Promise.all(wave.map(async (url) => {
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) return;
+            const source = await resp.text();
+            this._imports.set(url, source);
+            sources.push(source);
+          } catch (e) {}
+        }));
+      }
+    }
+    this._autoRun();
   }
   _makeScope() {
     const worker = this;
@@ -17648,6 +17702,20 @@ globalThis.Worker = class Worker {
         scope._ev[type].push(fn);
       },
       close: () => { worker.terminate(); },
+      importScripts: (...urls) => {
+        const prefix = "Failed to execute 'importScripts' on 'WorkerGlobalScope': ";
+        const resolved = urls.map((url) => {
+          try { return new URL(String(url), worker._baseURL).href; }
+          catch (e) { throw new DOMException(`${prefix}The URL '${url}' is invalid.`, 'SyntaxError'); }
+        });
+        for (const url of resolved) {
+          const source = worker._imports?.get(url);
+          if (typeof source !== 'string') {
+            throw new DOMException(`${prefix}The script at '${url}' failed to load.`, 'NetworkError');
+          }
+          _runWorkerSource(scope, source);
+        }
+      },
       crypto: globalThis.crypto,
       Crypto: globalThis.Crypto,
       TextEncoder: globalThis.TextEncoder,
@@ -17685,10 +17753,8 @@ globalThis.Worker = class Worker {
     if (this._terminated || this._scope || this._code === undefined) return;
     const scope = this._makeScope();
     try {
-      // Direct eval preserves script directives and resolves bare handler names
-      // against the worker scope. Run once so message closures retain their state.
-      const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      fn.call(scope, scope, this._code);
+      // Run once so message closures retain their state.
+      _runWorkerSource(scope, this._code);
     } catch(e) {
       console.error('Worker error:', e.message);
       if (this.onerror) this.onerror(e);
