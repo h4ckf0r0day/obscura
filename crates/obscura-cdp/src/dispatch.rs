@@ -261,6 +261,29 @@ impl CdpContext {
             .expect("default browser context must exist")
     }
 
+    /// Ensure a page with the given id exists, materializing it on demand.
+    /// Page-level DevTools connections upgrade against an id advertised by
+    /// /json/list ("page-1"), but obscura creates pages lazily — the first
+    /// sessionless command on such a connection must materialize the target.
+    /// The page counter is advanced past the materialized id so a later
+    /// Target.createTarget cannot collide with it.
+    pub(crate) fn ensure_page(&mut self, page_id: &str) {
+        if self.pages.iter().any(|p| p.id == page_id) {
+            return;
+        }
+        let context = self.default_context.clone();
+        let mut page = Page::new(page_id.to_string(), context);
+        page.navigate_blank();
+        self.pages.push(page);
+        self.current_loader_ids
+            .insert(page_id.to_string(), format!("loader-blank-{page_id}"));
+        self.lifecycle_timestamps
+            .insert(page_id.to_string(), [Some(domains::page::timestamp()); 5]);
+        if let Some(n) = page_id.strip_prefix("page-").and_then(|n| n.parse::<u64>().ok()) {
+            self.page_counter = self.page_counter.max(u32::try_from(n).unwrap_or(u32::MAX));
+        }
+    }
+
     pub fn create_page_in_context(&mut self, context_id: Option<&str>) -> Result<String, String> {
         let context = match context_id {
             Some(id) => self

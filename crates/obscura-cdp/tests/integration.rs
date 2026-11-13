@@ -64,6 +64,7 @@ integration_tests!(
     runtime_console_events,
     runtime_get_properties_objectid_escaping,
     runtime_primitives,
+    sessionless_page_level_commands,
     scroll_event_on_assignment,
     structured_clone_crypto_parity,
     textarea_enter_selection,
