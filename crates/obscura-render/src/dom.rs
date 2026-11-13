@@ -511,7 +511,8 @@ pub fn retained_attribute_mutation_kind(
             | "valign"
             | "viewbox"
             | "width"
-    ) || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
+    ) || (local == "dialog" && name == "open")
+        || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
         || (matches!(local.as_str(), "select" | "font") && name == "size")
         || (local == "textarea" && matches!(name.as_str(), "cols" | "rows" | "wrap"))
         || matches!(name.as_str(), "dir" | "lang" | "xml:lang")
@@ -2781,6 +2782,11 @@ fn cascade_node_style(
                 }
                 _ => {}
             }
+        }
+        if elem.local.as_ref() == "dialog" && elem.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+            && node.get_attribute("open").is_none()
+        {
+            style.display = crate::Display::None;
         }
         // UA rule `[hidden]:not([hidden=until-found]) { display: none }`.
         // Applied before the author cascade so a matching author `display`

@@ -488,6 +488,28 @@ fn css_table_mixed_children_are_not_discarded() {
 }
 
 #[test]
+fn closed_html_dialogs_use_a_ua_display_rule_below_author_styles() {
+    let tree = parse_html(r#"<!doctype html><style>
+        html,body{margin:0} dialog{width:80px;height:30px}
+        #authored{display:block} #contents{display:contents}
+        #contents > div{width:20px;height:10px}
+    </style><dialog id=closed><div id=closed_child>hidden</div></dialog>
+    <dialog id=opened open></dialog><dialog id=authored></dialog>
+    <dialog id=contents><div id=visible_child></div></dialog>
+    <svg><dialog id=svg_dialog></dialog></svg>"#);
+    let layout = layout_dom(&tree, (400.0,300.0));
+    for name in ["closed", "closed_child"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(name).unwrap()), "{name} generated a box");
+    }
+    for name in ["opened", "authored"] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!((rect.width,rect.height),(80.0,30.0), "{name}");
+    }
+    assert!(layout.rects.contains_key(&tree.get_element_by_id("visible_child").unwrap()));
+    assert_ne!(layout.styles[&tree.get_element_by_id("svg_dialog").unwrap()].display, obscura_render::Display::None);
+}
+
+#[test]
 fn table_rowspans_are_clipped_to_the_originating_row_group() {
     let tree = parse_html(
         r#"
