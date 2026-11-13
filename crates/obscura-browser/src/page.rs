@@ -6822,6 +6822,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn history_urls_keep_the_committed_origin_during_pending_navigation() {
+        let mut page = import_map_test_page("history-committed-origin", "http://example.com/current", "<title>history</title>");
+        let result = page.evaluate("(() => { location.href='https://other.example/next'; let error=null; try { history.pushState({}, '', 'https://other.example/spoof'); } catch(e) { error=e.name; } history.pushState({n:1}, '', '/kept'); location.href='https://other.example/again'; history.replaceState({n:2}, ''); return {error,href:location.href,state:history.state}; })()");
+        assert_eq!(result, serde_json::json!({"error":"SecurityError","href":"http://example.com/kept","state":{"n":2}}));
+        page.sync_history_updates();
+        assert_eq!(page.url_string(), "http://example.com/kept");
+        assert!(page.history.iter().all(|url| url.starts_with("http://example.com/")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn history_sync_rejects_non_url_page_values() {
         let mut page = page_without_chain_limit("history-url-type");
         page.navigate("data:text/html,<title>history</title>").await.unwrap();

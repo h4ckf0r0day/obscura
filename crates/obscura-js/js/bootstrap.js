@@ -13650,11 +13650,12 @@ globalThis.atob = globalThis.atob || ((s) => {
   };
   const historyToken = Symbol("History");
   const resolveHistoryUrl = (url, method) => {
+    // A Location setter can preview a destination before the document commits.
+    const base = stack[idx].url ?? (_domParse("document_url") || "about:blank");
     // A missing url (pushState/replaceState called with < 3 args) keeps the
     // current document URL per the HTML spec; capture it so the entry does not
     // reset location back to the original document URL.
-    if (url === null || url === undefined) return __currentUrl();
-    const base = __currentUrl();
+    if (url === null || url === undefined) return base;
     let target;
     try {
       target = new URL(String(url), base);
