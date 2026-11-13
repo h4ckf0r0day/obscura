@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/assets/icon.png" alt="Obscura" width="80" />
+  <img src="https://raw.githubusercontent.com/itskum47/obscura/main/assets/icon.png" alt="Obscura" width="80" />
 </p>
 <h2 align="center">Obscura</h2>
 <p align="center">
@@ -10,7 +10,7 @@
   <a href="https://obscura.sh"><img src="https://img.shields.io/badge/Website-1a1a1a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjE5MCAxNzAgNDIwIDQyMCI+PHBhdGggZmlsbD0iI0ZGRkZGRiIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNDA2LDE3NS4wMDA0MTIgQzQ0MC40OTg5MzIsMTc1LjAwMDM1MSA0NzQuNDk4MTA4LDE3NS4wODA5OTQgNTA4LjQ5NjczNSwxNzQuOTc1NjYyIEM1MzcuNzMzNjQzLDE3NC44ODUwODYgNTYxLjI3MDY5MSwxODcuMjIwNTUxIDU3OS45Mzk2MzYsMjA4Ljc4NjYyMSBDNTkwLjg0MTA2NCwyMjEuMzc5Nzc2IDU5Ny44ODM1NDUsMjM2LjM1MjY2MSA1OTkuOTgxODczLDI1My4yMjAzNjcgQzYwMC40NDU1NTcsMjU2Ljk0NzU0MCA2MDAuOTUxMTExLDI2MC43MDQ0MzcgNjAwLjk1NjYwNCwyNjQuNDQ4MzY0IEM2MDEuMDIyNjQ0LDMwOS42MTM1MjUgNjAxLjA3NTgwNiwzNTQuNzc5MDIyIDYwMC45NTE3ODIsMzk5Ljk0MzkzOSBDNjAwLjkxMzE0Nyw0MTQuMDMyMzQ5IDYwMC42NjMyNjksNDI4LjE0MDEwNiA1OTkuNzgyMjg4LDQ0Mi4xOTMzNTkgQzU5OS41NDEwMTYsNDQ2LjA0MDg5NCA1OTcuNTYwNzkxLDQ1MC42MTU2MDEgNTk0Ljg1MzIxMCw0NTMuMzQxMzA5IEM1NzEuMTc3NTUxLDQ3Ny4xNzUzMjMgNTQ3LjE4MDcyNSw1MDAuNjkwNzk2IDUyMy4yMjc5NjYsNTI0LjI0ODc3OSBDNTA2Ljc5OTgzNSw1NDAuNDA2MTI4IDQ5MC4yMDk5OTEsNTU2LjM5OTkwMiA0NzMuODY0NTYzLDU3Mi42NDAxMzcgQzQ2OC44MDA4NDIsNTc3LjY3MTIwNCA0NjMuMDgyODg2LDU4MC4wNTQxOTkgNDU1Ljk3MDYxMiw1ODAuMDQzODIzIEM0MDAuOTcyNDQzLDU3OS45NjM1MDEgMzQ1Ljk3MzY2Myw1ODAuMTMyMDE5IDI5MC45NzYwNDQsNTc5LjkzNjc2OCBDMjY3LjU4MDQxNCw1NzkuODUzNjk5IDI0Ni41NTEyMDgsNTcyLjA0MzU3OSAyMjguOTM5NzQzLDU1Ni44Mjc1MTUgQzIxMi44NDk2MjUsNTQyLjkyNTg0MiAyMDIuNzUxOTY4LDUyNC45MDIxMDAgMTk4LjE1NjE1OCw1MDQuMDM5NjczIEMxOTcuMjgyMTk2LDUwMC4wNzIyOTYgMTk3LjA1MjQxNCw0OTUuODk1Mzg2IDE5Ny4wNDczMzMsNDkxLjgxNDQ4NCBDMTk2Ljk3ODE0OSw0MzYuMTQ5NjU4IDE5Ny4wNTA3MjAsMzgwLjQ4NDYxOSAxOTYuOTMyNjE3LDMyNC44MTk5NDYgQzE5Ni45MTkxNDQsMzE4LjQ3MDkxNyAxOTkuMTg0ODQ1LDMxMy40MTYxOTkgMjAzLjQ5NTU3NSwzMDkuMTAwNTI1IEMyNDAuNTg3OTk3LDI3MS45NjU0MjQgMjc3LjY4MjQ5NSwyMzQuODMyMzA2IDMxNC44MzQ1NjQsMTk3Ljc1Njk1OCBDMzIwLjk1NjQyMSwxOTEuNjQ3Nzk3IDMyNy4yNjQ0MzUsMTg1LjcxNTI1NiAzMzMuNjczOTIwLDE3OS45MDgwODEgQzMzNy4zNzYwMzgsMTc2LjU1MzgzMyAzNDEuNzIxNDY2LDE3NC44NTMzMTcgMzQ3LjAwNTc5OCwxNzQuOTEyODcyIEMzNjYuNTAxNzA5LDE3NS4xMzI2MTQgMzg2LjAwMTYxNywxNzUuMDAwMzIwIDQwNiwxNzUuMDAwNDEyIFogTTUwMy4zNDQ2NjYsMjczLjg0MDE0OSBDNTA0LjEwMjcyMiwyNzYuMTY3NTcyIDUwNC45NDA5NDgsMjc4LjIxMTA5MCA1MDQuOTQzMjY4LDI4MC4yNTU1MjQgQzUwNS4wMTI4NDgsMzQxLjc0MjI0OSA1MDQuOTY5MTQ3LDQwMy4yMjkwNjUgNTA1LjAzMDc5Miw0NjQuNzE1NzkwIEM1MDUuMDQwODAyLDQ3NC42ODY0OTMgNDk2LjExNzQ2Miw0ODMuOTUzMTg2IDQ4NS43Nzc5MjQsNDgzLjk2NTI3MSBDNDI0LjYyNDQ1MSw0ODQuMDM2ODk2IDM2My40NzA5MTcsNDg0LjAwMzIzNSAzMDIuMzE3MzgzLDQ4My45OTY3MzUgQzI5NS41ODc3NjksNDgzLjk5NjAzMyAyOTMuMDAxMjUxLDQ4MS4zMDE2MDUgMjkzLjAwMDkxNiw0NzQuMzM4NTYyIEMyOTIuOTk3ODY0LDQxMy4zNTE2NTQgMjkzLjIwOTYyNSwzNTIuMzYzMzEyIDI5Mi43ODA3MDEsMjkxLjM3OTM5NSBDMjkyLjcxMzUzMSwyODEuODI4MDk0IDMwMy4yMTMwNDMsMjcwLjgyNDE1OCAzMTMuNDc4MjcxLDI3MC44OTQzMTggQzM1MS45NjgyMDEsMjcxLjE1NzQ0MCAzOTAuNDYwOTk5LDI3MC45OTk3ODYgNDI4Ljk1MjcyOCwyNzAuOTk5Nzg2IEM0NTEuMTE0NjI0LDI3MC45OTk3ODYgNDczLjI3NzI4MywyNzAuOTE3NDgwIDQ5NS40Mzc0NjksMjcxLjExMjE1MiBDNDk3Ljk3NzAyMCwyNzEuMTM0NDkxIDUwMC41MDI5MzAsMjcyLjcwNDM3NiA1MDMuMzQ0NjY2LDI3My44NDAxNDkgWiI+PC9wYXRoPjwvc3ZnPgo=&logoColor=white" alt="Website" /></a>
   <a href="https://x.com/obscura_sh" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/TWITTER%20%2F%20X-1a1a1a?style=for-the-badge&logo=x&logoColor=white" alt="Obscura on Twitter/X" /></a>
   <a href="https://cal.com/obscura/quick-chat"><img src="https://img.shields.io/badge/Book_a_Demo-1a1a1a?style=for-the-badge&logo=googlecalendar&logoColor=white" alt="Book a demo" /></a>
-  <a href="https://github.com/h4ckf0r0day/obscura/releases"><img src="https://img.shields.io/badge/Releases-1a1a1a?style=for-the-badge&logo=github&logoColor=white" alt="Releases" /></a>
+  <a href="https://github.com/itskum47/obscura/releases"><img src="https://img.shields.io/badge/Releases-1a1a1a?style=for-the-badge&logo=github&logoColor=white" alt="Releases" /></a>
 </p>
 <p align="center">
   <strong>The open-source headless browser for AI agents and web scraping.</strong><br>
@@ -109,27 +109,27 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 
 ### Download
 
-Grab the latest binary from [Releases](https://github.com/h4ckf0r0day/obscura/releases):
+Grab the latest binary from [Releases](https://github.com/itskum47/obscura/releases):
 
 ```bash
 # Linux x86_64
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
+curl -LO https://github.com/itskum47/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
 tar xzf obscura-x86_64-linux.tar.gz
 ./obscura fetch https://example.com --eval "document.title"
 
 # Linux ARM64 (aarch64)
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+curl -LO https://github.com/itskum47/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
 tar xzf obscura-aarch64-linux.tar.gz
 
 # NixOS
 nix-env -iA nixpkgs.obscura
 
 # macOS Apple Silicon
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
+curl -LO https://github.com/itskum47/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
 
 # macOS Intel
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
+curl -LO https://github.com/itskum47/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
 tar xzf obscura-x86_64-macos.tar.gz
 
 # Windows
@@ -155,15 +155,15 @@ usable on common LTS servers with glibc 2.35+.
 ```bash
 docker run -d --name obscura -p 127.0.0.1:9222:9222 \
   -e OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" \
-  h4ckf0r0day/obscura
+  itskum47/obscura
 ```
 
-Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc:nonroot` — no shell, no package manager, runs as uid 65532, ~57 MB compressed. A mounted `--storage-dir` must be writable by uid 65532. Publish to host loopback as above; `-p 9222:9222` exposes the port on every interface.
+Image on [Docker Hub](https://hub.docker.com/r/itskum47/obscura). Multi-stage build on `distroless/cc:nonroot` — no shell, no package manager, runs as uid 65532, ~57 MB compressed. A mounted `--storage-dir` must be writable by uid 65532. Publish to host loopback as above; `-p 9222:9222` exposes the port on every interface.
 
 ### Build from source
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
+git clone https://github.com/itskum47/obscura.git
 cd obscura
 
 # Rendering
@@ -364,7 +364,7 @@ Page load:
 | JS + XHR + fetch | **84 ms** | ~800 ms |
 | Dynamic scripts | **78 ms** | ~700 ms |
 
-The full benchmark suite (WPT conformance, obstacle course, real-world corpus, and vs-Chrome speed) lives in a separate repo: https://github.com/h4ckf0r0day/obscura-benchmark
+The full benchmark suite (WPT conformance, obstacle course, real-world corpus, and vs-Chrome speed) lives in a separate repo: https://github.com/itskum47/obscura-benchmark
 
 ## Stealth Mode
 
