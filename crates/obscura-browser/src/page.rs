@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
 use obscura_js::ops::{OriginStorage, max_live_frames, NavigationTiming};
-use obscura_js::runtime::ObscuraJsRuntime;
+use obscura_js::runtime::{HistoryUpdate, ObscuraJsRuntime};
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
     ResourceType, Response, ResponseCallback,
@@ -3381,14 +3381,8 @@ impl Page {
         self.push_history_entry(url, false);
     }
 
-    pub(crate) fn apply_history_update(&mut self, fields: &[serde_json::Value]) {
-        let Some(start) = fields.get(1).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
-        let Some(index) = fields.get(2).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
-        let Some(old_length) = fields.get(3).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
-        let Some(truncate_forward) = fields.get(4).and_then(|value| value.as_bool()) else { return; };
-        let Some(first) = fields.get(5).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
-        let Some(urls) = fields.get(6).and_then(|value| value.as_array()) else { return; };
-        let Some(urls) = urls.iter().map(|value| value.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>() else { return; };
+    pub(crate) fn apply_history_update(&mut self, update: HistoryUpdate) {
+        let HistoryUpdate::Entries { start, index, old_length, truncate_forward, first, urls, .. } = update else { return; };
         let Some(end) = first.checked_add(urls.len()) else { return; };
         let length = if truncate_forward { end } else { old_length };
         if first > old_length || index >= length || (!truncate_forward && end > old_length) { return; }
@@ -5339,7 +5333,7 @@ mod tests {
         register_linked_stylesheet_script, script_response_is_executable, split_css_imports,
         stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
         LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
-        Page, BrowserContext, LifecycleState, BASE64,
+        Page, BrowserContext, LifecycleState, HistoryUpdate, BASE64,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
@@ -6775,7 +6769,8 @@ mod tests {
         page.navigate(url).await.unwrap();
         page.evaluate("(() => { for(let i=0;i<10000;i++) history.replaceState(i, '', '#'+i); })()");
         let update = page.js.as_mut().unwrap().take_history_update().unwrap();
-        assert!(update.to_string().len() < 512, "one entry must not retain a mutation log");
+        assert!(matches!(update, HistoryUpdate::Entries { urls, .. }
+            if urls.len() == 1 && urls[0].len() < 512), "one entry must not retain a mutation log");
         page.evaluate("history.replaceState(null, '', '#last')");
         page.sync_virtual_url();
         assert_eq!(page.history, vec![format!("{url}#last")]);
@@ -6793,7 +6788,8 @@ mod tests {
         }
         page.evaluate("history.replaceState(null, '', '#last')");
         let update = page.js.as_mut().unwrap().take_history_update().unwrap();
-        assert!(update.to_string().len() < 512, "one changed entry must not transfer the unchanged history");
+        assert!(matches!(update, HistoryUpdate::Entries { urls, .. }
+            if urls.len() == 1 && urls[0].len() < 512), "one changed entry must not transfer the unchanged history");
         page.evaluate("history.replaceState(null, '', '#verified')");
         page.sync_virtual_url();
         assert_eq!(page.history.len(), 1001);
@@ -6849,7 +6845,8 @@ mod tests {
         let mut page = page_without_chain_limit("history-url-type");
         page.navigate("data:text/html,<title>history</title>").await.unwrap();
         page.evaluate("globalThis.__virtualUrl = new Array(100000)");
-        assert_eq!(page.js.as_mut().unwrap().take_history_update().unwrap(), serde_json::json!(""));
+        assert!(matches!(page.js.as_mut().unwrap().take_history_update().unwrap(),
+            HistoryUpdate::Url(url) if url.is_empty()));
     }
 
     /// Same-document entries sit between the documents: a push drops the

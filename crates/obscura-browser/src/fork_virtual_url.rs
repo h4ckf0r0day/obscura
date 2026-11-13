@@ -13,6 +13,7 @@
 //! `self.sync_virtual_url()`.
 
 use url::Url;
+use obscura_js::runtime::HistoryUpdate;
 
 use crate::page::Page;
 
@@ -35,14 +36,15 @@ impl Page {
     pub fn sync_history_updates(&mut self) -> bool {
         let Some(js) = self.js.as_mut() else { return false; };
         let Ok(value) = js.take_history_update() else { return false; };
-        if !value.is_array() { return false; }
+        if !matches!(&value, HistoryUpdate::Entries { .. }) { return false; }
         self.adopt_virtual_url(value)
     }
 
-    fn adopt_virtual_url(&mut self, value: serde_json::Value) -> bool {
-        let updates = value.as_array();
-        let virtual_url = updates.and_then(|fields| fields.first()).unwrap_or(&value);
-        let Some(virtual_url) = virtual_url.as_str().filter(|url| !url.is_empty()) else {
+    fn adopt_virtual_url(&mut self, value: HistoryUpdate) -> bool {
+        let virtual_url = match &value {
+            HistoryUpdate::Url(url) | HistoryUpdate::Entries { url, .. } => url,
+        };
+        if virtual_url.is_empty() {
             return false;
         };
         let Ok(parsed) = Url::parse(virtual_url) else {
@@ -53,8 +55,8 @@ impl Page {
             return false;
         }
         let changed = self.url.as_ref() != Some(&parsed);
-        if let Some(fields) = updates {
-            self.apply_history_update(fields);
+        if matches!(&value, HistoryUpdate::Entries { .. }) {
+            self.apply_history_update(value);
             self.url = Some(parsed);
             self.sync_js_session_history();
         } else if changed {

@@ -212,6 +212,21 @@ pub struct AccessibilityStyle {
     pub visibility_hidden: Option<bool>,
 }
 
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum HistoryUpdate {
+    Url(String),
+    Entries {
+        url: String,
+        start: usize,
+        index: usize,
+        old_length: usize,
+        truncate_forward: bool,
+        first: usize,
+        urls: Vec<String>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     /// True when this object is a value that was thrown or that a promise
@@ -2710,7 +2725,7 @@ impl ObscuraJsRuntime {
     }
 
     /// Read host history metadata without invoking author-defined JSON hooks.
-    pub fn take_history_update(&mut self) -> Result<serde_json::Value, String> {
+    pub fn take_history_update(&mut self) -> Result<HistoryUpdate, String> {
         #[cfg(feature = "render")]
         self.service_render_resources();
         self.begin_javascript_task();
@@ -2722,12 +2737,15 @@ impl ObscuraJsRuntime {
         v8::scope_with_context!(scope, entered.v8_isolate(), context);
         let value = v8::Local::new(scope, result);
         if value.is_string() {
-            return Ok(serde_json::Value::String(value.to_rust_string_lossy(scope)));
+            return Ok(HistoryUpdate::Url(value.to_rust_string_lossy(scope)));
         }
         let update: (String, usize, usize, bool, usize, Vec<String>) =
             deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string())?;
-        serde_json::to_value((update.0, document_start, update.1, update.2, update.3, update.4, update.5))
-            .map_err(|error| error.to_string())
+        Ok(HistoryUpdate::Entries {
+            url: update.0, start: document_start, index: update.1,
+            old_length: update.2, truncate_forward: update.3,
+            first: update.4, urls: update.5,
+        })
     }
 
     pub async fn evaluate_for_cdp(
