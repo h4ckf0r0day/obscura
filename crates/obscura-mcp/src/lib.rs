@@ -2506,6 +2506,23 @@ mod tests {
         assert_eq!(build_press_key_js("document", key), expected);
     }
 
+    #[test]
+    fn cookie_tools_restore_public_suffix_host_sessions() {
+        let mut state = BrowserState::new(None, None, false);
+        tool_set_cookie(&json!({"name":"direct", "value":"one", "domain":"httpbin.org", "secure":true, "http_only":true}), &state).unwrap();
+        tool_set_storage_state(&json!({"state":{"cookies":[{
+            "name":"restored", "value":"two", "domain":".httpbin.org", "path":"/",
+            "secure":true, "http_only":true, "same_site":"Lax", "expires":-1
+        }],"origins":[]}}), &mut state).unwrap();
+        let listed = tool_get_cookies(&json!({"domain":"httpbin.org"}), &state).unwrap();
+        for name in ["direct", "restored"] {
+            assert!(listed.contains(name), "successful cookie tools must store {name}: {listed}");
+        }
+        let header = state.context.cookie_jar.get_cookie_header_same_site(&url::Url::parse("https://httpbin.org/cookies").unwrap());
+        assert!(header.contains("direct=one") && header.contains("restored=two"), "{header}");
+        assert!(state.context.cookie_jar.get_cookie_header_same_site(&url::Url::parse("https://unrelated.httpbin.org/").unwrap()).is_empty());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn tab_switch_preserves_globals_listeners_and_pending_promises() {
         let mut state = BrowserState::new(None, None, false);

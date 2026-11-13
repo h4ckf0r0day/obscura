@@ -315,19 +315,21 @@ impl CookieJar {
             // RFC 6265 4.1.2.3: the leading dot is ignored. The Set-Cookie path already strips
             // it, but this code did not, which is why one cookie became two entries.
             let domain = canonical_domain(&cookie.domain);
-            if domain.is_empty()
-                || (is_public_suffix(&domain)
-                    && domain != "localhost"
-                    && domain.parse::<std::net::IpAddr>().is_err())
-            {
+            if domain.is_empty() {
                 continue;
             }
+            let suffix_host = is_public_suffix(&domain)
+                && domain != "localhost"
+                && domain.parse::<std::net::IpAddr>().is_err();
             if cookie.same_site == "None" && !cookie.secure {
                 continue;
             }
-            if !cookie_prefix_allows(&cookie.name, cookie.secure, !host_only, Some(&cookie.path)) {
+            // Trusted suffix imports are host-only, but an explicit dotted Domain still invalidates __Host-.
+            let prefix_host_only = host_only || (suffix_host && !cookie.domain.trim().starts_with('.'));
+            if !cookie_prefix_allows(&cookie.name, cookie.secure, !prefix_host_only, Some(&cookie.path)) {
                 continue;
             }
+            let host_only = host_only || suffix_host;
             if cookie.expires.is_some_and(|expires| {
                 expires == 0 || (expires > 0 && expires <= now)
             }) {
@@ -591,11 +593,19 @@ impl CookieJar {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
         let mut tmp = tempfile::NamedTempFile::new_in(
             path.parent().unwrap_or(std::path::Path::new(".")),
         )?;
+        // Cookie values are live session tokens. Do not depend on the tempfile
+        // crate's default mode for keeping them private.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         tmp.write_all(json.as_bytes())?;
         tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
@@ -619,6 +629,21 @@ impl CookieJar {
         );
         Ok(count)
     }
+}
+
+/// Create `dir` and any missing parents. On unix, directories created here
+/// are owner-only (0700) because the cookie file inside holds session tokens.
+/// A directory that already exists keeps the mode its owner gave it. On
+/// Windows a new directory inherits the ACL of its parent.
+fn create_private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 impl Default for CookieJar {
@@ -1491,6 +1516,77 @@ mod tests {
     }
 
     #[test]
+    fn save_to_file_reports_an_uncreatable_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("session=abc123; Path=/", &url);
+
+        let result = jar.save_to_file(&blocker.join("profile").join("cookies.json"));
+        assert!(result.is_err(), "a save that cannot create its directory must fail");
+        assert!(!blocker.join("profile").exists());
+    }
+
+    #[cfg(unix)]
+    mod private_storage {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        fn jar_with_session() -> CookieJar {
+            let jar = CookieJar::new();
+            let url = Url::parse("https://example.com/").unwrap();
+            jar.set_cookie("session=abc123; Path=/", &url);
+            jar
+        }
+
+        #[test]
+        fn creates_directories_0700_and_file_0600() {
+            let tmp = tempfile::tempdir().unwrap();
+            let profile = tmp.path().join("profile");
+            let path = profile.join("nested").join("cookies.json");
+
+            jar_with_session().save_to_file(&path).unwrap();
+
+            assert_eq!(mode(&profile), 0o700);
+            assert_eq!(mode(&profile.join("nested")), 0o700);
+            assert_eq!(mode(&path), 0o600);
+        }
+
+        #[test]
+        fn leaves_an_existing_directory_mode_alone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let profile = tmp.path().join("profile");
+            std::fs::create_dir(&profile).unwrap();
+            std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+            jar_with_session()
+                .save_to_file(&profile.join("cookies.json"))
+                .unwrap();
+
+            assert_eq!(mode(&profile), 0o750);
+        }
+
+        #[test]
+        fn tightens_a_cookie_file_left_world_readable() {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("cookies.json");
+            std::fs::write(&path, "[]").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            jar_with_session().save_to_file(&path).unwrap();
+
+            assert_eq!(mode(&path), 0o600);
+        }
+    }
+
+    #[test]
     fn test_load_nonexistent_file_returns_zero() {
         let jar = CookieJar::new();
         let count = jar
@@ -1687,6 +1783,56 @@ mod tests {
         assert!(jar
             .get_cookie_header_same_site(&Url::parse("https://sub.github.io/").unwrap())
             .is_empty());
+    }
+
+    #[test]
+    fn imported_public_suffix_cookies_are_host_only() {
+        for domain in ["httpbin.org", ".httpbin.org", "com", ".co.uk"] {
+            let jar = CookieJar::new();
+            jar.set_cookies_from_cdp(vec![CookieInfo {
+                name: "session".into(), value: "restored".into(), domain: domain.into(),
+                path: "/".into(), secure: true, http_only: true,
+                same_site: "Lax".into(), expires: None,
+            }]);
+            let host = canonical_domain(domain);
+            let cookies = jar.get_all_cookies();
+            assert_eq!(cookies.len(), 1, "trusted cookie import for {domain}");
+            assert_eq!(cookies[0].domain, host);
+            assert!(jar.get_cookie_header_same_site(&Url::parse(&format!("https://{host}/")).unwrap()).contains("session=restored"));
+            assert!(jar.get_cookie_header_same_site(&Url::parse(&format!("https://sub.{host}/")).unwrap()).is_empty(), "public suffix import must not reach subdomains: {domain}");
+            let profile = tempfile::tempdir().unwrap();
+            let file = profile.path().join("cookies.json");
+            jar.save_to_file(&file).unwrap();
+            let reloaded = CookieJar::new();
+            assert_eq!(reloaded.load_from_file(&file).unwrap(), 1);
+            assert!(reloaded.get_cookie_header_same_site(&Url::parse(&format!("https://{host}/")).unwrap()).contains("session=restored"));
+            assert!(reloaded.get_cookie_header_same_site(&Url::parse(&format!("https://sub.{host}/")).unwrap()).is_empty());
+        }
+    }
+
+    #[test]
+    fn imported_public_suffix_host_prefixes_preserve_scope_after_reload() {
+        for (domain, secure, path, accepted) in [
+            ("httpbin.org", true, "/", true),
+            (".httpbin.org", true, "/", false),
+            ("httpbin.org", false, "/", false),
+            ("httpbin.org", true, "/admin", false),
+        ] {
+            let jar = CookieJar::new();
+            jar.set_cookies_from_cdp(vec![CookieInfo {
+                name: "__Host-session".into(), value: "restored".into(), domain: domain.into(),
+                path: path.into(), secure, http_only: true,
+                same_site: "Lax".into(), expires: None,
+            }]);
+            assert_eq!(!jar.get_all_cookies().is_empty(), accepted, "{domain} secure={secure} path={path}");
+            let profile = tempfile::tempdir().unwrap();
+            let file = profile.path().join("cookies.json");
+            jar.save_to_file(&file).unwrap();
+            let reloaded = CookieJar::new();
+            assert_eq!(reloaded.load_from_file(&file).unwrap(), usize::from(accepted));
+            assert_eq!(reloaded.get_cookie_header_same_site(&Url::parse("https://httpbin.org/").unwrap()).contains("__Host-session=restored"), accepted);
+            assert!(reloaded.get_cookie_header_same_site(&Url::parse("https://sub.httpbin.org/").unwrap()).is_empty());
+        }
     }
 
     #[test]

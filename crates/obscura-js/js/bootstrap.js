@@ -30,6 +30,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
+    '__obscuraHistory',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__obscura_inputChecked', '__obscura_setInputChecked',
@@ -390,7 +391,7 @@ function _decodeDataScriptUrl(url) {
 // native per-document state so it survives wrapper churn, fragment parsing,
 // moves, and cloneNode().
 globalThis.__markParserScripts = function(nids) {
-  for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid);
+  for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid, _realmFrameId);
 };
 async function __fetchDynClassicScript(task) {
   let body;
@@ -2208,7 +2209,7 @@ let _scriptingEnabled = true;
 let _sandboxOpaqueOrigin = false;
 function __prepareInsertedScript(script) {
   if (!_scriptingEnabled) return;
-  if (!__obscuraCore.ops.op_script_try_start(script._nid)) return;
+  if (!__obscuraCore.ops.op_script_try_start(script._nid, _realmFrameId)) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
   const isModule = scriptType === 'module';
   const isImportMap = scriptType === 'importmap';
@@ -2238,6 +2239,9 @@ function __prepareInsertedScript(script) {
   if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
     return;
   }
+  // HTML "prepare the script element": classic scripts with `nomodule` do not
+  // run in a browser that supports module scripts.
+  if (!isModule && script.hasAttribute('nomodule')) return;
   const src = script.getAttribute('src');
   const code = src ? "" : script.textContent;
   if (!src && !code) return;
@@ -7297,7 +7301,13 @@ class DocumentFragment extends Node {
   constructor(nid) {
     const created = nid === undefined;
     super(created ? +_dom("create_document_fragment") : nid);
-    if (created) _seedDetachedTreeState(this);
+    if (created) {
+      _seedDetachedTreeState(this);
+      // Register the wrapper like createDocumentFragment() does. The native
+      // node reports node_type 9, so an unregistered fragment is re-wrapped
+      // as a Document the first time a child's parentNode misses the cache.
+      _cache.set(this._nid, this);
+    }
   }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
@@ -7656,7 +7666,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        Promise.resolve(op(this._nid >>> 0)).then(
+        Promise.resolve(op(this._nid >>> 0, _realmFrameId)).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -7680,7 +7690,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      const metadata = JSON.parse(op(this._nid >>> 0, true, _realmFrameId));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
@@ -13617,6 +13627,12 @@ globalThis.atob = globalThis.atob || ((s) => {
 (() => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
+  let dirty = false;
+  let syncedLength = 1;
+  let truncateForward = false;
+  let changedStart = Infinity;
+  let changedEnd = 0;
+  const setPrototypeOf = Object.setPrototypeOf;
   // The page owns the tab's session history. `stack` covers only this
   // document's entries; entries before it and after the current one come
   // from the page, and a push drops the forward ones as the page will.
@@ -13627,18 +13643,19 @@ globalThis.atob = globalThis.atob || ((s) => {
         .split(",").map(Number);
       if (length > 0) {
         return {start, current, before: start,
-          after: forwardCleared ? 0 : Math.max(0, length - 1 - current)};
+          after: forwardCleared ? 0 : Math.max(0, length - start - stack.length)};
       }
     } catch (e) {}
     return {start: 0, current: 0, before: 0, after: 0};
   };
   const historyToken = Symbol("History");
   const resolveHistoryUrl = (url, method) => {
+    // A Location setter can preview a destination before the document commits.
+    const base = stack[idx].url ?? (_domParse("document_url") || "about:blank");
     // A missing url (pushState/replaceState called with < 3 args) keeps the
     // current document URL per the HTML spec; capture it so the entry does not
     // reset location back to the original document URL.
-    if (url === null || url === undefined) return __currentUrl();
-    const base = __currentUrl();
+    if (url === null || url === undefined) return base;
     let target;
     try {
       target = new URL(String(url), base);
@@ -13665,9 +13682,18 @@ globalThis.atob = globalThis.atob || ((s) => {
     }
     return target.href;
   };
-  const applyVirtual = () => {
+  const applyVirtual = (action) => {
     const entry = stack[idx];
     globalThis.__virtualUrl = entry.url ?? null;
+    dirty = true;
+    if (action !== 'traverse') {
+      if (idx < changedStart) changedStart = idx;
+      if (idx + 1 > changedEnd) changedEnd = idx + 1;
+    }
+    if (action === 'push') {
+      truncateForward = true;
+      if (changedEnd > stack.length) changedEnd = stack.length;
+    }
   };
   // Same-document fragment navigation, reached from the Location setters and
   // `<a href="#x">` activation. Per the HTML spec it adds a history entry
@@ -13685,7 +13711,7 @@ globalThis.atob = globalThis.atob || ((s) => {
         idx = stack.length - 1;
         forwardCleared = true;
       }
-      applyVirtual();
+      applyVirtual(replace ? 'replace' : 'push');
       setTimeout(() => {
         const ev = new HashChangeEvent('hashchange');
         ev.oldURL = prevUrl; ev.newURL = url;
@@ -13731,14 +13757,14 @@ globalThis.atob = globalThis.atob || ((s) => {
       stack.push({state: state ?? null, url: resolved});
       idx = stack.length - 1;
       forwardCleared = true;
-      applyVirtual();
+      applyVirtual('push');
       fireHashChangeIfNeeded(prevUrl);
     }
     replaceState(state, _title, url) {
       const prevUrl = __currentUrl();
       const resolved = resolveHistoryUrl(url, 'replaceState');
       stack[idx] = {state: state ?? null, url: resolved};
-      applyVirtual();
+      applyVirtual('replace');
       fireHashChangeIfNeeded(prevUrl);
     }
     go(n) {
@@ -13747,18 +13773,18 @@ globalThis.atob = globalThis.atob || ((s) => {
       const target = idx + n;
       if (target < 0 || target >= stack.length) {
         // Another document's entry: the page loads it and moves its cursor.
-        const {start, current, before, after} = session();
+        const {start, before, after} = session();
         if (target < 0 && -target <= before) {
           __obscuraCore.ops.op_history_traverse(start + target, _realmFrameId);
         } else if (target >= stack.length && target - (stack.length - 1) <= after) {
-          __obscuraCore.ops.op_history_traverse(current + target - (stack.length - 1), _realmFrameId);
+          __obscuraCore.ops.op_history_traverse(start + target, _realmFrameId);
         }
         return;
       }
       const next = target;
       const prevUrl = __currentUrl();
       idx = next;
-      applyVirtual();
+      applyVirtual('traverse');
       // Real Chrome fires popstate on back/forward with the destination entry's state.
       try {
         const ev = new PopStateEvent('popstate', {state: stack[idx].state});
@@ -13769,6 +13795,39 @@ globalThis.atob = globalThis.atob || ((s) => {
     back() { this.go(-1); }
     forward() { this.go(1); }
   }
+  const traverse = History.prototype.go.bind(null);
+  Object.defineProperty(globalThis, '__obscuraHistory', {
+    writable: false, configurable: false,
+    value: Object.freeze({
+      take() {
+        if (!dirty) return null;
+        const urls = setPrototypeOf([], null);
+        const first = changedEnd ? changedStart : syncedLength;
+        for (let i = first; i < changedEnd; i++) urls[i - first] = stack[i].url ?? _domParse('document_url');
+        const url = stack[idx].url ?? _domParse('document_url');
+        const result = [url, idx, syncedLength, truncateForward, first, urls];
+        syncedLength = stack.length;
+        dirty = false; truncateForward = false;
+        changedStart = Infinity; changedEnd = 0;
+        return result;
+      },
+      traverse(index, url) {
+        const target = index - session().start;
+        if (target < 0 || target >= stack.length || target === idx) return false;
+        if ((stack[target].url ?? _domParse('document_url')) !== url) return false;
+        traverse(target - idx);
+        return true;
+      },
+      reset(url) {
+        const entry = {state: stack[idx].state, url};
+        stack.length = 1; stack[0] = entry; idx = 0;
+        dirty = false; syncedLength = 1;
+        truncateForward = false; forwardCleared = false;
+        changedStart = Infinity; changedEnd = 0;
+        globalThis.__virtualUrl = url;
+      },
+    }),
+  });
   Object.defineProperty(History.prototype, Symbol.toStringTag, {value: "History"});
   Object.defineProperty(globalThis, "History", {
     value: History, writable: true, configurable: true,
@@ -14865,7 +14924,11 @@ function _optionIndexGetter() {
 }
 Object.defineProperties(HTMLSelectElement.prototype, {
   length: {
-    get() { return _selectOptions(this).length; },
+    get() {
+      return this && _nodeCacheGet(this._nid) === this
+        ? _selectApply(_selectIndexedSnapshot, this, []).length
+        : _selectOptions(this).length;
+    },
     set(value) {
       _selectApply(_validateSelect, this, []);
       const length = +value >>> 0;
@@ -16927,7 +16990,7 @@ class _Canvas2D {
         this._buf.byteOffset,
         this._buf.byteLength,
       );
-      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
+      if (!register(this.canvas._nid, this._w, this._h, bytes, _realmFrameId)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
@@ -16938,7 +17001,7 @@ class _Canvas2D {
     queueMicrotask(() => {
       this._damageQueued = false;
       const damage = __obscuraCore.ops.op_canvas_paint_damage;
-      if (typeof damage === 'function') damage(this.canvas._nid);
+      if (typeof damage === 'function') damage(this.canvas._nid, _realmFrameId);
     });
   }
   _parseColor(css) {

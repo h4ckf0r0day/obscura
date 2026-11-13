@@ -2149,8 +2149,9 @@ fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
 }
 
 #[op2(fast)]
-fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_mark_started(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    // Resolve the calling frame's document (a frame's node ids are not the page's).
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -2166,8 +2167,9 @@ fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
 /// Atomically claim an executable script.  A false result means the node was
 /// created inert by an HTML-string API or has already been prepared once.
 #[op2(fast)]
-fn op_script_try_start(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    // Resolve the calling frame's document (a frame's node ids are not the page's).
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -8495,6 +8497,7 @@ fn op_canvas_register_surface(
     width: u32,
     height: u32,
     #[buffer] pixels: JsBuffer,
+    frame_id: u32,
 ) -> bool {
     const MAX_CANVAS_DIMENSION: u32 = 32_767;
     const MAX_CANVAS_PIXELS: usize = 67_108_864;
@@ -8513,7 +8516,7 @@ fn op_canvas_register_surface(
         return false;
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let mut state = shared.borrow_mut();
     let node = NodeId::new(nid);
     let is_canvas = state
@@ -8558,8 +8561,9 @@ fn op_canvas_register_surface(
 /// screencast/readiness without throwing away otherwise-valid layout.
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_canvas_paint_damage(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    // Resolve the calling frame's document (a frame's node ids are not the page's).
+    let shared = frame_state(state, frame_id);
     let mut state = shared.borrow_mut();
     let node = NodeId::new(nid);
     if !state.canvas_surfaces.contains_key(&node) {
@@ -9409,8 +9413,9 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool, frame_id: u32) -> String {
+    // Resolve the calling frame's document: a frame's node ids are not the page's.
+    let shared = frame_state(state, frame_id);
     let gs = shared.borrow();
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
@@ -9495,10 +9500,13 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
+async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id: u32) -> String {
+    // An async op cannot ask V8 which realm called it; the JS side passes its
+    // frame id. Without this, an <img> inside an iframe was looked up in the
+    // page's DOM, answered "stale" forever, and never fired load/error.
     let shared = {
         let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+        frame_state(&state, frame_id)
     };
     let node_id = NodeId::new(nid);
     let (

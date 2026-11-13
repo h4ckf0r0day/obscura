@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
 use obscura_js::ops::{OriginStorage, max_live_frames, NavigationTiming};
-use obscura_js::runtime::ObscuraJsRuntime;
+use obscura_js::runtime::{HistoryUpdate, ObscuraJsRuntime};
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
     ResourceType, Response, ResponseCallback,
@@ -612,6 +612,7 @@ fn rebase_css_urls(css: &str, base: &url::Url) -> String {
 /// Extract network-backed `url(...)` assets while respecting CSS comments and
 /// strings. Linked sheets have already been rebased before materialization;
 /// inline declarations are resolved against the document base here.
+#[cfg(any(feature = "render", test))]
 fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
     let mut urls = Vec::new();
     let mut index = 0usize;
@@ -704,6 +705,7 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
 ///
 /// Shared by the generic scan and the `@font-face` path so the two cannot
 /// disagree about quoting, fragments, `data:` or an unresolved `var()`.
+#[cfg(any(feature = "render", test))]
 fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
     let raw = raw.trim();
     let value = if raw.len() >= 2
@@ -742,6 +744,7 @@ fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
 ///
 /// A malformed block is left to the normal scanner, so this cannot swallow the
 /// rules that follow it.
+#[cfg(any(feature = "render", test))]
 fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)> {
     if !css.get(..10)?.eq_ignore_ascii_case("@font-face") {
         return None;
@@ -766,6 +769,7 @@ fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)
 
 /// Byte offset of the brace closing the block that `css` opens, or `None` when
 /// the block is unterminated. Braces inside strings do not count.
+#[cfg(any(feature = "render", test))]
 fn css_block_end(css: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
@@ -803,6 +807,7 @@ fn css_block_end(css: &str) -> Option<usize> {
 /// Value of the last declaration named `name` in a declaration block. Last
 /// rather than first, because that is what the cascade resolves to and what
 /// `obscura-render` reads.
+#[cfg(any(feature = "render", test))]
 fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
     let mut found = None;
     let mut start = 0usize;
@@ -848,6 +853,7 @@ fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// The `url(...)` values of one declaration, unquoted, in source order.
+#[cfg(any(feature = "render", test))]
 fn css_url_values(value: &str) -> Vec<&str> {
     let lower = value.to_ascii_lowercase();
     let mut out = Vec::new();
@@ -877,6 +883,7 @@ fn css_url_values(value: &str) -> Vec<&str> {
 
 /// Whether the renderer can decode a font source, by the same extension rule
 /// `obscura-render` applies before it will even consider one.
+#[cfg(any(feature = "render", test))]
 fn font_source_is_decodable(src: &str) -> bool {
     let path = src
         .split(['?', '#'])
@@ -890,6 +897,7 @@ fn font_source_is_decodable(src: &str) -> bool {
 /// terminating semicolon. Semicolons inside quoted URLs, comments, or `url()`
 /// parentheses do not end the rule. A malformed import is left to the normal
 /// scanner so this helper cannot swallow following declarations.
+#[cfg(any(feature = "render", test))]
 fn css_import_rule_len(css: &str) -> Option<usize> {
     let prefix = css.get(..7)?;
     if !prefix.eq_ignore_ascii_case("@import") {
@@ -941,6 +949,7 @@ fn css_import_rule_len(css: &str) -> Option<usize> {
     None
 }
 
+#[cfg(any(feature = "render", test))]
 fn render_resource_is_font(url: &url::Url) -> bool {
     let path = url.path().to_ascii_lowercase();
     [".woff", ".woff2", ".ttf", ".otf", ".eot"]
@@ -2462,6 +2471,16 @@ impl Page {
                                 }
                                 _ => continue,
                             };
+                            // HTML "prepare the script element": a classic
+                            // script with `nomodule` does not run in a browser
+                            // that supports module scripts. Sites ship a modern
+                            // module build beside a nomodule legacy build;
+                            // running both mixes their webpack runtimes.
+                            if matches!(kind, ScriptKind::Classic)
+                                && node.get_attribute("nomodule").is_some()
+                            {
+                                continue;
+                            }
 
                             let inline_code = if src.is_none() {
                                 dom.text_content(sid)
@@ -3362,6 +3381,37 @@ impl Page {
         self.push_history_entry(url, false);
     }
 
+    pub(crate) fn apply_history_update(&mut self, update: HistoryUpdate) {
+        let HistoryUpdate::Entries { start, index, old_length, truncate_forward, first, urls, .. } = update else { return; };
+        let Some(end) = first.checked_add(urls.len()) else { return; };
+        let length = if truncate_forward { end } else { old_length };
+        if first > old_length || index >= length || (!truncate_forward && end > old_length) { return; }
+        let current_url = self.url_string();
+        if urls.iter().any(|url| cross_scheme_to_file(&current_url, url)) { return; }
+        if self.history.is_empty() && start == 0 {
+            self.history.push(current_url);
+        }
+        let Some(document_end) = start.checked_add(old_length).filter(|&end| end <= self.history.len()) else { return; };
+        let Some(changed_end) = start.checked_add(end) else { return; };
+        self.history.splice(start + first..changed_end.min(document_end), urls);
+        self.document_history_start = start;
+        self.history_index = start + index;
+        if truncate_forward {
+            self.history.truncate(start + length);
+        }
+    }
+
+    /// Traverse an entry belonging to the live document without replacing its runtime.
+    pub fn traverse_same_document_history(&mut self, index: usize) -> bool {
+        self.sync_history_updates();
+        let Some(url) = self.history.get(index) else { return false; };
+        let expression = format!("globalThis.__obscuraHistory.traverse({}, {})", index,
+            serde_json::to_string(url).unwrap_or_default());
+        if self.evaluate(&expression) != serde_json::json!(true) { return false; }
+        self.sync_virtual_url();
+        true
+    }
+
     fn push_history_entry(&mut self, url: String, new_document: bool) {
         if url.is_empty() {
             return;
@@ -3394,6 +3444,13 @@ impl Page {
         self.history = history;
         self.history_index = index;
         self.document_history_start = index;
+        if self.history.is_empty() {
+            let url = self.url_string();
+            if let Some(js) = self.js.as_mut() {
+                let _ = js.execute_script("<reset-history>", &format!(
+                    "globalThis.__obscuraHistory.reset({})", serde_json::to_string(&url).unwrap_or_default()));
+            }
+        }
         self.sync_js_session_history();
     }
 
@@ -3445,6 +3502,7 @@ impl Page {
         initial_referrer: &str,
         initial_initiator: Option<&Url>,
     ) -> Result<(), PageError> {
+        self.sync_history_updates();
         // file:// is a local file read. Every client route (CLI, CDP's
         // Page.navigate/reload/history and Target.createTarget, the MCP
         // tools) ends up here, so the context's opt-in is enforced once
@@ -3658,6 +3716,21 @@ impl Page {
         }
         if !response.redirected_from.is_empty() {
             self.url = Some(response.url.clone());
+        }
+
+        // An HTTP error status with no body at all (a bare 429/403/503 from a
+        // rate limiter or WAF) is not a document. Chrome fails that navigation
+        // with net::ERR_HTTP_RESPONSE_CODE_FAILURE and shows its own error
+        // page, so Page.navigate / page.goto reject. Parsing the empty body
+        // instead commits `<html><head></head><body></body></html>` as a
+        // successful load and the block looks like an empty site. An error
+        // status that carries a body (a real 404 page) still renders.
+        if response.status >= 400 && response.body.is_empty() {
+            self.lifecycle = LifecycleState::Failed;
+            return Err(PageError::NetworkError(format!(
+                "net::ERR_HTTP_RESPONSE_CODE_FAILURE: HTTP {} with an empty body for {}",
+                response.status, response.url
+            )));
         }
 
         // Honor the response charset: HTTP Content-Type → <meta charset> sniff
@@ -5194,6 +5267,7 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
+        self.sync_history_updates();
         let initiator = self.url.clone();
         let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
@@ -5259,7 +5333,7 @@ mod tests {
         register_linked_stylesheet_script, script_response_is_executable, split_css_imports,
         stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
         LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
-        Page, BrowserContext, LifecycleState, BASE64,
+        Page, BrowserContext, LifecycleState, HistoryUpdate, BASE64,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
@@ -6266,6 +6340,55 @@ mod tests {
         }
     }
 
+    // A bare HTTP error (rate limiter, WAF) with no body must fail the
+    // navigation like Chrome's net::ERR_HTTP_RESPONSE_CODE_FAILURE instead of
+    // committing an empty document; an error status with a body still renders.
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_body_http_error_fails_navigation_but_error_page_renders() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let response = if request.starts_with("GET /blocked ") {
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    let body = "<html><body><h1>Not here</h1></body></html>";
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "empty-http-error".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("empty-http-error".to_string(), context);
+        let error = page
+            .navigate(&format!("http://{address}/blocked"))
+            .await
+            .expect_err("an empty 429 must not become an empty document");
+        assert!(error.to_string().contains("ERR_HTTP_RESPONSE_CODE_FAILURE"), "{error}");
+        assert!(error.to_string().contains("429"), "{error}");
+        assert_eq!(page.lifecycle, crate::LifecycleState::Failed);
+
+        page.navigate(&format!("http://{address}/missing")).await.unwrap();
+        let heading = page.evaluate("document.querySelector('h1').textContent");
+        assert_eq!(heading.as_str(), Some("Not here"));
+    }
+
     // #1231: a text/plain or text/markdown response is a plain-text document.
     // Parsing it as HTML turned every <word> in the body into an element and
     // dropped its text, and document.contentType reported text/html.
@@ -6574,6 +6697,158 @@ mod tests {
         assert_eq!(page.url_string(), two);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_keeps_entries_when_the_cursor_moves() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-cursor");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { globalThis.marker=42; history.pushState({n:1}, '', '#one'); history.pushState({n:2}, '', '#two'); })()");
+        page.sync_virtual_url();
+        let entries = vec![url.to_string(), format!("{url}#one"), format!("{url}#two")];
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("history.back()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("[marker, history.state.n, history.length]"), serde_json::json!([42, 1, 3]));
+        page.evaluate("history.replaceState({n:3}, '', '#replaced')");
+        page.sync_virtual_url();
+        assert_eq!(page.history.len(), 3);
+        assert_eq!(page.history[1], format!("{url}#replaced"));
+        page.evaluate("history.forward()");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 2);
+        assert_eq!(page.evaluate("history.state.n"), serde_json::json!(2.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_keeps_distinct_entries_with_the_same_url() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-same-url");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState({n:1}, ''); history.pushState({n:2}, ''); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(); 3]);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("history.back()");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("history.state.n"), serde_json::json!(1.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_sync_ignores_authored_json_serialization() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-json-override");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState({n:1}, '', '#one'); JSON.stringify=()=> '\"forged\"'; Array.prototype.toJSON=()=> 'forged'; })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.url_string(), format!("{url}#one"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_keeps_native_document_position_when_authors_patch_array_map() {
+        let one = "data:text/html,<title>one</title>";
+        let two = "data:text/html,<title>two</title>";
+        let mut page = page_without_chain_limit("history-native-position");
+        page.navigate(one).await.unwrap();
+        page.navigate(two).await.unwrap();
+        page.evaluate("(() => { const map=Array.prototype.map; Array.prototype.map=function(...args){if(this.length===3 && this.every(v=>typeof v==='string' && /^\\d+$/.test(v)))throw new Error('authored map');return Reflect.apply(map,this,args);}; history.pushState(1,'','#one'); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![one.to_string(), two.to_string(), format!("{two}#one")]);
+        assert_eq!(page.history_index, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_metadata_is_bounded_by_entries() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-metadata");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { for(let i=0;i<10000;i++) history.replaceState(i, '', '#'+i); })()");
+        let update = page.js.as_mut().unwrap().take_history_update().unwrap();
+        assert!(matches!(update, HistoryUpdate::Entries { urls, .. }
+            if urls.len() == 1 && urls[0].len() < 512), "one entry must not retain a mutation log");
+        page.evaluate("history.replaceState(null, '', '#last')");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![format!("{url}#last")]);
+        assert_eq!(page.history_index, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_does_not_transfer_unchanged_entries() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-incremental-sync");
+        page.navigate(url).await.unwrap();
+        for index in 0..1000 {
+            page.evaluate(&format!("history.pushState({index}, '', '#{index}')"));
+            page.sync_virtual_url();
+        }
+        page.evaluate("history.replaceState(null, '', '#last')");
+        let update = page.js.as_mut().unwrap().take_history_update().unwrap();
+        assert!(matches!(update, HistoryUpdate::Entries { urls, .. }
+            if urls.len() == 1 && urls[0].len() < 512), "one changed entry must not transfer the unchanged history");
+        page.evaluate("history.replaceState(null, '', '#verified')");
+        page.sync_virtual_url();
+        assert_eq!(page.history.len(), 1001);
+        assert_eq!(page.history[0], url);
+        assert_eq!(page.history[1000], format!("{url}#verified"));
+        page.evaluate("history.go(-500)");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 500);
+        assert_eq!(page.url_string(), format!("{url}#499"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_keeps_only_surviving_batched_changes() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-batched-changes");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState(1, '', '#one'); history.pushState(2, '', '#two'); history.pushState(3, '', '#three'); })()");
+        page.sync_virtual_url();
+        page.evaluate("(() => { history.replaceState(4, '', '#discarded'); history.go(-2); history.pushState(5, '', '#last'); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one"), format!("{url}#last")]);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("(() => { history.back(); history.replaceState(6, '', '#changed'); history.forward(); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#changed"), format!("{url}#last")]);
+        assert_eq!(page.history_index, 2);
+        assert_eq!(page.url_string(), format!("{url}#last"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_does_not_commit_a_pending_location_navigation() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-location-preview");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState(1, '', '#one'); location.href='https://example.org/next'; })()");
+        page.sync_history_updates();
+        assert_eq!(page.url_string(), format!("{url}#one"));
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_urls_keep_the_committed_origin_during_pending_navigation() {
+        let mut page = import_map_test_page("history-committed-origin", "http://example.com/current", "<title>history</title>");
+        let result = page.evaluate("(() => { location.href='https://other.example/next'; let error=null; try { history.pushState({}, '', 'https://other.example/spoof'); } catch(e) { error=e.name; } history.pushState({n:1}, '', '/kept'); location.href='https://other.example/again'; history.replaceState({n:2}, ''); return {error,href:location.href,state:history.state}; })()");
+        assert_eq!(result, serde_json::json!({"error":"SecurityError","href":"http://example.com/kept","state":{"n":2}}));
+        page.sync_history_updates();
+        assert_eq!(page.url_string(), "http://example.com/kept");
+        assert!(page.history.iter().all(|url| url.starts_with("http://example.com/")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_rejects_non_url_page_values() {
+        let mut page = page_without_chain_limit("history-url-type");
+        page.navigate("data:text/html,<title>history</title>").await.unwrap();
+        page.evaluate("globalThis.__virtualUrl = new Array(100000)");
+        assert!(matches!(page.js.as_mut().unwrap().take_history_update().unwrap(),
+            HistoryUpdate::Url(url) if url.is_empty()));
+    }
+
     /// Same-document entries sit between the documents: a push drops the
     /// forward documents, and back() past the document's own entries loads
     /// the previous document.
@@ -6597,7 +6872,8 @@ mod tests {
         page.evaluate("history.go(-2)");
         assert!(!page.process_pending_navigation().await.unwrap());
         page.evaluate("history.back()");
-        assert!(!page.process_pending_navigation().await.unwrap());
+        assert!(page.process_pending_navigation().await.unwrap());
+        assert_eq!(page.url_string(), one);
         assert_eq!(page.evaluate("location.hash"), serde_json::json!(""));
     }
 
@@ -7830,6 +8106,43 @@ mod tests {
         assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
     }
 
+    /// A child realm's node ids index its own document. Native ops that
+    /// resolved the page's document instead left a frame's `<img>` without a
+    /// load or error event, returned a null 2D context for a frame's canvas,
+    /// and silently dropped every script that frame code inserted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_realm_node_ops_resolve_the_frame_document() {
+        let mut page = import_map_test_page("frame-node-ops", "https://parent.test",
+            "<body><p>parent</p></body>");
+        page.evaluate_script(r#"(() => {
+            const frame = document.createElement('iframe'); frame.id = 'child';
+            frame.srcdoc = `<body><script>
+                globalThis.results = {};
+                const ctx = document.createElement('canvas').getContext('2d');
+                results.canvas = ctx ? 'context' : 'null';
+                const inserted = document.createElement('script');
+                inserted.textContent = 'results.script = "ran"';
+                document.head.appendChild(inserted);
+                const image = new Image();
+                image.onload = () => { results.image = 'load'; };
+                image.onerror = () => { results.image = 'error'; };
+                image.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+            <\/script></body>`;
+            document.body.appendChild(frame);
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        let mut value = serde_json::Value::Null;
+        for _ in 0..20 {
+            value = page.evaluate_script(
+                "JSON.stringify(document.getElementById('child').contentWindow.results)").unwrap();
+            if value.as_str().is_some_and(|json| json.contains("image")) { break; }
+            page.js.as_mut().unwrap().run_event_loop_bounded(20).await.unwrap();
+        }
+        let results: serde_json::Value = serde_json::from_str(value.as_str().unwrap()).unwrap();
+        assert_eq!(results, serde_json::json!({"canvas": "context", "script": "ran", "image": "load"}));
+    }
+
     /// A page script can call a frame's own Location methods (lazy-load
     /// scripts do `iframe.contentWindow.location.replace(src)`). The running
     /// context is then the page's, so the navigation was queued on the top
@@ -8729,6 +9042,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value, Some(serde_json::json!(2.0)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nomodule_classic_scripts_do_not_run() {
+        let mut page = import_map_test_page(
+            "nomodule",
+            "http://127.0.0.1:9",
+            r#"<html><head>
+                <script>globalThis.__ran = ['classic'];</script>
+                <script nomodule>globalThis.__ran.push('nomodule-inline');</script>
+                <script type="module">globalThis.__ran.push('module');</script>
+                <script nomodule type="text/javascript">globalThis.__ran.push('nomodule-typed');</script>
+                <script>
+                  const dynamic = document.createElement('script');
+                  dynamic.setAttribute('nomodule', '');
+                  dynamic.textContent = "globalThis.__ran.push('nomodule-dynamic')";
+                  document.head.appendChild(dynamic);
+                  const plain = document.createElement('script');
+                  plain.textContent = "globalThis.__ran.push('dynamic')";
+                  document.head.appendChild(plain);
+                </script>
+            </head><body></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(None).await;
+        let ran = page.js.as_mut().unwrap().evaluate("globalThis.__ran").unwrap();
+        assert_eq!(ran, serde_json::json!(["classic", "dynamic", "module"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_xmlns_attribute_has_no_prefix() {
+        let mut page = import_map_test_page(
+            "xmlns",
+            "http://127.0.0.1:9",
+            r#"<html><body><div id=w><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg></div></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(None).await;
+        let result = page.js.as_mut().unwrap().evaluate(r#"(() => {
+            const attr = document.querySelector('svg').attributes[0];
+            return [attr.name, attr.localName, attr.prefix, attr.namespaceURI,
+                document.getElementById('w').innerHTML,
+                document.querySelector('svg').getAttribute('xmlns')];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "xmlns", "xmlns", null, "http://www.w3.org/2000/xmlns/",
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>"#,
+            "http://www.w3.org/2000/svg"
+        ]));
     }
 
     fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {

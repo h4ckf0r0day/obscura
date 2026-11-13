@@ -7689,19 +7689,6 @@ fn fetch_bytes_with_kind(
     cache.get_or_load(&resolved, is_font)
 }
 
-fn fetch_profiled_image_bytes(
-    src: &str,
-    base_url: Option<&str>,
-    cache: &mut RenderResourceCache,
-    profile: ImageRequestProfile,
-) -> Option<Arc<[u8]>> {
-    if src.starts_with("data:") {
-        return fetch_bytes(src, base_url, cache);
-    }
-    let resolved = resolve_resource_url(src, base_url)?;
-    cache.get_or_load_image(&resolved, profile)
-}
-
 fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
     if src.starts_with("data:") {
         return Some(src.to_string());

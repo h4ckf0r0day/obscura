@@ -212,6 +212,21 @@ pub struct AccessibilityStyle {
     pub visibility_hidden: Option<bool>,
 }
 
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum HistoryUpdate {
+    Url(String),
+    Entries {
+        url: String,
+        start: usize,
+        index: usize,
+        old_length: usize,
+        truncate_forward: bool,
+        first: usize,
+        urls: Vec<String>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     /// True when this object is a value that was thrown or that a promise
@@ -2709,6 +2724,30 @@ impl ObscuraJsRuntime {
         self.v8_to_json(result)
     }
 
+    /// Read host history metadata without invoking author-defined JSON hooks.
+    pub fn take_history_update(&mut self) -> Result<HistoryUpdate, String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
+        self.begin_javascript_task();
+        let result = self.execute_runtime_script("<history-update>",
+            "(() => { const update = globalThis.__obscuraHistory.take(); if (update) return update; const url = globalThis.__virtualUrl; return typeof url === 'string' ? url : ''; })()".to_owned())?;
+        let document_start = self.state.borrow().session_history.document_start;
+        let mut entered = self.runtime();
+        let context = entered.main_context();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        let value = v8::Local::new(scope, result);
+        if value.is_string() {
+            return Ok(HistoryUpdate::Url(value.to_rust_string_lossy(scope)));
+        }
+        let update: (String, usize, usize, bool, usize, Vec<String>) =
+            deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string())?;
+        Ok(HistoryUpdate::Entries {
+            url: update.0, start: document_start, index: update.1,
+            old_length: update.2, truncate_forward: update.3,
+            first: update.4, urls: update.5,
+        })
+    }
+
     pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
@@ -5171,6 +5210,55 @@ mod tests {
             "initial":[4,["first","second","third","outer"],[0,1,2,0,0,3,0],"first",0,true,true],
             "chosen":[true,true,"third",2], "moved":[1,3], "liveRows":"function",
         }));
+    }
+
+    #[test]
+    fn select_length_snapshot_stays_live_and_private() {
+        let mut rt = setup_runtime("<html><body><select id='s'><option>A</option><optgroup><option>B</option></optgroup></select><select id='other'></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.getElementById('s');
+            const other = document.getElementById('other');
+            const counts = [select.length, select.length];
+            const exposed = select.options;
+            exposed.length = 0;
+            counts.push(select.length);
+            other.append(select.item(0));
+            counts.push(select.length, other.length);
+            const group = select.querySelector('optgroup');
+            group.append(new Option('C'));
+            counts.push(select.length);
+            group.replaceWith(new Option('D'));
+            counts.push(select.length);
+            const nested = document.createElement('select');
+            nested.append(new Option('hidden'));
+            select.append(nested);
+            const datalist = document.createElement('datalist');
+            datalist.append(new Option('suggested'));
+            select.append(datalist);
+            counts.push(select.length);
+            select.innerHTML = '<option>E</option><option>F</option>';
+            counts.push(select.length, select[1].text);
+            select.length = 0;
+            counts.push(select.length, select[0] === undefined);
+            select.remove();
+            select.append(new Option('detached'));
+            counts.push(select.length, select[0].text);
+            return counts;
+        })()"#).unwrap(), serde_json::json!([2,2,2,1,1,2,1,1,2,"F",0,true,1,"detached"]));
+    }
+
+    #[test]
+    fn select_length_snapshot_observes_native_dom_mutations() {
+        let mut rt = setup_runtime("<html><body><select id='s'><option>A</option><option id='b'>B</option></select></body></html>");
+        assert_eq!(rt.evaluate("(() => { globalThis.savedSelect = document.getElementById('s'); return savedSelect.length; })()")
+            .unwrap(), serde_json::json!(2.0));
+        {
+            let state = rt.state.borrow();
+            let dom = state.dom.as_ref().unwrap();
+            dom.remove_child(dom.query_selector("#b").unwrap().unwrap());
+        }
+        assert_eq!(rt.evaluate("[savedSelect.length, savedSelect[1] === undefined]").unwrap(),
+            serde_json::json!([1,true]));
     }
 
     #[test]
@@ -9334,6 +9422,39 @@ mod tests {
                 ],
                 "recordType": ["function", true, 0],
                 "options": ["TypeError", "TypeError"]
+            })
+        );
+    }
+
+    #[test]
+    fn constructed_document_fragment_keeps_its_identity_as_parent() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const check = (fragment) => {
+                    const child = document.createElement("div");
+                    fragment.appendChild(child);
+                    const scratch = document.createElement("span");
+                    document.body.appendChild(scratch);
+                    scratch.remove();
+                    const parent = child.parentNode;
+                    let removed;
+                    try { fragment.removeChild(child); removed = "ok"; } catch (error) { removed = error.name; }
+                    return [parent === fragment, parent && parent.nodeType, removed, child.parentNode];
+                };
+                return {
+                    constructed: check(new DocumentFragment()),
+                    created: check(document.createDocumentFragment())
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructed": [true, 11, "ok", null],
+                "created": [true, 11, "ok", null]
             })
         );
     }
@@ -25527,6 +25648,27 @@ mod tests {
             v,
             serde_json::json!("TypeError|TypeError|123:string|null|7|click|\"\"")
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn closed_dialog_ua_visibility_tracks_open_mutations_in_retained_styles() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>dialog{width:80px;height:30px}</style>
+            <dialog id=target><div>hidden content</div></dialog>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const dialog = document.getElementById('target');
+            const style = getComputedStyle(dialog);
+            const read = () => [style.display, dialog.getBoundingClientRect().height];
+            const result = [read()];
+            dialog.show(); result.push(read());
+            dialog.close(); result.push(read());
+            dialog.open = true; result.push(read());
+            dialog.removeAttribute('open'); result.push(read());
+            dialog.style.display = 'block'; result.push(read());
+            return result;
+        })()"#).unwrap(), serde_json::json!([
+            ["none",0],["block",30],["none",0],["block",30],["none",0],["block",30]
+        ]));
     }
 
     #[test]

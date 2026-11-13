@@ -180,7 +180,7 @@ impl TreeSink for DomTree {
         let converted_attrs: Vec<Attribute> = attrs
             .into_iter()
             .map(|a| Attribute {
-                name: a.name,
+                name: adjusted_attribute_name(a.name),
                 value: a.value.to_string(),
             })
             .collect();
@@ -274,10 +274,11 @@ impl TreeSink for DomTree {
         self.with_node_mut(*target, |node| {
             if let NodeData::Element { attrs: existing, .. } = &mut node.data {
                 for attr in attrs {
-                    let dominated = existing.iter().any(|a| a.name == attr.name);
+                    let name = adjusted_attribute_name(attr.name);
+                    let dominated = existing.iter().any(|a| a.name == name);
                     if !dominated {
                         existing.push(Attribute {
-                            name: attr.name,
+                            name,
                             value: attr.value.to_string(),
                         });
                     }
@@ -853,4 +854,35 @@ mod tests {
             ShadowRootMode::Closed
         );
     }
+
+    #[test]
+    fn foreign_xmlns_attribute_has_no_prefix() {
+        let tree = parse_html(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"></svg><math xmlns="http://www.w3.org/1998/Math/MathML"></math>"#,
+        );
+        for selector in ["svg", "math"] {
+            let el = tree.query_selector(selector).unwrap().unwrap();
+            let attr = tree
+                .with_node(el, |node| node.attrs().unwrap()[0].clone())
+                .unwrap();
+            assert_eq!(attr.name.prefix, None, "{selector}");
+            assert_eq!(attr.name.ns, ns!(xmlns), "{selector}");
+            assert_eq!(attr.qualified_name(), "xmlns", "{selector}");
+        }
+        let svg = tree.query_selector("svg").unwrap().unwrap();
+        let xlink = tree
+            .with_node(svg, |node| node.attrs().unwrap()[1].qualified_name())
+            .unwrap();
+        assert_eq!(xlink, "xmlns:xlink");
+    }
+}
+
+/// html5ever's foreign-attribute table maps `xmlns` to an empty prefix
+/// (`qualname!("" xmlns "xmlns")`). HTML "adjust foreign attributes" gives it
+/// no prefix; an empty one makes the attribute's name `:xmlns`.
+fn adjusted_attribute_name(mut name: QualName) -> QualName {
+    if name.prefix.as_ref().is_some_and(|prefix| prefix.is_empty()) {
+        name.prefix = None;
+    }
+    name
 }
