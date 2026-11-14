@@ -8467,7 +8467,32 @@ globalThis.navigator = {
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
-  sendBeacon() { return true; },
+  // Queue a POST to `url` with `data` (Beacon spec): credentials included,
+  // sent as a keepalive fetch, after the current task. Returns false when the
+  // body exceeds the 64 KiB keepalive quota.
+  sendBeacon(url, data) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'sendBeacon' on 'Navigator': 1 argument required, but only 0 present.");
+    }
+    let target;
+    try { target = new URL(String(url), document.baseURI); } catch (e) {
+      throw new TypeError("Failed to execute 'sendBeacon' on 'Navigator': The URL provided ('" + url + "') is invalid.");
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      throw new TypeError("Failed to execute 'sendBeacon' on 'Navigator': Beacons are only supported over HTTP(S).");
+    }
+    let size = 0;
+    if (data == null) data = undefined;
+    else if (typeof data === 'string') size = new TextEncoder().encode(data).length;
+    else if (typeof Blob !== 'undefined' && data instanceof Blob) size = data.size;
+    else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) size = data.byteLength;
+    else if (typeof URLSearchParams !== 'undefined' && data instanceof URLSearchParams) size = data.toString().length;
+    else if (typeof FormData === 'undefined' || !(data instanceof FormData)) { data = String(data); size = new TextEncoder().encode(data).length; }
+    if (size > 65536) return false;
+    const init = { method: 'POST', body: data, credentials: 'include', mode: 'no-cors', keepalive: true };
+    Promise.resolve().then(() => _fetch(target.href, init, 'Ping')).catch(() => {});
+    return true;
+  },
   javaEnabled() { return false; },
   geolocation: {
     getCurrentPosition(success, error) {
