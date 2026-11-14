@@ -928,6 +928,8 @@ fn run_connection(
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
             let (io_stop_tx, io_stop_rx) = tokio::sync::oneshot::channel::<()>();
             let (io_done_tx, io_done_rx) = tokio::sync::oneshot::channel::<()>();
+            // Page script runs on this thread; the socket thread interrupts it.
+            let connection_thread = std::thread::current().id();
             let io_thread = match std::thread::Builder::new()
                 .name("obscura-cdp-io".into())
                 .spawn(move || {
@@ -952,7 +954,7 @@ fn run_connection(
                             }
                         };
                         tokio::select! {
-                            result = handle_connection_ws(stream, msg_tx) => {
+                            result = handle_connection_ws(stream, msg_tx, connection_thread) => {
                                 if let Err(error) = result {
                                     error!("WebSocket connection error: {error}");
                                 }
@@ -2386,6 +2388,26 @@ fn decode_base64_bytes(input: &str) -> Result<Vec<u8>, String> {
     BASE64.decode(input).map_err(|error| error.to_string())
 }
 
+/// `Runtime.terminateExecution`, answered on the socket thread. Synchronous
+/// page script holds the connection thread, so a command queued behind it
+/// would wait for the script to end. This fires the V8 watchdogs the
+/// connection thread has armed: the running script (a parser script, a task
+/// in the event loop or a `Runtime.evaluate`) unwinds the way it does at its
+/// deadline, and queued commands are then served. A no-op when no script runs.
+fn terminate_execution_response(text: &str, connection_thread: std::thread::ThreadId) -> Option<String> {
+    if !text.contains("Runtime.terminateExecution") {
+        return None;
+    }
+    let req: CdpRequest = serde_json::from_str(text).ok()?;
+    if req.method != "Runtime.terminateExecution" {
+        return None;
+    }
+    let fired = obscura_js::cdp_watchdog::interrupt_thread(connection_thread);
+    tracing::info!(fired, "Runtime.terminateExecution");
+    let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
+    serde_json::to_string(&resp).ok()
+}
+
 fn fast_path_response(text: &str) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
@@ -2427,6 +2449,7 @@ fn fast_path_response(text: &str) -> Option<String> {
 async fn handle_connection_ws(
     stream: TcpStream,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
+    connection_thread: std::thread::ThreadId,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -2482,7 +2505,9 @@ async fn handle_connection_ws(
                     break;
                 }
 
-                if let Some(resp) = fast_path_response(&text) {
+                if let Some(resp) = terminate_execution_response(&text, connection_thread) {
+                    let _ = reply_tx.send(resp);
+                } else if let Some(resp) = fast_path_response(&text) {
                     let _ = reply_tx.send(resp);
                 } else {
                     let _ = msg_tx.send(ServerMessage::Cdp(CdpMessage {

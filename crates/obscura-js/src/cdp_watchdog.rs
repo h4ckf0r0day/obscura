@@ -23,6 +23,9 @@ struct Slot {
     deadline: Instant,
     handle: IsolateHandle,
     fired: Arc<AtomicBool>,
+    // The thread that armed the slot: the connection thread running the
+    // isolate. `interrupt_thread` fires every slot one connection owns.
+    owner: std::thread::ThreadId,
 }
 
 struct Shared {
@@ -103,10 +106,36 @@ pub fn arm(handle: IsolateHandle, budget: Duration) -> Armed {
             deadline: Instant::now() + budget,
             handle,
             fired: fired.clone(),
+            owner: std::thread::current().id(),
         },
     );
     s.cv.notify_one();
     Armed { gen, fired }
+}
+
+/// Fire, now, every armed slot that `owner` armed, as if each had reached its
+/// deadline: the isolate running on that thread is terminated and the owner's
+/// `disarm` reports `fired`, so it clears the termination flag the same way.
+/// Called from a connection's socket thread for `Runtime.terminateExecution`,
+/// which cannot reach the connection thread while synchronous script holds it.
+/// Returns how many slots fired; zero when no script was running.
+pub fn interrupt_thread(owner: std::thread::ThreadId) -> usize {
+    let s = shared();
+    let mut guard = s.state.lock().unwrap();
+    let owned: Vec<u64> = guard
+        .0
+        .iter()
+        .filter(|(_, slot)| slot.owner == owner)
+        .map(|(gen, _)| *gen)
+        .collect();
+    for gen in &owned {
+        if let Some(slot) = guard.0.remove(gen) {
+            slot.fired.store(true, Ordering::SeqCst);
+            slot.handle.terminate_execution();
+        }
+    }
+    s.cv.notify_one();
+    owned.len()
 }
 
 /// Disarm the command's watchdog. Returns true if it had already fired
