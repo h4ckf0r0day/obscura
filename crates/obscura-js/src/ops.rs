@@ -1117,9 +1117,31 @@ fn op_abort_signal_state<'s, 'i>(
     value: v8::Local<'s, v8::Value>,
     initial: v8::Local<'s, v8::Value>,
 ) -> v8::Local<'s, v8::Value> {
+    private_state(scope, "obscura.AbortSignal", value, initial)
+}
+
+// Each realm's Event.prototype carries that realm's event-state reader in a
+// private slot, so code in another realm (a frame dispatching on its parent's
+// nodes) can reach a foreign event's state and both see one target/phase.
+#[op2]
+fn op_event_state<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    value: v8::Local<'s, v8::Value>,
+    initial: v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    private_state(scope, "obscura.Event", value, initial)
+}
+
+// Reads (initial undefined) or sets the isolate-wide private slot `brand`.
+fn private_state<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    brand: &str,
+    value: v8::Local<'s, v8::Value>,
+    initial: v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
     let undefined = v8::undefined(scope).into();
     let Ok(object) = v8::Local::<v8::Object>::try_from(value) else { return undefined; };
-    let Some(name) = v8::String::new(scope, "obscura.AbortSignal") else { return undefined; };
+    let Some(name) = v8::String::new(scope, brand) else { return undefined; };
     let brand = v8::Private::for_api(scope, Some(name));
     if !initial.is_undefined() {
         if object.set_private(scope, brand, initial).unwrap_or(false) { initial } else { undefined }
@@ -8711,6 +8733,7 @@ pub fn build_extension() -> Extension {
         op_fetch_url(),
         op_fetch_cancel_handle(),
         op_abort_signal_state(),
+        op_event_state(),
         op_fetch_body(),
         op_get_cookies(),
         op_set_cookie(),
