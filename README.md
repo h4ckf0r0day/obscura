@@ -313,6 +313,26 @@ obscura scrape https://example.com --quiet --format json
 obscura --proxy http://127.0.0.1:8080 scrape https://example.com https://news.ycombinator.com
 ```
 
+## Desktop browser
+
+`obscura-gui` is a windowed browser on top of the engine: tabs, an address
+bar that also searches (DuckDuckGo Lite), back/forward/reload, link previews,
+and a persistent profile. It starts `obscura serve` on a free local port and
+drives it over CDP, showing the page through the screencast stream, so the
+window does not link V8 and builds in seconds.
+
+```bash
+cargo build --release -p obscura-cli --bins --features render   # the engine
+cargo build --release -p obscura-gui                            # the window
+./target/release/obscura-gui [url-or-search]
+```
+
+The window looks for `obscura` next to its own executable, then on `PATH`;
+`OBSCURA_BIN` overrides both. Cookies and localStorage persist in
+`%LOCALAPPDATA%\Obscura\Profile` (or `$XDG_DATA_HOME/Obscura/Profile`).
+Shortcuts: Ctrl+T, Ctrl+W, Ctrl+Shift+T, Ctrl+L, Ctrl+R/F5, Alt+Left/Right,
+Ctrl+Tab, Ctrl+1..9.
+
 ## Puppeteer / Playwright
 
 [Media preference emulation](docs/CDP-media.md) covers color-scheme and reduced-motion overrides.

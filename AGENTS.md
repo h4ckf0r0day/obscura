@@ -91,6 +91,10 @@ edit instead.
   `render` feature powers geometry, screenshots, CDP screencasting, and PDF.
 - **obscura-mcp** — stateful MCP automation tools. Render builds expose
   `browser_screenshot` and `browser_pdf`; streaming screencasts remain CDP-only.
+- **obscura-gui** — desktop browser window (egui). Launches `obscura serve` and
+  drives it over CDP (screencast frames in, input events out); it never links
+  V8, so `cargo build -p obscura-gui` is fast and needs a separately built
+  render-enabled `obscura` binary.
 - **obscura** — embeddable Rust library API (git dependency; builds V8 locally, not on crates.io). Public request-interception API on `Page`: `add_preload_script`, `enable_interception` (channel of `InterceptedRequest`, resolved with `InterceptResolution::{Continue, Fulfill, Fail}`), and passive `on_request` / `on_response`. `op_fetch_url` invokes these for JS `fetch()`/XHR, so when touching it keep a `Continue` URL rewrite behind `validate_fetch_url` (the SSRF gate, same as redirects).
 
 ## Conventions

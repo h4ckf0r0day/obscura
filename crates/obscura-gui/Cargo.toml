@@ -1,0 +1,25 @@
+[package]
+name = "obscura-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop browser window for the Obscura engine"
+
+# The GUI never links V8: it launches `obscura serve` and drives it over CDP,
+# so building it takes seconds and a page crash cannot take the window down.
+[[bin]]
+name = "obscura-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "accesskit", "wayland", "x11"] }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
+serde_json = { workspace = true }
+serde = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+anyhow = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

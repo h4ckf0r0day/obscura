@@ -623,9 +623,16 @@ fn parse_screencast_state(params: &Value, session_id: i64) -> Result<ScreencastS
 fn screencast_capture_region(
     viewport: (f32, f32),
     scroll: (f32, f32),
+    device_scale_factor: f32,
     state: &ScreencastState,
 ) -> (obscura_browser::CaptureRegion, (u32, u32)) {
-    let mut scale = 1.0_f64;
+    // Chromium streams screencast frames in device pixels, so an emulated
+    // HiDPI viewport yields a sharp frame instead of an upscaled 1x one.
+    let mut scale = if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
+        f64::from(device_scale_factor)
+    } else {
+        1.0
+    };
     if let Some(max_width) = state.max_width {
         scale = scale.min(f64::from(max_width) / f64::from(viewport.0));
     }
@@ -643,7 +650,27 @@ fn screencast_capture_region(
         viewport.1,
         1.0,
     );
-    if scale >= 1.0 || obscura_browser::validate_capture_region(native).is_ok() {
+    if scale > 1.0 {
+        let device = obscura_browser::CaptureRegion::with_output_size(
+            scroll.0,
+            scroll.1,
+            viewport.0,
+            viewport.1,
+            scale as f32,
+            output.0,
+            output.1,
+        );
+        if obscura_browser::validate_capture_region(device).is_ok() {
+            return (device, output);
+        }
+        // Too large to paint at device scale: degrade to a 1x frame.
+        let native_output = (
+            viewport.0.round().max(1.0) as u32,
+            viewport.1.round().max(1.0) as u32,
+        );
+        return (native, native_output);
+    }
+    if scale == 1.0 || obscura_browser::validate_capture_region(native).is_ok() {
         return (native, output);
     }
     let scaled = obscura_browser::CaptureRegion::with_output_size(
@@ -736,7 +763,8 @@ pub(crate) fn queue_screencast_frame(
         let animation_sample = page.live_animation_sample();
         let viewport = page.viewport;
         let scroll = page.screenshot_scroll_offset();
-        let (region, output) = screencast_capture_region(viewport, scroll, &state);
+        let (region, output) =
+            screencast_capture_region(viewport, scroll, page.device_scale_factor, &state);
         let raster = page
             .screenshot_region_raster_with_animation_sample(
                 region,
@@ -3558,14 +3586,40 @@ mod tests {
         )
         .expect("screencast state");
         let (region, output) =
-            screencast_capture_region((1280.0, 720.0), (0.0, 0.0), &state);
+            screencast_capture_region((1280.0, 720.0), (0.0, 0.0), 1.0, &state);
         assert_eq!(region.scale, 1.0);
         assert_eq!(output, (800, 450));
 
         let (oversized, output) =
-            screencast_capture_region((4097.0, 4097.0), (0.0, 0.0), &state);
+            screencast_capture_region((4097.0, 4097.0), (0.0, 0.0), 1.0, &state);
         assert!(oversized.scale < 1.0);
         assert_eq!(output, (450, 450));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screencast_capture_paints_at_the_device_scale_factor() {
+        let unbounded = parse_screencast_state(&json!({"format": "jpeg"}), 1)
+            .expect("screencast state");
+        let (region, output) =
+            screencast_capture_region((1280.0, 720.0), (0.0, 40.0), 1.5, &unbounded);
+        assert_eq!(region.scale, 1.5);
+        assert_eq!(region.y, 40.0);
+        assert_eq!(output, (1920, 1080));
+
+        // maxWidth still bounds the device-pixel frame.
+        let bounded = parse_screencast_state(&json!({"maxWidth": 1600}), 1)
+            .expect("screencast state");
+        let (region, output) =
+            screencast_capture_region((1280.0, 720.0), (0.0, 0.0), 2.0, &bounded);
+        assert_eq!(region.scale, 1.25);
+        assert_eq!(output, (1600, 900));
+
+        // A device-scale frame over the surface limit degrades to 1x.
+        let (region, output) =
+            screencast_capture_region((4000.0, 4000.0), (0.0, 0.0), 2.0, &unbounded);
+        assert_eq!(region.scale, 1.0);
+        assert_eq!(output, (4000, 4000));
     }
 
     #[cfg(feature = "render")]

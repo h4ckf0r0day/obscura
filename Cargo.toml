@@ -11,6 +11,7 @@ members = [
     "crates/obscura-render",
     "crates/obscura-cli",
     "crates/obscura",
+    "crates/obscura-gui",
 ]
 exclude = ["vendor/taffy", "vendor/cosmic-text", "vendor/wreq-util"]
 
