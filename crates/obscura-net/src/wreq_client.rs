@@ -16,8 +16,9 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
-    cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
+    cors_required, document_body_deadline, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_origin_header, request_referrer, response_too_large,
+    keeps_partial_body, note_body_truncated, BodyCut,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
     validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
     ResourceRequest, Response, SsrfGuardResolver,
@@ -134,6 +135,7 @@ async fn read_wreq_body_limited(
     response: wreq::Response,
     url: &Url,
     limit: usize,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     if response
         .headers()
@@ -153,10 +155,36 @@ async fn read_wreq_body_limited(
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
     let mut body = Vec::with_capacity(capacity);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
-        })?;
+    loop {
+        let next = match deadline {
+            Some(at) => match tokio::time::timeout_at(at, stream.next()).await {
+                Ok(next) => next,
+                Err(_) if !body.is_empty() => {
+                    note_body_truncated(url, body.len(), BodyCut::Deadline);
+                    break;
+                }
+                Err(_) => {
+                    return Err(ObscuraNetError::Network(
+                        "Failed to read body: deadline reached before any body arrived".into(),
+                    ))
+                }
+            },
+            None => stream.next().await,
+        };
+        let chunk = match next {
+            Some(Ok(chunk)) => chunk,
+            None => break,
+            Some(Err(error)) if keeps_partial_body(deadline, error.is_timeout(), body.len()) => {
+                note_body_truncated(url, body.len(), BodyCut::RequestTimeout);
+                break;
+            }
+            Some(Err(error)) => {
+                return Err(ObscuraNetError::Network(format!(
+                    "Failed to read body: {}",
+                    error_chain(&error)
+                )))
+            }
+        };
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
@@ -524,7 +552,7 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
+            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes, document_body_deadline(&request))
                 .await?;
             drop(in_flight);
 
@@ -659,7 +687,7 @@ impl StealthHttpClient {
             headers: response_headers,
             body: Box::pin(async move {
                 let _in_flight = in_flight;
-                read_wreq_body_limited(resp, &body_url, max_body_bytes).await
+                read_wreq_body_limited(resp, &body_url, max_body_bytes, None).await
             }),
         })
     }

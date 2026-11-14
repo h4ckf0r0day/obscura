@@ -380,6 +380,51 @@ fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
 }
 
+/// Run a navigation under its deadline. The outer `Err` is the deadline
+/// itself; the inner result is the navigation's own.
+///
+/// A document still arriving near the deadline is cut a little before it and
+/// parsed as far as it got, as a browser shows a partly loaded page; without
+/// this the deadline left an empty document. Such a navigation still reports
+/// the deadline, with the partial document in place.
+async fn within_navigation_deadline<F>(
+    nav_timeout: std::time::Duration,
+    navigation: F,
+) -> Result<Result<(), PageError>, PageError>
+where
+    F: std::future::Future<Output = Result<(), PageError>>,
+{
+    let nav_timeout_ms = duration_millis_u64(nav_timeout);
+    let body_deadline = tokio::time::Instant::now()
+        + nav_timeout.saturating_sub(document_body_reserve(nav_timeout));
+    let (result, cut) = obscura_net::with_body_deadline(
+        body_deadline,
+        tokio::time::timeout(nav_timeout, navigation),
+    )
+    .await;
+    match (result, cut) {
+        (Ok(Ok(())), Some(obscura_net::BodyCut::Deadline)) => Err(PageError::NetworkError(format!(
+            "navigation exceeded {nav_timeout_ms}ms deadline; the document was still arriving and is kept as far as it got"
+        ))),
+        (Ok(Ok(())), Some(obscura_net::BodyCut::RequestTimeout)) => Err(PageError::NetworkError(
+            "document request timed out while the document was still arriving; it is kept as far as it got".into(),
+        )),
+        (Ok(result), _) => Ok(result),
+        (Err(_), _) => Err(PageError::NetworkError(format!(
+            "navigation exceeded {nav_timeout_ms}ms deadline"
+        ))),
+    }
+}
+
+/// The share of a navigation's deadline kept for parsing and running a
+/// document cut at the deadline: a tenth, between half a second and five.
+fn document_body_reserve(nav_timeout: std::time::Duration) -> std::time::Duration {
+    (nav_timeout / 10).clamp(
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(5),
+    )
+}
+
 fn navigation_timeout_from_env_value(value: Option<&str>) -> std::time::Duration {
     let milliseconds = value
         .and_then(|value| value.parse().ok())
@@ -3182,22 +3227,15 @@ impl Page {
         // with `OBSCURA_NAV_TIMEOUT_MS=NN`, or set a page-scoped deadline when
         // the automation request already has an explicit timeout.
         let nav_timeout = self.navigation_timeout();
-        let nav_timeout_ms = duration_millis_u64(nav_timeout);
-
-        let result = match tokio::time::timeout(
+        let result = within_navigation_deadline(
             nav_timeout,
             self.navigate_with_wait_post_inner(url_str, wait_until, method, body, "", None),
         )
         .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                Err(PageError::NetworkError(format!(
-                    "navigation exceeded {nav_timeout_ms}ms deadline"
-                )))
-            }
-        };
+        .unwrap_or_else(|deadline| {
+            self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+            Err(deadline)
+        });
         if result.is_ok() {
             self.push_history(self.url_string());
         }
@@ -5273,15 +5311,14 @@ impl Page {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
         }).unwrap_or_default();
         let nav_timeout = self.navigation_timeout();
-        let nav_timeout_ms = duration_millis_u64(nav_timeout);
-        tokio::time::timeout(
+        within_navigation_deadline(
             nav_timeout,
             self.navigate_with_wait_post_inner(
                 url, crate::lifecycle::WaitUntil::Load, method, body, &source_url, initiator.as_ref(),
             ),
-        ).await.map_err(|_| {
+        ).await.map_err(|deadline| {
             self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-            PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
+            deadline
         })??;
         self.push_history(self.url_string());
         Ok(())
@@ -5647,6 +5684,53 @@ mod tests {
         server.await.unwrap();
         assert!(result.unwrap_err().to_string().contains("deadline"));
         assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::Failed);
+    }
+
+    /// A document still arriving at the navigation deadline is parsed as far
+    /// as it got; the navigation still reports the deadline.
+    async fn navigation_deadline_keeps_the_partial_document(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "partial-document".into(), None, stealth, None, None, true,
+        ));
+        let mut page = super::Page::new("partial-document".into(), context);
+        page.set_navigation_timeout(std::time::Duration::from_secs(2));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 2048];
+            let _ = socket.read(&mut bytes).await;
+            let _ = socket.write_all(concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "6d\r\n<!doctype html><title>partial</title><h1 id=head>arrived</h1><script>document.body.dataset.ran='yes'</script>\r\n",
+            ).as_bytes()).await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let started = std::time::Instant::now();
+        let error = page
+            .navigate_with_wait(&url, crate::lifecycle::WaitUntil::Load)
+            .await
+            .expect_err("the navigation did not finish");
+        assert!(error.to_string().contains("kept as far as it got"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::Failed);
+        assert_eq!(
+            page.evaluate("[document.title, !!document.getElementById('head'), document.body.dataset.ran]"),
+            serde_json::json!(["partial", true, "yes"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_deadline_keeps_the_partial_document_rustls() {
+        navigation_deadline_keeps_the_partial_document(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_deadline_keeps_the_partial_document_stealth() {
+        navigation_deadline_keeps_the_partial_document(true).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
