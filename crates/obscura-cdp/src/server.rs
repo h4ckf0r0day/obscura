@@ -258,6 +258,34 @@ use crate::types::CdpRequest;
 struct CdpMessage {
     text: String,
     reply_tx: mpsc::UnboundedSender<String>,
+    /// Target id when the connection upgraded at `/devtools/page/{id}` (the
+    /// page-level DevTools endpoint). Commands on such connections arrive
+    /// without a sessionId; the processor binds them to an implicit session.
+    page_target: Option<String>,
+}
+
+/// Session id bound to a page-level connection's target. Deterministic per
+/// target so every sessionless command from that connection reuses it (and so
+/// the map entry stays bounded).
+fn implicit_session_id(target: &str) -> String {
+    format!("__page__{target}")
+}
+
+/// Rewrite a sessionless CDP command to carry the implicit session id of the
+/// page-level connection it arrived on. Returns `None` when the message
+/// already carries a sessionId (browser-level multiplexing — untouched), is
+/// not a JSON object, or is the connection init frame.
+fn rewrite_sessionless_for_page(text: &str, target: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = value.as_object_mut()?;
+    if obj.contains_key("sessionId") {
+        return None;
+    }
+    obj.insert(
+        "sessionId".to_string(),
+        serde_json::json!(implicit_session_id(target)),
+    );
+    Some(value.to_string())
 }
 
 enum ServerMessage {
@@ -472,7 +500,8 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         publish_ready_file(path, bound_addr)?;
     }
 
-    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
+    let (ws_tx, mut ws_rx) =
+        mpsc::channel::<(std::net::TcpStream, Option<String>)>(MAX_PENDING_WS_HANDOFFS);
 
     // Ctrl-C / graceful shutdown coordination.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -662,7 +691,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
             stream = ws_rx.recv() => stream,
             _ = shutdown_notify.notified() => None,
         };
-        let stream = match stream {
+        let (stream, page_target) = match stream {
             Some(s) => s,
             None => break,
         };
@@ -698,6 +727,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         }
         run_connection(
             stream,
+            page_target,
             shared_ctx.clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
@@ -875,6 +905,7 @@ fn claim_connection_memory_trim(last_trim: &AtomicU64, now: u64, idle: bool) -> 
 /// plumbing is needed.
 fn run_connection(
     std_stream: std::net::TcpStream,
+    page_target: Option<String>,
     context_template: Arc<obscura_browser::BrowserContext>,
     persistence_context: Arc<obscura_browser::BrowserContext>,
     persistence_lock: Arc<std::sync::Mutex<()>>,
@@ -952,7 +983,7 @@ fn run_connection(
                             }
                         };
                         tokio::select! {
-                            result = handle_connection_ws(stream, msg_tx) => {
+                            result = handle_connection_ws(stream, msg_tx, page_target.clone()) => {
                                 if let Err(error) = result {
                                     error!("WebSocket connection error: {error}");
                                 }
@@ -1183,7 +1214,7 @@ fn accept_dispatch(
     forwarded: Option<(std::net::IpAddr, u16)>,
     auth_token: Option<&str>,
     allowed_origins: Option<&str>,
-    ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    ws_tx: &mpsc::Sender<(std::net::TcpStream, Option<String>)>,
     head: &str,
 ) -> anyhow::Result<()> {
     if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token, allowed_origins) {
@@ -1207,6 +1238,19 @@ fn accept_dispatch(
         let _ = stream.set_nonblocking(false);
         return handle_http_json_blocking(stream, port, ep, head);
     }
+    // Page-level DevTools endpoint: `/devtools/page/{targetId}` (as advertised
+    // by /json/list). Chrome binds such a connection to that page; commands on
+    // it arrive WITHOUT a sessionId. Remember the target so the processor can
+    // bind an implicit session (see rewrite_sessionless_for_page).
+    let page_target = head
+        .split("/devtools/page/")
+        .nth(1)
+        .and_then(|rest| {
+            rest.lines()
+                .next()
+                .map(|line| line.split(&[' ', '?'][..]).next().unwrap_or("").to_string())
+        })
+        .filter(|target| !target.is_empty());
     // Fall through: GET request that isn't a /json endpoint → treat as
     // WebSocket upgrade (Chromium DevTools clients issue GET with
     // Upgrade: websocket).
@@ -1218,7 +1262,7 @@ fn accept_dispatch(
     // dropped `stream` closes itself; the client will see ECONNRESET and
     // can retry.
     ws_tx
-        .try_send(stream)
+        .try_send((stream, page_target))
         .map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
@@ -1490,7 +1534,20 @@ async fn cdp_processor(
                         .to_string(),
                 );
             }
-            ServerMessage::Cdp(cdp_msg) => {
+            ServerMessage::Cdp(mut cdp_msg) => {
+                // Page-level connections (`/devtools/page/{id}`) send commands
+                // without a sessionId. Bind them to an implicit session on the
+                // advertised target so domain routing sees the page (Chrome
+                // treats the endpoint itself as the session).
+                if let Some(target) = cdp_msg.page_target.take() {
+                    if let Some(rewritten) = rewrite_sessionless_for_page(&cdp_msg.text, &target) {
+                        ctx.ensure_page(&target);
+                        ctx.sessions
+                            .entry(implicit_session_id(&target))
+                            .or_insert_with(|| target.clone());
+                        cdp_msg.text = rewritten;
+                    }
+                }
                 // Route navigation and reload through the spawn-and-defer path,
                 // not just intercepted ones. Holding the V8 lock across a
                 // multi-second navigate inside the regular dispatch wedges the
@@ -2427,6 +2484,7 @@ fn fast_path_response(text: &str) -> Option<String> {
 async fn handle_connection_ws(
     stream: TcpStream,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
+    page_target: Option<String>,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -2488,6 +2546,7 @@ async fn handle_connection_ws(
                     let _ = msg_tx.send(ServerMessage::Cdp(CdpMessage {
                         text: text.to_string(),
                         reply_tx: reply_tx.clone(),
+                        page_target: page_target.clone(),
                     }));
                 }
             }
@@ -2909,7 +2968,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             stream.set_nodelay(true).unwrap();
             let context = crate::dispatch::CdpContext::new().default_context;
-            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+            super::run_connection(stream.into_std().unwrap(), None, context.clone(), context,
                 Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
@@ -2967,7 +3026,7 @@ mod tests {
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let context = crate::dispatch::CdpContext::new().default_context;
-            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+            super::run_connection(stream.into_std().unwrap(), None, context.clone(), context,
                 Arc::new(std::sync::Mutex::new(())), Arc::new(Notify::new()), live_server);
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
@@ -3032,7 +3091,7 @@ mod tests {
             for _ in 0..8 {
                 let (stream, _) = listener.accept().await.unwrap();
                 live_server.fetch_add(1, Ordering::AcqRel);
-                super::run_connection(stream.into_std().unwrap(), context.clone(), context.clone(),
+                super::run_connection(stream.into_std().unwrap(), None, context.clone(), context.clone(),
                     Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server.clone());
             }
         });
@@ -3108,7 +3167,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             stream.set_nodelay(true).unwrap();
             let context = crate::dispatch::CdpContext::new().default_context;
-            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+            super::run_connection(stream.into_std().unwrap(), None, context.clone(), context,
                 Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
@@ -3232,6 +3291,7 @@ mod tests {
                         .send(super::ServerMessage::Cdp(super::CdpMessage {
                             text: value.to_string(),
                             reply_tx: reply_tx.clone(),
+                            page_target: None,
                         }))
                         .unwrap();
                 };
@@ -3368,6 +3428,7 @@ mod tests {
                         .send(super::ServerMessage::Cdp(super::CdpMessage {
                             text: value.to_string(),
                             reply_tx: reply_tx.clone(),
+                            page_target: None,
                         }))
                         .unwrap();
                 };
@@ -3556,6 +3617,7 @@ mod tests {
             let send = |value: Value| {
                 server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
                     text: value.to_string(), reply_tx: reply_tx.clone(),
+                    page_target: None,
                 })).unwrap();
             };
             send(json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
@@ -3651,6 +3713,7 @@ mod tests {
             let send = |value: Value| {
                 server_tx.send(ServerMessage::Cdp(CdpMessage {
                     text: value.to_string(), reply_tx: reply_tx.clone(),
+                    page_target: None,
                 })).unwrap();
             };
             send(json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
@@ -3743,6 +3806,7 @@ mod tests {
             let send = |value: Value| {
                 server_tx.send(ServerMessage::Cdp(CdpMessage {
                     text: value.to_string(), reply_tx: reply_tx.clone(),
+                    page_target: None,
                 })).unwrap();
             };
             send(json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
@@ -3835,6 +3899,7 @@ mod tests {
             let send = |value: Value| {
                 server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
                     text: value.to_string(), reply_tx: reply_tx.clone(),
+                    page_target: None,
                 })).unwrap();
             };
             let mut sessions = Vec::new();
@@ -4029,6 +4094,7 @@ mod tests {
             let send = |value: serde_json::Value| {
                 server_tx.send(ServerMessage::Cdp(CdpMessage {
                     text: value.to_string(), reply_tx: reply_tx.clone(),
+                    page_target: None,
                 })).unwrap();
             };
             let foreign_count = if method == "failRequest" { MAX_DEFERRED_MESSAGES + 1 } else { 1 };
@@ -4168,6 +4234,7 @@ mod tests {
                     text: json!({"id": id, "method": if id == 2 { "Page.stopLoading" } else { method },
                         "sessionId": session, "params": {"targetId": page_id}}).to_string(),
                     reply_tx: reply_tx.clone(),
+                    page_target: None,
                 })).unwrap();
             }
             let (mut ctx, paused, deferred) = tokio::time::timeout(std::time::Duration::from_secs(2), navigation)
@@ -4260,6 +4327,7 @@ mod tests {
                                         "params": {"requestId": request_id, "errorReason": "Aborted", "responseCode": 200,
                                             "responseHeaders": [{"name": "Content-Type", "value": "text/html"}],
                                             "body": base64::engine::general_purpose::STANDARD.encode(body)}}).to_string(),
+                                    page_target: None,
                                     reply_tx: reply_tx.clone(),
                                 })).unwrap();
                             }
@@ -4350,6 +4418,7 @@ mod tests {
                         server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
                             text: json!({"id": 2, "method": "Page.stopLoading", "sessionId": session}).to_string(),
                             reply_tx: reply_tx.clone(),
+                            page_target: None,
                         })).unwrap();
                     }
                     if event["method"] == "Network.loadingFailed" {
