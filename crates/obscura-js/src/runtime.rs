@@ -24043,6 +24043,133 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn request_extracts_its_body_and_the_content_type_it_implies() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        __obscura_test_ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                calls.push({
+                                    headers: JSON.parse(headers),
+                                    text: new TextDecoder().decode(body),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const form = new FormData();
+                        form.append("k", "v 雪");
+                        form.append(
+                            "upload",
+                            new File([new Uint8Array([0, 128, 255, 16])], "sentinel.bin", {
+                                type: "application/octet-stream",
+                            }),
+                        );
+                        const request = new Request("/form", { method: "POST", body: form });
+                        // A FormData body is serialized at construction, so a
+                        // later mutation of the source must not reach the request.
+                        form.append("late", "ignored");
+
+                        const type = request.headers.get("content-type");
+                        const boundary = type.slice("multipart/form-data; boundary=".length);
+                        const text = await request.text();
+                        const parsed = await request.formData();
+                        const file = parsed.get("upload");
+                        const clone = request.clone();
+                        await fetch(request);
+                        await fetch(clone);
+
+                        const params = new Request("/params", {
+                            method: "POST",
+                            body: new URLSearchParams("a=1&b=x y"),
+                        });
+                        const explicit = new Request("/explicit", {
+                            method: "POST",
+                            headers: { "Content-Type": "text/plain" },
+                            body: new URLSearchParams("a=1"),
+                        });
+                        const blob = new Request("/blob", {
+                            method: "POST",
+                            body: new Blob(["hi"], { type: "text/x-test" }),
+                        });
+                        const backing = new Uint8Array([1, 2, 3]);
+                        const binary = new Request("/binary", { method: "POST", body: backing });
+                        let unparseable = false;
+                        try { await binary.formData(); } catch (e) { unparseable = e instanceof TypeError; }
+
+                        return {
+                            type: type.startsWith("multipart/form-data; boundary=----WebKitFormBoundary"),
+                            text: text.startsWith(
+                                "--" + boundary + '\r\nContent-Disposition: form-data; name="k"\r\n\r\nv 雪\r\n',
+                            ) && text.endsWith("--" + boundary + "--\r\n"),
+                            arrayBuffer: new TextDecoder().decode(await request.arrayBuffer()) === text,
+                            names: [...parsed.keys()],
+                            k: parsed.get("k"),
+                            file: [
+                                file instanceof File,
+                                file.name,
+                                file.type,
+                                [...new Uint8Array(await file.arrayBuffer())],
+                            ],
+                            clone: clone.headers.get("content-type") === type && (await clone.text()) === text,
+                            sent: calls.map(call => call.headers["content-type"] === type && call.text === text),
+                            params: [
+                                params.headers.get("content-type"),
+                                await params.text(),
+                                [...(await params.formData()).entries()],
+                            ],
+                            explicit: explicit.headers.get("content-type"),
+                            blob: [blob.headers.get("content-type"), await blob.text(), (await blob.blob()).type],
+                            binary: [
+                                binary.headers.get("content-type"),
+                                [...new Uint8Array(await binary.arrayBuffer())],
+                                unparseable,
+                            ],
+                        };
+                    } finally {
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "type": true,
+                "text": true,
+                "arrayBuffer": true,
+                "names": ["k", "upload"],
+                "k": "v \u{96ea}",
+                "file": [true, "sentinel.bin", "application/octet-stream", [0, 128, 255, 16]],
+                "clone": true,
+                "sent": [true, true],
+                "params": [
+                    "application/x-www-form-urlencoded;charset=UTF-8",
+                    "a=1&b=x+y",
+                    [["a", "1"], ["b", "x y"]],
+                ],
+                "explicit": "text/plain",
+                "blob": ["text/x-test", "hi", "text/x-test"],
+                "binary": [null, [1, 2, 3], true],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fetch_form_urlencoded_and_xhr_bodies_reach_the_op_as_bytes() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt

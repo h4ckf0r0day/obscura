@@ -8824,6 +8824,61 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
+function _indexOfBytes(bytes, needle, from) {
+  outer: for (let i = from; i <= bytes.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (bytes[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+// Body.formData(): parse body bytes back into a FormData according to the
+// Content-Type, the inverse of _serializeBody for FormData and URLSearchParams.
+function _parseFormDataBody(bytes, contentType, iface) {
+  const fail = () => new TypeError("Failed to execute 'formData' on '" + iface + "': Failed to parse body as FormData.");
+  const type = String(contentType || '');
+  const essence = type.split(';')[0].trim().toLowerCase();
+  const fd = new FormData();
+  if (essence === 'application/x-www-form-urlencoded') {
+    for (const [k, v] of new URLSearchParams(new TextDecoder().decode(bytes))) fd.append(k, v);
+    return fd;
+  }
+  const boundary = essence === 'multipart/form-data' && /;\s*boundary=(?:"([^"]+)"|([^;]+))/i.exec(type);
+  if (!boundary) throw fail();
+  const encoder = new TextEncoder(), decoder = new TextDecoder();
+  const delimiter = encoder.encode('--' + (boundary[1] || boundary[2].trim()));
+  const partEnd = encoder.encode('\r\n--' + (boundary[1] || boundary[2].trim()));
+  const headEnd = encoder.encode('\r\n\r\n');
+  let pos = _indexOfBytes(bytes, delimiter, 0);
+  if (pos < 0) throw fail();
+  for (;;) {
+    pos += delimiter.length;
+    if (bytes[pos] === 45 && bytes[pos + 1] === 45) return fd;
+    if (bytes[pos] !== 13 || bytes[pos + 1] !== 10) throw fail();
+    const bodyStart = _indexOfBytes(bytes, headEnd, pos);
+    if (bodyStart < 0) throw fail();
+    const bodyEnd = _indexOfBytes(bytes, partEnd, bodyStart + 2);
+    if (bodyEnd < 0) throw fail();
+    let name = null, filename = null, partType = null;
+    for (const line of decoder.decode(bytes.subarray(pos + 2, bodyStart)).split('\r\n')) {
+      const colon = line.indexOf(':');
+      const header = line.slice(0, colon).trim().toLowerCase(), value = line.slice(colon + 1).trim();
+      if (header === 'content-disposition') {
+        const n = /;\s*name="([^"]*)"/i.exec(value), f = /;\s*filename="([^"]*)"/i.exec(value);
+        if (n) name = n[1];
+        if (f) filename = f[1];
+      } else if (header === 'content-type') partType = value;
+    }
+    if (name === null) throw fail();
+    const data = bytes.subarray(bodyStart + 4, bodyEnd);
+    if (filename !== null) fd.append(name, new File([data], filename, { type: partType || 'text/plain' }));
+    else fd.append(name, decoder.decode(data));
+    pos = bodyEnd + 2;
+  }
+}
+
 const _requestHeaderGuards = new WeakSet();
 const _forbiddenRequestHeaderNames = new Set([
   'accept-charset', 'accept-encoding', 'access-control-request-headers',
@@ -8870,7 +8925,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   const inheritsRequestBody = init.body === undefined && request !== null;
   const initBody = init.body !== undefined
     ? init.body
-    : (request ? request.body : undefined);
+    : (request ? (request._bodyBytes || request.body) : undefined);
   const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (request ? request.mode : "cors");
@@ -9325,14 +9380,39 @@ if (typeof Request === 'undefined') {
   globalThis.Request = class Request {
     constructor(input, init = {}) {
       const inputRequest = input instanceof Request ? input : null;
+      let inheritsBody = false;
       if (typeof input === 'string') { this.url = input; }
-      else if (inputRequest) { this.url = inputRequest.url; init = { ...inputRequest, ...init }; }
+      else if (inputRequest) {
+        this.url = inputRequest.url;
+        inheritsBody = init == null || init.body === undefined;
+        init = { ...inputRequest, ...init };
+      }
       else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
       else { this.url = input?.url || input?.href || String(input); }
       this.method = (init.method || 'GET').toUpperCase();
       this.headers = new Headers(_filterRequestHeaders(init.headers));
       _requestHeaderGuards.add(this.headers);
       this.body = init.body || null;
+      // The Content-Type a body implies is visible on request.headers. A
+      // FormData body is serialized here, because its boundary is part of
+      // that header and the bytes fetch() sends must use the same one. Every
+      // other body is serialized on first use to keep construction cheap.
+      this._bodyBytes = null;
+      if (inheritsBody) {
+        this._bodyBytes = inputRequest._bodyBytes;
+      } else if (this.body !== null && typeof this.body !== 'string') {
+        let implied = null;
+        if (this.body instanceof FormData) {
+          const multipart = _formDataToMultipart(this.body);
+          this._bodyBytes = multipart.body;
+          implied = 'multipart/form-data; boundary=' + multipart.boundary;
+        } else if (this.body instanceof URLSearchParams) {
+          implied = 'application/x-www-form-urlencoded;charset=UTF-8';
+        } else if (typeof Blob !== 'undefined' && this.body instanceof Blob && this.body.type) {
+          implied = this.body.type;
+        }
+        if (implied !== null && !this.headers.has('content-type')) this.headers.set('content-type', implied);
+      }
       this.mode = init.mode || 'cors';
       this.credentials = init.credentials !== undefined
         ? String(init.credentials)
@@ -9350,24 +9430,23 @@ if (typeof Request === 'undefined') {
       this.cache = init.cache || 'default';
     }
     clone() {
-      return new Request(this.url, {
-        method: this.method,
-        headers: this.headers,
-        body: this.body,
-        mode: this.mode,
-        credentials: this.credentials,
-        redirect: this.redirect,
-        referrer: this.referrer,
-        signal: this.signal,
-        cache: this.cache,
-      });
+      // Constructing from the request itself carries over its extracted body,
+      // so a FormData clone keeps the boundary its Content-Type names.
+      return new Request(this);
     }
-    async text() { return this.body ? String(this.body) : ''; }
+    _extractBody() {
+      if (this._bodyBytes === null) this._bodyBytes = _serializeBody(this.body, {}, false);
+      return this._bodyBytes;
+    }
+    async text() { return typeof this.body === 'string' ? this.body : new TextDecoder().decode(this._extractBody()); }
     async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
+    async arrayBuffer() { return _arrayBufferFromBytes(this._extractBody()); }
     async blob() {
       const ct = this.headers && this.headers.get ? (this.headers.get('content-type') || '') : '';
-      return new Blob(this.body != null ? [this.body] : [], { type: ct });
+      return new Blob(this.body != null ? [this._extractBody()] : [], { type: ct });
+    }
+    async formData() {
+      return _parseFormDataBody(this._extractBody(), this.headers.get('content-type'), 'Request');
     }
   };
 }
