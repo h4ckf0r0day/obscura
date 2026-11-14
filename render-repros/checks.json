@@ -1,4 +1,8 @@
 {
+  "svg-modern-colors": [
+    {"name": "OKLCH and OKLab fills match the sRGB control", "color": "#808080", "x": 0, "y": 0, "width": 240, "height": 80},
+    {"name": "OKLCH stroke preserves its geometry", "color": "#808080", "x": 10, "y": 110, "width": 140, "height": 20}
+  ],
   "deep-parser-layout": [
     {"name": "fragment depth matches Chromium without losing the last element", "color": "#3186e8", "x": 545, "width": 80, "height": 20}
   ],
