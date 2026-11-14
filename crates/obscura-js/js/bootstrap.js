@@ -15024,6 +15024,23 @@ _markNative(SVGAnimatedString);
 class SVGElement extends Element {
   get [Symbol.toStringTag]() { return "SVGElement"; }
 }
+function _svgAncestorElement(receiver, viewport) {
+  if (!receiver || _nodeCacheGet(receiver._nid) !== receiver) {
+    const member = receiver && _documentRealmMember(receiver, 'svgAncestor');
+    if (member) return Reflect.apply(member, receiver, [viewport]);
+    throw new TypeError('Illegal invocation');
+  }
+  const ancestor = __obscuraCore.ops.op_svg_ancestor(receiver._nid, viewport, _realmFrameId);
+  if (ancestor === -2) throw new TypeError('Illegal invocation');
+  return _wrapEl(ancestor);
+}
+const _svgElementAccessors = Object.getOwnPropertyDescriptors({
+  get ownerSVGElement() { return _svgAncestorElement(this, false); },
+  get viewportElement() { return _svgAncestorElement(this, true); },
+});
+Object.defineProperties(SVGElement.prototype, _svgElementAccessors);
+_markNative(_svgElementAccessors.ownerSVGElement.get);
+_markNative(_svgElementAccessors.viewportElement.get);
 class SVGGraphicsElement extends SVGElement {}
 class SVGGeometryElement extends SVGGraphicsElement {}
 class SVGTextContentElement extends SVGGraphicsElement {}
@@ -19620,6 +19637,7 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['elementStyle', function() { return _elementStyle(this); }],
   ['selectOptions', _selectOptionsMember],
   ['formOwner', _formOwnerMember],
+  ['svgAncestor', function(viewport) { return _svgAncestorElement(this, viewport); }],
   ['formControls', _formControlsMember],
   ['validateSelect', _validateSelectMember],
   ['optionIndex', _optionIndexMember],
