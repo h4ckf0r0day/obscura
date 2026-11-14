@@ -837,11 +837,98 @@ fn reject_oversized_content_length(
     Ok(())
 }
 
+tokio::task_local! {
+    static BODY_DEADLINE: BodyDeadline;
+}
+
+#[derive(Clone)]
+struct BodyDeadline {
+    at: tokio::time::Instant,
+    // 0: not cut; otherwise a `BodyCut` discriminant.
+    cut: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Why a body read under [`with_body_deadline`] kept a partial body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyCut {
+    /// The [`with_body_deadline`] deadline passed.
+    Deadline = 1,
+    /// The request's own timeout fired while the body was arriving.
+    RequestTimeout = 2,
+}
+
+/// Run `fetch` so that a response body still arriving at `at` ends there with
+/// the bytes received so far, instead of failing. The same applies when the
+/// request's own timeout cuts a body that has started. Returns the fetch's
+/// output and, when a body was cut short, why.
+///
+/// A navigation uses this around its document fetch: a document still
+/// arriving at the navigation deadline is parsed as far as it got, as a
+/// browser renders a partly loaded page, instead of leaving an empty one.
+/// Only the requests made inside `fetch` are affected.
+pub async fn with_body_deadline<F: std::future::Future>(
+    at: tokio::time::Instant,
+    fetch: F,
+) -> (F::Output, Option<BodyCut>) {
+    let deadline = BodyDeadline {
+        at,
+        cut: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+    };
+    let cut = deadline.cut.clone();
+    let output = BODY_DEADLINE.scope(deadline, fetch).await;
+    let cut = match cut.load(Ordering::Relaxed) {
+        1 => Some(BodyCut::Deadline),
+        2 => Some(BodyCut::RequestTimeout),
+        _ => None,
+    };
+    (output, cut)
+}
+
+/// The [`with_body_deadline`] deadline for this request's body: documents
+/// only. A cut-short script or image is worse than none.
+pub(crate) fn document_body_deadline(request: &ResourceRequest) -> Option<tokio::time::Instant> {
+    if request.resource_type != ResourceType::Document {
+        return None;
+    }
+    BODY_DEADLINE.try_with(|deadline| deadline.at).ok()
+}
+
+/// Record that a body read under [`with_body_deadline`] kept a partial body.
+pub(crate) fn note_body_truncated(url: &Url, received: usize, cut: BodyCut) {
+    if BODY_DEADLINE
+        .try_with(|deadline| deadline.cut.store(cut as u8, Ordering::Relaxed))
+        .is_ok()
+    {
+        tracing::warn!("{url}: body cut ({cut:?}); keeping the {received} bytes received");
+    }
+}
+
+/// Whether a body read that ended this way keeps the partial body: only with a
+/// [`document_body_deadline`], only for a timeout, and only once bytes arrived.
+pub(crate) fn keeps_partial_body(
+    deadline: Option<tokio::time::Instant>,
+    is_timeout: bool,
+    received: usize,
+) -> bool {
+    deadline.is_some() && is_timeout && received > 0
+}
+
 /// Read a response with a cap on both advertised and decoded body bytes.
 pub async fn read_reqwest_body_limited(
+    response: reqwest::Response,
+    url: &Url,
+    limit: usize,
+) -> Result<Vec<u8>, ObscuraNetError> {
+    read_reqwest_body_until(response, url, limit, None).await
+}
+
+/// [`read_reqwest_body_limited`] that keeps the body received so far when
+/// `deadline` passes (see [`with_body_deadline`]).
+async fn read_reqwest_body_until(
     mut response: reqwest::Response,
     url: &Url,
     limit: usize,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     reject_oversized_content_length(response.headers(), url, limit)?;
     let capacity = response
@@ -850,9 +937,36 @@ pub async fn read_reqwest_body_limited(
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
-    })? {
+    loop {
+        let next = match deadline {
+            Some(at) => match tokio::time::timeout_at(at, response.chunk()).await {
+                Ok(next) => next,
+                Err(_) if !body.is_empty() => {
+                    note_body_truncated(url, body.len(), BodyCut::Deadline);
+                    break;
+                }
+                Err(_) => {
+                    return Err(ObscuraNetError::Network(
+                        "Failed to read body: deadline reached before any body arrived".into(),
+                    ))
+                }
+            },
+            None => response.chunk().await,
+        };
+        let chunk = match next {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) if keeps_partial_body(deadline, error.is_timeout(), body.len()) => {
+                note_body_truncated(url, body.len(), BodyCut::RequestTimeout);
+                break;
+            }
+            Err(error) => {
+                return Err(ObscuraNetError::Network(format!(
+                    "Failed to read body: {}",
+                    error_chain(&error)
+                )))
+            }
+        };
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
@@ -1778,10 +1892,11 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
+            let body_bytes = read_reqwest_body_until(
                 resp,
                 &current_url,
                 request.max_response_bytes,
+                document_body_deadline(&request),
             )
             .await?;
             drop(in_flight);
@@ -2784,6 +2899,93 @@ mod ssrf_tests {
             ));
             assert_eq!(client.active_requests(), 0);
         }
+    }
+
+    /// Sends response headers and the start of a body, then stalls.
+    async fn stalled_body_fixture(content_type: &'static str) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: 100000\r\n\r\n<title>partial</title><p>arrived"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+        Url::parse(&format!("http://{address}/stall")).unwrap()
+    }
+
+    fn private_client() -> ObscuraHttpClient {
+        ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true)
+    }
+
+    #[tokio::test]
+    async fn body_deadline_keeps_the_document_received_so_far() {
+        let target = stalled_body_fixture("text/html").await;
+        let client = private_client();
+        let started = std::time::Instant::now();
+        let at = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        let (response, cut) = super::with_body_deadline(at, client.fetch(&target)).await;
+        let response = response.expect("the partial document is kept");
+        assert_eq!(response.body, b"<title>partial</title><p>arrived");
+        assert_eq!(cut, Some(super::BodyCut::Deadline));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn body_deadline_leaves_subresources_alone() {
+        let target = stalled_body_fixture("application/javascript").await;
+        let mut client = private_client();
+        client.timeout = std::time::Duration::from_millis(600);
+        let at = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+        let request = ResourceRequest::subresource(ResourceType::Script, &target);
+        let (response, cut) =
+            super::with_body_deadline(at, client.fetch_resource_with_callbacks(&target, request, None)).await;
+        assert!(response.is_err(), "a cut-short script is an error, not a script");
+        assert_eq!(cut, None);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_keeps_a_navigation_document_received_so_far() {
+        let target = stalled_body_fixture("text/html").await;
+        let mut client = private_client();
+        client.timeout = std::time::Duration::from_millis(300);
+        let at = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let (response, cut) = super::with_body_deadline(at, client.fetch(&target)).await;
+        assert_eq!(response.expect("partial document").body, b"<title>partial</title><p>arrived");
+        assert_eq!(cut, Some(super::BodyCut::RequestTimeout));
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn stealth_body_deadline_keeps_the_document_received_so_far() {
+        let target = stalled_body_fixture("text/html").await;
+        let client = crate::StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let at = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        let (response, cut) = super::with_body_deadline(
+            at,
+            client.fetch_navigation_request_from_document(&target, "GET", None, None, None, None),
+        )
+        .await;
+        assert_eq!(response.expect("partial document").body, b"<title>partial</title><p>arrived");
+        assert_eq!(cut, Some(super::BodyCut::Deadline));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_outside_a_navigation_is_still_an_error() {
+        let target = stalled_body_fixture("text/html").await;
+        let mut client = private_client();
+        client.timeout = std::time::Duration::from_millis(300);
+        assert!(client.fetch(&target).await.is_err());
     }
 
     async fn hanging_fixture() -> (Url, tokio::sync::oneshot::Receiver<()>) {
