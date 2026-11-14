@@ -61,10 +61,20 @@ fn rerun_when_head_moves() {
     let mut names = vec!["HEAD".to_string(), "packed-refs".to_string(), "logs/HEAD".to_string()];
     names.extend(git(&["symbolic-ref", "-q", "HEAD"]));
     for name in names {
-        // A path that does not exist would rerun the script on every build.
-        // The reflog covers a branch whose ref is packed until its next commit.
-        if let Some(path) = git(&["rev-parse", "--git-path", &name]).filter(|path| std::path::Path::new(path).exists()) {
-            println!("cargo:rerun-if-changed={path}");
+        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+            let path = std::path::Path::new(&path);
+            let watch = if path.exists() {
+                Some(path)
+            } else if name.starts_with("refs/") {
+                // Watch for a packed ref becoming loose, even without a reflog.
+                path.ancestors().skip(1).find(|parent| parent.is_dir())
+            } else {
+                None
+            };
+
+            if let Some(path) = watch {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
         }
     }
 }
