@@ -12525,6 +12525,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn send_beacon_posts_its_data() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !String::from_utf8_lossy(&request).contains("k=v&n=1") {
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                if read == 0 { break; }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+            request_tx.send(String::from_utf8_lossy(&request).into_owned()).unwrap();
+        });
+
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+            None,
+            true,
+        )));
+        rt.run_page_init();
+        let queued = rt.evaluate(r#"[
+            navigator.sendBeacon('/collect', new URLSearchParams('k=v&n=1')),
+            navigator.sendBeacon('/too-big', 'x'.repeat(65537)),
+            (() => { try { navigator.sendBeacon('ftp://example.com/'); return 'no throw'; }
+                     catch (e) { return e.constructor.name; } })(),
+        ]"#).unwrap();
+        assert_eq!(queued, serde_json::json!([true, false, "TypeError"]));
+        rt.run_event_loop_until_quiescent(3_000, 150).await.unwrap();
+
+        let request = request_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the beacon reached the server");
+        assert!(request.starts_with("POST /collect HTTP/1.1"), "{request}");
+        assert!(request.to_ascii_lowercase().contains("content-type: application/x-www-form-urlencoded"), "{request}");
+        assert!(request.ends_with("k=v&n=1"), "{request}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn quiescent_event_loop_allows_fetch_hydration_within_network_grace() {
         let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(700));
         rt.execute_script(

@@ -4350,6 +4350,8 @@ async fn fetch_url_inner(
         "Stylesheet" => (ResourceType::Stylesheet, "Stylesheet"),
         "Document" => (ResourceType::Document, "Document"),
         "XHR" => (ResourceType::Xhr, "XHR"),
+        // navigator.sendBeacon: fetch metadata of a fetch, CDP type "Ping".
+        "Ping" => (ResourceType::Fetch, "Ping"),
         _ => (ResourceType::Fetch, "Fetch"),
     };
     let internal_load = matches!(resource_type,
