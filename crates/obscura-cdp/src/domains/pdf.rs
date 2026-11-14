@@ -145,7 +145,6 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
         return Err("Invalid parameters: expected an object".to_string());
     }
     let unsupported_true = [
-        ("displayHeaderFooter", "headers and footers"),
         ("preferCSSPageSize", "CSS @page sizing"),
         ("generateDocumentOutline", "document outlines"),
     ];
@@ -174,16 +173,18 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
         }
         None => Vec::new(),
     };
-    for name in ["headerTemplate", "footerTemplate"] {
-        if let Some(value) = params.get(name) {
-            let template = value
+    let display_header_footer = boolean(params, "displayHeaderFooter", false)?;
+    let template = |name: &str| -> Result<String, String> {
+        match params.get(name) {
+            None => Ok(String::new()),
+            Some(value) => value
                 .as_str()
-                .ok_or_else(|| format!("Invalid parameters: {name} must be a string"))?;
-            if !template.is_empty() {
-                return Err(format!("Page.printToPDF {name} is not yet supported"));
-            }
+                .map(str::to_owned)
+                .ok_or_else(|| format!("Invalid parameters: {name} must be a string")),
         }
-    }
+    };
+    let header_template = template("headerTemplate")?;
+    let footer_template = template("footerTemplate")?;
     let transfer_mode = match params.get("transferMode") {
         None => PdfTransferMode::ReturnAsBase64,
         Some(Value::String(value)) => match value.as_str() {
@@ -207,6 +208,9 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
             margin_bottom_in: number(params, "marginBottom", defaults.margin_bottom_in)?,
             margin_left_in: number(params, "marginLeft", defaults.margin_left_in)?,
             margin_right_in: number(params, "marginRight", defaults.margin_right_in)?,
+            display_header_footer,
+            header_template,
+            footer_template,
         },
         transfer_mode,
         requested_print_background,
@@ -241,6 +245,7 @@ pub async fn print_to_pdf(
                 "honorsPrintMedia": true,
                 "honorsPrintBackground": true,
                 "honorsScale": true,
+                "headerFooter": true,
                 "pageRanges": true,
                 "printColorAdjustExact": false,
                 "taggedPdf": false,
@@ -310,13 +315,34 @@ mod tests {
         assert!(standard.raster.page_ranges.is_empty());
 
         for params in [
-            json!({"displayHeaderFooter": true}),
             json!({"preferCSSPageSize": true}),
-            json!({"headerTemplate": "<span>title</span>"}),
             json!({"generateDocumentOutline": true}),
+            json!({"displayHeaderFooter": "yes"}),
+            json!({"headerTemplate": 1}),
+            json!({"footerTemplate": false}),
         ] {
             assert!(parse_options(&params).is_err(), "must reject {params}");
         }
+
+        let with_header_footer = parse_options(&json!({
+            "displayHeaderFooter": true,
+            "headerTemplate": "<span class='title'></span>",
+            "footerTemplate": "<span class='pageNumber'></span>",
+        }))
+        .expect("header and footer templates are supported");
+        assert!(with_header_footer.raster.display_header_footer);
+        assert_eq!(
+            with_header_footer.raster.header_template,
+            "<span class='title'></span>"
+        );
+        assert_eq!(
+            with_header_footer.raster.footer_template,
+            "<span class='pageNumber'></span>"
+        );
+        assert!(
+            !standard.raster.display_header_footer,
+            "templates are ignored unless displayHeaderFooter is set"
+        );
 
         let ranged = parse_options(&json!({
             "scale": 0.5,
@@ -531,5 +557,61 @@ mod tests {
         let ranged_text = String::from_utf8_lossy(&ranged_bytes);
         assert!(ranged_text.contains("/Count 1"));
         assert_eq!(ranged_text.matches("/Subtype /Image").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn print_to_pdf_renders_playwright_header_and_footer_templates() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        ctx.get_session_page_mut(&session)
+            .unwrap()
+            .set_viewport((100.0, 80.0));
+        page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<title>Sample report</title><body style='margin:0;height:900px;background:%23ddd'>Sample report</body>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate fixture");
+
+        // The parameters Playwright's page.pdf() sends for the report in
+        // h4ckf0r0day/obscura#1565: A4, 100px margins, both templates.
+        let response = print_to_pdf(
+            &json!({
+                "paperWidth": 8.27, "paperHeight": 11.7,
+                "marginTop": 1.0416666, "marginBottom": 1.0416666,
+                "marginLeft": 0.0, "marginRight": 0.0,
+                "printBackground": true,
+                "displayHeaderFooter": true,
+                "headerTemplate": "<div style='font-size:10px;padding:0 20px'>Sample header</div>",
+                "footerTemplate": "<div style='font-size:10px;padding:0 20px'>Page <span class='pageNumber'></span> of <span class='totalPages'></span></div>",
+                "transferMode": "ReturnAsBase64",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("displayHeaderFooter must be accepted");
+        assert_eq!(response["obscuraCapabilities"]["headerFooter"], true);
+        assert_eq!(response["obscuraIgnoredOptions"], json!([]));
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(response["data"].as_str().unwrap())
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let pages = text.matches("/Type /Page ").count();
+        assert!(pages >= 1);
+        assert_eq!(
+            text.matches("/Subtype /Image").count(),
+            pages * 3,
+            "every page carries a body, a header and a footer image"
+        );
     }
 }
