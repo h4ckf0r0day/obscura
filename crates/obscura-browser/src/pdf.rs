@@ -21,6 +21,14 @@ const MAX_PDF_DOCUMENT_PAGES: usize = 1_000_000;
 const MAX_PDF_PAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_PDF_TOTAL_RASTER_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_PDF_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const CSS_PIXELS_PER_INCH: f32 = 96.0;
+/// Upper bound on one header or footer template, matching the order of
+/// magnitude of the other bounded CDP string inputs.
+const MAX_HEADER_FOOTER_TEMPLATE_BYTES: usize = 64 * 1024;
+/// Chromium's default header (date and title) and footer (URL and page
+/// numbers), used when `displayHeaderFooter` is set and a template is empty.
+const DEFAULT_HEADER_TEMPLATE: &str = "<div style=\"width:100%;padding:0 0.4in;display:flex;justify-content:space-between\"><span class=\"date\"></span><span class=\"title\"></span></div>";
+const DEFAULT_FOOTER_TEMPLATE: &str = "<div style=\"width:100%;padding:0 0.4in;display:flex;justify-content:space-between\"><span class=\"url\"></span><span><span class=\"pageNumber\"></span>/<span class=\"totalPages\"></span></span></div>";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RasterPdfPageRange {
@@ -42,6 +50,12 @@ pub struct RasterPdfOptions {
     pub margin_bottom_in: f32,
     pub margin_left_in: f32,
     pub margin_right_in: f32,
+    /// Draw `header_template` in the top margin and `footer_template` in the
+    /// bottom margin of every page (CDP `displayHeaderFooter`). An empty
+    /// template falls back to Chromium's default for that band.
+    pub display_header_footer: bool,
+    pub header_template: String,
+    pub footer_template: String,
 }
 
 impl Default for RasterPdfOptions {
@@ -58,6 +72,9 @@ impl Default for RasterPdfOptions {
             margin_bottom_in: 0.3937,
             margin_left_in: 0.3937,
             margin_right_in: 0.3937,
+            display_header_footer: false,
+            header_template: String::new(),
+            footer_template: String::new(),
         }
     }
 }
@@ -68,6 +85,8 @@ pub enum RasterPdfError {
     InvalidPaperSize,
     #[error("PDF margins must be finite, non-negative, and leave a printable area")]
     InvalidMargins,
+    #[error("PDF header and footer templates must each be at most {0} bytes")]
+    TemplateTooLarge(usize),
     #[error("PDF scale must be finite and between 0.1 and 2")]
     InvalidScale,
     #[error("PDF page ranges select no pages from this document")]
@@ -93,8 +112,40 @@ struct RasterPage {
     rgb: image::RgbImage,
     draw_width_pt: f32,
     draw_height_pt: f32,
+    header: Option<RasterBand>,
+    footer: Option<RasterBand>,
     #[cfg(test)]
     _lifetime_probe: Option<std::rc::Rc<()>>,
+}
+
+/// A rendered header or footer, positioned in PDF user space (origin at the
+/// bottom-left corner of the page).
+#[derive(Debug)]
+struct RasterBand {
+    rgb: image::RgbImage,
+    x_pt: f32,
+    y_pt: f32,
+    width_pt: f32,
+    height_pt: f32,
+}
+
+/// Pixel and point geometry of one margin band.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BandGeometry {
+    width_px: u32,
+    height_px: u32,
+    y_pt: f32,
+    width_pt: f32,
+    height_pt: f32,
+}
+
+/// Values injected into elements carrying the CDP header/footer classes.
+struct BandFields<'a> {
+    date: &'a str,
+    title: &'a str,
+    url: &'a str,
+    page_number: usize,
+    total_pages: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +241,7 @@ fn validate_selected_raster_work(
     content_height: f32,
     plan: PaginationPlan,
     selected_pages: &[usize],
+    band_pixels_per_page: u64,
 ) -> Result<(), RasterPdfError> {
     let pixel_width = content_width.ceil();
     if !pixel_width.is_finite()
@@ -220,6 +272,7 @@ fn validate_selected_raster_work(
         }
         total_pixels = total_pixels
             .checked_add(page_pixels)
+            .and_then(|total| total.checked_add(band_pixels_per_page))
             .ok_or(RasterPdfError::RasterWorkLimitExceeded)?;
         if total_pixels > MAX_PDF_TOTAL_RASTER_PIXELS {
             return Err(RasterPdfError::RasterWorkLimitExceeded);
@@ -276,8 +329,29 @@ impl Page {
     ///
     /// The full document width is scaled uniformly into the printable width;
     /// vertical slices become pages. Print media rules participate in normal
-    /// cascade and layout, but CSS paged media, headers, and footers remain
-    /// outside this raster-backed exporter.
+    /// cascade and layout, but CSS paged media remains outside this
+    /// raster-backed exporter. Header and footer templates are rendered
+    /// separately into the page margins.
+    /// Date, title and URL for the header/footer `date`, `title` and `url`
+    /// classes. The title is read from the live document so script changes
+    /// are reflected, like `document.title` in Chromium.
+    fn header_footer_document_fields(&self) -> (String, String, String) {
+        let title = self
+            .with_dom(|dom| {
+                dom.query_selector("title")
+                    .ok()
+                    .flatten()
+                    .map(|node| dom.text_content(node))
+            })
+            .flatten()
+            .unwrap_or_else(|| self.title.clone());
+        (
+            current_date_string(),
+            title.split_whitespace().collect::<Vec<_>>().join(" "),
+            self.url_string(),
+        )
+    }
+
     pub fn raster_pdf(&self, options: RasterPdfOptions) -> Result<Vec<u8>, RasterPdfError> {
         self.raster_pdf_with_animation_sample(options, self.live_animation_sample())
     }
@@ -303,6 +377,7 @@ impl Page {
     ) -> Result<Vec<u8>, RasterPdfError> {
         let (page_width, page_height, printable_width, printable_height, left, bottom) =
             options.page_geometry()?;
+        let header_footer = HeaderFooterPlan::new(&options, page_width, page_height)?;
         let js = self
             .js
             .as_ref()
@@ -334,7 +409,16 @@ impl Page {
                 options.scale,
             )?;
             let selected_pages = selected_page_indices(plan.page_count, &options.page_ranges)?;
-            validate_selected_raster_work(content_width, content_height, plan, &selected_pages)?;
+            validate_selected_raster_work(
+                content_width,
+                content_height,
+                plan,
+                &selected_pages,
+                header_footer.pixels_per_page(),
+            )?;
+            let document = header_footer
+                .is_enabled()
+                .then(|| self.header_footer_document_fields());
 
             encode_pdf_pages(
                 selected_pages.len(),
@@ -343,6 +427,8 @@ impl Page {
                 left,
                 bottom,
                 printable_height,
+                header_footer.header.is_some(),
+                header_footer.footer.is_some(),
                 |output_page_index| {
                     let page_index = selected_pages[output_page_index];
                     let y = page_index as f32 * plan.css_page_height;
@@ -363,10 +449,24 @@ impl Page {
                     // PNGs or JPEGs for earlier pages.
                     drop(png);
                     let rgb = decoded.into_rgb8();
+                    let (header, footer) = match &document {
+                        Some((date, title, url)) => header_footer.render(&BandFields {
+                            date,
+                            title,
+                            url,
+                            // Chromium numbers pages of the whole document,
+                            // so a pageRanges selection keeps original numbers.
+                            page_number: page_index + 1,
+                            total_pages: plan.page_count,
+                        })?,
+                        None => (None, None),
+                    };
                     Ok(RasterPage {
                         rgb,
                         draw_width_pt: content_width * plan.points_per_css_pixel,
                         draw_height_pt: slice_height * plan.points_per_css_pixel,
+                        header,
+                        footer,
                         #[cfg(test)]
                         _lifetime_probe: None,
                     })
@@ -378,6 +478,217 @@ impl Page {
     }
 }
 
+/// Resolved header/footer work for one export: which bands exist, their
+/// geometry, and the template each one renders.
+struct HeaderFooterPlan {
+    header: Option<(BandGeometry, String)>,
+    footer: Option<(BandGeometry, String)>,
+}
+
+impl HeaderFooterPlan {
+    fn new(
+        options: &RasterPdfOptions,
+        page_width_pt: f32,
+        page_height_pt: f32,
+    ) -> Result<Self, RasterPdfError> {
+        if !options.display_header_footer {
+            return Ok(Self {
+                header: None,
+                footer: None,
+            });
+        }
+        for template in [&options.header_template, &options.footer_template] {
+            if template.len() > MAX_HEADER_FOOTER_TEMPLATE_BYTES {
+                return Err(RasterPdfError::TemplateTooLarge(
+                    MAX_HEADER_FOOTER_TEMPLATE_BYTES,
+                ));
+            }
+        }
+        let template_or_default = |template: &str, default: &str| {
+            if template.trim().is_empty() {
+                default.to_string()
+            } else {
+                template.to_string()
+            }
+        };
+        Ok(Self {
+            header: band_geometry(page_width_pt, page_height_pt, options.margin_top_in, true)?.map(|geometry| {
+                (
+                    geometry,
+                    template_or_default(&options.header_template, DEFAULT_HEADER_TEMPLATE),
+                )
+            }),
+            footer: band_geometry(page_width_pt, page_height_pt, options.margin_bottom_in, false)?.map(
+                |geometry| {
+                    (
+                        geometry,
+                        template_or_default(&options.footer_template, DEFAULT_FOOTER_TEMPLATE),
+                    )
+                },
+            ),
+        })
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.header.is_some() || self.footer.is_some()
+    }
+
+    fn pixels_per_page(&self) -> u64 {
+        [&self.header, &self.footer]
+            .into_iter()
+            .flatten()
+            .map(|(geometry, _)| u64::from(geometry.width_px) * u64::from(geometry.height_px))
+            .sum()
+    }
+
+    fn render(
+        &self,
+        fields: &BandFields<'_>,
+    ) -> Result<(Option<RasterBand>, Option<RasterBand>), RasterPdfError> {
+        let render_one = |band: &Option<(BandGeometry, String)>| match band {
+            Some((geometry, template)) => render_band(template, *geometry, fields).map(Some),
+            None => Ok(None),
+        };
+        Ok((render_one(&self.header)?, render_one(&self.footer)?))
+    }
+}
+
+/// Geometry of the top or bottom margin band. A margin thinner than one CSS
+/// pixel has no room for a template, so it yields no band.
+fn band_geometry(
+    page_width_pt: f32,
+    page_height_pt: f32,
+    margin_in: f32,
+    top: bool,
+) -> Result<Option<BandGeometry>, RasterPdfError> {
+    let height_px = (margin_in * CSS_PIXELS_PER_INCH).ceil();
+    if !height_px.is_finite() || height_px < 1.0 {
+        return Ok(None);
+    }
+    let width_px = (page_width_pt / POINTS_PER_INCH * CSS_PIXELS_PER_INCH).ceil();
+    let max_dimension = obscura_js::MAX_CAPTURE_DIMENSION as f32;
+    if !width_px.is_finite()
+        || width_px < 1.0
+        || width_px > max_dimension
+        || height_px > max_dimension
+    {
+        return Err(RasterPdfError::RasterWorkLimitExceeded);
+    }
+    let (width_px, height_px) = (width_px as u32, height_px as u32);
+    if u64::from(width_px) * u64::from(height_px) > MAX_PDF_PAGE_PIXELS {
+        return Err(RasterPdfError::RasterWorkLimitExceeded);
+    }
+    let height_pt = margin_in * POINTS_PER_INCH;
+    Ok(Some(BandGeometry {
+        width_px,
+        height_px,
+        y_pt: if top { page_height_pt - height_pt } else { 0.0 },
+        width_pt: page_width_pt,
+        height_pt,
+    }))
+}
+
+/// Replace the children of every element carrying one of the header/footer
+/// classes (`date`, `title`, `url`, `pageNumber`, `totalPages`) with text.
+fn inject_band_fields(dom: &obscura_dom::DomTree, fields: &BandFields<'_>) {
+    for node in dom.descendants(dom.document()) {
+        let Some(class) = dom
+            .with_node(node, |node| {
+                node.get_attribute("class").map(str::to_owned)
+            })
+            .flatten()
+        else {
+            continue;
+        };
+        for token in class.split_ascii_whitespace() {
+            let value = match token {
+                "date" => fields.date.to_string(),
+                "title" => fields.title.to_string(),
+                "url" => fields.url.to_string(),
+                "pageNumber" => fields.page_number.to_string(),
+                "totalPages" => fields.total_pages.to_string(),
+                _ => continue,
+            };
+            for child in dom.children(node) {
+                dom.detach(child);
+            }
+            let text = dom.new_node(obscura_dom::NodeData::Text { contents: value });
+            dom.append_child(node, text);
+            break;
+        }
+    }
+}
+
+/// Rasterize one template into a band image. The template is laid out across
+/// the full paper width inside the margin height, like Chromium, with no
+/// script execution and no network access.
+fn render_band(
+    template: &str,
+    geometry: BandGeometry,
+    fields: &BandFields<'_>,
+) -> Result<RasterBand, RasterPdfError> {
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
+         html,body{{margin:0;padding:0;background:#fff}}\
+         body{{width:{}px;height:{}px;overflow:hidden;font-size:10px;font-family:sans-serif}}\
+         </style></head><body>{template}</body></html>",
+        geometry.width_px, geometry.height_px,
+    );
+    let dom = obscura_dom::parse_html(&html);
+    inject_band_fields(&dom, fields);
+
+    // Scripts never run here, and sync resource loading stays off so a
+    // template cannot make the exporter fetch arbitrary URLs.
+    let mut resources = obscura_js::RenderResourceCache::default();
+    resources.set_sync_loading_enabled(false);
+    let png = obscura_js::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+        &dom,
+        (geometry.width_px as f32, geometry.height_px as f32),
+        None,
+        (0.0, 0.0),
+        obscura_js::AnimationSampleTime::default(),
+        [255, 255, 255, 255],
+        &mut resources,
+    )
+    .ok_or_else(|| {
+        RasterPdfError::CaptureFailed("header/footer template could not be rendered".to_string())
+    })?;
+    let rgb = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .map_err(|error| RasterPdfError::ImageDecode(error.to_string()))?
+        .into_rgb8();
+    Ok(RasterBand {
+        rgb,
+        x_pt: 0.0,
+        y_pt: geometry.y_pt,
+        width_pt: geometry.width_pt,
+        height_pt: geometry.height_pt,
+    })
+}
+
+/// `M/D/YYYY` in UTC, the shape Chromium uses for the `date` class in en-US.
+fn current_date_string() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| (elapsed.as_secs() / 86_400) as i64)
+        .unwrap_or(0);
+    // Howard Hinnant's civil-from-days algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{month}/{day}/{year}")
+}
+
 fn encode_pdf_pages(
     page_count: usize,
     page_width: f32,
@@ -385,12 +696,17 @@ fn encode_pdf_pages(
     left: f32,
     bottom: f32,
     printable_height: f32,
+    has_header: bool,
+    has_footer: bool,
     mut page_source: impl FnMut(usize) -> Result<RasterPage, RasterPdfError>,
 ) -> Result<Vec<u8>, RasterPdfError> {
+    // Per page: page dictionary, content stream, body image, then one image
+    // object for each header/footer band.
+    let objects_per_page = 3 + usize::from(has_header) + usize::from(has_footer);
     let object_count = 2usize
         .checked_add(
             page_count
-                .checked_mul(3)
+                .checked_mul(objects_per_page)
                 .ok_or(RasterPdfError::OutputLimitExceeded)?,
         )
         .ok_or(RasterPdfError::OutputLimitExceeded)?;
@@ -398,7 +714,7 @@ fn encode_pdf_pages(
     writer.write_object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
 
     let kids = (0..page_count)
-        .map(|index| format!("{} 0 R", 3 + index * 3))
+        .map(|index| format!("{} 0 R", 3 + index * objects_per_page))
         .collect::<Vec<_>>()
         .join(" ");
     let pages_dictionary = format!("<< /Type /Pages /Count {page_count} /Kids [{kids}] >>");
@@ -406,19 +722,44 @@ fn encode_pdf_pages(
 
     for index in 0..page_count {
         let page = page_source(index)?;
-        let page_id = 3 + index * 3;
+        if page.header.is_some() != has_header || page.footer.is_some() != has_footer {
+            return Err(RasterPdfError::CaptureFailed(
+                "header/footer band layout changed between pages".to_string(),
+            ));
+        }
+        let page_id = 3 + index * objects_per_page;
         let content_id = page_id + 1;
         let image_id = page_id + 2;
+        let header_id = page_id + 3;
+        let footer_id = header_id + usize::from(has_header);
+        let mut xobjects = format!("/Im0 {image_id} 0 R");
+        if has_header {
+            xobjects.push_str(&format!(" /Im1 {header_id} 0 R"));
+        }
+        if has_footer {
+            xobjects.push_str(&format!(" /Im2 {footer_id} 0 R"));
+        }
         let page_dictionary = format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width:.3} {page_height:.3}] /Resources << /XObject << /Im0 {image_id} 0 R >> >> /Contents {content_id} 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width:.3} {page_height:.3}] /Resources << /XObject << {xobjects} >> >> /Contents {content_id} 0 R >>"
         );
         writer.write_object(page_id, page_dictionary.as_bytes())?;
 
         let draw_y = bottom + printable_height - page.draw_height_pt;
-        let commands = format!(
+        // Margin bands first: the body is drawn last so it wins any sub-pixel
+        // overlap at the margin edge.
+        let mut commands = String::new();
+        for (name, band) in [("Im1", &page.header), ("Im2", &page.footer)] {
+            if let Some(band) = band {
+                commands.push_str(&format!(
+                    "q\n{:.3} 0 0 {:.3} {:.3} {:.3} cm\n/{name} Do\nQ\n",
+                    band.width_pt, band.height_pt, band.x_pt, band.y_pt,
+                ));
+            }
+        }
+        commands.push_str(&format!(
             "q\n{:.3} 0 0 {:.3} {:.3} {:.3} cm\n/Im0 Do\nQ\n",
             page.draw_width_pt, page.draw_height_pt, left, draw_y,
-        );
+        ));
         let content = format!(
             "<< /Length {} >>\nstream\n{}endstream",
             commands.len(),
@@ -426,6 +767,12 @@ fn encode_pdf_pages(
         );
         writer.write_object(content_id, content.as_bytes())?;
         writer.write_rgb_image(image_id, &page.rgb)?;
+        if let Some(band) = &page.header {
+            writer.write_rgb_image(header_id, &band.rgb)?;
+        }
+        if let Some(band) = &page.footer {
+            writer.write_rgb_image(footer_id, &band.rgb)?;
+        }
         // `page`, including its decoded RGB raster, is dropped here before
         // the next page is captured. Only the bounded final PDF survives.
     }
@@ -617,7 +964,7 @@ mod tests {
             .expect("an ordinary multi-page document stays inside the budget");
         assert!(ordinary.page_count > 1);
         let ordinary_pages = selected_page_indices(ordinary.page_count, &[]).unwrap();
-        validate_selected_raster_work(1280.0, 10_000.0, ordinary, &ordinary_pages).unwrap();
+        validate_selected_raster_work(1280.0, 10_000.0, ordinary, &ordinary_pages, 0).unwrap();
 
         let oversized_page =
             pagination_plan(5_000.0, 5_000.0, printable_width, printable_height, 1.0).unwrap();
@@ -629,6 +976,7 @@ mod tests {
                 5_000.0,
                 oversized_page,
                 &oversized_page_selection,
+                0,
             )
             .unwrap_err(),
             RasterPdfError::RasterWorkLimitExceeded,
@@ -645,6 +993,7 @@ mod tests {
                 70_000.0,
                 too_much_total,
                 &too_much_total_selection,
+                0,
             )
             .unwrap_err(),
             RasterPdfError::RasterWorkLimitExceeded,
@@ -675,7 +1024,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected, vec![0]);
-        validate_selected_raster_work(1_000.0, 400_000.0, long, &selected).unwrap();
+        validate_selected_raster_work(1_000.0, 400_000.0, long, &selected, 0).unwrap();
 
         assert_eq!(
             selected_page_indices(
@@ -982,11 +1331,13 @@ mod tests {
 
     #[test]
     fn writer_emits_xref_and_one_image_per_page() {
-        let pdf = encode_pdf_pages(1, 612.0, 792.0, 36.0, 36.0, 720.0, |_| {
+        let pdf = encode_pdf_pages(1, 612.0, 792.0, 36.0, 36.0, 720.0, false, false, |_| {
             Ok(RasterPage {
                 rgb: image::RgbImage::from_pixel(2, 3, image::Rgb([10, 20, 30])),
                 draw_width_pt: 100.0,
                 draw_height_pt: 150.0,
+                header: None,
+                footer: None,
                 _lifetime_probe: None,
             })
         })
@@ -1022,7 +1373,7 @@ mod tests {
     #[test]
     fn page_rasters_are_released_before_capturing_the_next_page() {
         let previous = std::cell::RefCell::new(None::<std::rc::Weak<()>>);
-        let pdf = encode_pdf_pages(4, 612.0, 792.0, 36.0, 36.0, 720.0, |index| {
+        let pdf = encode_pdf_pages(4, 612.0, 792.0, 36.0, 36.0, 720.0, false, false, |index| {
             if let Some(previous) = previous.borrow().as_ref() {
                 assert!(
                     previous.upgrade().is_none(),
@@ -1035,6 +1386,8 @@ mod tests {
                 rgb: image::RgbImage::from_pixel(8, 8, image::Rgb([index as u8, 0, 0])),
                 draw_width_pt: 100.0,
                 draw_height_pt: 100.0,
+                header: None,
+                footer: None,
                 _lifetime_probe: Some(probe),
             })
         })
@@ -1068,5 +1421,199 @@ mod tests {
             Err(RasterPdfError::OutputLimitExceeded)
         );
         assert!(writer.output.len() <= 600);
+    }
+
+    fn header_footer_fixture(name: &str) -> crate::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::new(name.to_string()));
+        let mut page = crate::Page::new(format!("{name}-page"), context);
+        page.set_viewport((100.0, 80.0));
+        let dom = obscura_dom::parse_html(
+            r#"<html style="margin:0"><head><title>  Quarterly
+                report </title></head>
+               <body style="margin:0;width:100px;height:200px;background:#2050e0"></body></html>"#,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url("https://example.test/report");
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page
+    }
+
+    /// 300x300pt paper with half-inch top and bottom margins: a 400x48 CSS
+    /// pixel band, and a 100x200px body that paginates into three pages.
+    fn header_footer_options() -> RasterPdfOptions {
+        RasterPdfOptions {
+            print_background: true,
+            paper_width_in: 300.0 / POINTS_PER_INCH,
+            paper_height_in: 300.0 / POINTS_PER_INCH,
+            margin_top_in: 0.5,
+            margin_bottom_in: 0.5,
+            margin_left_in: 0.0,
+            margin_right_in: 0.0,
+            display_header_footer: true,
+            ..RasterPdfOptions::default()
+        }
+    }
+
+    #[test]
+    fn band_geometry_places_header_and_footer_in_the_margins() {
+        let header = band_geometry(300.0, 400.0, 0.5, true).unwrap().unwrap();
+        assert_eq!((header.width_px, header.height_px), (400, 48));
+        assert_eq!(header.y_pt, 400.0 - 36.0);
+        assert_eq!((header.width_pt, header.height_pt), (300.0, 36.0));
+        let footer = band_geometry(300.0, 400.0, 0.5, false).unwrap().unwrap();
+        assert_eq!(footer.y_pt, 0.0);
+        assert_eq!(band_geometry(300.0, 400.0, 0.0, true).unwrap(), None);
+        assert_eq!(
+            band_geometry(300.0, 400.0, 0.005, true).unwrap().map(|g| g.height_px),
+            Some(1)
+        );
+        assert_eq!(
+            band_geometry(14_400.0, 14_400.0, 150.0, true).unwrap_err(),
+            RasterPdfError::RasterWorkLimitExceeded,
+            "a margin band must respect the per-page pixel budget"
+        );
+    }
+
+    #[test]
+    fn band_fields_replace_children_of_classed_elements() {
+        let dom = obscura_dom::parse_html(
+            r#"<body><span id="a" class="pageNumber">x</span>
+               <span id="b" class="foo totalPages"><b>y</b></span>
+               <span id="c" class="title"></span><span id="d" class="url"></span>
+               <span id="e" class="date"></span><span id="f" class="other">keep</span></body>"#,
+        );
+        inject_band_fields(
+            &dom,
+            &BandFields {
+                date: "1/2/2027",
+                title: "A <b>title</b>",
+                url: "https://example.test/",
+                page_number: 3,
+                total_pages: 7,
+            },
+        );
+        let text = |id: &str| {
+            let node = dom.query_selector(&format!("#{id}")).unwrap().unwrap();
+            dom.text_content(node)
+        };
+        assert_eq!(text("a"), "3");
+        assert_eq!(text("b"), "7");
+        assert_eq!(text("c"), "A <b>title</b>", "injected values are text, not markup");
+        assert_eq!(text("d"), "https://example.test/");
+        assert_eq!(text("e"), "1/2/2027");
+        assert_eq!(text("f"), "keep");
+    }
+
+    #[test]
+    fn current_date_has_month_day_year_shape() {
+        let date = current_date_string();
+        let parts = date.split('/').map(|p| p.parse::<u32>().unwrap()).collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3, "{date}");
+        assert!((1..=12).contains(&parts[0]) && (1..=31).contains(&parts[1]));
+        assert!(parts[2] >= 2024, "{date}");
+    }
+
+    #[test]
+    fn raster_pdf_draws_header_and_footer_bands_on_every_page() {
+        let page = header_footer_fixture("pdf-header-footer");
+        let mut options = header_footer_options();
+        options.header_template =
+            r#"<div style="height:48px;background:#e02020"></div>"#.to_string();
+        options.footer_template =
+            r#"<div style="height:48px;background:#20c040"></div>"#.to_string();
+        let pdf = page.raster_pdf(options.clone()).expect("PDF with header/footer");
+        let rasters = pdf_page_rasters(&pdf);
+        // Per page: body, header band, footer band.
+        assert_eq!(rasters.len(), 9);
+        for page_rasters in rasters.chunks(3) {
+            assert!(channel_near(*page_rasters[0].get_pixel(50, 10), [32, 80, 224]));
+            assert_eq!(page_rasters[1].dimensions(), (400, 48));
+            assert!(channel_near(*page_rasters[1].get_pixel(200, 24), [224, 32, 32]));
+            assert_eq!(page_rasters[2].dimensions(), (400, 48));
+            assert!(channel_near(*page_rasters[2].get_pixel(200, 24), [32, 192, 64]));
+        }
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("/MediaBox [0 0 300.000 300.000]"));
+        assert!(text.contains("/Im1"), "header XObject must be referenced");
+        assert!(text.contains("/Im2"), "footer XObject must be referenced");
+        assert!(
+            text.contains("1 0 0 36.000 0.000 264.000 cm") || text.contains("300.000 0 0 36.000 0.000 264.000 cm"),
+            "header must be drawn in the top margin"
+        );
+
+        // The flag gates everything: templates are ignored when it is false.
+        let mut disabled = options;
+        disabled.display_header_footer = false;
+        assert_eq!(
+            pdf_page_rasters(&page.raster_pdf(disabled).expect("plain PDF")).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn raster_pdf_injects_page_numbers_and_respects_page_ranges() {
+        let page = header_footer_fixture("pdf-page-numbers");
+        let mut options = header_footer_options();
+        options.header_template = "<span></span>".to_string();
+        options.footer_template =
+            r#"<div style="font-size:40px;padding-left:20px"><span class="pageNumber"></span> of <span class="totalPages"></span></div>"#
+                .to_string();
+        let ink = |raster: &image::RgbImage| {
+            raster.pixels().filter(|pixel| pixel.0.iter().any(|c| *c < 128)).count()
+        };
+        let all = pdf_page_rasters(&page.raster_pdf(options.clone()).expect("three pages"));
+        // Per page: body, header, footer.
+        let footer = |index: usize| &all[index * 3 + 2];
+        assert!(ink(footer(0)) > 0, "page number text must be drawn");
+        assert_ne!(
+            footer(0).as_raw(),
+            footer(1).as_raw(),
+            "each page must show its own page number"
+        );
+
+        options.page_ranges = vec![RasterPdfPageRange { start: Some(2), end: Some(2) }];
+        let ranged = pdf_page_rasters(&page.raster_pdf(options).expect("page two only"));
+        assert_eq!(ranged.len(), 3);
+        assert_eq!(
+            ranged[2].as_raw(),
+            footer(1).as_raw(),
+            "a page range keeps the document's own page numbers"
+        );
+    }
+
+    #[test]
+    fn empty_templates_fall_back_to_chromium_defaults() {
+        let page = header_footer_fixture("pdf-default-templates");
+        let pdf = page.raster_pdf(header_footer_options()).expect("default bands");
+        let rasters = pdf_page_rasters(&pdf);
+        assert_eq!(rasters.len(), 9);
+        let ink = |raster: &image::RgbImage| {
+            raster.pixels().filter(|pixel| pixel.0.iter().any(|c| *c < 128)).count()
+        };
+        assert!(ink(&rasters[1]) > 0, "default header shows the date and title");
+        assert!(ink(&rasters[2]) > 0, "default footer shows the URL and page numbers");
+    }
+
+    #[test]
+    fn oversized_header_footer_templates_are_rejected_before_rendering() {
+        let page = header_footer_fixture("pdf-template-limit");
+        let mut options = header_footer_options();
+        options.footer_template = "x".repeat(MAX_HEADER_FOOTER_TEMPLATE_BYTES + 1);
+        assert_eq!(
+            page.raster_pdf(options).unwrap_err(),
+            RasterPdfError::TemplateTooLarge(MAX_HEADER_FOOTER_TEMPLATE_BYTES)
+        );
+    }
+
+    #[test]
+    fn header_footer_templates_cannot_trigger_network_fetches() {
+        let page = header_footer_fixture("pdf-template-ssrf");
+        let mut options = header_footer_options();
+        options.header_template =
+            r#"<img src="http://127.0.0.1:9/probe.png" style="width:20px;height:20px">"#.to_string();
+        page.raster_pdf(options).expect("a template with a remote image still renders");
     }
 }
