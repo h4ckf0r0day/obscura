@@ -42,21 +42,43 @@ fn archive_version() -> Option<String> {
         .map(|value| normalize_version(value.to_string()))
 }
 
+fn git(args: &[&str]) -> Option<String> {
+    std::process::Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|out| out.trim().to_string())
+        .filter(|out| !out.is_empty())
+}
+
+/// Cargo reruns a build script that prints any `rerun-if` line only when one
+/// of those inputs changes, so the commit in the version went stale after a
+/// commit or a checkout. Watch the files git rewrites when HEAD moves.
+/// `--git-path` also resolves them in a linked worktree.
+fn rerun_when_head_moves() {
+    let mut names = vec!["HEAD".to_string(), "packed-refs".to_string(), "logs/HEAD".to_string()];
+    names.extend(git(&["symbolic-ref", "-q", "HEAD"]));
+    for name in names {
+        // A path that does not exist would rerun the script on every build.
+        // The reflog covers a branch whose ref is packed until its next commit.
+        if let Some(path) = git(&["rev-parse", "--git-path", &name]).filter(|path| std::path::Path::new(path).exists()) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+}
+
 /// Local builds are not cut from a tag, so the bare workspace version cannot
 /// tell two checkouts apart. Append the commit when git is there to answer;
 /// tarball and minimal-image builds without git keep the bare version.
 fn local_version() -> String {
     let package = env::var("CARGO_PKG_VERSION").expect("Cargo sets CARGO_PKG_VERSION");
-    let sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|sha| sha.trim().to_string())
-        .filter(|sha| !sha.is_empty());
-    match sha {
-        Some(sha) => format!("{package}-dev+{sha}"),
+    match git(&["rev-parse", "--short", "HEAD"]) {
+        Some(sha) => {
+            rerun_when_head_moves();
+            format!("{package}-dev+{sha}")
+        }
         None => package,
     }
 }
