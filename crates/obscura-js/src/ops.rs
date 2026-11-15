@@ -7430,9 +7430,12 @@ fn op_initial_frame(
         page.borrow_mut().frame_id_counter = frame_id;
         let Some(parent_context) = initialize.get_creation_context(scope) else { return 0 };
         let main_context = scope.get_current_context();
+        #[cfg(not(obscura_runtime_bootstrap))]
         let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
             .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
         else { return 0 };
+        #[cfg(obscura_runtime_bootstrap)]
+        let context = v8::Context::new(scope);
         // Same borrowed deno_core slots as fetched frame realms. Child contexts
         // must not own or free these pointers.
         unsafe {
@@ -7443,6 +7446,10 @@ fn op_initial_frame(
         }
         context.clear_all_slots();
         context.set_security_token(parent_context.get_security_token(scope));
+        #[cfg(obscura_runtime_bootstrap)]
+        if !crate::bootstrap::install_in_context(scope, context) {
+            return 0;
+        }
         let mut child = ObscuraState::new();
         #[cfg(feature = "render")]
         child.set_viewport(300.0, 150.0);

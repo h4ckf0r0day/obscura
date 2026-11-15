@@ -1,4 +1,6 @@
 pub mod cdp_watchdog;
+#[cfg(obscura_runtime_bootstrap)]
+mod bootstrap;
 pub mod frame;
 mod import_map;
 pub mod indexed_db;

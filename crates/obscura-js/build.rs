@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(obscura_external_bootstrap)");
+    println!("cargo:rustc-check-cfg=cfg(obscura_runtime_bootstrap)");
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=js/indexed_db.js");
     println!("cargo:rerun-if-changed=build.rs");
@@ -14,6 +15,15 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     let host = std::env::var("HOST").unwrap_or_default();
     let is_cross = target != host;
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    if is_cross && target_os == "android" {
+        println!("cargo:rustc-cfg=obscura_runtime_bootstrap");
+        eprintln!(
+            "[obscura-js build.rs] Cross-compiling to Android; bootstrap will run in the target runtime"
+        );
+        return;
+    }
 
     let bootstrap_source = include_str!("js/bootstrap.js")
         .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"));
