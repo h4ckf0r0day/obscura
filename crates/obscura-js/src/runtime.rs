@@ -278,6 +278,20 @@ struct CdpObjectRecord {
     frame: Option<(u32, v8::Global<v8::Context>)>,
 }
 
+/// A script compilation failure with its 0-based position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScriptSyntaxError {
+    pub text: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl ScriptSyntaxError {
+    fn new(text: &str) -> Self {
+        ScriptSyntaxError { text: text.to_string(), line: 0, column: 0 }
+    }
+}
+
 pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, CdpObjectRecord>,
@@ -618,6 +632,51 @@ impl ObscuraJsRuntime {
     /// Run a full collection only when an automation client explicitly asks.
     pub fn collect_garbage(&mut self) {
         self.runtime().v8_isolate().low_memory_notification();
+    }
+
+    /// Compile `source` in the main context without running it, returning the
+    /// V8 exception message when it does not parse.
+    pub fn check_script_syntax(&mut self, source: &str, source_url: &str) -> Result<(), ScriptSyntaxError> {
+        let mut entered = self.runtime();
+        let context = entered.main_context();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let source = v8::String::new(scope, source)
+            .ok_or_else(|| ScriptSyntaxError::new("source allocation failed"))?;
+        let name = v8::String::new(scope, source_url)
+            .ok_or_else(|| ScriptSyntaxError::new("script URL allocation failed"))?;
+        let origin = v8::ScriptOrigin::new(
+            scope, name.into(), 0, 0, false, 0, None, false, false, false, None,
+        );
+        v8::tc_scope!(let tc_scope, scope);
+        let mut compilation = v8::script_compiler::Source::new(source, Some(&origin));
+        let script = v8::script_compiler::compile(
+            tc_scope,
+            &mut compilation,
+            v8::script_compiler::CompileOptions::NoCompileOptions,
+            v8::script_compiler::NoCacheReason::NoReason,
+        );
+        if script.is_some() {
+            return Ok(());
+        }
+        if tc_scope.is_execution_terminating() {
+            tc_scope.cancel_terminate_execution();
+            return Err(ScriptSyntaxError::new("execution terminated"));
+        }
+        let text = match tc_scope.exception() {
+            Some(exception) => exception.to_rust_string_lossy(tc_scope),
+            None => "script compilation failed without an exception".to_string(),
+        };
+        let (line, column) = match tc_scope.message() {
+            Some(message) => (
+                message.get_line_number(tc_scope).map_or(0, |line| line.saturating_sub(1) as u32),
+                message.get_start_column() as u32,
+            ),
+            None => (0, 0),
+        };
+        Err(ScriptSyntaxError { text, line, column })
     }
 
     /// Freeze the document timeline for one JavaScript task. Browser timelines
