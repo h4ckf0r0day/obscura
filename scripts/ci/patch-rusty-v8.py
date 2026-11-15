@@ -25,7 +25,7 @@ BUILD_REPLACEMENT = """  // obscura-ci: build V8 from source only for Android
   {
 """
 
-ANDROID_CONFIG_MARKER = "// obscura-ci: declare Android NDK version"
+ANDROID_CONFIG_MARKER = "# obscura-ci: declare Android NDK version"
 ANDROID_NDK_VERSION = "r26"
 
 
