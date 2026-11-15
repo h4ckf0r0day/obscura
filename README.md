@@ -298,6 +298,12 @@ obscura serve --port 9222
 obscura serve --port 9222 --stealth
 ```
 
+### One-click deploy
+
+To run the CDP server on a hosted machine instead of your own, deploy it with one click:
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Obscura/)
+
 ### Scrape in parallel
 
 ```bash
