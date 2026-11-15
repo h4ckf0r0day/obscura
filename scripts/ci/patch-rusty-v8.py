@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Prepare the published rusty_v8 crate for an Android source build.
+"""Prepare a rusty_v8 source tree for an Android source build.
 
-Two source-layout differences between the published crate and a Chromium
-checkout have to be repaired in CI:
+Two source-layout differences between a standalone rusty_v8 checkout and a
+Chromium checkout have to be repaired in CI:
 
 * The source-build branch must run only for the Android Cargo target. The host
   copy used by Cargo build scripts can use rusty_v8's published x86_64
