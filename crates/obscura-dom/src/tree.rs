@@ -168,6 +168,11 @@ impl Node {
         }
     }
 
+    /// The element's `id` attribute value, if it has one.
+    pub fn element_id(&self) -> Option<&str> {
+        self.get_attribute("id")
+    }
+
     pub fn get_attribute(&self, name: &str) -> Option<&str> {
         self.attrs()?.iter().find_map(|a| {
             if a.qualified_name_eq(name) {
@@ -310,7 +315,11 @@ pub(crate) struct DomTreeInner {
     pub(crate) free_list: Vec<u32>,
     node_generations: Option<Box<NodeAllocationGenerations>>,
     pub(crate) document: NodeId,
-    pub(crate) id_index: HashMap<String, NodeId>,
+    /// Every live element whose `id` attribute has the key value, connected or
+    /// not, in no particular order. Creation, attribute edits (all of which go
+    /// through `new_node` or `with_node_mut`) and arena frees keep it complete,
+    /// so a lookup never needs to scan the document.
+    pub(crate) id_index: HashMap<String, Vec<NodeId>>,
     form_controls: HashMap<NodeId, FormControlState>,
     // Only parser-associated controls outside their form subtree need records.
     parser_form_owners: HashMap<NodeId, NodeId>,
@@ -888,15 +897,6 @@ impl DomTree {
             NodeId(idx)
         };
 
-        if let NodeData::Element { ref attrs, .. } = data {
-            if let Some(id_attr) = attrs.iter().find(|a| a.name.local.as_ref() == "id") {
-                // Keep the FIRST element created with a given id. Parse order is
-                // document order, so getElementById / querySelector('#id') return
-                // the first-in-tree-order element on duplicate ids, per spec.
-                inner.id_index.entry(id_attr.value.clone()).or_insert(id);
-            }
-        }
-
         inner.nodes[id.index()] = Some(Node {
             id,
             connected: false,
@@ -907,6 +907,10 @@ impl DomTree {
             next_sibling: None,
             data,
         });
+        if let Some(value) = inner.nodes[id.index()].as_ref().and_then(Node::element_id) {
+            let value = value.to_string();
+            Self::index_element_id(&mut inner, id, &value);
+        }
         id
     }
 
@@ -917,6 +921,22 @@ impl DomTree {
         inner.nodes.get(id.index())?.as_ref()?;
         Some(inner.node_generations.as_ref()
             .and_then(|generations| generations.reused.get(&id)).copied().unwrap_or(0))
+    }
+
+    fn index_element_id(inner: &mut DomTreeInner, node: NodeId, value: &str) {
+        let entry = inner.id_index.entry(value.to_string()).or_default();
+        if !entry.contains(&node) {
+            entry.push(node);
+        }
+    }
+
+    fn unindex_element_id(inner: &mut DomTreeInner, node: NodeId, value: &str) {
+        if let Some(entry) = inner.id_index.get_mut(value) {
+            entry.retain(|&candidate| candidate != node);
+            if entry.is_empty() {
+                inner.id_index.remove(value);
+            }
+        }
     }
 
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
@@ -961,7 +981,18 @@ impl DomTree {
         } else {
             None
         };
+        let old_element_id = inner.nodes.get(id.index())?.as_ref()?.element_id().map(str::to_owned);
         let result = inner.nodes.get_mut(id.index())?.as_mut().map(f);
+        let new_element_id = inner.nodes.get(id.index()).and_then(Option::as_ref).and_then(Node::element_id);
+        if new_element_id != old_element_id.as_deref() {
+            let new_element_id = new_element_id.map(str::to_owned);
+            if let Some(old) = &old_element_id {
+                Self::unindex_element_id(&mut inner, id, old);
+            }
+            if let Some(new) = &new_element_id {
+                Self::index_element_id(&mut inner, id, new);
+            }
+        }
         if !inner.parser_form_owners.is_empty() && inner.parser_form_owners.contains_key(&id)
             && inner.nodes.get(id.index())?.as_ref()?.get_attribute("form") != old_form.as_deref() {
             inner.parser_form_owners.remove(&id);
@@ -1209,38 +1240,12 @@ impl DomTree {
         }
     }
 
-    /// Detach a node from its parent AND remove it (and all descendants)
-    /// from the id-index so that `getElementById` no longer returns them.
-    /// Unlike `remove()`, this does NOT free the nodes — the JS side may
-    /// still hold references to the wrappers.
+    /// Detach a node from its parent. Unlike `remove()`, this does NOT free
+    /// the nodes: the JS side may still hold references to the wrappers. The
+    /// id index keeps the detached elements; lookups only return connected
+    /// ones, so a later reinsertion is found again.
     pub fn remove_child(&self, node_id: NodeId) {
-        // Collect all id attribute values in the subtree. We snapshot them
-        // before detaching so `get_attribute` can still see the tree.
-        let ids_to_remove: Vec<String> = {
-            let descendants = self.descendants(node_id);
-            let inner = self.inner.borrow();
-            let mut ids: Vec<String> = Vec::new();
-            if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
-                if let Some(id_val) = node.get_attribute("id") {
-                    ids.push(id_val.to_string());
-                }
-            }
-            for desc_id in &descendants {
-                if let Some(Some(node)) = inner.nodes.get(desc_id.index()) {
-                    if let Some(id_val) = node.get_attribute("id") {
-                        ids.push(id_val.to_string());
-                    }
-                }
-            }
-            ids
-        };
-
         self.detach(node_id);
-
-        let mut inner = self.inner.borrow_mut();
-        for id_str in &ids_to_remove {
-            inner.id_index.remove(id_str);
-        }
     }
 
     pub fn remove(&self, node_id: NodeId) {
@@ -1254,14 +1259,14 @@ impl DomTree {
         let mut ids_to_remove = Vec::new();
         for &id in &nodes_to_remove {
             if let Some(Some(node)) = inner.nodes.get(id.index()) {
-                if let Some(id_val) = node.get_attribute("id") {
-                    ids_to_remove.push(id_val.to_string());
+                if let Some(id_val) = node.element_id() {
+                    ids_to_remove.push((id, id_val.to_string()));
                 }
             }
         }
 
-        for id_str in ids_to_remove {
-            inner.id_index.remove(&id_str);
+        for (node, id_str) in ids_to_remove {
+            Self::unindex_element_id(&mut inner, node, &id_str);
         }
 
         // Remove both directions before freeing any arena slot. Otherwise a
@@ -2018,21 +2023,99 @@ impl DomTree {
         result
     }
 
+    /// The first element in tree order of the document's light tree whose id
+    /// is `id`. Shadow-tree and detached elements are never returned. Without
+    /// a document match, an element of a template's content document is
+    /// returned for internal callers; `document.getElementById` filters it.
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
-        let indexed = self.inner.borrow().id_index.get(id).copied();
-        if indexed.is_some_and(|node| self.containing_shadow_root(node).is_none()) {
-            return indexed;
+        let mut connected: Option<NodeId> = None;
+        let mut inert: Option<NodeId> = None;
+        for node in self.elements_with_id(id) {
+            let slot = if self.is_connected(node) {
+                if self.containing_shadow_root(node).is_some() {
+                    continue;
+                }
+                &mut connected
+            } else {
+                let in_document = self.tree_scope_root(node).is_some_and(|root| {
+                    self.with_node(root, |root| matches!(root.data, NodeData::Document))
+                        .unwrap_or(false)
+                });
+                if !in_document {
+                    continue;
+                }
+                &mut inert
+            };
+            *slot = Some(match *slot {
+                Some(current) if self.precedes_in_tree_order(current, node) => current,
+                _ => node,
+            });
         }
+        connected.or(inert)
+    }
 
-        // Creation happens before insertion, so the O(1) best-effort index can
-        // point at a shadow descendant. Never expose that node through
-        // document.getElementById; recover the first matching light-tree
-        // element in document order instead. Detached and template-content
-        // nodes retain the legacy best-effort lookup behavior used internally.
-        self.descendants(self.document()).into_iter().find(|node_id| {
-            self.with_node(*node_id, |node| node.get_attribute("id") == Some(id))
-                .unwrap_or(false)
-        })
+    /// Every live element whose id attribute is `id`, in no particular order.
+    pub fn elements_with_id(&self, id: &str) -> Vec<NodeId> {
+        let inner = self.inner.borrow();
+        let Some(candidates) = inner.id_index.get(id) else {
+            return Vec::new();
+        };
+        candidates
+            .iter()
+            .copied()
+            .filter(|node| {
+                inner
+                    .nodes
+                    .get(node.index())
+                    .and_then(Option::as_ref)
+                    .and_then(Node::element_id)
+                    == Some(id)
+            })
+            .collect()
+    }
+
+    /// Whether `a` comes before `b` in tree order. Nodes in different trees
+    /// compare by their roots' arena order, which is stable but arbitrary.
+    pub fn precedes_in_tree_order(&self, a: NodeId, b: NodeId) -> bool {
+        if a == b {
+            return false;
+        }
+        let mut chain_a = self.ancestors(a);
+        chain_a.reverse();
+        chain_a.push(a);
+        let mut chain_b = self.ancestors(b);
+        chain_b.reverse();
+        chain_b.push(b);
+        let common = chain_a
+            .iter()
+            .zip(chain_b.iter())
+            .take_while(|(x, y)| x == y)
+            .count();
+        if common == 0 {
+            return chain_a[0].index() < chain_b[0].index();
+        }
+        // An ancestor precedes its descendants.
+        let (Some(&branch_a), Some(&branch_b)) = (chain_a.get(common), chain_b.get(common)) else {
+            return chain_a.len() < chain_b.len();
+        };
+        let inner = self.inner.borrow();
+        let mut current = inner
+            .nodes
+            .get(branch_a.index())
+            .and_then(Option::as_ref)
+            .and_then(|node| node.next_sibling);
+        for _ in 0..inner.nodes.len() {
+            let Some(sibling) = current else { break };
+            if sibling == branch_b {
+                return true;
+            }
+            current = inner
+                .nodes
+                .get(sibling.index())
+                .and_then(Option::as_ref)
+                .and_then(|node| node.next_sibling);
+        }
+        false
     }
 
     pub fn text_content(&self, node_id: NodeId) -> String {
@@ -2288,13 +2371,21 @@ impl DomTree {
         self.len() <= 1
     }
 
+    /// Bring the id index in line with an id change. `with_node_mut` already
+    /// does this for every attribute edit, so this is idempotent.
     pub fn update_id_index(&self, node_id: NodeId, old_id: Option<&str>, new_id: Option<&str>) {
         let mut inner = self.inner.borrow_mut();
-        if let Some(old) = old_id {
-            inner.id_index.remove(old);
+        let current = inner
+            .nodes
+            .get(node_id.index())
+            .and_then(Option::as_ref)
+            .and_then(Node::element_id)
+            .map(str::to_owned);
+        if let Some(old) = old_id.filter(|old| current.as_deref() != Some(*old)) {
+            Self::unindex_element_id(&mut inner, node_id, old);
         }
-        if let Some(new) = new_id {
-            inner.id_index.insert(new.to_string(), node_id);
+        if let Some(new) = new_id.filter(|new| current.as_deref() == Some(*new)) {
+            Self::index_element_id(&mut inner, node_id, new);
         }
     }
 }
@@ -3169,6 +3260,49 @@ mod tests {
 
         assert_eq!(tree.get_element_by_id("main"), Some(div));
         assert_eq!(tree.get_element_by_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn id_index_follows_reinsertion_attribute_edits_and_tree_order() {
+        let tree = crate::parse_html("<div id=list><p id=a></p></div>");
+        let body = tree.query_selector("body").unwrap().unwrap();
+        let list = tree.get_element_by_id("list").unwrap();
+        let a = tree.get_element_by_id("a").unwrap();
+
+        // A removed and reinserted element is found again.
+        tree.remove_child(list);
+        assert_eq!(tree.get_element_by_id("a"), None);
+        assert_eq!(tree.query_selector("#a").unwrap(), None);
+        tree.append_child(body, list);
+        assert_eq!(tree.get_element_by_id("a"), Some(a));
+        assert_eq!(tree.query_selector("#a").unwrap(), Some(a));
+
+        // Duplicates resolve to the first in tree order, not creation order.
+        let later = element(&tree, "span");
+        tree.with_node_mut(later, |node| node.set_attribute("id", "a".into()));
+        tree.insert_before(a, later);
+        assert_eq!(tree.get_element_by_id("a"), Some(later));
+        assert_eq!(tree.query_selector("#a").unwrap(), Some(later));
+        assert_eq!(tree.query_selector_from(list, "#a").unwrap(), Some(later));
+
+        // Renaming moves the element between keys.
+        tree.with_node_mut(later, |node| node.set_attribute("id", "b".into()));
+        assert_eq!(tree.get_element_by_id("a"), Some(a));
+        assert_eq!(tree.get_element_by_id("b"), Some(later));
+        tree.with_node_mut(later, |node| {
+            if let Some(attrs) = node.attrs_mut() {
+                attrs.clear();
+            }
+        });
+        assert_eq!(tree.get_element_by_id("b"), None);
+
+        // A freed arena slot no longer answers for its old id, even reused.
+        tree.remove(a);
+        assert_eq!(tree.get_element_by_id("a"), None);
+        let reused = element(&tree, "i");
+        tree.append_child(list, reused);
+        assert_eq!(tree.get_element_by_id("a"), None);
+        assert!(tree.elements_with_id("a").is_empty());
     }
 
     #[test]

@@ -2852,27 +2852,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             "null".into()
         }
         "get_element_by_id" => {
-            // Verify the indexed node is in the live document. The id_index is best-effort:
-            // it only registers nodes at creation time and doesn't update on reparent, so
-            // it can point to a detached clone while the live node is elsewhere in the tree.
+            // The id index lists every element with the id, so a lookup that
+            // finds no element in the live document has no match to scan for.
             let doc = dom.document();
-            let nid = dom.get_element_by_id(&arg1);
-            let live = nid.filter(|&n| dom.ancestors(n).contains(&doc));
-            match live {
-                Some(n) => n.index().to_string(),
-                None => {
-                    // Fall back to full scan for the live document.
-                    let sel = format!(
-                        "[id=\"{}\"]",
-                        arg1.replace('\\', "\\\\").replace('"', "\\\"")
-                    );
-                    dom.query_selector(&sel)
-                        .ok()
-                        .flatten()
-                        .map(|id| id.index().to_string())
-                        .unwrap_or("-1".into())
-                }
-            }
+            dom.get_element_by_id(&arg1)
+                .filter(|&n| dom.ancestors(n).contains(&doc))
+                .map(|n| n.index().to_string())
+                .unwrap_or("-1".into())
         }
         "query_selector" => dom
             .query_selector(&arg1)
