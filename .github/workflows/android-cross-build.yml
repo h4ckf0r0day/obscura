@@ -102,6 +102,17 @@ jobs:
           test -d "$rusty_v8_dir/third_party/libc++/src"
           test -d "$rusty_v8_dir/third_party/llvm-libc/src"
 
+      - name: Install the host amd64 sysroot
+        run: |
+          set -euxo pipefail
+          # Chromium's Android cross build still compiles host tools (for
+          # example the snapshot generator) with the Linux x86_64 toolchain.
+          python3 \
+            "$RUNNER_TEMP/rusty_v8/build/linux/sysroot_scripts/install-sysroot.py" \
+            --arch=amd64
+          test -d \
+            "$RUNNER_TEMP/rusty_v8/build/linux/debian_bullseye_amd64-sysroot"
+
       - name: Prepare the V8 source build for Android
         run: |
           set -euxo pipefail
