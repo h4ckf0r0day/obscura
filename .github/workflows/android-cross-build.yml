@@ -14,6 +14,7 @@ jobs:
       ANDROID_API: "29"
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
+      CHROMIUM_BINDGEN_STRIP_HOST_X64_FLAGS_FOR_ANDROID: "1"
       LIBCLANG_PATH: "/usr/lib/llvm-19/lib"
       V8_FROM_SOURCE: "1"
     steps:
@@ -119,6 +120,7 @@ jobs:
           test -f "$rusty_v8_dir/v8/BUILD.gn"
           test -f "$rusty_v8_dir/v8/src/api/api.cc"
           test -f "$rusty_v8_dir/v8/tools/gen-v8-gn.py"
+          test -f "$rusty_v8_dir/build/rust/gni_impl/filter_clang_args.py"
           test -f "$rusty_v8_dir/build/android/pylib/results/presentation/test_results_presentation.pydeps"
           test -f "$rusty_v8_dir/third_party/icu/common/icudtl.dat"
           test -f "$rusty_v8_dir/third_party/libc++/src/src/vector.cpp"
@@ -140,11 +142,14 @@ jobs:
           set -euxo pipefail
           python3 scripts/ci/patch-rusty-v8.py \
             "$RUNNER_TEMP/rusty_v8/build.rs" \
-            "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni"
+            "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni" \
+            "$RUNNER_TEMP/rusty_v8/build/rust/gni_impl/filter_clang_args.py"
           grep -n -A5 -B2 'build V8 from source only for Android' \
             "$RUNNER_TEMP/rusty_v8/build.rs"
           grep -n -A3 -B2 'declare Android NDK version' \
             "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni"
+          grep -n -A8 -B2 'CHROMIUM_BINDGEN_STRIP_HOST_X64_FLAGS_FOR_ANDROID' \
+            "$RUNNER_TEMP/rusty_v8/build/rust/gni_impl/filter_clang_args.py"
 
       - name: Link the NDK into rusty_v8
         run: |
