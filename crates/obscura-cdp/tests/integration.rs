@@ -47,6 +47,7 @@ integration_tests!(
     form_submission_ownership,
     form_submit_method_bypasses_listener,
     html_serialization_escaping,
+    heap_snapshot,
     iframe_event_dispatch,
     input_activation_author_accessors,
     input_key_event_escaping,
