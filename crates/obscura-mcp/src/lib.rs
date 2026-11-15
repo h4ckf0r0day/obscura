@@ -2281,7 +2281,7 @@ async fn fetch_web_search(
     let status = response.status();
     let response_url = response.url().clone();
     let body = obscura_net::client::read_reqwest_body_limited(
-        response, &response_url, WEB_SEARCH_RESPONSE_BYTES,
+        response, &response_url, WEB_SEARCH_RESPONSE_BYTES, None,
     ).await
         .map_err(|error| format!("web search response failed: {error}"))?;
     if !status.is_success() {

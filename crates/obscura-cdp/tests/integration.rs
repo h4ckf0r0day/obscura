@@ -57,6 +57,7 @@ integration_tests!(
     lifecycle_replay,
     max_connections_cap,
     module_network_events,
+    network_conditions,
     nodefilter_constants,
     page_close_destroys_target,
     page_frame_contract,

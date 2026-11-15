@@ -1067,6 +1067,7 @@ fn fetch_max_body_bytes() -> usize {
 async fn read_body_capped(
     mut response: reqwest::Response,
     max: usize,
+    conditions: Option<&obscura_net::NetworkConditionsCell>,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
     if let Some(len) = response.content_length() {
         if len > max as u64 {
@@ -1076,6 +1077,7 @@ async fn read_body_capped(
         }
     }
     let mut buf: Vec<u8> = Vec::new();
+    let started = std::time::Instant::now();
     while let Some(chunk) = response
         .chunk()
         .await
@@ -1087,6 +1089,9 @@ async fn read_body_capped(
             )));
         }
         buf.extend_from_slice(&chunk);
+        if let Some(conditions) = conditions {
+            conditions.pace_download(started, buf.len()).await;
+        }
     }
     Ok(buf)
 }
@@ -4648,6 +4653,12 @@ async fn fetch_url_inner(
                 unsafe_header_names.join(","),
             );
         }
+        if let (Some(cbs), Ok(parsed)) = (&callbacks, url::Url::parse(&url)) {
+            cbs.network_conditions()
+                .before_request(&parsed, 0)
+                .await
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+        }
         let preflight = preflight_request.send().await.map_err(|e| {
                 deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
             })?;
@@ -4811,6 +4822,13 @@ async fn fetch_url_inner(
 
         if !current_body.is_empty() {
             req = req.body(current_body.clone());
+        }
+
+        if let (Some(cbs), Ok(parsed_current)) = (&callbacks, url::Url::parse(&current_url)) {
+            cbs.network_conditions()
+                .before_request(&parsed_current, current_body.len())
+                .await
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
         }
 
         let resp = {
@@ -4989,7 +5007,12 @@ async fn fetch_url_inner(
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
         let mut network_guard = network_guard;
-        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        let resp_bytes = read_body_capped(
+            response,
+            fetch_max_body_bytes(),
+            callbacks.as_deref().map(CallbackRegistry::network_conditions),
+        )
+        .await?;
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -5118,6 +5141,7 @@ async fn stealth_fetch_all(
                 cookie_context,
                 credentials_allowed,
                 fetch_max_body_bytes().min(64 * 1024 * 1024),
+                callbacks.clone(),
             )
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
@@ -6136,7 +6160,7 @@ mod tests {
             .send()
             .await
             .expect("request should reach the local server");
-        let err = read_body_capped(resp, 1024 * 1024)
+        let err = read_body_capped(resp, 1024 * 1024, None)
             .await
             .expect_err("a body larger than the cap must be rejected");
         assert!(
@@ -6153,7 +6177,7 @@ mod tests {
             .send()
             .await
             .expect("request should reach the local server");
-        let body = read_body_capped(resp, 1024 * 1024)
+        let body = read_body_capped(resp, 1024 * 1024, None)
             .await
             .expect("a small body must be read successfully");
         assert_eq!(body.len(), 1024, "should read the whole small body");
