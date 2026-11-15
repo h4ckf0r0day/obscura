@@ -77,30 +77,52 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Download rusty_v8 with Android build sources
+      - name: Check out rusty_v8 with complete Android build sources
         run: |
           set -euxo pipefail
           rusty_v8_dir="$RUNNER_TEMP/rusty_v8"
+          crate_dir="$RUNNER_TEMP/v8-crate"
           crate="$RUNNER_TEMP/v8-150.4.0.crate"
 
-          # The published crate contains both the generated host bindings and
-          # the complete V8/Chromium sources needed for an Android source
-          # build. Using it avoids replacing the host v8 unit with an
-          # ungenerated git checkout.
+          # The crates.io package omits files needed by a source build (for
+          # example Chromium's Android test-runner data, ICU data and libc++
+          # implementation). Use the pinned git checkout and restore every
+          # submodule at the revision selected by rusty_v8 v150.4.0.
+          git clone --depth=1 --branch v150.4.0 --no-recurse-submodules \
+            https://github.com/denoland/rusty_v8.git "$rusty_v8_dir"
+          test "$(git -C "$rusty_v8_dir" rev-parse HEAD)" = \
+            "5c15a6995c9bb4bacd3e341b59fff32c909c80bf"
+          git -C "$rusty_v8_dir" submodule update --init --depth=1 --recursive
+          submodule_status="$(git -C "$rusty_v8_dir" submodule status --recursive)"
+          printf '%s\n' "$submodule_status"
+          if printf '%s\n' "$submodule_status" | grep -Eq '^[-+U]'; then
+            echo "A rusty_v8 submodule is missing or is not at its pinned revision" >&2
+            exit 1
+          fi
+
+          # A git checkout does not include rusty_v8's generated host binding.
+          # Copy the matching published binding while retaining the complete
+          # git sources for the Android unit.
           curl -fL --retry 3 --retry-delay 2 \
             https://crates.io/api/v1/crates/v8/150.4.0/download \
             -o "$crate"
           tar -xzf "$crate" -C "$RUNNER_TEMP"
           rm -f "$crate"
-          mv "$RUNNER_TEMP/v8-150.4.0" "$rusty_v8_dir"
+          mv "$RUNNER_TEMP/v8-150.4.0" "$crate_dir"
+          binding="$crate_dir/gen/src_binding_simdutf_release_x86_64-unknown-linux-gnu.rs"
+          test -s "$binding"
+          install -m 0644 "$binding" "$rusty_v8_dir/gen/"
+          rm -rf "$crate_dir"
 
           test -f "$rusty_v8_dir/build.rs"
           test -f "$rusty_v8_dir/gen/src_binding_simdutf_release_x86_64-unknown-linux-gnu.rs"
           test -f "$rusty_v8_dir/v8/BUILD.gn"
           test -f "$rusty_v8_dir/v8/src/api/api.cc"
-          test -d "$rusty_v8_dir/third_party/icu/source"
-          test -d "$rusty_v8_dir/third_party/libc++/src"
-          test -d "$rusty_v8_dir/third_party/llvm-libc/src"
+          test -f "$rusty_v8_dir/v8/tools/gen-v8-gn.py"
+          test -f "$rusty_v8_dir/build/android/pylib/results/presentation/test_results_presentation.pydeps"
+          test -f "$rusty_v8_dir/third_party/icu/common/icudtl.dat"
+          test -f "$rusty_v8_dir/third_party/libc++/src/src/vector.cpp"
+          test -f "$rusty_v8_dir/tools/clang/scripts/update.py"
 
       - name: Install the host amd64 sysroot
         run: |
