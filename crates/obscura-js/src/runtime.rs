@@ -26781,6 +26781,75 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_dynamic_imports_fetch_each_module_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let requests_tx = requests_tx.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut request = [0u8; 2048];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..length]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let _ = requests_tx.send(path.clone());
+                    let body = match path.as_str() {
+                        "/a.js" => "import { shared } from './shared.js'; export const a = shared + 'a';",
+                        "/b.js" => "import { shared } from './shared.js'; export const b = shared + 'b';",
+                        _ => {
+                            // Keep the shared dependency in flight while the
+                            // other graphs reach it.
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                            "export const shared = 's';"
+                        }
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: application/javascript\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        let base = format!("http://{address}");
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/index.html"));
+        rt.set_http_client(client);
+
+        rt.load_inline_module(
+            "const [a1, b, a2] = await Promise.all([\
+                 import('./a.js'), import('./b.js'), import('./a.js'),\
+             ]); \
+             globalThis.__concurrent_imports = [a1.a, b.b, a2.a];",
+            &format!("{base}/index.html"),
+            5_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__concurrent_imports").unwrap(),
+            serde_json::json!(["sa", "sb", "sa"]),
+        );
+        let mut paths = requests.try_iter().collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, vec!["/a.js", "/b.js", "/shared.js"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn import_map_resolves_prefix_static_and_exact_dynamic_imports() {
         let (base, requests) = spawn_import_map_server();
         let jar = std::sync::Arc::new(obscura_net::CookieJar::new());

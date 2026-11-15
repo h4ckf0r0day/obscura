@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use deno_core::error::ModuleLoaderError;
+use deno_core::futures::future::{FutureExt, LocalBoxFuture, WeakShared};
 use deno_core::ModuleLoadOptions;
 use deno_core::ModuleLoadReferrer;
 use deno_core::ModuleLoadResponse;
@@ -92,7 +94,28 @@ pub struct ObscuraModuleLoader {
     /// prepared root with the dependencies that its successful evaluation also
     /// evaluates.
     loaded_specifiers: Rc<RefCell<Vec<String>>>,
+    /// Module fetches that some graph load still awaits, keyed by request URL.
+    /// deno_core runs each `import()` and module script as its own graph load
+    /// and only dedups a module once it is registered, so concurrent graphs
+    /// that share a dependency would each fetch it. A browser module map has a
+    /// "fetching" state that makes later requests wait for the first one.
+    /// Entries are weak: the waiting loads own the fetch, so a fetch whose
+    /// loads were all cancelled is dropped (and reported as failed) as before.
+    /// Every waiting load hands the source to deno_core, which registers the
+    /// module before polling anything else, so once the last one has taken it
+    /// later loads find the module in deno_core's map. A failed fetch is not
+    /// cached: a later request fetches it again.
+    inflight: Rc<RefCell<HashMap<String, WeakShared<ModuleFetch>>>>,
 }
+
+/// A fetched module body, cheap to clone into each waiting graph load.
+#[derive(Clone)]
+struct FetchedModule {
+    found: ModuleSpecifier,
+    code: Arc<str>,
+}
+
+type ModuleFetch = LocalBoxFuture<'static, Result<FetchedModule, String>>;
 
 impl ObscuraModuleLoader {
     pub fn new(base_url: &str) -> Self {
@@ -121,6 +144,7 @@ impl ObscuraModuleLoader {
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
             loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
+            inflight: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -138,6 +162,7 @@ impl ObscuraModuleLoader {
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
             loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
+            inflight: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -147,6 +172,46 @@ impl ObscuraModuleLoader {
 
     pub(crate) fn loaded_specifiers(&self) -> Rc<RefCell<Vec<String>>> {
         self.loaded_specifiers.clone()
+    }
+
+    /// The page's network context for a new module fetch.
+    fn page_network(&self) -> PageNetwork {
+        match self.page_state.as_ref() {
+            Some(weak) => (|| {
+                let state = weak
+                    .upgrade()
+                    .ok_or_else(|| "Module loader page state was dropped".to_string())?;
+                let state = state
+                    .try_borrow()
+                    .map_err(|_| "Module loader page state is already borrowed".to_string())?;
+                let client = state
+                    .http_client
+                    .clone()
+                    .ok_or_else(|| "No http_client wired to module loader".to_string())?;
+                // Fork: in stealth mode an ES module must be fetched over the
+                // same transport as the document. Upstream sends it through the
+                // plain reqwest client, so a `type="module"` script arrives with
+                // a different TLS fingerprint and none of the browser identity
+                // headers, while the HTML that referenced it came over wreq.
+                // That cross-transport mismatch is trivially detectable.
+                #[cfg(feature = "stealth")]
+                let stealth = state.stealth_client.clone();
+                #[cfg(not(feature = "stealth"))]
+                let stealth: Option<std::sync::Arc<()>> = None;
+                Ok((client, stealth, state.callbacks.clone()))
+            })(),
+            None => self
+                .standalone_client
+                .clone()
+                .map(|client| {
+                    #[cfg(feature = "stealth")]
+                    let stealth = None;
+                    #[cfg(not(feature = "stealth"))]
+                    let stealth: Option<std::sync::Arc<()>> = None;
+                    (client, stealth, None)
+                })
+                .ok_or_else(|| "No network context wired to module loader".to_string()),
+        }
     }
 }
 
@@ -218,41 +283,27 @@ impl ModuleLoader for ObscuraModuleLoader {
         let is_dyn_import = options.is_dynamic_import;
         let activity_guard = is_dyn_import.then(|| activity.begin());
         let page_state = self.page_state.clone();
-        let page_network = match self.page_state.as_ref() {
-            Some(weak) => (|| {
-                let state = weak
-                    .upgrade()
-                    .ok_or_else(|| "Module loader page state was dropped".to_string())?;
-                let state = state
-                    .try_borrow()
-                    .map_err(|_| "Module loader page state is already borrowed".to_string())?;
-                let client = state
-                    .http_client
-                    .clone()
-                    .ok_or_else(|| "No http_client wired to module loader".to_string())?;
-                // Fork: in stealth mode an ES module must be fetched over the
-                // same transport as the document. Upstream sends it through the
-                // plain reqwest client, so a `type="module"` script arrives with
-                // a different TLS fingerprint and none of the browser identity
-                // headers, while the HTML that referenced it came over wreq.
-                // That cross-transport mismatch is trivially detectable.
-                #[cfg(feature = "stealth")]
-                let stealth = state.stealth_client.clone();
-                #[cfg(not(feature = "stealth"))]
-                let stealth: Option<std::sync::Arc<()>> = None;
-                Ok((client, stealth, state.callbacks.clone()))
-            })(),
-            None => self
-                .standalone_client
-                .clone()
-                .map(|client| {
-                    #[cfg(feature = "stealth")]
-                    let stealth = None;
-                    #[cfg(not(feature = "stealth"))]
-                    let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None)
-                })
-                .ok_or_else(|| "No network context wired to module loader".to_string()),
+
+        let requested_specifier = module_specifier.clone();
+        let fetch = {
+            let mut inflight = self.inflight.borrow_mut();
+            inflight.retain(|_, fetch| fetch.upgrade().is_some());
+            match inflight.get(&url).and_then(WeakShared::upgrade) {
+                Some(fetch) => fetch,
+                None => {
+                    let page_network = self.page_network();
+                    let fetch = fetch_module(
+                        url.clone(), proxy_url, document_url, referrer, page_state, page_network,
+                    )
+                    .map(|result| result.map_err(|error| error.to_string()))
+                    .boxed_local()
+                    .shared();
+                    if let Some(weak) = fetch.downgrade() {
+                        inflight.insert(url, weak);
+                    }
+                    fetch
+                }
+            }
         };
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
@@ -260,122 +311,146 @@ impl ModuleLoader for ObscuraModuleLoader {
             // the recursive graph, so this excludes parser-discovered/static
             // graphs without losing descendant fetches of a lazy graph.
             let _activity_guard = activity_guard;
-            tracing::debug!(
-                "Loading ES module: {} (proxy: {})",
-                url,
-                proxy_url.as_deref().unwrap_or("direct")
-            );
-
-            match page_network {
-                Ok((client, stealth, callbacks)) => {
-                    let requested = ModuleSpecifier::parse(&url)
-                        .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
-                    static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(1);
-                    let request_id = format!("module-{}", NEXT_MODULE_REQUEST_ID.fetch_add(
-                        1, std::sync::atomic::Ordering::Relaxed,
-                    ));
-                    // Keep failed and cancelled graph fetches visible to the
-                    // same Network listeners as ordinary fetch/XHR failures.
-                    let mut network_guard = page_state.as_ref().map(|state| FetchNetworkGuard {
-                        state: state.clone(), cancel: None,
-                        event: Some(JsNetworkEvent {
-                            request_id: request_id.clone(), intercepted: false,
-                            url: url.clone(), method: "GET".to_string(),
-                            resource_type: "Script".to_string(), status: 0,
-                            response_headers: Default::default(), body_size: 0,
-                            timestamp: 0.0, error_text: None,
-                        }),
-                    });
-                    let request =
-                        obscura_net::ResourceRequest::module_script(&document_url, &referrer);
-                    #[cfg(feature = "stealth")]
-                    let resp = match stealth {
-                        Some(stealth) => stealth
-                            .fetch_resource_with_callbacks(
-                                &requested,
-                                request,
-                                callbacks.as_deref(),
-                            )
-                            .await,
-                        None => {
-                            client
-                                .fetch_resource_with_callbacks(
-                                    &requested,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                                .await
-                        }
-                    }
-                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
-                    #[cfg(not(feature = "stealth"))]
-                    let resp = {
-                        let _ = &stealth;
-                        client
-                            .fetch_resource_with_callbacks(
-                                &requested,
-                                request,
-                                callbacks.as_deref(),
-                            )
-                            .await
-                            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
-                    };
-                    // A response (including the blocked-tracker sentinel) is
-                    // not a transport failure, even if evaluation later fails.
-                    if let Some(guard) = &mut network_guard { guard.event = None; }
-                    // A module response belongs to the owning page regardless
-                    // of whether graph preparation or evaluation later fails.
-                    // Status 0 is the transport's blocked-tracker sentinel.
-                    if resp.status != 0 {
-                        if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
-                            let mut state = state.try_borrow_mut().map_err(|_| {
-                                io_err("Module loader page state is already borrowed".to_string())
-                            })?;
-                            record_network_completion(&mut state, JsNetworkEvent {
-                                request_id, intercepted: false,
-                                url: resp.url.to_string(), method: "GET".to_string(),
-                                resource_type: "Script".to_string(), status: resp.status,
-                                response_headers: resp.headers.clone(), body_size: resp.body.len(),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default().as_secs_f64(),
-                                error_text: None,
-                            }, || match std::str::from_utf8(&resp.body) {
-                                Ok(body) => StoredNetworkResponseBody {
-                                    body: body.to_string(), base64_encoded: false,
-                                },
-                                Err(_) => StoredNetworkResponseBody {
-                                    body: BASE64.encode(&resp.body), base64_encoded: true,
-                                },
-                            });
-                        }
-                    }
-                    if !(200..=299).contains(&resp.status) {
-                        return Err(io_err(format!(
-                            "Module {} returned HTTP {}",
-                            url, resp.status
-                        )));
-                    }
-                    let found = ModuleSpecifier::parse(resp.url.as_str()).map_err(|e| {
-                        io_err(format!("Invalid final module URL {}: {}", resp.url, e))
-                    })?;
-                    if found.as_str() != requested.as_str() {
-                        loaded_specifiers
-                            .borrow_mut()
-                            .push(found.to_string());
-                    }
-                    let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                    Ok(ModuleSource::new_with_redirect(
-                        deno_core::ModuleType::JavaScript,
-                        ModuleSourceCode::String(code.into()),
-                        &requested,
-                        &found,
-                        None,
-                    ))
-                }
-                Err(error) => Err(io_err(error)),
+            let fetched = fetch.await.map_err(io_err)?;
+            if fetched.found.as_str() != requested_specifier.as_str() {
+                loaded_specifiers.borrow_mut().push(fetched.found.to_string());
             }
+            Ok(ModuleSource::new_with_redirect(
+                deno_core::ModuleType::JavaScript,
+                ModuleSourceCode::String(fetched.code.into()),
+                &requested_specifier,
+                &fetched.found,
+                None,
+            ))
         })))
+    }
+}
+
+#[cfg(feature = "stealth")]
+type StealthClient = Option<Arc<obscura_net::StealthHttpClient>>;
+#[cfg(not(feature = "stealth"))]
+type StealthClient = Option<Arc<()>>;
+
+type PageNetwork = Result<
+    (
+        Arc<obscura_net::ObscuraHttpClient>,
+        StealthClient,
+        Option<Arc<obscura_net::CallbackRegistry>>,
+    ),
+    String,
+>;
+
+async fn fetch_module(
+    url: String,
+    proxy_url: Option<String>,
+    document_url: ModuleSpecifier,
+    referrer: ModuleSpecifier,
+    page_state: Option<Weak<RefCell<ObscuraState>>>,
+    page_network: PageNetwork,
+) -> Result<FetchedModule, ModuleLoaderError> {
+    tracing::debug!(
+        "Loading ES module: {} (proxy: {})",
+        url,
+        proxy_url.as_deref().unwrap_or("direct")
+    );
+
+    match page_network {
+        Ok((client, stealth, callbacks)) => {
+            let requested = ModuleSpecifier::parse(&url)
+                .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+            static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            let request_id = format!("module-{}", NEXT_MODULE_REQUEST_ID.fetch_add(
+                1, std::sync::atomic::Ordering::Relaxed,
+            ));
+            // Keep failed and cancelled graph fetches visible to the
+            // same Network listeners as ordinary fetch/XHR failures.
+            let mut network_guard = page_state.as_ref().map(|state| FetchNetworkGuard {
+                state: state.clone(), cancel: None,
+                event: Some(JsNetworkEvent {
+                    request_id: request_id.clone(), intercepted: false,
+                    url: url.clone(), method: "GET".to_string(),
+                    resource_type: "Script".to_string(), status: 0,
+                    response_headers: Default::default(), body_size: 0,
+                    timestamp: 0.0, error_text: None,
+                }),
+            });
+            let request =
+                obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+            #[cfg(feature = "stealth")]
+            let resp = match stealth {
+                Some(stealth) => stealth
+                    .fetch_resource_with_callbacks(
+                        &requested,
+                        request,
+                        callbacks.as_deref(),
+                    )
+                    .await,
+                None => {
+                    client
+                        .fetch_resource_with_callbacks(
+                            &requested,
+                            request,
+                            callbacks.as_deref(),
+                        )
+                        .await
+                }
+            }
+            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+            #[cfg(not(feature = "stealth"))]
+            let resp = {
+                let _ = &stealth;
+                client
+                    .fetch_resource_with_callbacks(
+                        &requested,
+                        request,
+                        callbacks.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
+            };
+            // A response (including the blocked-tracker sentinel) is
+            // not a transport failure, even if evaluation later fails.
+            if let Some(guard) = &mut network_guard { guard.event = None; }
+            // A module response belongs to the owning page regardless
+            // of whether graph preparation or evaluation later fails.
+            // Status 0 is the transport's blocked-tracker sentinel.
+            if resp.status != 0 {
+                if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
+                    let mut state = state.try_borrow_mut().map_err(|_| {
+                        io_err("Module loader page state is already borrowed".to_string())
+                    })?;
+                    record_network_completion(&mut state, JsNetworkEvent {
+                        request_id, intercepted: false,
+                        url: resp.url.to_string(), method: "GET".to_string(),
+                        resource_type: "Script".to_string(), status: resp.status,
+                        response_headers: resp.headers.clone(), body_size: resp.body.len(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs_f64(),
+                        error_text: None,
+                    }, || match std::str::from_utf8(&resp.body) {
+                        Ok(body) => StoredNetworkResponseBody {
+                            body: body.to_string(), base64_encoded: false,
+                        },
+                        Err(_) => StoredNetworkResponseBody {
+                            body: BASE64.encode(&resp.body), base64_encoded: true,
+                        },
+                    });
+                }
+            }
+            if !(200..=299).contains(&resp.status) {
+                return Err(io_err(format!(
+                    "Module {} returned HTTP {}",
+                    url, resp.status
+                )));
+            }
+            let found = ModuleSpecifier::parse(resp.url.as_str()).map_err(|e| {
+                io_err(format!("Invalid final module URL {}: {}", resp.url, e))
+            })?;
+            let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+            Ok(FetchedModule { found, code: Arc::from(code) })
+        }
+        Err(error) => Err(io_err(error)),
     }
 }
