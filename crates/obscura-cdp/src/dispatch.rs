@@ -852,6 +852,7 @@ pub(crate) async fn dispatch_with_deferred(
     let result = match domain {
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
         "Browser" => domains::browser::handle(method, &req.params).await,
+        "SystemInfo" => domains::systeminfo::handle(method, &req.params).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => {
