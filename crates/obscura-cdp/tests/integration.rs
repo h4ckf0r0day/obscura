@@ -51,6 +51,7 @@ integration_tests!(
     input_activation_author_accessors,
     input_key_event_escaping,
     input_mouse_event_parity,
+    input_mouse_hover_pointer_events,
     input_mouse_label_activation,
     js_fetch_emits_network_events,
     legacy_table_apis,

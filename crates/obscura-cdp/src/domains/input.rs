@@ -164,25 +164,40 @@ pub async fn handle(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body;\
                             if (!target) return;\
-                            var old = globalThis.__obscura_hover_target || null;\
+                            var old = globalThis.__obscura_mouse_over_target || globalThis.__obscura_hover_target || null;\
+                            if (old && !old.isConnected) old = null;\
                             globalThis.__obscura_hover_target = target;\
                             globalThis.__obscura_setHovered(target);\
-                            var init = {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}};\
+                            function pointerEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:-1,buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
+                            function mouseEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:{buttons},detail:0,relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
                             if (old !== target) {{\
-                                if (old) old.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseout', Object.assign({{}}, init, {{relatedTarget:target}}))));\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseover', Object.assign({{}}, init, {{relatedTarget:old}}))));\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', Object.assign({{}}, init, {{bubbles:false,relatedTarget:old}}))));\
+                                function ancestry(node) {{ var path=[]; while (node) {{ path.push(node); node=node.parentNode || null; }} return path; }}\
+                                var oldPath = old ? ancestry(old) : [];\
+                                var newPath = ancestry(target);\
+                                var common = newPath.find(function(node) {{ return oldPath.includes(node); }}) || null;\
+                                var exited = common ? oldPath.slice(0, oldPath.indexOf(common)) : oldPath;\
+                                var entered = common ? newPath.slice(0, newPath.indexOf(common)) : newPath;\
+                                if (old) pointerEvent(old,'pointerout',true,target);\
+                                for (var pi=0; pi<exited.length; pi++) pointerEvent(exited[pi],'pointerleave',false,target);\
+                                pointerEvent(target,'pointerover',true,old);\
+                                for (var pe=entered.length-1; pe>=0; pe--) pointerEvent(entered[pe],'pointerenter',false,old);\
+                                if (old) mouseEvent(old,'mouseout',true,target);\
+                                for (var mi=0; mi<exited.length; mi++) mouseEvent(exited[mi],'mouseleave',false,target);\
+                                mouseEvent(target,'mouseover',true,old);\
+                                for (var me=entered.length-1; me>=0; me--) mouseEvent(entered[me],'mouseenter',false,old);\
+                                globalThis.__obscura_mouse_over_target = target;\
                             }}\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', init)));\
+                            pointerEvent(target,'pointermove',true,null);\
+                            mouseEvent(target,'mousemove',true,null);\
                         }})()",
                         x = x,
                         y = y,
-                        button_code = button_code,
                         buttons = buttons,
                         alt_key = alt_key,
                         ctrl_key = ctrl_key,
                         meta_key = meta_key,
                         shift_key = shift_key,
+                        pointer_pressure = if buttons == 0 { 0.0 } else { 0.5 },
                     );
                     page.evaluate(&code);
                 }
