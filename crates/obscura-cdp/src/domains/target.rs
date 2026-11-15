@@ -282,7 +282,17 @@ pub async fn handle(
             Ok(json!({}))
         }
         "getTargetInfo" => {
-            let target_id = params.get("targetId").and_then(|v| v.as_str());
+            // Chrome answers for the target of the session the command was
+            // sent on; only a sessionless call describes the browser target.
+            let session_target = parent_session_id
+                .as_ref()
+                .and_then(|sid| ctx.sessions.get(sid))
+                .filter(|id| ctx.get_page(id).is_some())
+                .cloned();
+            let target_id = params
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .or(session_target.as_deref());
             match target_id {
                 Some(id) => {
                     let page = ctx.get_page(id).ok_or("Target not found")?;
