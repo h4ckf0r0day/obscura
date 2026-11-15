@@ -52,7 +52,7 @@ jobs:
       - name: Enable sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          github-token: ${{ github.token }}
+          token: ${{ github.token }}
 
       - name: Install Android NDK r26c
         run: |
@@ -77,33 +77,30 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Checkout rusty_v8 with Android build sources
+      - name: Download rusty_v8 with Android build sources
         run: |
           set -euxo pipefail
           rusty_v8_dir="$RUNNER_TEMP/rusty_v8"
-          git clone --filter=blob:none --depth 1 --branch v150.4.0 \
-            --no-recurse-submodules \
-            https://github.com/denoland/rusty_v8.git "$rusty_v8_dir"
-          git -C "$rusty_v8_dir" submodule update --init --depth 1 --jobs 2 --recursive \
-            v8 \
-            build \
-            tools/clang \
-            third_party/jinja2 \
-            third_party/markupsafe \
-            buildtools \
-            third_party/icu \
-            third_party/abseil-cpp \
-            third_party/fp16/src \
-            'third_party/libc++/src' \
-            'third_party/libc++abi/src' \
-            'third_party/libunwind/src' \
-            'third_party/fast_float/src' \
-            'third_party/llvm-libc/src' \
-            third_party/simdutf \
-            'third_party/highway/src' \
-            third_party/partition_alloc \
-            'third_party/dragonbox/src' \
-            third_party/rust
+          crate="$RUNNER_TEMP/v8-150.4.0.crate"
+
+          # The published crate contains both the generated host bindings and
+          # the complete V8/Chromium sources needed for an Android source
+          # build. Using it avoids replacing the host v8 unit with an
+          # ungenerated git checkout.
+          curl -fL --retry 3 --retry-delay 2 \
+            https://crates.io/api/v1/crates/v8/150.4.0/download \
+            -o "$crate"
+          tar -xzf "$crate" -C "$RUNNER_TEMP"
+          rm -f "$crate"
+          mv "$RUNNER_TEMP/v8-150.4.0" "$rusty_v8_dir"
+
+          test -f "$rusty_v8_dir/build.rs"
+          test -f "$rusty_v8_dir/gen/src_binding_simdutf_release_x86_64-unknown-linux-gnu.rs"
+          test -f "$rusty_v8_dir/v8/BUILD.gn"
+          test -f "$rusty_v8_dir/v8/src/api/api.cc"
+          test -d "$rusty_v8_dir/third_party/icu/source"
+          test -d "$rusty_v8_dir/third_party/libc++/src"
+          test -d "$rusty_v8_dir/third_party/llvm-libc/src"
 
       - name: Restrict V8 source build to the Android target
         run: |
