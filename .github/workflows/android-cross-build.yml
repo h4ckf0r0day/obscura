@@ -38,6 +38,13 @@ jobs:
           curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
           chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 19
+
+          # apt.llvm.org may install the versioned shared library without
+          # the unversioned libclang.so symlink expected by bindgen.
+          libclang_so="$(find /usr/lib/llvm-19 /usr/lib/x86_64-linux-gnu \
+            -type f -name 'libclang.so.*' -print -quit)"
+          test -n "$libclang_so"
+          sudo ln -sfn "$libclang_so" /usr/lib/llvm-19/lib/libclang.so
           test -e /usr/lib/llvm-19/lib/libclang.so
           /usr/lib/llvm-19/bin/clang --version
 
