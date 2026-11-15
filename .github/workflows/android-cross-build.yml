@@ -102,13 +102,16 @@ jobs:
           test -d "$rusty_v8_dir/third_party/libc++/src"
           test -d "$rusty_v8_dir/third_party/llvm-libc/src"
 
-      - name: Restrict V8 source build to the Android target
+      - name: Prepare the V8 source build for Android
         run: |
           set -euxo pipefail
           python3 scripts/ci/patch-rusty-v8.py \
-            "$RUNNER_TEMP/rusty_v8/build.rs"
+            "$RUNNER_TEMP/rusty_v8/build.rs" \
+            "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni"
           grep -n -A5 -B2 'build V8 from source only for Android' \
             "$RUNNER_TEMP/rusty_v8/build.rs"
+          grep -n -A3 -B2 'declare Android NDK version' \
+            "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni"
 
       - name: Link the NDK into rusty_v8
         run: |
@@ -150,7 +153,7 @@ jobs:
           # rusty_v8 downloads Chromium Clang for the V8 build. Do not set
           # CLANG_BASE_PATH: Ubuntu's Clang is only used by libclang 19 here.
           unset CLANG_BASE_PATH
-          export GN_ARGS='android_ndk_version="r26c"'
+          export EXTRA_GN_ARGS="android_ndk_api_level=${ANDROID_API}"
           export PRINT_GN_ARGS=1
 
           v8_patch="patch.crates-io.v8.path=\"$RUNNER_TEMP/rusty_v8\""
