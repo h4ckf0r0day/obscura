@@ -744,6 +744,7 @@ impl ObscuraState {
         #[cfg(feature = "render")]
         if has_page_transport(parent) {
             self.render_resources.set_sync_loading_enabled(false);
+            self.render_resources.set_document_scoped(true);
         }
     }
 
@@ -2063,6 +2064,7 @@ pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::Re
     let mut cache = obscura_render::RenderResourceCache::default();
     if has_page_transport(state) {
         cache.set_sync_loading_enabled(false);
+        cache.set_document_scoped(true);
     }
     cache
 }

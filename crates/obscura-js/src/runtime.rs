@@ -1331,7 +1331,10 @@ impl ObscuraJsRuntime {
         // A page transport makes the renderer cache-only; see
         // `ops::fresh_render_resources` for why layout must not fetch itself.
         #[cfg(feature = "render")]
-        state.render_resources.set_sync_loading_enabled(false);
+        {
+            state.render_resources.set_sync_loading_enabled(false);
+            state.render_resources.set_document_scoped(true);
+        }
     }
 
     /// Install the owning page's passive on_request/on_response callback
@@ -1347,7 +1350,10 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         state.stealth_client = Some(client);
         #[cfg(feature = "render")]
-        state.render_resources.set_sync_loading_enabled(false);
+        {
+            state.render_resources.set_sync_loading_enabled(false);
+            state.render_resources.set_document_scoped(true);
+        }
     }
 
     pub fn set_dom(&self, dom: DomTree) {

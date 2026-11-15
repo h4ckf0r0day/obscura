@@ -34,6 +34,9 @@ const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// intrinsic geometry before that cascade instead of always laying out twice.
 const DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES: usize = 256;
 const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+/// Outcomes a document-scoped cache keeps after FIFO eviction of the bytes.
+/// Only URLs and intrinsic metadata are retained, so the bound is generous.
+const EVICTED_OUTCOME_ENTRIES: usize = 16 * 1024;
 /// Exact formats the renderer can decode. Do not use `image/*` or `*/*` here:
 /// either wildcard permits a content-negotiating server to choose AVIF,
 /// JPEG-XL, or another format that this build cannot rasterize.
@@ -83,6 +86,16 @@ enum CachedResource {
         static_raster: std::sync::OnceLock<bool>,
     },
     Missing(std::time::Instant),
+}
+
+/// What a document-scoped cache remembers about an evicted entry. Layout only
+/// needs the intrinsic metadata, so evicting the bytes must not make the URL
+/// unknown again: that turned every relayout of a page with more images than
+/// cache entries into a refetch of the evicted ones.
+#[derive(Clone, Copy)]
+enum EvictedOutcome {
+    Loaded(Option<crate::ReplacedIntrinsic>),
+    Missing,
 }
 
 impl CachedResource {
@@ -182,6 +195,13 @@ pub struct RenderResourceCache {
     /// Deduplicated so repeated layouts do not grow the list.
     sync_misses: Vec<(String, Option<ImageRequestProfile>, bool)>,
     sync_miss_keys: HashSet<String>,
+    /// Owned by one page document and fed by its transport. Such a cache
+    /// keeps negative outcomes for the document's lifetime
+    /// (a browser does not refetch a failed image on relayout) and remembers
+    /// the outcome of evicted entries.
+    document_scoped: bool,
+    evicted: HashMap<String, EvictedOutcome>,
+    evicted_order: VecDeque<String>,
     loader: Box<dyn RenderResourceLoader>,
 }
 
@@ -226,6 +246,9 @@ impl RenderResourceCache {
             sync_loading_enabled: true,
             sync_misses: Vec::new(),
             sync_miss_keys: HashSet::new(),
+            document_scoped: false,
+            evicted: HashMap::new(),
+            evicted_order: VecDeque::new(),
             loader: Box::new(loader),
         }
     }
@@ -243,6 +266,21 @@ impl RenderResourceCache {
     /// the page transport instead.
     pub fn sync_loading_enabled(&self) -> bool {
         self.sync_loading_enabled
+    }
+
+    /// Mark this cache as owned by one page document and fed by its
+    /// transport: failed or evicted resources are not fetched again for this
+    /// document by layout or the warmup scan.
+    pub fn set_document_scoped(&mut self, enabled: bool) {
+        self.document_scoped = enabled;
+    }
+
+    pub fn document_scoped(&self) -> bool {
+        self.document_scoped
+    }
+
+    fn missing_is_live(&self, at: &std::time::Instant) -> bool {
+        self.document_scoped || at.elapsed() < MISSING_RESOURCE_RETRY_AFTER
     }
 
     /// Take the resources that cache-only layout or paint asked for and did
@@ -292,8 +330,8 @@ impl RenderResourceCache {
         if self.stopped.contains(&key) { return true; }
         match self.entries.get(&key) {
             Some(CachedResource::Bytes { .. }) => true,
-            Some(CachedResource::Missing(at)) => at.elapsed() < MISSING_RESOURCE_RETRY_AFTER,
-            None => false,
+            Some(CachedResource::Missing(at)) => self.missing_is_live(at),
+            None => self.evicted.contains_key(&key),
         }
     }
 
@@ -409,10 +447,9 @@ impl RenderResourceCache {
                 entry.image_intrinsic().and_then(crate::ReplacedIntrinsic::natural_size)
                     .map(|(width, height)| (resolved_url, width, height)),
             ),
-            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
-                Some(None)
-            }
-            _ => None,
+            Some(CachedResource::Missing(at)) if self.missing_is_live(at) => Some(None),
+            Some(_) => None,
+            None => self.evicted_image_metadata(&key, &resolved_url),
         }
     }
 
@@ -433,10 +470,9 @@ impl RenderResourceCache {
                 entry.image_intrinsic().and_then(crate::ReplacedIntrinsic::natural_size)
                     .map(|(width, height)| (resolved_url, width, height)),
             ),
-            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
-                Some(None)
-            }
-            _ => None,
+            Some(CachedResource::Missing(at)) if self.missing_is_live(at) => Some(None),
+            Some(_) => None,
+            None => self.evicted_image_metadata(&key, &resolved_url),
         }
     }
 
@@ -535,6 +571,13 @@ impl RenderResourceCache {
         if let Some(entry @ CachedResource::Bytes { .. }) = self.entries.get(&key) {
             return entry.image_intrinsic();
         }
+        if !self.entries.contains_key(&key) {
+            match self.evicted.get(&key) {
+                Some(EvictedOutcome::Loaded(intrinsic)) => return *intrinsic,
+                Some(EvictedOutcome::Missing) => return None,
+                None => {}
+            }
+        }
         let bytes = self.get_or_load_image(&resolved_url, profile)?;
         match self.entries.get(&key) {
             Some(entry @ CachedResource::Bytes { .. }) => entry.image_intrinsic(),
@@ -549,11 +592,13 @@ impl RenderResourceCache {
         if let Some(entry) = self.entries.get(&url) {
             match entry {
                 CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+                CachedResource::Missing(at) if self.missing_is_live(at) => {
                     return None;
                 }
                 CachedResource::Missing(_) => {}
             }
+        } else if matches!(self.evicted.get(&url), Some(EvictedOutcome::Missing)) {
+            return None;
         }
         if !self.sync_loading_enabled {
             self.record_sync_miss(url.clone(), url, None, is_font);
@@ -580,11 +625,13 @@ impl RenderResourceCache {
         if let Some(entry) = self.entries.get(&key) {
             match entry {
                 CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+                CachedResource::Missing(at) if self.missing_is_live(at) => {
                     return None;
                 }
                 CachedResource::Missing(_) => {}
             }
+        } else if matches!(self.evicted.get(&key), Some(EvictedOutcome::Missing)) {
+            return None;
         }
         if !self.sync_loading_enabled {
             self.record_sync_miss(key, network_resource_url(url), Some(profile), false);
@@ -611,6 +658,10 @@ impl RenderResourceCache {
 
     fn insert_bytes(&mut self, url: String, bytes: Arc<[u8]>) {
         if self.max_entries == 0 || bytes.len() > self.max_bytes {
+            // Unretainable bytes still settle the document's request.
+            if self.document_scoped {
+                self.remember_evicted(url, EvictedOutcome::Loaded(image_intrinsic_metadata(&bytes)));
+            }
             return;
         }
         while self.entries.len() >= self.max_entries
@@ -619,8 +670,9 @@ impl RenderResourceCache {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            self.remove_entry(&oldest);
+            self.evict_entry(oldest);
         }
+        self.forget_evicted(&url);
         self.retained_bytes = self.retained_bytes.saturating_add(bytes.len());
         self.order.push_back(url.clone());
         self.entries.insert(url, CachedResource::Bytes {
@@ -638,8 +690,9 @@ impl RenderResourceCache {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            self.remove_entry(&oldest);
+            self.evict_entry(oldest);
         }
+        self.forget_evicted(&url);
         self.order.push_back(url.clone());
         self.entries
             .insert(url, CachedResource::Missing(std::time::Instant::now()));
@@ -649,6 +702,57 @@ impl RenderResourceCache {
         if self.entries.contains_key(url) {
             self.order.retain(|key| key != url);
             self.remove_entry(url);
+        }
+    }
+
+    /// Drop the oldest entry's bytes, keeping its outcome when this cache
+    /// belongs to one document.
+    fn evict_entry(&mut self, key: String) {
+        if self.document_scoped {
+            let outcome = match self.entries.get(&key) {
+                Some(entry @ CachedResource::Bytes { .. }) => {
+                    Some(EvictedOutcome::Loaded(entry.image_intrinsic()))
+                }
+                Some(CachedResource::Missing(_)) => Some(EvictedOutcome::Missing),
+                None => None,
+            };
+            if let Some(outcome) = outcome {
+                self.remember_evicted(key.clone(), outcome);
+            }
+        }
+        self.remove_entry(&key);
+    }
+
+    fn remember_evicted(&mut self, key: String, outcome: EvictedOutcome) {
+        while self.evicted.len() >= EVICTED_OUTCOME_ENTRIES {
+            let Some(oldest) = self.evicted_order.pop_front() else {
+                break;
+            };
+            self.evicted.remove(&oldest);
+        }
+        if self.evicted.insert(key.clone(), outcome).is_none() {
+            self.evicted_order.push_back(key);
+        }
+    }
+
+    fn forget_evicted(&mut self, key: &str) {
+        if self.evicted.remove(key).is_some() {
+            self.evicted_order.retain(|evicted| evicted != key);
+        }
+    }
+
+    fn evicted_image_metadata(
+        &self,
+        key: &str,
+        resolved_url: &str,
+    ) -> Option<Option<(String, f32, f32)>> {
+        match self.evicted.get(key)? {
+            EvictedOutcome::Loaded(intrinsic) => Some(
+                intrinsic
+                    .and_then(crate::ReplacedIntrinsic::natural_size)
+                    .map(|(width, height)| (resolved_url.to_string(), width, height)),
+            ),
+            EvictedOutcome::Missing => Some(None),
         }
     }
 
@@ -13040,6 +13144,55 @@ mod tests {
             1,
             "a deferred miss is reported later"
         );
+    }
+
+    #[test]
+    fn document_scoped_cache_keeps_evicted_and_failed_outcomes() {
+        let svg = |width: u32| {
+            format!("<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='10'/>")
+                .into_bytes()
+        };
+        let mut cache = RenderResourceCache::with_loader_and_limits(
+            |_url: &str| panic!("a page-owned cache never loads synchronously"),
+            1,
+            DEFAULT_RESOURCE_CACHE_BYTES,
+        );
+        cache.set_sync_loading_enabled(false);
+        cache.set_document_scoped(true);
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let first = "https://assets.test/first.svg";
+        let second = "https://assets.test/second.svg";
+        cache.seed_image(first.into(), profile, svg(20));
+        cache.seed_image(second.into(), profile, svg(30));
+        assert_eq!(cache.retained_entry_count(), 1);
+        // Layout and the warmup scan keep using the evicted outcome.
+        assert!(cache.has_live_image_outcome(first, profile));
+        assert_eq!(
+            cache.profiled_image_intrinsic(first, profile).unwrap().natural_size(),
+            Some((20.0, 10.0))
+        );
+        assert_eq!(cache.cached_image_metadata(first, None), Some(Some((first.into(), 20.0, 10.0))));
+        assert!(!cache.has_sync_misses(), "relayout must not refetch evicted images");
+        // Paint needs the bytes again and asks for them.
+        assert!(cache.get_or_load_image(first, profile).is_none());
+        assert_eq!(cache.take_sync_misses(), vec![(first.to_string(), Some(profile), false)]);
+
+        // A failure is final for the document, including after eviction.
+        let failed = "https://assets.test/failed.svg";
+        cache.seed_image_missing(failed.into(), profile);
+        cache.entries.insert(
+            failed.to_string(),
+            CachedResource::Missing(
+                std::time::Instant::now() - MISSING_RESOURCE_RETRY_AFTER * 2,
+            ),
+        );
+        assert!(cache.has_live_image_outcome(failed, profile));
+        assert!(cache.get_or_load_image(failed, profile).is_none());
+        cache.seed_image(second.into(), profile, svg(30));
+        assert!(cache.has_live_image_outcome(failed, profile));
+        assert_eq!(cache.profiled_image_intrinsic(failed, profile), None);
+        assert!(cache.get_or_load_image(failed, profile).is_none());
+        assert!(!cache.has_sync_misses(), "a failed image is not requested again");
     }
 
     #[test]
