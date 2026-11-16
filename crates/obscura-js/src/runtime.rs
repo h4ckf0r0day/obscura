@@ -5766,7 +5766,7 @@ mod tests {
         assert!(error.contains("child iframe realms are unavailable"), "{error}");
         assert_eq!(rt.realm_states().borrow().live_count(), 0);
 
-        let observed = rt.evaluate(r#"(() => {
+        let observed = rt.evaluate_script(r#"(() => {
             let errorEvent = false;
             const frame = document.createElement('iframe');
             frame.addEventListener('error', () => { errorEvent = true; });
@@ -5779,7 +5779,9 @@ mod tests {
                 errorEvent,
             ];
         })()"#).unwrap();
-        let document_text = observed[0].as_str().unwrap();
+        let document_text = observed[0]
+            .as_str()
+            .unwrap_or_else(|| panic!("unexpected iframe observation: {observed:?}"));
         assert!(document_text.contains("child iframe realms are unavailable"), "{document_text}");
         assert_eq!(observed[1], observed[0]);
         assert_eq!(observed[2], serde_json::json!("Parent stays usable"));
