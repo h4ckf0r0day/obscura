@@ -3027,7 +3027,8 @@ impl Page {
             js.record_navigation_timing("domInteractive");
             let _ = js.execute_script(
                 "<ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';",
+                "globalThis.__documentReadyState__ = 'interactive';\n\
+                 try { document.dispatchEvent(new Event('readystatechange')); } catch(e) {}",
             );
         }
 
@@ -3128,6 +3129,7 @@ impl Page {
             let completed = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
+                 try { document.dispatchEvent(new Event('readystatechange')); } catch(e) {}\n\
                  try {\n\
                    const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
                    try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
@@ -9505,6 +9507,31 @@ mod tests {
             ];
         })()"#).unwrap();
         assert_eq!(actual, serde_json::json!([true, true, true, true, true, true, true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_fires_readystatechange_for_interactive_and_complete() {
+        let mut page = import_map_test_page(
+            "readystatechange", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        // Consent managers wait for readystatechange when they run while
+        // the document is still loading.
+        let html = r#"<!doctype html><script>
+            globalThis.__readyEvents = [document.readyState];
+            document.addEventListener('readystatechange', () => {
+                __readyEvents.push('rsc:' + document.readyState);
+            });
+            document.addEventListener('DOMContentLoaded', () => __readyEvents.push('dcl'));
+            window.addEventListener('load', () => __readyEvents.push('load'));
+        </script><script defer src="data:text/javascript,__readyEvents.push('defer:'+document.readyState)"></script>"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+        page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("__readyEvents").unwrap(),
+            serde_json::json!([
+                "loading", "rsc:interactive", "defer:interactive", "dcl", "rsc:complete", "load"
+            ]),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

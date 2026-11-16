@@ -165,6 +165,7 @@ impl FrameRealm {
         self.execute_script(
             parent,
             "globalThis.__documentReadyState__ = 'interactive';\
+             try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
              try { document.dispatchEvent(new Event('DOMContentLoaded', \
                  { bubbles: false, cancelable: false })); } catch (_) {}\
              try { window.dispatchEvent(new Event('DOMContentLoaded', \
