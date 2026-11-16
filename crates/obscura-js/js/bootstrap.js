@@ -17746,6 +17746,16 @@ globalThis.Worker = class Worker {
       performance: globalThis.performance,
       location: globalThis.location,
     };
+    // Chrome's dedicated-worker global is a DedicatedWorkerGlobalScope that
+    // inherits from WorkerGlobalScope, so `self instanceof WorkerGlobalScope`
+    // is true inside a worker. Feature detection like
+    // `self instanceof WorkerGlobalScope ? new OffscreenCanvas(...) :
+    // document.createElement(...)` (seen on real sites) picks the page-only
+    // branch when the scope is a plain object, and with the spec-mandated
+    // `document: undefined` that branch throws a worker error Chrome does not.
+    scope.DedicatedWorkerGlobalScope.prototype = Object.create(scope.WorkerGlobalScope.prototype);
+    scope.DedicatedWorkerGlobalScope.prototype.constructor = scope.DedicatedWorkerGlobalScope;
+    Object.setPrototypeOf(scope, scope.DedicatedWorkerGlobalScope.prototype);
     scope.self = scope;
     // A worker global carries the ECMAScript builtins and the worker-visible
     // web APIs as properties. Bare identifiers already resolved through the
