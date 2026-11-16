@@ -145,13 +145,17 @@ jobs:
           python3 scripts/ci/patch-rusty-v8.py \
             "$RUNNER_TEMP/rusty_v8/build.rs" \
             "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni" \
-            "$RUNNER_TEMP/rusty_v8/build/rust/gni_impl/filter_clang_args.py"
+            "$RUNNER_TEMP/rusty_v8/build/rust/gni_impl/filter_clang_args.py" \
+            "$RUNNER_TEMP/rusty_v8/v8/src/codegen/arm64/cpu-arm64.cc"
           grep -n -A5 -B2 'build V8 from source only for Android' \
             "$RUNNER_TEMP/rusty_v8/build.rs"
           grep -n -A3 -B2 'declare Android NDK version' \
             "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni"
           grep -n -A8 -B2 'CHROMIUM_BINDGEN_STRIP_HOST_X64_FLAGS_FOR_ANDROID' \
             "$RUNNER_TEMP/rusty_v8/build/rust/gni_impl/filter_clang_args.py"
+          grep -n -A5 -B2 \
+            'defined(V8_OS_LINUX) && !defined(V8_OS_ANDROID)' \
+            "$RUNNER_TEMP/rusty_v8/v8/src/codegen/arm64/cpu-arm64.cc"
 
       - name: Link the NDK into rusty_v8
         run: |

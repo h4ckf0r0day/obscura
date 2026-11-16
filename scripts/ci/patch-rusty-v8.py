@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Prepare a rusty_v8 source tree for an Android source build.
 
-Three source-layout differences between a standalone rusty_v8 checkout and a
-Chromium checkout have to be repaired in CI:
+Four differences between a standalone rusty_v8 checkout and a Chromium
+checkout have to be repaired in CI:
 
 * The source-build branch must run only for the Android Cargo target. The host
   copy used by Cargo build scripts can use rusty_v8's published x86_64
@@ -13,6 +13,9 @@ Chromium checkout have to be repaired in CI:
 * Chromium's bindgen filter can forward host x86 flags into an Android
   bindgen invocation. The CI environment variable enables removing those
   incompatible flags before libclang parses V8's headers.
+* Clang lowers V8's `__builtin___clear_cache` call to the `__clear_cache`
+  symbol, which is absent from Bionic and Rust's Android compiler-builtins.
+  Android keeps V8's existing inline ARM64 cache-maintenance path instead.
 """
 
 from __future__ import annotations
@@ -36,6 +39,11 @@ BINDGEN_FILTER_NEEDLE = """  def do_filter(args):
     i = 0
     while i < len(args):
 """
+CACHE_FLUSH_NEEDLE = "#elif defined(V8_OS_LINUX)\n"
+CACHE_FLUSH_REPLACEMENT = (
+    "#elif defined(V8_OS_LINUX) && !defined(V8_OS_ANDROID)\n"
+)
+
 BINDGEN_FILTER_REPLACEMENT = """  def do_filter(args):
     strip = os.environ.get("CHROMIUM_BINDGEN_STRIP_HOST_X64_FLAGS_FOR_ANDROID") == "1"
     i = 0
@@ -119,11 +127,34 @@ def patch_bindgen_filter(path: Path) -> None:
     print(f"{path}: patched bindgen filter for Android host-x64 flags")
 
 
+def patch_arm64_cache_flush(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    newline = "\r\n" if "\r\n" in text else "\n"
+    needle = CACHE_FLUSH_NEEDLE.replace("\n", newline)
+    replacement = CACHE_FLUSH_REPLACEMENT.replace("\n", newline)
+    needle_count = text.count(needle)
+    replacement_count = text.count(replacement)
+    if needle_count == 0 and replacement_count == 1:
+        print(f"{path}: Android ARM64 cache-flush patch already present")
+        return
+    if needle_count != 1 or replacement_count != 0:
+        raise SystemExit(
+            f"{path}: expected one unpatched V8 Linux cache-flush branch, "
+            f"found {needle_count} original and {replacement_count} patched"
+        )
+
+    path.write_text(
+        text.replace(needle, replacement, 1), encoding="utf-8", newline=""
+    )
+    print(f"{path}: routed Android ARM64 cache flush through V8's inline path")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("build_rs", type=Path)
     parser.add_argument("android_config", type=Path, nargs="?")
     parser.add_argument("bindgen_filter", type=Path, nargs="?")
+    parser.add_argument("v8_cpu_arm64", type=Path, nargs="?")
     args = parser.parse_args()
 
     patch_build_script(args.build_rs)
@@ -131,6 +162,8 @@ def main() -> None:
         patch_android_config(args.android_config)
     if args.bindgen_filter is not None:
         patch_bindgen_filter(args.bindgen_filter)
+    if args.v8_cpu_arm64 is not None:
+        patch_arm64_cache_flush(args.v8_cpu_arm64)
 
 
 if __name__ == "__main__":
