@@ -2,6 +2,9 @@ name: obscura-runtime-bootstrap-host-test
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/android-runtime-bootstrap-repro
 
 permissions:
   contents: read
