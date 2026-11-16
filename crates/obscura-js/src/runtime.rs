@@ -21052,6 +21052,22 @@ mod tests {
     }
 
     #[test]
+    fn test_cancelled_click_on_an_unnamed_radio_reverts_it() {
+        let mut rt = setup_runtime(r#"<input type="radio" id="u">"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const u = document.getElementById('u');
+            u.addEventListener('click', e => e.preventDefault());
+            u.click();
+            return u.checked;
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(false));
+    }
+
+    #[test]
     fn test_script_checked_setter_unchecks_radio_group() {
         let mut rt = setup_runtime(
             r#"<form id="f1">
