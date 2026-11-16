@@ -26448,9 +26448,10 @@ mod tests {
             globalThis.__dynOnerrorMessages = [];
             globalThis.__dynErrorEvents = [];
             globalThis.__pageAlive = false;
-            window.onerror = (arg) => {
-                __dynOnerrorMessages.push(String(arg?.message ?? arg));
-                return true;
+            // The special window handler takes (message, source, lineno,
+            // colno, error); returning nothing keeps the event uncanceled.
+            window.onerror = (message) => {
+                __dynOnerrorMessages.push(String(message));
             };
             addEventListener('error', event => {
                 __dynErrorEvents.push([
@@ -26484,6 +26485,89 @@ mod tests {
         assert_eq!(exceptions.len(), 1);
         assert_eq!(exceptions[0].name, "Error");
         assert!(exceptions[0].description.contains("boom"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_onerror_property_gets_five_args_and_true_cancels_the_event() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate(r#"(() => {
+            globalThis.__onerrorArgs = null;
+            globalThis.__listenerEvents = [];
+            addEventListener('error', event => {
+                __listenerEvents.push([
+                    event.type, event.message, event.filename,
+                    event.lineno, event.colno, event.error && event.error.message,
+                ]);
+            });
+            window.onerror = (message, source, lineno, colno, error) => {
+                __onerrorArgs = [
+                    typeof message, message,
+                    typeof source, source,
+                    typeof lineno, lineno,
+                    typeof colno, colno,
+                    error instanceof Error, error && error.message,
+                ];
+                return true;
+            };
+            const script = document.createElement('script');
+            script.src = 'data:text/javascript,throw new Error("boom")';
+            document.head.appendChild(script);
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+
+        // HTML's special error event handler: five arguments, and the script
+        // URL arrives as the source.
+        assert_eq!(
+            rt.evaluate("__onerrorArgs").unwrap(),
+            serde_json::json!([
+                "string", "boom",
+                "string", "data:text/javascript,throw new Error(\"boom\")",
+                "number", 0,
+                "number", 0,
+                true, "boom",
+            ])
+        );
+        // addEventListener listeners still receive the ErrorEvent object.
+        assert_eq!(
+            rt.evaluate("__listenerEvents").unwrap(),
+            serde_json::json!([[
+                "error", "boom", "data:text/javascript,throw new Error(\"boom\")",
+                0, 0, "boom",
+            ]])
+        );
+        // The true return canceled the event: no Runtime.exceptionThrown.
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Exception(error) => Some(error),
+                _ => None,
+            }).collect();
+        assert_eq!(exceptions.len(), 0);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_onerror_property_still_gets_the_event_object() {
+        let mut rt = parser_image_runtime(
+            r#"<img id="missing" src="missing.png">"#,
+            move |_url: &str| None,
+        );
+        rt.execute_script("element-onerror-shape", r#"
+            globalThis.__imgArgs = null;
+            const missing = document.getElementById("missing");
+            missing.onerror = function (arg) {
+                __imgArgs = [arg instanceof Event, arg.type, arguments.length];
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        // The element's onerror keeps the ordinary listener shape: one event
+        // argument, not the window's five-argument error convention.
+        assert_eq!(
+            rt.evaluate("__imgArgs").unwrap(),
+            serde_json::json!([true, "error", 1])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
