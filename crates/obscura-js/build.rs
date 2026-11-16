@@ -17,10 +17,10 @@ fn main() {
     let is_cross = target != host;
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    if is_cross && target_os == "android" {
+    if target_os == "android" {
         println!("cargo:rustc-cfg=obscura_runtime_bootstrap");
         eprintln!(
-            "[obscura-js build.rs] Cross-compiling to Android; bootstrap will run in the target runtime"
+            "[obscura-js build.rs] Building for Android; bootstrap will run in the target runtime"
         );
         return;
     }
