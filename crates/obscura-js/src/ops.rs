@@ -424,6 +424,9 @@ pub struct ObscuraState {
     pub(crate) inherited_origin: Option<String>,
     pub(crate) scripting_enabled: bool,
     pub(crate) sandbox_opaque_origin: bool,
+    /// `<link rel=modulepreload>` responses by request URL: (final URL, source).
+    /// The module loader takes an entry instead of fetching that URL again.
+    pub(crate) module_preloads: HashMap<String, (String, String)>,
     storage_origin_cache: RefCell<StorageOriginCache>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
@@ -758,6 +761,7 @@ impl ObscuraState {
             inherited_origin: None,
             scripting_enabled: true,
             sandbox_opaque_origin: false,
+            module_preloads: HashMap::new(),
             storage_origin_cache: RefCell::new(StorageOriginCache { origin: "null".into(), ..Default::default() }),
             encoding: "UTF-8".to_string(),
             content_type: String::new(),
@@ -2239,6 +2243,25 @@ fn stylesheet_origin_clean(document_url: &str, response_url: &str) -> bool {
         return false;
     };
     document.origin() == response.origin()
+}
+
+/// Keep a `<link rel=modulepreload>` response for the module loader, so an
+/// import that later reaches the URL uses it instead of a second fetch.
+#[op2(fast)]
+fn op_module_preload_store(
+    state: &OpState,
+    #[string] url: String,
+    #[string] final_url: String,
+    #[string] code: String,
+) -> bool {
+    const MAX_ENTRIES: usize = 512;
+    let shared = state.borrow::<SharedState>().clone();
+    let Ok(mut state) = shared.try_borrow_mut() else { return false };
+    if state.module_preloads.len() >= MAX_ENTRIES && !state.module_preloads.contains_key(&url) {
+        return false;
+    }
+    state.module_preloads.insert(url, (final_url, code));
+    true
 }
 
 /// Install host-fetched CSS without manufacturing a page-visible `<style>`.
@@ -8699,6 +8722,7 @@ pub fn build_extension() -> Extension {
         op_shadow_attach(),
         op_shadow_root_info(),
         op_external_stylesheet_set(),
+        op_module_preload_store(),
         op_external_stylesheet_remove(),
         op_external_stylesheet_get(),
         op_stylesheet_generation(),
