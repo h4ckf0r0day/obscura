@@ -9518,19 +9518,26 @@ mod tests {
         // the document is still loading.
         let html = r#"<!doctype html><script>
             globalThis.__readyEvents = [document.readyState];
+            document.onreadystatechange = () => __readyEvents.push('handler:' + document.readyState);
             document.addEventListener('readystatechange', () => {
                 __readyEvents.push('rsc:' + document.readyState);
             });
             document.addEventListener('DOMContentLoaded', () => __readyEvents.push('dcl'));
             window.addEventListener('load', () => __readyEvents.push('load'));
+            document.onclick = () => __readyEvents.push('click');
         </script><script defer src="data:text/javascript,__readyEvents.push('defer:'+document.readyState)"></script>"#;
         let encoded = base64::engine::general_purpose::STANDARD.encode(html);
         page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
         assert_eq!(
-            page.js.as_mut().unwrap().evaluate("__readyEvents").unwrap(),
-            serde_json::json!([
-                "loading", "rsc:interactive", "defer:interactive", "dcl", "rsc:complete", "load"
-            ]),
+            page.js.as_mut().unwrap().evaluate(
+                "(document.dispatchEvent(new Event('click')), \
+                 [__readyEvents, 'onreadystatechange' in Document.prototype, \
+                  'onvisibilitychange' in document])"
+            ).unwrap(),
+            serde_json::json!([[
+                "loading", "handler:interactive", "rsc:interactive", "defer:interactive", "dcl",
+                "handler:complete", "rsc:complete", "load", "click"
+            ], true, true]),
         );
     }
 

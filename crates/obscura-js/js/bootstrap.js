@@ -2106,9 +2106,13 @@ function _domEventInvokeHandlers(target, event, capture, phase) {
   // listener group. Keep their existing position ahead of listeners installed
   // through addEventListener; changing that ordering here would be an unrelated
   // compatibility change.
-  if (!capture && typeof target._resolveInlineHandler === "function") {
+  // A Document has IDL handlers (document.onreadystatechange) but no content
+  // attributes to compile.
+  const resolvesInline = typeof target._resolveInlineHandler === "function";
+  if (!capture && (resolvesInline || (target !== globalThis && target.nodeType === 9))) {
     const handlerName = "on" + event.type;
-    const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
+    const inlineFn = target[handlerName]
+      || (resolvesInline ? target._resolveInlineHandler(handlerName) : null);
     if (typeof inlineFn === "function") {
       try {
         if (inlineFn.call(target, event) === false) event.preventDefault();
@@ -8183,6 +8187,13 @@ for (const _ev of [
     if (!(_on in _proto)) {
       Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
     }
+  }
+}
+// Document-only event handler IDL attributes.
+for (const _ev of ["readystatechange", "visibilitychange"]) {
+  const _on = "on" + _ev;
+  if (!(_on in Document.prototype)) {
+    Object.defineProperty(Document.prototype, _on, { value: null, writable: true, configurable: true, enumerable: false });
   }
 }
 
