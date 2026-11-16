@@ -448,7 +448,7 @@ async function __runDynScriptTask(task) {
             const previousNid = globalThis.__currentScriptNid;
             globalThis.__currentScriptNid = task.nid;
             try { _executeClassicScript(body); }
-            catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+            catch(e) { _reportUncaughtException(e); }
             finally { globalThis.__currentScriptNid = previousNid || 0; }
             resolve();
           };
@@ -12249,7 +12249,11 @@ globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);t
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
 const _browserErrorEvent = globalThis.ErrorEvent;
-__obscuraCore.setReportExceptionCallback(error => {
+// Shared reporter for uncaught exceptions that reach the task/event-loop
+// boundary: deno_core tasks (timers, microtasks, posted tasks) call it through
+// the report-exception callback, and dynamic classic scripts call it directly
+// so their run-time errors report like any other uncaught error.
+function _reportUncaughtException(error) {
   // deno_core's default reporter terminates execution, discarding the rest of
   // the microtask checkpoint. Browser callback errors must leave queued work live.
   let message;
@@ -12260,7 +12264,8 @@ __obscuraCore.setReportExceptionCallback(error => {
     __obscuraCore.ops.op_report_browser_exception(error, globalThis.__obscura_frameId || 0);
     _consoleFn("error", [error]);
   }
-});
+}
+__obscuraCore.setReportExceptionCallback(_reportUncaughtException);
 globalThis.PointerEvent = class extends MouseEvent {
   constructor(t,o={}) {
     super(t,o);
