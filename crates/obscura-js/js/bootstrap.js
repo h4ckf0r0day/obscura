@@ -16510,6 +16510,9 @@ function _connectInsertedFrames(root, html) {
 }
 
 function _ensureInitialFrameRealm(element, srcdoc) {
+  // Building the explicit error document can ask for its defaultView while
+  // the iframe tree is being parsed. Do not rebuild that document reentrantly.
+  if (element._obscuraRealmUnsupported) return false;
   if (element._frameId || !element.isConnected) return;
   _connectFrameContext(element);
   if (!__obscuraChildRealmsSupported) {
