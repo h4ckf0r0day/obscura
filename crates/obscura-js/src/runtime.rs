@@ -5758,9 +5758,11 @@ mod tests {
         );
         rt.set_runtime_events_enabled(true);
 
-        let error = crate::frame::FrameRealm::try_new(&mut rt, 1, 0,
-            "http://example.com/child", "<html><body>must not run</body></html>")
-            .expect_err("runtime-bootstrap builds must not create a child realm");
+        let error = match crate::frame::FrameRealm::try_new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>must not run</body></html>") {
+            Ok(_) => panic!("runtime-bootstrap builds must not create a child realm"),
+            Err(error) => error,
+        };
         assert!(error.contains("child iframe realms are unavailable"), "{error}");
         assert_eq!(rt.realm_states().borrow().live_count(), 0);
 
