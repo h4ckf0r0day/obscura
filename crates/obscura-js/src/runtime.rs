@@ -25401,6 +25401,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn body_onerror_attribute_acts_as_the_window_error_handler() {
+        let mut rt = setup_runtime(
+            "<html><head></head><body onerror=\"window.__args=[typeof event, event, source, error && error.message]; return true\"><p>hi</p></body></html>",
+        );
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate(r#"(() => {
+            globalThis.__pageAlive = false;
+            const script = document.createElement('script');
+            script.src = 'data:text/javascript,throw new Error("boom")';
+            document.head.appendChild(script);
+            setTimeout(() => { globalThis.__pageAlive = true; }, 0);
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+
+        // The body's inline onerror runs as the window's special error
+        // handler: the compiled function sees the message as `event`, the
+        // script URL as `source`, and the thrown error as `error`.
+        assert_eq!(
+            rt.evaluate("__args").unwrap(),
+            serde_json::json!([
+                "string", "boom",
+                "data:text/javascript,throw new Error(\"boom\")",
+                "boom",
+            ])
+        );
+        assert_eq!(rt.evaluate("__pageAlive").unwrap(), serde_json::json!(true));
+
+        // The attribute's `return true` cancelled the event: no
+        // Runtime.exceptionThrown.
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Exception(error) => Some(error),
+                _ => None,
+            }).collect();
+        assert_eq!(exceptions.len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_dynamic_script_loads_without_exposing_fetch_body() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

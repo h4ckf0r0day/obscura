@@ -8237,6 +8237,60 @@ Object.defineProperty(Element.prototype, 'onload', {
   enumerable: false,
 });
 
+// body/frameset onerror is the window's error handler. It gets the five
+// arguments of the special error event handler, so the compiled inline
+// function names them (event, source, lineno, colno, error) for the
+// attribute text.
+const _defaultWindowOnError = globalThis.onerror;
+let _windowOnErrorOverrideSet = false;
+let _windowOnErrorOverride = null;
+function _windowReflectingBodyErrorHandler() {
+  if (!_scriptingEnabled) return null;
+  const body = _windowReflectingBodyElement();
+  if (!body || typeof body.getAttribute !== 'function') return null;
+  const src = body.getAttribute('onerror');
+  if (!src) return null;
+  const cache = body.__windowInlineError;
+  if (cache && cache.src === src) return cache.fn;
+  let fn = null;
+  try {
+    fn = new Function('event', 'source', 'lineno', 'colno', 'error', src);
+  } catch (_e) {
+    fn = null;
+  }
+  body.__windowInlineError = { src, fn };
+  return fn;
+}
+Object.defineProperty(globalThis, 'onerror', {
+  get() {
+    if (_windowOnErrorOverrideSet) return _windowOnErrorOverride;
+    return _windowReflectingBodyErrorHandler() || _defaultWindowOnError;
+  },
+  set(value) {
+    _windowOnErrorOverrideSet = true;
+    _windowOnErrorOverride = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: true,
+});
+Object.defineProperty(Element.prototype, 'onerror', {
+  get() {
+    if (_isWindowReflectingBodyElement(this)) {
+      return globalThis.onerror;
+    }
+    return this.__onerror || null;
+  },
+  set(value) {
+    if (_isWindowReflectingBodyElement(this)) {
+      globalThis.onerror = value;
+      return;
+    }
+    this.__onerror = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: false,
+});
+
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
