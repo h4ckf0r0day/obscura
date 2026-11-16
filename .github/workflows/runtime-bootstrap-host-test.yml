@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   runtime-bootstrap:
-    name: Runtime bootstrap / child realm
+    name: Runtime bootstrap / explicit child-realm failure
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
@@ -37,5 +37,5 @@ jobs:
         run: |
           set -euxo pipefail
           cargo test -p obscura-js \
-            noninteractive_dialog_defaults_apply_to_child_realms \
+            runtime_bootstrap_child_realms_fail_explicitly \
             -- --nocapture

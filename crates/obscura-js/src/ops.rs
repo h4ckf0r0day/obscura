@@ -7168,6 +7168,14 @@ fn op_frame_document_ready(
     #[number] viewport_height: u64,
     owner_node: u32,
 ) -> u32 {
+    #[cfg(obscura_runtime_bootstrap)]
+    {
+        tracing::error!(
+            "cannot create child iframe realm for {url}: {}",
+            crate::bootstrap::CHILD_REALMS_UNAVAILABLE,
+        );
+        return 0;
+    }
     // Whoever called this is the new frame's parent, which is how a frame
     // nested two deep gets `parent` pointing at the frame above it rather than
     // at the page.
@@ -7401,6 +7409,22 @@ pub fn max_live_frames() -> usize {
         .and_then(|value| value.parse().ok()).unwrap_or(64)
 }
 
+/// Whether this runtime can create an isolated child JavaScript realm.
+#[op2(fast)]
+fn op_frame_realms_supported() -> bool {
+    crate::bootstrap::CHILD_REALMS_SUPPORTED
+}
+
+/// Record a visible native diagnostic when JavaScript asks for a child realm
+/// that this runtime cannot create safely.
+#[op2(fast)]
+fn op_frame_realm_error(#[string] url: &str) {
+    tracing::error!(
+        "cannot create child iframe realm for {url}: {}",
+        crate::bootstrap::CHILD_REALMS_UNAVAILABLE,
+    );
+}
+
 /// Initial blank and srcdoc documents share their creator's realm setup.
 /// reentrant: the initialize callback synchronously bootstraps the child
 /// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
@@ -7414,6 +7438,14 @@ fn op_initial_frame(
     owner_node: u32,
     #[string] srcdoc: Option<String>,
 ) -> u32 {
+    #[cfg(obscura_runtime_bootstrap)]
+    {
+        tracing::error!(
+            "cannot create child iframe realm: {}",
+            crate::bootstrap::CHILD_REALMS_UNAVAILABLE,
+        );
+        return 0;
+    }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
         let page = state.borrow::<SharedState>().clone();
@@ -7435,7 +7467,9 @@ fn op_initial_frame(
             .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
         else { return 0 };
         #[cfg(obscura_runtime_bootstrap)]
-        let context = v8::Context::new(scope, Default::default());
+        let context: v8::Local<v8::Context> = {
+            return 0;
+        };
         // Same borrowed deno_core slots as fetched frame realms. Child contexts
         // must not own or free these pointers.
         unsafe {
@@ -7446,10 +7480,6 @@ fn op_initial_frame(
         }
         context.clear_all_slots();
         context.set_security_token(parent_context.get_security_token(scope));
-        #[cfg(obscura_runtime_bootstrap)]
-        if !crate::bootstrap::install_in_context(scope, context) {
-            return 0;
-        }
         let mut child = ObscuraState::new();
         #[cfg(feature = "render")]
         child.set_viewport(300.0, 150.0);
@@ -8735,6 +8765,8 @@ pub fn build_extension() -> Extension {
         op_frame_context(),
         op_frame_relation(),
         op_frame_name(),
+        op_frame_realms_supported(),
+        op_frame_realm_error(),
         op_document_realm_member(),
         op_register_document_realm(),
         op_post_frame_message(),

@@ -6,6 +6,10 @@
 // after deno_core finishes binding ops and before any page script runs. All
 // browser APIs below close over this reference.
 const __obscuraCore = globalThis.Deno.core;
+const __obscuraChildRealmsSupported =
+    __obscuraCore.ops.op_frame_realms_supported?.() !== false;
+const __obscuraChildRealmError =
+    'Obscura: child iframe realms are unavailable in this build; this frame was not executed.';
 
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
@@ -5334,6 +5338,10 @@ class Element extends Node {
   }
   _loadIframeSrc(url, submission) {
     _connectFrameContext(this);
+    if (!__obscuraChildRealmsSupported) {
+      _setUnsupportedIframeRealm(this, url || 'about:blank', true);
+      return;
+    }
     if (!submission && this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
     if (url === 'about:blank' || !url) { this._resetIframeFrame(); if (submission) _ensureInitialFrameRealm(this); return; }
     let fullUrl = url;
@@ -5408,6 +5416,10 @@ class Element extends Node {
   _loadIframeSrcdoc(force = false) {
     if (this.namespaceURI !== 'http://www.w3.org/1999/xhtml' || !this.isConnected) return;
     _connectFrameContext(this);
+    if (!__obscuraChildRealmsSupported) {
+      _setUnsupportedIframeRealm(this, 'about:srcdoc', true);
+      return;
+    }
     const html = this.getAttribute('srcdoc');
     if (html === null) return;
     if (!force && this._iframeLoadingUrl === 'about:srcdoc' && this._iframeSrcdoc === html) return;
@@ -5431,7 +5443,9 @@ class Element extends Node {
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
     if (_postConnection && _iframeConnectionPending(this)) return null;
-    if (_ensureInitialFrameRealm(this) === false) return null;
+    if (_ensureInitialFrameRealm(this) === false) {
+      return this._obscuraRealmUnsupported ? this._iframeDoc : null;
+    }
     if (this._iframeOpaque) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
@@ -5456,6 +5470,7 @@ class Element extends Node {
     if (this.localName !== 'iframe') return undefined;
     if (_postConnection && _iframeConnectionPending(this)) return null;
     if (_ensureInitialFrameRealm(this) === false) {
+      if (this._obscuraRealmUnsupported) return this._iframeWin;
       const contextId = _connectFrameContext(this);
       return contextId < 0 ? null : _remoteContextWindow(contextId);
     }
@@ -16497,6 +16512,12 @@ function _connectInsertedFrames(root, html) {
 function _ensureInitialFrameRealm(element, srcdoc) {
   if (element._frameId || !element.isConnected) return;
   _connectFrameContext(element);
+  if (!__obscuraChildRealmsSupported) {
+    const url = element._iframeLoadedUrl ||
+      (srcdoc === undefined ? 'about:blank' : 'about:srcdoc');
+    _setUnsupportedIframeRealm(element, url, true);
+    return false;
+  }
   // An opaque sandbox must never receive the creator's security token.
   let opaque = element.hasAttribute('sandbox') &&
       !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin');
@@ -16557,6 +16578,10 @@ function _resetIframeElement(element) {
   element._iframeOpaque = false;
   element._iframeLoadingUrl = null;
   element._iframeRequest = null;
+  if (!__obscuraChildRealmsSupported) {
+    _setUnsupportedIframeRealm(element, 'about:blank', false);
+    return;
+  }
   element._iframeLoadedUrl = 'about:blank';
   element._iframeDoc = new _IframeDocument(
     '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', element);
@@ -16871,6 +16896,25 @@ class _IframeWindow {
   close() { this.closed = true; }
   focus() {}
   blur() {}
+}
+
+// Put an iframe into an explicit failure state when this runtime cannot
+// create an isolated child realm. Never expose an empty or parent-owned frame
+// as though its document had loaded successfully.
+function _setUnsupportedIframeRealm(element, url, report) {
+  const target = String(url || 'about:blank');
+  element._obscuraRealmUnsupported = true;
+  element._iframeLoadedUrl = target;
+  const errorHtml = '<!DOCTYPE html><html><head></head><body><pre id="obscura-frame-error">' +
+    __obscuraChildRealmError + '</pre></body></html>';
+  element._iframeDoc = new _IframeDocument(errorHtml, target, element);
+  element._iframeWin = new _IframeWindow(element._iframeDoc, target);
+  if (report && !element._obscuraRealmErrorReported) {
+    element._obscuraRealmErrorReported = true;
+    console.error(__obscuraChildRealmError);
+    try { __obscuraCore.ops.op_frame_realm_error?.(target); } catch (_) {}
+    try { element.dispatchEvent(new Event('error')); } catch (_) {}
+  }
 }
 
 // Encode an RGBA pixel buffer into a valid PNG data URL.

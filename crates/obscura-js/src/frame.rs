@@ -60,12 +60,32 @@ impl FrameRealm {
         url: &str,
         html: &str,
     ) -> Option<Self> {
+        Self::try_new(parent, frame_id, parent_frame_id, url, html).ok()
+    }
+
+    /// Builds a frame realm and preserves the reason when it cannot be built.
+    ///
+    /// Production callers must use this method so an unavailable child realm is
+    /// reported to the user instead of being silently treated as an empty frame.
+    pub fn try_new(
+        parent: &mut ObscuraJsRuntime,
+        frame_id: u32,
+        parent_frame_id: u32,
+        url: &str,
+        html: &str,
+    ) -> Result<Self, String> {
+        if !crate::bootstrap::CHILD_REALMS_SUPPORTED {
+            return Err(crate::bootstrap::CHILD_REALMS_UNAVAILABLE.to_string());
+        }
         let realms = parent.realm_states();
         let existing = realms.borrow().context(frame_id);
         if let Some(context) = existing {
-            let state = realms.borrow().by_frame_id(frame_id)?;
+            let state = realms
+                .borrow()
+                .by_frame_id(frame_id)
+                .ok_or_else(|| "existing frame realm has no document state".to_string())?;
             let origin = state.borrow().inherited_origin.clone().unwrap_or_else(|| origin_of(url));
-            return Some(Self {
+            return Ok(Self {
                 context,
                 realms,
                 frame_id,
@@ -75,16 +95,17 @@ impl FrameRealm {
             });
         }
         if realms.borrow().live_count() >= crate::ops::max_live_frames() {
-            return None;
+            return Err("live child frame limit reached".to_string());
         }
         let context = parent.create_realm_context()?;
         if !parent.share_ops_with_realm(&context) {
-            return None;
+            return Err("could not bind the child realm op table".to_string());
         }
         parent.copy_identity_to_realm(&context);
         // A snapshot-created realm has null deno_core per-context state slots, so
         // a promise rejection or dynamic import() in the frame would segfault in
         // deno_core's global callbacks (#850, #841). Alias the main realm's state.
+        #[cfg(not(obscura_runtime_bootstrap))]
         parent.share_deno_context_state_with_realm(&context);
 
         // Only a same-origin frame is reachable from the page. Cross-origin
@@ -138,13 +159,13 @@ impl FrameRealm {
              globalThis.__obscura_init();"
         ));
         parent.disarm_watchdog(watchdog);
-        initialized.ok()?;
+        initialized.map_err(|error| format!("child realm initialization failed: {error}"))?;
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
             parent.publish_realm_objects(&realm.context, frame_id);
         }
-        Some(realm)
+        Ok(realm)
     }
 
     /// Fires the frame document's lifecycle events, in spec order.

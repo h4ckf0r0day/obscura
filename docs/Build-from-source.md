@@ -94,6 +94,12 @@ result is an ELF64 AArch64 binary using `/system/bin/linker64`. The resulting
 If the executable imports `libc++_shared.so`, place the matching NDK library
 in the same directory and run the command with `LD_LIBRARY_PATH=.`.
 
+Android runtime-bootstrap builds do not currently create isolated child iframe
+realms. An affected iframe is not presented as an empty successful document:
+the page receives a visible error document, a `console.error`, and a native error
+log stating that the child realm was not executed. The main document remains
+usable.
+
 ## Run from the build
 
 ```bash

@@ -798,46 +798,41 @@ impl ObscuraJsRuntime {
 
     /// Creates an additional realm in this isolate: a second `v8::Context`.
     ///
-    /// The startup snapshot already contains the whole bootstrap (see
-    /// `build.rs`), so a context restored from it arrives with every DOM class
-    /// and shim installed. Building a realm is therefore a context restore, not
-    /// a re-parse of the whole bootstrap.
-    ///
-    /// The new context has no ops: deno_core binds those into the main context
-    /// only. Use [`Self::share_ops_with_realm`] to give it the same `Deno.core`
-    /// object, which is legal because native function objects are shareable
-    /// between contexts of one isolate.
+    /// Snapshot builds restore the context from the startup snapshot. Runtime-
+    /// bootstrap builds do not have per-context `deno_core` state, module map,
+    /// rejection tracker, dispatch callbacks, or timer queue. Creating a context
+    /// there and aliasing the parent's state would mix realms, so the operation
+    /// fails explicitly instead.
     pub(crate) fn create_realm_context(
         &mut self,
-    ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
-        let context = {
-            let mut entered = self.runtime();
-            let isolate = entered.v8_isolate();
-            deno_core::v8::scope!(let scope, isolate);
-            #[cfg(not(obscura_runtime_bootstrap))]
-            let context = deno_core::v8::Context::from_snapshot(
-                scope,
-                1,
-                deno_core::v8::ContextOptions::default(),
-            )
-            .or_else(|| {
-                deno_core::v8::Context::from_snapshot(
+    ) -> Result<deno_core::v8::Global<deno_core::v8::Context>, String> {
+        #[cfg(obscura_runtime_bootstrap)]
+        {
+            return Err(crate::bootstrap::CHILD_REALMS_UNAVAILABLE.to_string());
+        }
+        #[cfg(not(obscura_runtime_bootstrap))]
+        {
+            let context = {
+                let mut entered = self.runtime();
+                let isolate = entered.v8_isolate();
+                deno_core::v8::scope!(let scope, isolate);
+                let context = deno_core::v8::Context::from_snapshot(
                     scope,
-                    0,
+                    1,
                     deno_core::v8::ContextOptions::default(),
                 )
-            })?;
-            #[cfg(obscura_runtime_bootstrap)]
-            let context = {
-                let context = deno_core::v8::Context::new(scope, Default::default());
-                if !crate::bootstrap::install_in_context(scope, context) {
-                    return None;
-                }
-                context
+                .or_else(|| {
+                    deno_core::v8::Context::from_snapshot(
+                        scope,
+                        0,
+                        deno_core::v8::ContextOptions::default(),
+                    )
+                })
+                .ok_or_else(|| "could not restore the child realm snapshot".to_string())?;
+                deno_core::v8::Global::new(scope, context)
             };
-            deno_core::v8::Global::new(scope, context)
-        };
-        Some(context)
+            Ok(context)
+        }
     }
 
     /// Takes the ops object bootstrap handed out, and removes the handoff from
@@ -5745,6 +5740,7 @@ mod tests {
         }));
     }
 
+    #[cfg(not(obscura_runtime_bootstrap))]
     #[test]
     fn noninteractive_dialog_defaults_apply_to_child_realms() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -5752,6 +5748,45 @@ mod tests {
             "http://example.com/child", "<html><body></body></html>").unwrap();
         assert_eq!(frame.evaluate(&mut rt, "confirm('Delete?')").unwrap(),
             serde_json::json!(false));
+    }
+
+    #[cfg(obscura_runtime_bootstrap)]
+    #[test]
+    fn runtime_bootstrap_child_realms_fail_explicitly() {
+        let mut rt = setup_runtime(
+            "<html><head><title>Parent stays usable</title></head><body></body></html>",
+        );
+        rt.set_runtime_events_enabled(true);
+
+        let error = crate::frame::FrameRealm::try_new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>must not run</body></html>")
+            .expect_err("runtime-bootstrap builds must not create a child realm");
+        assert!(error.contains("child iframe realms are unavailable"), "{error}");
+        assert_eq!(rt.realm_states().borrow().live_count(), 0);
+
+        let observed = rt.evaluate(r#"(() => {
+            let errorEvent = false;
+            const frame = document.createElement('iframe');
+            frame.addEventListener('error', () => { errorEvent = true; });
+            frame.srcdoc = '<p>must not run</p>';
+            document.body.appendChild(frame);
+            return [
+                frame.contentDocument?.body?.textContent || '',
+                frame.contentWindow?.document?.body?.textContent || '',
+                document.title,
+                errorEvent,
+            ];
+        })()"#).unwrap();
+        let document_text = observed[0].as_str().unwrap();
+        assert!(document_text.contains("child iframe realms are unavailable"), "{document_text}");
+        assert_eq!(observed[1], observed[0]);
+        assert_eq!(observed[2], serde_json::json!("Parent stays usable"));
+        assert_eq!(observed[3], serde_json::json!(true));
+        assert_eq!(rt.realm_states().borrow().live_count(), 0);
+
+        let events = rt.take_pending_runtime_events();
+        let rendered = format!("{events:?}");
+        assert!(rendered.contains("child iframe realms are unavailable"), "{rendered}");
     }
 
     #[cfg(obscura_external_bootstrap)]

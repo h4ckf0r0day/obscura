@@ -119,7 +119,12 @@ standards mode without requiring a doctype and honors script-disabled
 
 Sandboxed `srcdoc` enforces opaque document access and script disabling,
 including inherited restrictions on nested frames. This does not implement
-every HTML sandbox policy. Frame module scripts remain unsupported.
+every HTML sandbox policy. Frame module scripts remain unsupported. Android
+runtime-bootstrap builds also reject child realm creation explicitly because
+`deno_core 0.412.0` does not expose the per-context state, rejection tracker,
+dispatch callbacks, and timer queue required for an isolated child. The iframe
+receives an error document and an error event/log instead of an empty realm or
+parent-owned state.
 CDP `DOM.describeNode` and `DOM.getOuterHTML` resolve remote node handles in
 their native owning document, including handles obtained through the parent.
 The document element carries that document's protocol frame ID, so Playwright

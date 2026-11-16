@@ -2,9 +2,6 @@ name: obscura-android-cross-build
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/android-runtime-bootstrap-repro
 
 permissions:
   contents: read
@@ -267,7 +264,7 @@ jobs:
               needs_libcxx=true
             fi
           done
-          if "$needs_libcxx"; then
+          if [ "$needs_libcxx" = true ]; then
             libcxx="$sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
             test -f "$libcxx"
             install -m 0644 "$libcxx" artifacts/libc++_shared.so

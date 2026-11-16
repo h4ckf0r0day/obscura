@@ -1261,12 +1261,23 @@ impl Page {
                 self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
                 return true;
             }
-            let realm = match self.js.as_mut().and_then(|js| {
-                FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
+            let realm = match self.js.as_mut().map(|js| {
+                FrameRealm::try_new(
+                    js,
+                    frame.frame_id,
+                    frame.parent_frame_id,
+                    &frame.url,
+                    &frame.html,
+                )
             }) {
-                Some(realm) => realm,
+                Some(Ok(realm)) => realm,
+                Some(Err(error)) => {
+                    tracing::error!("could not build a realm for frame {}: {error}", frame.url);
+                    self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                    return true;
+                }
                 None => {
-                    tracing::warn!("could not build a realm for frame {}", frame.url);
+                    tracing::error!("could not build a realm for frame {}: runtime unavailable", frame.url);
                     self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
                     return true;
                 }
