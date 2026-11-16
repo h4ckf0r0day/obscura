@@ -835,7 +835,7 @@ function _radioType(el) {
 // same case-sensitive name, type=radio. A radio with an empty name is alone.
 function _radioGroupSiblings(radio) {
   const name = radio.getAttribute('name') || '';
-  if (!name) return [];
+  if (!name) return [radio];
   const root = radio.getRootNode ? radio.getRootNode() : (radio.ownerDocument || globalThis.document);
   const all = root && root.querySelectorAll
     ? root.querySelectorAll('input')
