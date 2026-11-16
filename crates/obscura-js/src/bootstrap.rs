@@ -10,10 +10,13 @@ pub(crate) fn source() -> &'static str {
     })
 }
 
-pub(crate) fn install_in_context<'i>(
-    scope: &mut v8::PinScope<'_, 'i>,
-    context: v8::Local<'i, v8::Context>,
-) -> bool {
+pub(crate) fn install_in_context<'scope, 'i, 'ctx>(
+    scope: &mut v8::PinScope<'scope, 'i, ()>,
+    context: v8::Local<'ctx, v8::Context>,
+) -> bool
+where
+    'ctx: 'scope,
+{
     let scope = &mut v8::ContextScope::new(scope, context);
     let global = context.global(scope);
     let ops = v8::Object::new(scope);

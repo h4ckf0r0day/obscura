@@ -7435,7 +7435,7 @@ fn op_initial_frame(
             .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
         else { return 0 };
         #[cfg(obscura_runtime_bootstrap)]
-        let context = v8::Context::new(scope);
+        let context = v8::Context::new(scope, Default::default());
         // Same borrowed deno_core slots as fetched frame realms. Child contexts
         // must not own or free these pointers.
         unsafe {

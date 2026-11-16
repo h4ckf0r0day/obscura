@@ -829,7 +829,7 @@ impl ObscuraJsRuntime {
             })?;
             #[cfg(obscura_runtime_bootstrap)]
             let context = {
-                let context = deno_core::v8::Context::new(scope);
+                let context = deno_core::v8::Context::new(scope, Default::default());
                 if !crate::bootstrap::install_in_context(scope, context) {
                     return None;
                 }
