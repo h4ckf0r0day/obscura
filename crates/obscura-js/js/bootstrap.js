@@ -4723,15 +4723,21 @@ class Element extends Node {
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
     // as a function body on first read and cache it on the instance.
     const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
-    if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
+    // body/frameset onerror is Window's special error handler, which takes
+    // (event, source, lineno, colno, error).
+    const windowError = name === 'onerror' && _isWindowReflectingBodyElement(this);
+    const key = windowError ? 'onerror:window' : name;
+    if (Object.prototype.hasOwnProperty.call(cache, key)) return cache[key];
     const src = this.getAttribute && this.getAttribute(name);
-    if (src == null) { cache[name] = null; return null; }
+    if (src == null) { cache[key] = null; return null; }
     try {
-      cache[name] = new Function('event', src);
+      cache[key] = windowError
+        ? new Function('event', 'source', 'lineno', 'colno', 'error', src)
+        : new Function('event', src);
     } catch (e) {
-      cache[name] = null;
+      cache[key] = null;
     }
-    return cache[name];
+    return cache[key];
   }
   click() {
     // A label activating this control on behalf of a real input event passes a
@@ -8181,6 +8187,11 @@ globalThis.frameElement = null;
 globalThis.length = 0;
 
 const _eventHandlerValues = new WeakMap();
+// Body and frameset handlers that are Window's handlers instead.
+const _windowReflectedBodyHandlers = new Set(['onload', 'onerror']);
+// Obscura's error recorder is window.onerror until a page sets one; a body
+// onerror attribute takes precedence over it.
+const _defaultWindowOnError = globalThis.onerror;
 // Window lives for the realm; keep its record through snapshot restoration.
 const _windowEventHandlerState = {kind: 'window', values: Object.create(null)};
 const _nativeResolveInlineHandler = Element.prototype._resolveInlineHandler;
@@ -8200,10 +8211,13 @@ function _eventHandlerState(receiver, kind) {
   return values;
 }
 function _eventHandlerValue(receiver, name, kind, values) {
-  if (values && name in values) return values[name];
-  if (kind === 'window' && name === 'onload') {
+  const isDefault = kind === 'window' && name === 'onerror' && values?.[name] === _defaultWindowOnError;
+  if (values && name in values && !isDefault) return values[name];
+  if (kind === 'window' && _windowReflectedBodyHandlers.has(name)) {
     const body = _windowReflectingBodyElement();
-    return body ? _nativeResolveInlineHandler.call(body, name) : null;
+    const inline = body ? _nativeResolveInlineHandler.call(body, name) : null;
+    if (inline || !isDefault) return inline;
+    return values[name];
   }
   return kind === 'element' ? _nativeResolveInlineHandler.call(receiver, name) : null;
 }
@@ -8213,7 +8227,7 @@ function _nativeEventHandler(receiver, name) {
     : typeof receiver._resolveInlineHandler === 'function' ? 'element'
     : receiver === globalThis ? 'window' : 'document';
   // Body load handlers belong to Window, not to a load dispatched on Body.
-  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(receiver)) return null;
+  if (kind === 'element' && _windowReflectedBodyHandlers.has(name) && _isWindowReflectingBodyElement(receiver)) return null;
   return _eventHandlerValue(receiver, name, kind, state?.values);
 }
 function _eventHandlerGet(name, kind) {
@@ -8223,7 +8237,7 @@ function _eventHandlerGet(name, kind) {
     if (get) return get.call(this, name, kind);
     throw new TypeError('Illegal invocation');
   }
-  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(this)) {
+  if (kind === 'element' && _windowReflectedBodyHandlers.has(name) && _isWindowReflectingBodyElement(this)) {
     return _eventHandlerGet.call(globalThis, name, 'window');
   }
   return _eventHandlerValue(this, name, kind, values);
@@ -8235,7 +8249,7 @@ function _eventHandlerSet(name, kind, value) {
     if (set) return set.call(this, name, kind, value);
     throw new TypeError('Illegal invocation');
   }
-  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(this)) {
+  if (kind === 'element' && _windowReflectedBodyHandlers.has(name) && _isWindowReflectingBodyElement(this)) {
     return _eventHandlerSet.call(globalThis, name, 'window', value);
   }
   return values[name] = value !== null && (typeof value === 'object' || typeof value === 'function') ? value : null;
@@ -8244,9 +8258,13 @@ function _eventHandlerAttributeChanged(element, name) {
   if (!name.startsWith('on')) return;
   const state = _eventHandlerValues.get(element);
   if (state) delete state.values[name];
-  if (element.__inlineHandlerCache) delete element.__inlineHandlerCache[name];
-  if (name === 'onload' && _isWindowReflectingBodyElement(element)) {
-    delete _windowEventHandlerState.values.onload;
+  if (element.__inlineHandlerCache) {
+    delete element.__inlineHandlerCache[name];
+    delete element.__inlineHandlerCache[name + ':window'];
+  }
+  if (_windowReflectedBodyHandlers.has(name) && _isWindowReflectingBodyElement(element)) {
+    if (name === 'onerror') _windowEventHandlerState.values.onerror = _defaultWindowOnError;
+    else delete _windowEventHandlerState.values[name];
   }
 }
 
@@ -8302,7 +8320,7 @@ for (const [_proto, _kind, _names] of [
       const descriptor = Object.getOwnPropertyDescriptor({
         get [_on]() {
           const state = this === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(this);
-          if (_on !== 'onload' && state?.kind === _kind && _on in state.values) return state.values[_on];
+          if (!_windowReflectedBodyHandlers.has(_on) && state?.kind === _kind && _on in state.values) return state.values[_on];
           return _eventHandlerGet.call(this, _on, _kind);
         },
         set [_on](value) { _eventHandlerSet.call(this, _on, _kind, value); },
