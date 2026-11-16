@@ -25271,6 +25271,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_script_exception_reports_as_uncaught_window_error() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate(r#"(() => {
+            globalThis.__dynOnerrorMessages = [];
+            globalThis.__dynErrorEvents = [];
+            globalThis.__pageAlive = false;
+            window.onerror = (arg) => {
+                __dynOnerrorMessages.push(String(arg?.message ?? arg));
+                return true;
+            };
+            addEventListener('error', event => {
+                __dynErrorEvents.push([
+                    String(event.error?.message ?? ''),
+                    event instanceof ErrorEvent,
+                ]);
+            });
+            const script = document.createElement('script');
+            script.src = 'data:text/javascript,throw new Error("boom")';
+            document.head.appendChild(script);
+            setTimeout(() => { globalThis.__pageAlive = true; }, 0);
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+
+        // window.onerror and the window 'error' ErrorEvent both saw the throw,
+        // the same report a parser-inserted script's exception produces.
+        assert_eq!(
+            rt.evaluate("[__dynOnerrorMessages, __dynErrorEvents]").unwrap(),
+            serde_json::json!([["boom"], [["boom", true]]])
+        );
+        // The exception did not poison the page: later tasks still run.
+        assert_eq!(rt.evaluate("__pageAlive").unwrap(), serde_json::json!(true));
+
+        // CDP receives Runtime.exceptionThrown, like Chrome.
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Exception(error) => Some(error),
+                _ => None,
+            }).collect();
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(exceptions[0].name, "Error");
+        assert!(exceptions[0].description.contains("boom"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_dynamic_script_loads_without_exposing_fetch_body() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
