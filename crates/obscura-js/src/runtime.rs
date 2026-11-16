@@ -7915,6 +7915,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_is_an_instance_of_worker_global_scope() {
+        // Chrome's worker global satisfies `self instanceof WorkerGlobalScope`,
+        // so feature detection like `self instanceof WorkerGlobalScope ?
+        // new OffscreenCanvas(...) : document.createElement(...)` takes the
+        // worker branch. As a plain object it took the page branch and threw on
+        // the spec-mandated `document: undefined` (112news.dk worker).
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-scope-instanceof",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                let canvasOk = false;
+                try {
+                    const c = self instanceof WorkerGlobalScope ? new OffscreenCanvas(300, 150) : document.createElement('canvas');
+                    canvasOk = !!c.getContext('2d');
+                } catch (e) {}
+                postMessage({
+                    selfIsWgs: self instanceof WorkerGlobalScope,
+                    selfIsDwgs: self instanceof DedicatedWorkerGlobalScope,
+                    globalThisIsWgs: globalThis instanceof WorkerGlobalScope,
+                    canvasOk,
+                    noDocument: typeof self.document === 'undefined',
+                });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            };
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([{
+                "selfIsWgs": true, "selfIsDwgs": true, "globalThisIsWgs": true,
+                "canvasOk": true, "noDocument": true,
+            }])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_initialization_error_does_not_rerun_source() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
