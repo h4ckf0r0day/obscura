@@ -826,6 +826,42 @@ function _setInputChecked(el, value) {
   _formChecked[el._nid] = checked;
   _dom("set_form_checked", el._nid, String(checked));
 }
+function _radioType(el) {
+  return el && el.localName === 'input'
+    ? ((el.getAttribute && el.getAttribute('type')) || '').toLowerCase()
+    : '';
+}
+// Radio group membership: same form owner (or, with no form, same node tree),
+// same case-sensitive name, type=radio. A radio with an empty name is alone.
+function _radioGroupSiblings(radio) {
+  const name = radio.getAttribute('name') || '';
+  if (!name) return [];
+  const root = radio.getRootNode ? radio.getRootNode() : (radio.ownerDocument || globalThis.document);
+  const all = root && root.querySelectorAll
+    ? root.querySelectorAll('input')
+    : (radio.ownerDocument || globalThis.document).querySelectorAll('input');
+  const out = [];
+  for (let i = 0; i < all.length; i++) {
+    const r = all[i];
+    if (_radioType(r) !== 'radio') continue;
+    if ((r.getAttribute('name') || '') !== name) continue;
+    if (r.form !== radio.form) continue;
+    out.push(r);
+  }
+  if (out.indexOf(radio) === -1) out.push(radio);
+  return out;
+}
+function _setRadioChecked(radio, value) {
+  if (!value) {
+    _setInputChecked(radio, false);
+    return;
+  }
+  const siblings = _radioGroupSiblings(radio);
+  for (let i = 0; i < siblings.length; i++) {
+    if (siblings[i] !== radio) _setInputChecked(siblings[i], false);
+  }
+  _setInputChecked(radio, true);
+}
 function _inputIndeterminate(el) {
   if (_formIndeterminate[el._nid] === undefined) _loadFormState(el._nid);
   return _formIndeterminate[el._nid] === true;
@@ -4754,19 +4790,8 @@ class Element extends Node {
       _oldChecked = _inputChecked(this);
       _oldIndeterminate = _inputIndeterminate(this);
       if (_type === 'radio') {
-        const _name = this.getAttribute('name') || '';
-        if (_name) {
-          _radioStates = [];
-          const _all = (this.ownerDocument || globalThis.document).querySelectorAll('input');
-          for (let i = 0; i < _all.length; i++) {
-            const r = _all[i];
-            if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
-            if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
-            _radioStates.push([r, _inputChecked(r)]);
-            if (r !== this) _setInputChecked(r, false);
-          }
-        }
-        _setInputChecked(this, true);
+        _radioStates = _radioGroupSiblings(this).map((r) => [r, _inputChecked(r)]);
+        _setRadioChecked(this, true);
       } else {
         // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
         // checkedness *and* drops indeterminateness. Clearing it here, not on
@@ -5171,6 +5196,10 @@ class Element extends Node {
     return _inputChecked(this);
   }
   set checked(v) {
+    if (this._inputType() === 'radio') {
+      _setRadioChecked(this, v);
+      return;
+    }
     _setInputChecked(this, v);
   }
   // `indeterminate` is IDL-only: it has no content attribute to reflect, so

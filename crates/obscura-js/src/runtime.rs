@@ -21508,6 +21508,57 @@ mod tests {
     }
 
     #[test]
+    fn test_script_checked_setter_unchecks_radio_group() {
+        let mut rt = setup_runtime(
+            r#"<form id="f1">
+                 <input type="radio" name="a" id="r1" checked>
+                 <input type="radio" name="a" id="r2">
+                 <input type="radio" name="a" id="r3">
+               </form>
+               <form id="f2">
+                 <input type="radio" name="a" id="other" checked>
+               </form>
+               <input type="radio" name="A" id="upper" checked>
+               <input type="radio" id="unnamed" checked>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const r1 = document.getElementById('r1');
+            document.getElementById('r2').checked = true;
+            const first = [
+                r1.checked,
+                document.getElementById('r2').checked,
+                document.getElementById('r3').checked,
+                document.getElementById('other').checked,
+                document.getElementById('upper').checked,
+                document.getElementById('unnamed').checked,
+                document.querySelectorAll('input:checked').length,
+            ];
+            r1.checked = false;
+            const second = [
+                r1.checked,
+                document.getElementById('r2').checked,
+                document.getElementById('r3').checked,
+                document.getElementById('other').checked,
+                document.getElementById('upper').checked,
+                document.getElementById('unnamed').checked,
+                document.querySelectorAll('input:checked').length,
+            ];
+            return [first, second];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [false, true, false, true, true, true, 4],
+                [false, true, false, true, true, true, 4]
+            ])
+        );
+    }
+
+    #[test]
     fn test_disabled_fieldset_exemption_is_the_first_legend_child_only() {
         // Every disabled fieldset ancestor counts, and only descendants of that
         // fieldset's first <legend> child escape it. A legend wrapped in a div
