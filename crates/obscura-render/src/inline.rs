@@ -2079,6 +2079,33 @@ impl TextEngine {
         item.clip = clip;
     }
 
+    /// Natural line extents before overflow clipping or ellipsis painting.
+    pub(crate) fn scrolling_bounds(&self, index: usize) -> Option<Rect> {
+        let item = self.items.get(index)?;
+        let mut bounds: Option<Rect> = None;
+        let starts = item.owner_text.as_deref()
+            .map(|source| source_line_starts(&item.buffer, source)).unwrap_or_default();
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            let start = starts.get(run.line_i).copied().unwrap_or(0);
+            let end = start + run.text.len();
+            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            for glyph in run.glyphs {
+                let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+                let rect = Rect {
+                    x: item.origin.0 + indent + relative.0 + glyph.x
+                        + line_edge_alignment_shift(item, start, end)
+                        + line_advance_before_text(item, start + glyph.start, start, end),
+                    y: item.origin.1 + relative.1 + run.line_top,
+                    width: glyph.w,
+                    height: run.line_height,
+                };
+                bounds = Some(bounds.map_or(rect, |bounds| bounds.union(&rect)));
+            }
+        }
+        bounds
+    }
+
     /// Replace only the finalized clip without reshaping. Used when canonical
     /// inline fragment rects make a second clip/transform tree walk necessary.
     pub(crate) fn set_clip(&mut self, idx: usize, clip: Option<Rect>) {

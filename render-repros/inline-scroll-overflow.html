@@ -1,0 +1,15 @@
+<!doctype html><meta charset="utf-8"><title>Inline scroll overflow</title>
+<style>
+body { margin: 0; font: 14px/16px sans-serif; }
+#a, #b, #c { width: 100px; white-space: nowrap; }
+#a, #b { overflow: hidden; }
+#a { text-overflow: ellipsis; }
+#v { height: 40px; overflow: auto; }
+#h { width: 200px; overflow-x: auto; }
+#h > div { width: 500px; height: 20px; background: lightblue; }
+</style>
+<div id="a">This text is far too long to fit</div>
+<div id="b">This text is far too long to fit</div>
+<div id="c">This text is far too long to fit</div>
+<div id="v">1<br>2<br>3<br>4<br>5<br>6</div>
+<div id="h"><div></div></div>
