@@ -832,6 +832,17 @@ pub(crate) async fn dispatch_with_deferred(
     } else {
         ctx.get_session_page(&req.session_id)
             .and_then(|p| p.isolate_handle())
+            .or_else(|| {
+                // Script commands can create their isolate inside the handler.
+                // Arm that first call too, without creating a realm for navigation.
+                if matches!(req.method.as_str(), "Runtime.evaluate" | "Runtime.callFunctionOn")
+                    || (req.method == "Page.addScriptToEvaluateOnNewDocument"
+                        && req.params.get("runImmediately").and_then(serde_json::Value::as_bool) == Some(true)
+                        && req.params.get("source").and_then(serde_json::Value::as_str).is_some_and(|source| !source.is_empty()))
+                {
+                    ctx.get_session_page_mut(&req.session_id).and_then(|p| p.isolate_handle())
+                } else { None }
+            })
             .map(|h| {
                 obscura_js::cdp_watchdog::arm(h, std::time::Duration::from_millis(cmd_budget_ms))
             })
