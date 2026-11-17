@@ -681,7 +681,12 @@ async function _loadLinkedStylesheet(c) {
   // Read both so the property-assignment form (the common framework pattern)
   // and the parsed-from-HTML form are both recognized.
   const rel = (c.getAttribute('rel') || c.rel || '').toString().toLowerCase();
-  if (!rel.split(/\s+/).includes('stylesheet')) return;
+  const relTokens = rel.split(/\s+/);
+  if (!relTokens.includes('stylesheet')) {
+    if (relTokens.includes('preload')) _loadLinkPreload(c);
+    else if (relTokens.includes('modulepreload')) _loadLinkModulePreload(c);
+    return;
+  }
   const href = c.getAttribute('href');
   if (!href) return;
   if (!c.getAttribute('rel') && c.rel) c.setAttribute('rel', String(c.rel));
@@ -707,6 +712,74 @@ async function _loadLinkedStylesheet(c) {
   } catch(e) {
     try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
   }
+}
+
+// Known values of the link `as` attribute (HTML "potential destination").
+const _LINK_AS_VALUES = new Set(["fetch", "audio", "audioworklet", "document",
+  "embed", "font", "frame", "iframe", "image", "json", "manifest", "object",
+  "paintworklet", "report", "script", "serviceworker", "sharedworker", "style",
+  "track", "video", "webidentity", "worker", "xslt"]);
+// `as` set on a non-link element stays a plain per-element value.
+const _linkAsExpando = new WeakMap();
+
+// Fetch destinations for `<link rel=preload as=...>`. An `as` value that is
+// not a known destination fetches nothing and fires no event (HTML spec).
+const _PRELOAD_DESTINATIONS = {
+  style: "Stylesheet", script: "Script", font: "Font", image: "Image",
+  fetch: "Fetch", audio: "Media", video: "Media",
+  track: "Other", worker: "Other", sharedworker: "Other", manifest: "Other",
+};
+
+// A dynamically inserted <link rel=preload href as> fetches its resource, then
+// fires load, or error on a network or HTTP failure. React 19 suspends a
+// transition's commit until the preload link it inserts for each new
+// stylesheet fires one of these events, so without them every route that
+// brings new CSS waited for React's 60 second fallback before committing.
+async function _loadLinkPreload(c) {
+  const href = c.getAttribute('href');
+  const as = (c.getAttribute('as') || '').toLowerCase();
+  const destination = _PRELOAD_DESTINATIONS[as];
+  if (!href || !destination) return;
+  let ok = false;
+  try {
+    let pageOrigin = "";
+    try { pageOrigin = new URL(_domParse("document_url") || "about:blank").origin; } catch(e) {}
+    const raw = await __obscuraCore.ops.op_fetch_url(
+      _resolveResourceUrl(href), "GET", "{}", new Uint8Array(0), pageOrigin,
+      "no-cors", "same-origin", destination
+    );
+    const parsed = JSON.parse(raw);
+    ok = !parsed.blocked && !parsed.corsBlocked
+      && (parsed.opaque || (parsed.status >= 200 && parsed.status < 300));
+  } catch(e) {}
+  try { c.dispatchEvent(new Event(ok ? 'load' : 'error')); } catch(e) {}
+}
+
+// A dynamically inserted <link rel=modulepreload href> fetches its module
+// script (CORS, script destination) and fires load or error. The source is
+// kept for the module loader, so an import that later reaches the URL does not
+// fetch it again; nothing is evaluated early. Routers insert one per module of
+// the next route so the whole graph downloads in parallel; without this the
+// graph loaded one dependency level at a time.
+async function _loadLinkModulePreload(c) {
+  const href = c.getAttribute('href');
+  if (!href) return;
+  let ok = false;
+  try {
+    const url = _resolveResourceUrl(href);
+    let pageOrigin = "";
+    try { pageOrigin = new URL(_domParse("document_url") || "about:blank").origin; } catch(e) {}
+    const credentials = (c.getAttribute('crossorigin') || '').toLowerCase() === 'use-credentials'
+      ? 'include' : 'same-origin';
+    const raw = await __obscuraCore.ops.op_fetch_url(
+      url, "GET", "{}", new Uint8Array(0), pageOrigin, "cors", credentials, "Script"
+    );
+    const parsed = JSON.parse(raw);
+    ok = !parsed.blocked && !parsed.corsBlocked
+      && parsed.status >= 200 && parsed.status < 300 && typeof parsed.body === 'string';
+    if (ok) __obscuraCore.ops.op_module_preload_store(url, parsed.url || url, parsed.body);
+  } catch(e) { ok = false; }
+  try { c.dispatchEvent(new Event(ok ? 'load' : 'error')); } catch(e) {}
 }
 
 function _fpRand(salt) {
@@ -5288,6 +5361,20 @@ class Element extends Node {
   set hreflang(v) { this.setAttribute("hreflang", v); }
   get rel() { return this.getAttribute("rel") || ""; }
   set rel(v) { this.setAttribute("rel", v); }
+  // HTMLLinkElement.as reflects the `as` content attribute, limited to known
+  // values. Routers build preload links with Object.assign(link, {rel, as,
+  // href}); without reflection the attribute stayed empty, so the preload
+  // fetched nothing and never fired the load/error the router awaits.
+  // Other elements keep ordinary expando semantics for `as`.
+  get as() {
+    if (this.localName !== "link") return _linkAsExpando.get(this);
+    const value = (this.getAttribute("as") || "").toLowerCase();
+    return _LINK_AS_VALUES.has(value) ? value : "";
+  }
+  set as(v) {
+    if (this.localName === "link") this.setAttribute("as", v);
+    else _linkAsExpando.set(this, v);
+  }
   get target() { return this.getAttribute("target") || ""; }
   set target(v) { this.setAttribute("target", v); }
   get download() { return this.getAttribute("download") || ""; }
@@ -7153,7 +7240,7 @@ class Document extends Node {
     if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
     return this._styleSheetList;
   }
-  get forms() { return this.querySelectorAll("form"); }
+  get forms() { return _documentLiveCollection(this, 'forms', 'form'); }
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
@@ -15324,14 +15411,21 @@ function _tableRowsGetter() {
   _tableRowCollections.set(this, collection);
   return collection;
 }
-function _createTableCollection(table, op) {
+// The same live, named HTMLCollection machinery works for document.forms:
+// unlike querySelectorAll's static NodeList, document.forms is a [SameObject]
+ // collection with namedItem and live updates as forms enter/leave the tree.
+function _createTableCollection(table, op, selector = null) {
   let epoch = -1;
   let elements = [];
   function refresh() {
     if (epoch !== _domMutationEpoch) {
-      const ids = _domParse(op, table._nid);
-      if (ids === null) throw new TypeError('Illegal invocation');
-      elements = ids.map(_wrapEl);
+      if (selector !== null) {
+        elements = Array.from(table.querySelectorAll(selector));
+      } else {
+        const ids = _domParse(op, table._nid);
+        if (ids === null) throw new TypeError('Illegal invocation');
+        elements = ids.map(_wrapEl);
+      }
       epoch = _domMutationEpoch;
     }
     return elements;
@@ -15399,6 +15493,24 @@ function _createTableCollection(table, op) {
   refresh();
   return collection;
 }
+// A collection belongs to its Document, not to the caller or to a particular
+// query. The cached wrapper also preserves element identity for event handlers
+// comparing event.target with document.forms.namedItem(...).
+const _documentLiveCollections = new WeakMap();
+function _documentLiveCollection(doc, name, selector) {
+  let collections = _documentLiveCollections.get(doc);
+  if (!collections) {
+    collections = new Map();
+    _documentLiveCollections.set(doc, collections);
+  }
+  let collection = collections.get(name);
+  if (!collection) {
+    collection = _createTableCollection(doc, null, selector);
+    collections.set(name, collection);
+  }
+  return collection;
+}
+
 Object.defineProperty(HTMLTableElement, 'length', {value: 0, configurable: true});
 Object.defineProperty(_tableRowsGetter, 'name', {value: 'get rows', configurable: true});
 Object.defineProperty(HTMLTableElement.prototype, 'rows', {
