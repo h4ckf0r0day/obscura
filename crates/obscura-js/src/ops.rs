@@ -2626,19 +2626,6 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             }
         }
         #[cfg(feature = "render")]
-        if matches!(cmd.as_str(), "set_attribute" | "remove_attribute" | "set_attribute_ns" | "remove_attribute_ns") {
-            let mut parts = arg2.split('\0');
-            let first = parts.next().unwrap_or_default();
-            let name = if cmd.ends_with("_ns") {
-                if first.is_empty() { parts.next().unwrap_or_default() } else { "" }
-            } else { first };
-            if matches!(name, "src" | "srcset" | "sizes" | "crossorigin") {
-                if let Ok(node) = arg1.parse::<u32>() {
-                    state.render_resources.forget_html_image_request(NodeId::new(node));
-                }
-            }
-        }
-        #[cfg(feature = "render")]
         let had_prepared_render = state.prepared_render.is_some();
         #[cfg(feature = "render")]
         if invalidate_geometry {
@@ -3182,6 +3169,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let node_id = NodeId::new(nid);
             if let Some((name, value)) = arg2.split_once('\0') {
+                #[cfg(feature = "render")]
+                if matches!(name, "src" | "srcset" | "sizes" | "crossorigin") {
+                    gs.render_resources.forget_html_image_request(node_id);
+                }
                 if name == "id" {
                     let old_id = dom
                         .with_node(node_id, |n| n.get_attribute("id").map(|s| s.to_string()))
@@ -3255,6 +3246,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "remove_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let node_id = NodeId::new(nid);
+            #[cfg(feature = "render")]
+            if matches!(arg2.as_str(), "src" | "srcset" | "sizes" | "crossorigin") {
+                gs.render_resources.forget_html_image_request(node_id);
+            }
             // Removing `id` must clear the id_index too, matching set_attribute /
             // remove_attribute_ns; otherwise getElementById keeps returning the
             // still-attached element (#1013).
@@ -3295,6 +3290,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let qualified = parts.next().unwrap_or("");
             let value = parts.next().unwrap_or("");
             if !qualified.is_empty() {
+                #[cfg(feature = "render")]
+                if ns.is_empty() && matches!(qualified, "src" | "srcset" | "sizes" | "crossorigin") {
+                    gs.render_resources.forget_html_image_request(node_id);
+                }
                 let local = qualified
                     .split_once(':')
                     .map(|(_, local)| local)
@@ -3319,6 +3318,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let node_id = NodeId::new(nid);
             let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
+            #[cfg(feature = "render")]
+            if arg2.starts_with('\0') && matches!(local, "src" | "srcset" | "sizes" | "crossorigin") {
+                gs.render_resources.forget_html_image_request(node_id);
+            }
             if ns.is_empty() && local == "id" {
                 let old_id = dom
                     .with_node(node_id, |n| n.get_attribute("id").map(str::to_owned))
