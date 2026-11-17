@@ -13505,10 +13505,13 @@ fn build(
     // leave floats on children after a newer rule turns their parent into a
     // flex container; routing those children through the block float-zone
     // approximation corrupts flex sizing and percentage-margin placement.
+    // Hidden children generate no float boxes.
     let has_float_child = style.display == crate::Display::Block
-        && dom_children
-            .iter()
-            .any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
+        && dom_children.iter().any(|&cid| {
+            styles.get(&cid).is_some_and(|s| {
+                s.float.is_some() && s.display != crate::Display::None
+            })
+        });
     let native_float_band =
         has_float_child && can_use_native_float_band(tree, style, &dom_children, styles);
     let has_in_flow_block_child = dom_children

@@ -18018,6 +18018,41 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_float_does_not_widen_a_shrink_to_fit_parent() {
+        let case = |inner: &str| {
+            let html = format!(
+                r#"<body style="margin:0;font:14px Arial,sans-serif">
+                   <style>.ib{{display:inline-block;width:20px}}</style>
+                   <div id="t" style="float:left">{inner}</div></body>"#
+            );
+            let tree = parse_html(&html);
+            let mut resources = RenderResourceCache::default();
+            let prepared =
+                prepare_dom(&tree, (800.0, 600.0), None, &mut resources).expect("prepared render");
+            prepared
+                .document_rect(tree.get_element_by_id("t").unwrap())
+                .expect("rect")
+                .width
+        };
+        let icons = r##"<a href="#"><i class="ib"></i>CMS<i class="ib"></i></a>"##;
+        let baseline = case(icons);
+        let formatted = format!("\n  {icons}\n  ");
+        assert_eq!(case(&formatted), baseline);
+        for side in ["left", "right"] {
+            let hidden = format!(
+                r#"<div style="display:none;float:{side}">A much longer hidden string</div>"#
+            );
+            assert_eq!(case(&format!("{icons}{hidden}")), baseline);
+            // Indentation exposed the wrong float path even when compact markup did not.
+            assert_eq!(case(&format!("{formatted}{hidden}\n")), baseline);
+        }
+        let visible = r#"<div style="float:left;width:100px;height:20px"></div>"#;
+        assert!((case(&format!("{icons}{visible}")) - baseline - 100.0).abs() < 1.0);
+        let hidden_block = r#"<div style="display:none">hidden</div>"#;
+        assert_eq!(case(&format!("{formatted}{hidden_block}\n")), baseline);
+    }
+
+    #[test]
     fn computed_style_exposes_float_and_clear() {
         let tree = parse_html(
             r#"<style>#left{float:left} #right{float:right;clear:both}</style>
