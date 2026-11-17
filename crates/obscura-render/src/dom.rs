@@ -10454,6 +10454,7 @@ fn is_flattenable_inline(
                 && style.background_radial_gradient.is_none()
                 && style.background_conic_gradient.is_none()
                 && style.background_gradient_layers.is_empty()
+                && style.waapi_sample_state.is_none()
                 && style.opacity.is_none_or(|opacity| opacity >= 1.0)
                 && !style.establishes_positioning_containing_block()
                 && style.transform_ops.is_empty()

@@ -19931,11 +19931,16 @@ mod tests {
                         <div id="sticky-child" style="width:8px;height:8px;background:black"></div>
                     </div>
                 </div>
+                <div style="position:fixed;left:100px;top:0">
+                    <a id="inline-fade" style="background-color:transparent"><span
+                        style="display:inline-block;width:40px;height:20px;background:rgb(40,80,200)"></span></a>
+                </div>
                 <div id="viewport-fixed" style="position:fixed;right:0;top:0;
                      width:8px;height:8px;background:magenta"></div>
             </body></html>"#,
         );
         let moving = tree.get_element_by_id("moving").unwrap();
+        let inline_fade = tree.get_element_by_id("inline-fade").unwrap();
         let affine = tree.get_element_by_id("affine").unwrap();
         let overflow = tree.get_element_by_id("overflow").unwrap();
         let captured_fixed = tree.get_element_by_id("captured-fixed").unwrap();
@@ -19978,32 +19983,34 @@ mod tests {
                     play_state: crate::WaapiPlayState::Running,
                 });
             }
-            timeline.register_waapi(crate::WaapiAnimation {
-                id: 4,
-                node: moving,
-                keyframes: vec![
-                    crate::WaapiKeyframe {
-                        offset: 0.0,
-                        opacity: Some(0.0),
-                        transform: None,
+            for (id, node, from, to) in [(4, moving, 0.0, 1.0), (5, inline_fade, 1.0, 0.5)] {
+                timeline.register_waapi(crate::WaapiAnimation {
+                    id,
+                    node,
+                    keyframes: vec![
+                        crate::WaapiKeyframe {
+                            offset: 0.0,
+                            opacity: Some(from),
+                            transform: None,
+                        },
+                        crate::WaapiKeyframe {
+                            offset: 1.0,
+                            opacity: Some(to),
+                            transform: None,
+                        },
+                    ],
+                    timing: crate::AnimationTiming {
+                        duration_ms: 1_000.0,
+                        fill_mode: crate::AnimationFillMode::Both,
+                        ..Default::default()
                     },
-                    crate::WaapiKeyframe {
-                        offset: 1.0,
-                        opacity: Some(1.0),
-                        transform: None,
-                    },
-                ],
-                timing: crate::AnimationTiming {
-                    duration_ms: 1_000.0,
-                    fill_mode: crate::AnimationFillMode::Both,
-                    ..Default::default()
-                },
-                easing: None,
-                linear_easing: None,
-                start_time_ms: 0.0,
-                hold_time_ms: None,
-                play_state: crate::WaapiPlayState::Running,
-            });
+                    easing: None,
+                    linear_easing: None,
+                    start_time_ms: 0.0,
+                    hold_time_ms: None,
+                    play_state: crate::WaapiPlayState::Running,
+                });
+            }
             timeline
         };
         let viewport = (240.0, 120.0);
@@ -20068,7 +20075,7 @@ mod tests {
                 .scroll_container_nodes()
                 .any(|node| node == scroller)
         );
-        for node in [moving, affine, overflow] {
+        for node in [moving, affine, overflow, inline_fade] {
             assert_eq!(
                 format!("{:?}", candidate.layout.styles[&node]),
                 format!("{:?}", oracle.layout.styles[&node]),
