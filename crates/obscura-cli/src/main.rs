@@ -1528,8 +1528,7 @@ async fn run_fetch(
                         }
                     }
                 }
-                println!(
-                    "{}",
+                print_stdout_line(
                     serde_json::json!({
                         "evaluation": result,
                         "controlledScroll": controlled_scroll_report,
@@ -1541,7 +1540,7 @@ async fn run_fetch(
                         },
                         "captureState": capture_state.unwrap_or(serde_json::Value::Null),
                     })
-                );
+                )?;
             }
             if !quiet {
                 eprintln!(
@@ -1790,6 +1789,19 @@ async fn run_batch_fetch(
     Ok(())
 }
 
+fn stdout_write_result(result: std::io::Result<()>) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("Failed to write to stdout: {}", error)),
+    }
+}
+
+fn print_stdout_line(content: impl std::fmt::Display) -> anyhow::Result<()> {
+    use std::io::Write;
+    stdout_write_result(writeln!(std::io::stdout().lock(), "{}", content))
+}
+
 async fn write_or_print(
     content: String,
     output: Option<&std::path::PathBuf>,
@@ -1799,7 +1811,7 @@ async fn write_or_print(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
     } else {
-        println!("{}", content);
+        print_stdout_line(content)?;
     }
     Ok(())
 }
@@ -1816,14 +1828,8 @@ async fn write_or_print_bytes(
         // Write raw bytes to stdout — never println! (would append a newline
         // and break binary payloads like JPEG/PNG).
         let mut stdout = tokio::io::stdout();
-        stdout
-            .write_all(bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to write to stdout: {}", e))?;
-        stdout
-            .flush()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {}", e))?;
+        stdout_write_result(stdout.write_all(bytes).await)?;
+        stdout_write_result(stdout.flush().await)?;
     }
     Ok(())
 }
