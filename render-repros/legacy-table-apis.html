@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Legacy table APIs</title>
+<style>
+body { margin: 24px; font: 16px Arial, sans-serif; }
+table { width: 360px; border-collapse: collapse; }
+th, td { padding: 8px; border: 1px solid #456; text-align: left; }
+thead { background: #dceaff; }
+tfoot { background: #eee; }
+#result { margin-top: 16px; }
+</style>
+<select id="s"><option value="a">A</option><option value="b" selected>B</option></select>
+<table id="t">
+  <tfoot><tr><td>Footer</td><td>Last</td></tr></tfoot>
+  <thead><tr><th>Header</th><th>Value</th></tr></thead>
+  <tbody><tr><td>First</td><td>1</td></tr></tbody>
+</table>
+<p id="result">RUNNING</p>
+<script>
+const table = document.getElementById('t');
+const select = document.getElementById('s');
+const cells = table.tBodies[0].rows[0].cells;
+const row = table.insertRow(2);
+row.insertCell().textContent = 'Inserted';
+row.insertCell().textContent = '2';
+row.insertCell().textContent = 'Remove';
+row.deleteCell(-1);
+const body = table.createTBody();
+body.insertRow().insertCell().textContent = 'Remove';
+body.deleteRow(-1);
+const values = [select.length, select[select.selectedIndex].value,
+  table.rows.length, cells.length, row.rowIndex, row.sectionRowIndex,
+  row.cells[1].cellIndex, table.tBodies.length, body.rows.length];
+document.getElementById('result').textContent = 'Result: ' + values.join(',');
+document.documentElement.dataset.legacyTableResult = JSON.stringify(values);
+</script>

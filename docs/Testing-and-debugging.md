@@ -16,11 +16,11 @@ cargo nextest run --release --features render -p obscura-browser
 By name, also selecting the crate and test target:
 
 ```bash
-rtk proxy env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --features render -p obscura-js --lib completed_scripts_do_not_wait_for_watchdog_deadline
+env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --features render -p obscura-js --lib completed_scripts_do_not_wait_for_watchdog_deadline
 ```
 
 Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
-because the engine owns one V8 isolate per process. Render tests must run in
+to keep V8 runtime state isolated. Render tests must run in
 release mode; debug builds are not a fidelity or performance gate.
 
 ### Fast edit/test loop
@@ -29,7 +29,7 @@ For runtime unit tests, the `test-js` Cargo alias enables incremental compilatio
 only for `obscura-js`, retaining release optimization and reusing dependencies:
 
 ```bash
-rtk proxy env -u CARGO_INCREMENTAL CARGO_BUILD_JOBS=2 cargo test-js -E 'test(classic_script_url_is_dynamic_import_referrer)'
+env -u CARGO_INCREMENTAL CARGO_BUILD_JOBS=2 cargo test-js -E 'test(classic_script_url_is_dynamic_import_referrer)'
 ```
 
 The first invocation warms an extra compiler cache. Later source edits reuse it.
@@ -42,7 +42,7 @@ For other crates, select the affected binary before applying a test-name filter.
 CDP integration tests share one binary; select a module within it:
 
 ```bash
-rtk proxy env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --features render -p obscura-cdp --test integration -E 'test(page_frame_contract::)'
+env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --features render -p obscura-cdp --test integration -E 'test(page_frame_contract::)'
 ```
 
 `-p` selects packages; `--lib` or `--test NAME` selects binaries to compile.
@@ -102,7 +102,8 @@ RUST_LOG=obscura_cdp=trace,obscura_browser=debug obscura serve
 
 Logs go to stderr.
 
-`--verbose` on any subcommand is equivalent to `RUST_LOG=obscura=info`.
+`--verbose` selects debug-level logging unless `RUST_LOG` supplies a filter.
+The default filter is `warn`; `--quiet` selects `off`.
 
 ## Driving the CDP server manually
 
@@ -116,11 +117,12 @@ In another shell:
 wscat -c ws://127.0.0.1:9222
 > {"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}
 > {"id":2,"method":"Target.attachToTarget","params":{"targetId":"...","flatten":true}}
-> {"id":3,"sessionId":"...-session","method":"Page.navigate","params":{"url":"https://example.com"}}
-> {"id":4,"sessionId":"...-session","method":"Runtime.evaluate","params":{"expression":"document.title"}}
+> {"id":3,"sessionId":"<returned sessionId>","method":"Page.navigate","params":{"url":"https://example.com"}}
+> {"id":4,"sessionId":"<returned sessionId>","method":"Runtime.evaluate","params":{"expression":"document.title"}}
 ```
 
-Useful for reproducing what Puppeteer or Playwright is doing without their abstraction.
+Use the `targetId` returned by command 1 and the `sessionId` returned by
+command 2. Send the commands one at a time after receiving each response.
 
 ## Common failure modes
 
@@ -133,8 +135,8 @@ under `target/release/deps/` references before changing engine behavior.
 To regenerate the snapshot while retaining dependency caches:
 
 ```bash
-rtk proxy touch crates/obscura-js/js/bootstrap.js
-rtk proxy env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
+touch crates/obscura-js/js/bootstrap.js
+env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
 ```
 
 Then rerun the failing nextest command, which rebuilds its own feature-specific
@@ -163,9 +165,11 @@ A handler is awaiting something that never resolves. Run with `RUST_LOG=obscura=
 
 ## Reproducing user bug reports
 
-The integration suite in `tests/test_all.py` is the fastest path from a one-line repro to a regression test. Add the failing case as a new test function, get it failing, then fix.
+Add a regression test to the affected crate. Reproduce the failure before
+changing the implementation, then run the focused release-mode nextest target.
 
-For Puppeteer / Playwright bug reports, the user's repro script usually drops straight in. Save it as `tests/repro_<issue>.js`, run with `node`, fix until it passes.
+For Puppeteer / Playwright bug reports, the user's repro script usually drops straight in. Save a temporary script outside the repository, run it with `node`, then add
+a regression test under the affected crate's `tests/` directory.
 
 ### Rendering regressions
 
@@ -191,7 +195,7 @@ fixture. Do not add hostname-specific render branches.
 CPU with `perf` and a flamegraph:
 
 ```bash
-cargo build --release --features render
+cargo build --release -p obscura-cli --bins --features render
 perf record -F 99 -g -- ./target/release/obscura fetch https://heavy-spa.example
 perf script | flamegraph.pl > flame.svg
 ```
@@ -202,13 +206,6 @@ Memory with heaptrack:
 heaptrack ./target/release/obscura serve
 ```
 
-Tokio task inspection:
-
-```bash
-RUSTFLAGS="--cfg tokio_unstable" cargo build --release --features render
-./target/release/obscura serve
-# in another shell
-tokio-console
-```
-
-Requires the workspace `tokio` dependency to be built with the `tracing` feature; not enabled by default, add it in the relevant `Cargo.toml` before profiling.
+Tokio task inspection requires adding both `console-subscriber` initialization
+and Tokio's `tracing` feature to a local profiling build. `tokio-console` cannot
+attach to the default binary.

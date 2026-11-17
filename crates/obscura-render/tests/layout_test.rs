@@ -488,6 +488,28 @@ fn css_table_mixed_children_are_not_discarded() {
 }
 
 #[test]
+fn closed_html_dialogs_use_a_ua_display_rule_below_author_styles() {
+    let tree = parse_html(r#"<!doctype html><style>
+        html,body{margin:0} dialog{width:80px;height:30px}
+        #authored{display:block} #contents{display:contents}
+        #contents > div{width:20px;height:10px}
+    </style><dialog id=closed><div id=closed_child>hidden</div></dialog>
+    <dialog id=opened open></dialog><dialog id=authored></dialog>
+    <dialog id=contents><div id=visible_child></div></dialog>
+    <svg><dialog id=svg_dialog></dialog></svg>"#);
+    let layout = layout_dom(&tree, (400.0,300.0));
+    for name in ["closed", "closed_child"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(name).unwrap()), "{name} generated a box");
+    }
+    for name in ["opened", "authored"] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!((rect.width,rect.height),(80.0,30.0), "{name}");
+    }
+    assert!(layout.rects.contains_key(&tree.get_element_by_id("visible_child").unwrap()));
+    assert_ne!(layout.styles[&tree.get_element_by_id("svg_dialog").unwrap()].display, obscura_render::Display::None);
+}
+
+#[test]
 fn table_rowspans_are_clipped_to_the_originating_row_group() {
     let tree = parse_html(
         r#"
@@ -2039,6 +2061,50 @@ fn absolute_inline_svg_keeps_percentage_width_and_view_box_ratio() {
     assert!((art.x - 640.0).abs() < 0.01, "percentage width must anchor from the right: {art:?}");
     assert!((art.width - 160.0).abs() < 0.01, "percentage width: {art:?}");
     assert!((art.height - 160.0).abs() < 0.01, "viewBox ratio: {art:?}");
+}
+
+/// `span 0` is an invalid grid line (CSS Grid 1 section 8.3), so the
+/// declaration is ignored: the earlier placement wins, or the item stays
+/// auto-placed. Shopify themes reach it through
+/// `grid-column: span var(--menu-content-columns-desktop) / -1` with the
+/// variable at 0; that once gave taffy a zero-track grid area and aborted the
+/// whole page ("slice index starts at 13 but ends at 12").
+#[test]
+fn grid_placement_with_zero_span_is_ignored() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             .grid{--n:0;display:grid;grid-template-columns:repeat(6,1fr);width:600px}
+             #literal{grid-column:span 0 / -1}
+             #variable{grid-column:span var(--n) / -1}
+             #kept{grid-column:2 / 4;grid-column:span 0 / -1}
+             #side{grid-column-start:3;grid-column-start:span 0}
+           </style></head><body>
+             <div class="grid"><div id="literal">x</div></div>
+             <div class="grid"><div id="variable">x</div></div>
+             <div class="grid"><div id="kept">x</div></div>
+             <div class="grid"><div id="side">x</div></div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["literal", "variable"] {
+        let r = rect(id);
+        assert!(
+            r.x.abs() < 0.01 && (r.width - 100.0).abs() < 0.01,
+            "{id}: an ignored declaration leaves the item auto-placed in the first track: {r:?}"
+        );
+    }
+    let kept = rect("kept");
+    assert!(
+        (kept.x - 100.0).abs() < 0.01 && (kept.width - 200.0).abs() < 0.01,
+        "the earlier valid grid-column must win: {kept:?}"
+    );
+    let side = rect("side");
+    assert!(
+        (side.x - 200.0).abs() < 0.01 && (side.width - 100.0).abs() < 0.01,
+        "the earlier valid grid-column-start must win: {side:?}"
+    );
 }
 
 /// Chromium 150 includes collapsed descendant margins in a grid item's
@@ -5009,14 +5075,6 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
-/// A float with a percentage width must keep that width when it also carries a
-/// percentage margin. It used to be disqualified from the native float band by
-/// `has_deferred_or_auto_margin`, fall onto the synthetic float-zone path, and
-/// shrink to its content width — taking the row's height to zero with it, so
-/// following flow content was painted over the float.
-///
-/// This is exactly the Bootstrap 3 grid: `.col-*-N` is `float:left` plus a
-/// percentage width, and `.col-*-offset-M` adds the percentage margin.
 #[test]
 fn a_float_keeps_its_percentage_width_when_it_has_a_percentage_margin() {
     let tree = parse_html(include_str!(
@@ -5024,33 +5082,42 @@ fn a_float_keeps_its_percentage_width_when_it_has_a_percentage_margin() {
     ));
     let layout = layout_dom(&tree, (1400.0, 1000.0));
     let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
-
     let offset = rect("offset");
     let plain = rect("plain");
     let row = rect("row-offset");
+    assert!((offset.width - 1000.0).abs() < 1.0, "width: {}", offset.width);
+    assert!((offset.x - 100.0).abs() < 1.0, "offset: {}", offset.x);
+    assert!((offset.width - plain.width).abs() < 1.0);
+    assert!(row.height > 0.0, "the row must contain its float");
+}
 
-    // 83.33333333% of the 1200px row, offset by 8.33333333% of it.
-    assert!(
-        (offset.width - 1000.0).abs() < 1.0,
-        "offset column should be 1000px wide, got {}",
-        offset.width
-    );
-    assert!(
-        (offset.x - 100.0).abs() < 1.0,
-        "offset column should start at x=100, got {}",
-        offset.x
-    );
-    // The margin must not change the width.
-    assert!(
-        (offset.width - plain.width).abs() < 1.0,
-        "a percentage margin changed the width: {} vs {}",
-        offset.width,
-        plain.width
-    );
-    // The clearfixed row must still contain the float rather than collapsing,
-    // or whatever follows is laid out on top of it.
-    assert!(
-        row.height > 0.0,
-        "the row collapsed to zero height around its float"
-    );
+#[test]
+fn percentage_float_margins_resolve_against_containing_width_on_every_side() {
+    for (float, margin, expected_x, expected_height) in [
+        ("left", "margin-left:8.33333333%", 100.0, 40.0),
+        ("left", "margin-left:-8.33333333%", -100.0, 40.0),
+        ("left", "margin-right:8.33333333%", 0.0, 40.0),
+        ("left", "margin-top:8.33333333%", 0.0, 140.0),
+        ("left", "margin-bottom:8.33333333%", 0.0, 140.0),
+        ("right", "margin-left:8.33333333%", 200.0, 40.0),
+        ("right", "margin-right:8.33333333%", 100.0, 40.0),
+    ] {
+        let html = format!(
+            r#"<style>
+              body{{margin:0}} #row{{width:1200px}}
+              #row::after{{content:" ";display:table;clear:both}}
+              #column{{float:{float};width:83.33333333%;{margin}}}
+              #inner{{width:300px;height:40px}} #after{{height:20px}}
+            </style><div id="row"><div id="column"><div id="inner"></div></div></div><div id="after"></div>"#
+        );
+        let tree = parse_html(&html);
+        let layout = layout_dom(&tree, (1400.0, 1000.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        let column = rect("column");
+        let row = rect("row");
+        assert!((column.width - 1000.0).abs() < 1.0, "{margin}: {}", column.width);
+        assert!((column.x - expected_x).abs() < 1.0, "{margin}: {}", column.x);
+        assert!((row.height - expected_height).abs() < 1.0, "{margin}: {}", row.height);
+        assert!((rect("after").y - expected_height).abs() < 1.0, "{margin}: following flow overlaps");
+    }
 }

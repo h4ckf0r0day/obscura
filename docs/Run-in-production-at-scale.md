@@ -5,14 +5,15 @@
 # by it. Without this the cookie jar silently fails to persist.
 sudo install -d -o 65532 -g 65532 /srv/obscura/data
 
+export OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)"
 docker run -d \
   --name obscura \
   --restart unless-stopped \
   -p 127.0.0.1:9222:9222 \
-  -e OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" \
+  -e OBSCURA_CDP_TOKEN \
   -v /srv/obscura/data:/data \
   h4ckf0r0day/obscura \
-  serve --host 0.0.0.0 --storage-dir /data --stealth
+  serve --host 0.0.0.0 --storage-dir /data
 ```
 
 The image runs `obscura serve` by default. Override with arguments after the image name.
@@ -24,7 +25,7 @@ uid/gid **65532**. Obscura executes untrusted page JavaScript in-process through
 V8, so a V8 exploit lands with the process's privileges — there is no reason for
 those to be root's.
 
-Two consequences worth knowing:
+Storage and privileges:
 
 - **A mounted `--storage-dir` must be writable by uid 65532**, as above. This is
   the one thing that breaks quietly rather than loudly. Verified: with an
@@ -50,7 +51,14 @@ the CDP client and still publish the port to host loopback where possible.
 
 ## Systemd
 
-`/etc/systemd/system/obscura.service`:
+Create a service account if it does not exist:
+
+```bash
+sudo useradd --system --user-group --home-dir /var/lib/obscura --shell /usr/sbin/nologin obscura
+```
+
+Save this unit as `/etc/systemd/system/obscura.service`. `StateDirectory` creates
+`/var/lib/obscura` with the service account as its owner:
 
 ```ini
 [Unit]
@@ -58,7 +66,8 @@ Description=Obscura headless browser
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/obscura serve --port 9222 --stealth --storage-dir /var/lib/obscura
+ExecStart=/usr/local/bin/obscura serve --port 9222 --storage-dir /var/lib/obscura
+StateDirectory=obscura
 Restart=always
 RestartSec=5
 User=obscura
@@ -70,8 +79,9 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-systemctl enable --now obscura
-journalctl -fu obscura
+sudo systemctl daemon-reload
+sudo systemctl enable --now obscura
+sudo journalctl -fu obscura
 ```
 
 ## Workers
@@ -82,7 +92,10 @@ journalctl -fu obscura
 obscura serve --workers 4
 ```
 
-Use one worker per CPU core. Each worker handles its own pool of pages. Sessions are sticky to a worker.
+Each worker accepts multiple CDP connections. Start with a small worker count
+and measure CPU and memory under your workload. Each connection stays on the
+worker that accepted it. `--max-connections` defaults to 128 per worker; excess
+connections receive HTTP 503.
 
 Worker memory can grow over days. Recycle workers with `--worker-max-connections`, `--worker-max-rss` (MB, Linux) or `--worker-max-age` (seconds). A replacement starts first and takes all new connections; the old worker finishes its live connections, then exits. `--worker-drain-timeout` (default 120 s) bounds that wait, after which remaining connections are closed, so set it above your longest session.
 
@@ -118,7 +131,7 @@ Reads URLs from stdin:
 cat urls.txt | obscura scrape --concurrency 20 -
 ```
 
-Requires `obscura-worker` next to `obscura` in `PATH`.
+Keep `obscura-worker` in the same directory as the `obscura` executable.
 
 ## Resource limits
 
@@ -182,11 +195,16 @@ obscura serve --verbose
 RUST_LOG=obscura=debug obscura serve
 ```
 
-`--verbose` enables info-level logs. `RUST_LOG=obscura=debug` enables debug-level. Logs go to stderr.
+`--verbose` selects debug-level logging unless `RUST_LOG` supplies a filter.
+The default filter is `warn`. Logs go to stderr.
 
 ## Reliability and timeouts
 
-The engine is hardened so one page cannot hang, crash, or wedge a worker. A V8 watchdog terminates runaway scripts and microtask storms, DOM ops are panic-safe, cyclic DOM mutations are rejected, and the CDP server terminates any single command that overruns its budget so a hung session cannot stall the others. Scripted `fetch()`/XHR and navigation are timeout-bounded. You can point the server at arbitrary or heavy pages without a stuck worker.
+A V8 watchdog terminates scripts that exceed their execution budget. DOM ops
+catch panics, and the DOM tree rejects cyclic mutations. Navigation and
+scripted network requests have separate timeouts. These controls do not prevent
+every native crash or resource-exhaustion failure; use worker recycling and
+process memory limits for long-running deployments.
 
 Tune the bounds with environment variables (see [Environment variables](Environment-variables.md)):
 
