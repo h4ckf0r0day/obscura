@@ -299,11 +299,16 @@ pub struct FormControlState {
     pub indeterminate: bool,
 }
 
+#[derive(Default)]
+struct NodeAllocationGenerations {
+    reused: HashMap<NodeId, u64>,
+    next: u64,
+}
+
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
-    reused_node_generations: HashMap<NodeId, u64>,
-    next_node_generation: u64,
+    node_generations: Option<Box<NodeAllocationGenerations>>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
     form_controls: HashMap<NodeId, FormControlState>,
@@ -346,8 +351,7 @@ impl DomTree {
             inner: RefCell::new(DomTreeInner {
                 nodes: vec![Some(doc_node)],
                 free_list: Vec::new(),
-                reused_node_generations: HashMap::new(),
-                next_node_generation: 0,
+                node_generations: None,
                 document: NodeId(0),
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
@@ -872,9 +876,11 @@ impl DomTree {
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
-            inner.next_node_generation = inner.next_node_generation.wrapping_add(1).max(1);
-            let generation = inner.next_node_generation;
-            inner.reused_node_generations.insert(NodeId(slot), generation);
+            let generations = inner.node_generations
+                .get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()));
+            generations.next = generations.next.wrapping_add(1).max(1);
+            let generation = generations.next;
+            generations.reused.insert(NodeId(slot), generation);
             NodeId(slot)
         } else {
             let idx = inner.nodes.len() as u32;
@@ -909,7 +915,8 @@ impl DomTree {
     pub fn node_allocation_generation(&self, id: NodeId) -> Option<u64> {
         let inner = self.inner.borrow();
         inner.nodes.get(id.index())?.as_ref()?;
-        Some(inner.reused_node_generations.get(&id).copied().unwrap_or(0))
+        Some(inner.node_generations.as_ref()
+            .and_then(|generations| generations.reused.get(&id)).copied().unwrap_or(0))
     }
 
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
