@@ -265,6 +265,26 @@ impl ModuleLoader for ObscuraModuleLoader {
                 url,
                 proxy_url.as_deref().unwrap_or("direct")
             );
+            // A <link rel=modulepreload> already fetched this URL (through the
+            // page's fetch path, so its network event is recorded there).
+            let preloaded = page_state.as_ref().and_then(Weak::upgrade).and_then(|state| {
+                state.try_borrow_mut().ok().and_then(|mut state| state.module_preloads.remove(&url))
+            });
+            if let Some((final_url, code)) = preloaded {
+                let requested = ModuleSpecifier::parse(&url)
+                    .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+                let found = ModuleSpecifier::parse(&final_url).unwrap_or_else(|_| requested.clone());
+                if found.as_str() != requested.as_str() {
+                    loaded_specifiers.borrow_mut().push(found.to_string());
+                }
+                return Ok(ModuleSource::new_with_redirect(
+                    deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(code.into()),
+                    &requested,
+                    &found,
+                    None,
+                ));
+            }
 
             match page_network {
                 Ok((client, stealth, callbacks)) => {

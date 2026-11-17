@@ -321,6 +321,48 @@ pub struct ObscuraJsRuntime {
     js_runtime: JsRuntime,
 }
 
+/// Wait for a module-graph load. `stall` bounds a period WITHOUT progress (no
+/// new module requested), not total time: a large application graph that keeps
+/// fetching modules may continue up to `hard_cap`. Runaway script execution is
+/// bounded separately by the evaluation budget and the V8 watchdog. A fixed
+/// total budget aborted real SPA bootstraps (chatgpt.com) whenever the network
+/// was slower than the budget, leaving the page unhydrated.
+async fn await_module_graph_load<F: Future>(
+    load: F,
+    stall: tokio::time::Duration,
+    hard_cap: tokio::time::Duration,
+    requested: &Rc<RefCell<Vec<String>>>,
+) -> Option<F::Output> {
+    let mut load = Box::pin(load);
+    let start = tokio::time::Instant::now();
+    let hard_cap = hard_cap.max(stall);
+    let mut last_count = requested.borrow().len();
+    let mut last_progress = start;
+    let slice = tokio::time::Duration::from_millis(100).min(stall.max(tokio::time::Duration::from_millis(1)));
+    loop {
+        match tokio::time::timeout(slice, &mut load).await {
+            Ok(result) => return Some(result),
+            Err(_) => {
+                let count = requested.borrow().len();
+                let now = tokio::time::Instant::now();
+                if count != last_count {
+                    last_count = count;
+                    last_progress = now;
+                }
+                if now.duration_since(last_progress) >= stall || now.duration_since(start) >= hard_cap {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+fn module_graph_hard_cap() -> tokio::time::Duration {
+    tokio::time::Duration::from_millis(
+        std::env::var("OBSCURA_MODULE_GRAPH_MAX_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000),
+    )
+}
+
 /// Renders a caught V8 exception as a message for realm evaluation errors.
 fn exception_text(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
@@ -3259,15 +3301,16 @@ impl ObscuraJsRuntime {
         // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
+        let requested = self.loaded_module_specifiers.clone();
         let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
             runtime.load_side_es_module(&specifier)
         });
-        let module_id = match tokio::time::timeout(budget, load).await {
-            Ok(Ok(id)) => id,
-            Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
-            Err(_) => {
+        let module_id = match await_module_graph_load(load, budget, module_graph_hard_cap(), &requested).await {
+            Some(Ok(id)) => id,
+            Some(Err(e)) => return Err(format!("Module load error: {}", e)),
+            None => {
                 return Err(format!(
-                    "Module graph load timed out after {}ms: {}",
+                    "Module graph load timed out (no progress for {}ms): {}",
                     budget_ms, url
                 ));
             }
@@ -3403,18 +3446,19 @@ impl ObscuraJsRuntime {
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
         let loaded_start = self.loaded_module_specifiers.borrow().len();
 
+        let requested = self.loaded_module_specifiers.clone();
         let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
             runtime.load_side_es_module_from_code(
                 &specifier,
                 deno_core::ModuleCodeString::from(code.to_string()),
             )
         });
-        let module_id = match tokio::time::timeout(budget, load).await {
-            Ok(Ok(id)) => id,
-            Ok(Err(e)) => return Err(format!("Inline module load error: {}", e)),
-            Err(_) => {
+        let module_id = match await_module_graph_load(load, budget, module_graph_hard_cap(), &requested).await {
+            Some(Ok(id)) => id,
+            Some(Err(e)) => return Err(format!("Inline module load error: {}", e)),
+            None => {
                 return Err(format!(
-                    "Inline module graph load timed out after {}ms",
+                    "Inline module graph load timed out (no progress for {}ms)",
                     budget_ms
                 ));
             }
@@ -24929,6 +24973,212 @@ mod tests {
         assert_eq!(result.value.unwrap(), serde_json::json!("rejected"));
     }
 
+    /// React 19 inserts `<link rel=preload as=style>` for each new stylesheet
+    /// and holds a transition's commit until that link fires load or error.
+    /// Without the events, route changes waited for React's 60 s fallback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_preload_link_fires_load_or_error_after_its_fetch() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
+                    const fetched = [];
+                    try {
+                        __obscura_test_ops.op_fetch_url = (url, method, h, b, o, mode, cred, destination) => {
+                            fetched.push(destination);
+                            return JSON.stringify({
+                                status: url.endsWith("/missing.css") ? 404 : 200,
+                                headers: { "content-type": "text/css" }, body: ".a{}", url,
+                            });
+                        };
+                        const sync = [];
+                        const preload = (href, as) => {
+                            const link = document.createElement("link");
+                            link.setAttribute("rel", "preload");
+                            if (as) link.setAttribute("as", as);
+                            link.setAttribute("href", href);
+                            const settled = new Promise(resolve => {
+                                link.addEventListener("load", () => { sync.push("load"); resolve("load"); });
+                                link.addEventListener("error", () => resolve("error"));
+                                setTimeout(() => resolve("none"), 200);
+                            });
+                            document.head.appendChild(link);
+                            return settled;
+                        };
+                        const order = preload("/route.css", "style");
+                        sync.push("after-append");
+                        return {
+                            ok: await order,
+                            asyncDispatch: sync.join(",") === "after-append,load",
+                            missing: await preload("/missing.css", "style"),
+                            font: await preload("/f.woff2", "font"),
+                            unknownAs: await preload("/x.css", "bogus"),
+                            noAs: await preload("/y.css", null),
+                            destinations: fetched,
+                        };
+                    } finally {
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "ok": "load",
+                "asyncDispatch": true,
+                "missing": "error",
+                "font": "load",
+                "unknownAs": "none",
+                "noAs": "none",
+                "destinations": ["Stylesheet", "Stylesheet", "Font"],
+            })
+        );
+    }
+
+    /// React Router's framework mode blocks a lazy route on its stylesheets:
+    /// it builds `<link>` with Object.assign(link, {rel:"preload", as:"style",
+    /// href}) and awaits load/error with no timeout. `as` must reflect to the
+    /// content attribute or the preload never fetches and the route never
+    /// commits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn router_blocking_style_preload_built_with_object_assign_settles() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
+                    const fetched = [];
+                    try {
+                        __obscura_test_ops.op_fetch_url = (url, method, h, b, o, mode, cred, destination) => {
+                            fetched.push(destination);
+                            return JSON.stringify({
+                                status: url.endsWith("/missing.css") ? 404 : 200,
+                                headers: { "content-type": "text/css" }, body: ".r{}", url,
+                            });
+                        };
+                        // Same steps as the router's blocking-link helper.
+                        const blockOn = (route) => new Promise(resolve => {
+                            const desc = { ...route, rel: "preload", as: "style" };
+                            if (document.querySelector(`link[rel="stylesheet"][href="${desc.href}"]`)) return resolve("existing");
+                            const n = document.createElement("link");
+                            const remove = () => { document.head.contains(n) && document.head.removeChild(n); };
+                            Object.assign(n, desc);
+                            n.onload = () => { remove(); resolve("load"); };
+                            n.onerror = () => { remove(); resolve("error"); };
+                            document.head.appendChild(n);
+                            setTimeout(() => resolve("hung"), 300);
+                        });
+                        const ok = await blockOn({ rel: "stylesheet", href: "/route.css" });
+                        const missing = await blockOn({ rel: "stylesheet", href: "/missing.css" });
+
+                        const link = document.createElement("link");
+                        link.as = "Style";
+                        const reflected = [link.getAttribute("as"), link.as];
+                        link.setAttribute("as", "bogus");
+                        const unknown = link.as;
+                        const div = document.createElement("div");
+                        div.as = 5;
+                        return {
+                            ok, missing, reflected, unknown,
+                            divExpando: div.as === 5 && div.getAttribute("as") === null,
+                            removed: document.head.querySelectorAll("link").length === 0,
+                            destinations: fetched,
+                        };
+                    } finally {
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "ok": "load",
+                "missing": "error",
+                "reflected": ["Style", "style"],
+                "unknown": "",
+                "divExpando": true,
+                "removed": true,
+                "destinations": ["Stylesheet", "Stylesheet"],
+            })
+        );
+    }
+
+    /// Routers insert `<link rel=modulepreload>` for every module of the next
+    /// route so the graph downloads in parallel. The link must fetch, fire
+    /// load/error, not evaluate, and hand its source to the module loader.
+    #[tokio::test(flavor = "current_thread")]
+    async fn modulepreload_link_fetches_once_and_feeds_the_module_loader() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let preload = r#"async (href, status) => {
+            const originalFetchOp = __obscura_test_ops.op_fetch_url;
+            const fetched = [];
+            try {
+                __obscura_test_ops.op_fetch_url = (url, method, h, b, o, mode, cred, destination) => {
+                    fetched.push([mode, destination]);
+                    return JSON.stringify({ status, headers: { "content-type": "text/javascript" },
+                        body: "globalThis.__mpEvaluated = (globalThis.__mpEvaluated||0)+1; export const v = 42;", url });
+                };
+                const settled = await new Promise(resolve => {
+                    const link = document.createElement("link");
+                    link.rel = "modulepreload";
+                    link.href = href;
+                    link.addEventListener("load", () => resolve("load"));
+                    link.addEventListener("error", () => resolve("error"));
+                    setTimeout(() => resolve("none"), 300);
+                    document.head.appendChild(link);
+                });
+                return { settled, evaluated: String(globalThis.__mpEvaluated || 0), fetched };
+            } finally {
+                __obscura_test_ops.op_fetch_url = originalFetchOp;
+            }
+        }"#;
+        let call = |href: &str, status: u16| {
+            vec![
+                serde_json::json!({ "value": href }),
+                serde_json::json!({ "value": status }),
+            ]
+        };
+        let ok = rt
+            .call_function_on_for_cdp(preload, None, &call("https://modulepreload.test/route/m.js", 200), true, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            ok.value.unwrap(),
+            serde_json::json!({ "settled": "load", "evaluated": "0", "fetched": [["cors", "Script"]] }),
+            "modulepreload fetches with CORS as a script, fires load and does not evaluate"
+        );
+        // The test runtime has no network for this host: only the preload can
+        // satisfy the import.
+        rt.load_inline_module(
+            "const m = await import('https://modulepreload.test/route/m.js');              globalThis.__mpValue = String(m.v) + '/' + String(globalThis.__mpEvaluated);",
+            "http://example.com/",
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rt.evaluate("globalThis.__mpValue").unwrap(), serde_json::json!("42/1"));
+        let missing = rt
+            .call_function_on_for_cdp(preload, None, &call("https://modulepreload.test/route/missing.js", 404), true, true)
+            .await
+            .unwrap();
+        assert_eq!(missing.value.unwrap()["settled"], serde_json::json!("error"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
         let mut rt =
@@ -28410,5 +28660,49 @@ mod tests {
             serde_json::json!("true,true,1,true,1,true,0,0,true"),
             "label association must follow the HTML labelable-element rules"
         );
+    }
+}
+
+#[cfg(test)]
+mod module_graph_wait_tests {
+    use super::await_module_graph_load;
+    use std::{cell::RefCell, rc::Rc};
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_graph_that_keeps_requesting_modules_may_outlast_the_stall_budget() {
+        let requested = Rc::new(RefCell::new(Vec::new()));
+        let r = requested.clone();
+        let load = async move {
+            for i in 0..8 {
+                sleep(Duration::from_millis(60)).await;
+                r.borrow_mut().push(format!("m{i}"));
+            }
+            42
+        };
+        // 8 x 60 ms = 480 ms total, far beyond the 150 ms stall budget.
+        let got = await_module_graph_load(load, Duration::from_millis(150), Duration::from_secs(5), &requested).await;
+        assert_eq!(got, Some(42));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_graph_still_times_out_after_the_budget() {
+        let requested = Rc::new(RefCell::new(Vec::<String>::new()));
+        let started = std::time::Instant::now();
+        let load = async { sleep(Duration::from_secs(5)).await; 1 };
+        let got = await_module_graph_load(load, Duration::from_millis(150), Duration::from_secs(5), &requested).await;
+        assert_eq!(got, None);
+        assert!(started.elapsed() < Duration::from_secs(2), "stall must end the wait promptly");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_graph_making_progress_forever_stops_at_the_hard_cap() {
+        let requested = Rc::new(RefCell::new(Vec::new()));
+        let r = requested.clone();
+        let load = async move { loop { sleep(Duration::from_millis(40)).await; r.borrow_mut().push(String::new()); if r.borrow().len() > 1_000_000 { break; } } };
+        let started = std::time::Instant::now();
+        let got: Option<()> = await_module_graph_load(load, Duration::from_millis(150), Duration::from_millis(600), &requested).await;
+        assert_eq!(got, None);
+        assert!(started.elapsed() >= Duration::from_millis(550) && started.elapsed() < Duration::from_secs(3));
     }
 }
