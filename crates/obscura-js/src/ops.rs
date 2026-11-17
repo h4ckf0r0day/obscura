@@ -573,7 +573,7 @@ pub struct ObscuraState {
     /// pages nor incompatible CORS profiles share a completion.
     #[cfg(feature = "render")]
     pub render_image_in_flight:
-        HashMap<(u64, String, ImageRequestProfile),
+        HashMap<(u64, String, ImageRequestProfile, Option<u64>),
             (tokio::sync::oneshot::Sender<()>, Vec<tokio::sync::oneshot::Sender<()>>)>,
     /// Page-transport loads for resources that cache-only layout or paint
     /// missed. The owning page fetches them and sends the outcome here; the
@@ -2015,6 +2015,7 @@ pub struct RenderResourceLoad {
     pub generation: u64,
     pub url: String,
     pub profile: Option<ImageRequestProfile>,
+    pub image_request_generation: Option<u64>,
     pub is_font: bool,
     /// Final URL, status, headers and body of the response; `None` when the
     /// request failed or was blocked.
@@ -2622,6 +2623,19 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             state.scroll_generation = state.scroll_generation.wrapping_add(1);
             if invalidate {
                 state.animation_timeline.remove_subtree(reset_nodes.iter());
+            }
+        }
+        #[cfg(feature = "render")]
+        if matches!(cmd.as_str(), "set_attribute" | "remove_attribute" | "set_attribute_ns" | "remove_attribute_ns") {
+            let mut parts = arg2.split('\0');
+            let first = parts.next().unwrap_or_default();
+            let name = if cmd.ends_with("_ns") {
+                if first.is_empty() { parts.next().unwrap_or_default() } else { "" }
+            } else { first };
+            if matches!(name, "src" | "srcset" | "sizes" | "crossorigin") {
+                if let Ok(node) = arg1.parse::<u32>() {
+                    state.render_resources.forget_html_image_request(NodeId::new(node));
+                }
             }
         }
         #[cfg(feature = "render")]
@@ -9415,7 +9429,7 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool, frame_id: u32) -> String {
+fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool, frame_id: u32) -> String {
     // Resolve the calling frame's document: a frame's node ids are not the page's.
     let shared = frame_state(state, frame_id);
     let gs = shared.borrow();
@@ -9428,6 +9442,20 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool, frame_id: u3
     });
     if !is_image {
         return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
+    }
+    if !cached_only {
+        // Source assignments may retry failed requests; getters and layout
+        // only observe the current outcome and must not restart it.
+        let request = gs.dom.as_ref().and_then(|dom| {
+            let (url, _, _, _) = profiled_cached_image_metadata(&gs, node_id)?;
+            Some((url, image_request_profile(dom, node_id)))
+        });
+        drop(gs);
+        let mut gs = shared.borrow_mut();
+        if let Some((url, profile)) = request {
+            gs.render_resources.retry_html_image_request(node_id, &url, profile);
+        }
+        return cached_image_metadata_for_node(&gs, node_id);
     }
     cached_image_metadata_for_node(&gs, node_id)
 }
@@ -9581,7 +9609,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id:
     }
 
     // Different CORS/credential profiles do not share an in-flight response.
-    let request_key = (document_generation, selected_url.clone(), request_profile);
+    let image_request_generation = shared.borrow().render_resources.begin_html_image_request(&selected_url, request_profile);
+    let request_key = (document_generation, selected_url.clone(), request_profile, image_request_generation);
     let (follower, cancel_rx) = {
         let mut gs = shared.borrow_mut();
         if let Some((_, waiters)) = gs.render_image_in_flight.get_mut(&request_key) {
@@ -9670,10 +9699,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id:
             match bytes {
                 Some(bytes) => {
                     if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
-                        gs.render_resources.seed_image(
-                            selected_url.clone(),
-                            request_profile,
-                            bytes,
+                        gs.render_resources.seed_image_shared_for_request(
+                            selected_url.clone(), request_profile, Arc::from(bytes), image_request_generation,
                         );
                         // The leader owns the unknown-to-known cache
                         // transition. Followers only observe this result and
@@ -9681,12 +9708,12 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id:
                         invalidate_render_resource_geometry(&mut gs);
                     } else {
                         gs.render_resources
-                            .seed_image_missing(selected_url.clone(), request_profile);
+                            .seed_image_missing_for_request(selected_url.clone(), request_profile, image_request_generation);
                     }
                 }
                 None => {
                     gs.render_resources
-                        .seed_image_missing(selected_url.clone(), request_profile);
+                        .seed_image_missing_for_request(selected_url.clone(), request_profile, image_request_generation);
                 }
             }
         }

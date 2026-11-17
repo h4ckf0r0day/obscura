@@ -7624,7 +7624,7 @@ class HTMLImageElement extends Element {
     const hasMetadataLoader = typeof __obscuraCore.ops.op_load_image_metadata === "function";
     this._adoptImageCandidate(hasMetadataLoader ? "" : this.src);
     this._imageCompletionDeferred = true;
-    this._refreshImageFromCache(true);
+    this._refreshImageFromCache(true, true);
     if (!this._imageComplete) this._queueImageRequest();
   }
 
@@ -7686,11 +7686,11 @@ class HTMLImageElement extends Element {
     }
   }
 
-  _refreshImageFromCache(deferCompletion) {
+  _refreshImageFromCache(deferCompletion, sourceChanged) {
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true, _realmFrameId));
+      const metadata = JSON.parse(op(this._nid >>> 0, !sourceChanged, _realmFrameId));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {

@@ -302,6 +302,8 @@ pub struct FormControlState {
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
+    reused_node_generations: HashMap<NodeId, u64>,
+    next_node_generation: u64,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
     form_controls: HashMap<NodeId, FormControlState>,
@@ -344,6 +346,8 @@ impl DomTree {
             inner: RefCell::new(DomTreeInner {
                 nodes: vec![Some(doc_node)],
                 free_list: Vec::new(),
+                reused_node_generations: HashMap::new(),
+                next_node_generation: 0,
                 document: NodeId(0),
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
@@ -868,6 +872,9 @@ impl DomTree {
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
+            inner.next_node_generation = inner.next_node_generation.wrapping_add(1).max(1);
+            let generation = inner.next_node_generation;
+            inner.reused_node_generations.insert(NodeId(slot), generation);
             NodeId(slot)
         } else {
             let idx = inner.nodes.len() as u32;
@@ -895,6 +902,14 @@ impl DomTree {
             data,
         });
         id
+    }
+
+    /// Identity of this allocation of an arena slot. Appended slots need no
+    /// generation entry; reuse changes only the reused slot's identity.
+    pub fn node_allocation_generation(&self, id: NodeId) -> Option<u64> {
+        let inner = self.inner.borrow();
+        inner.nodes.get(id.index())?.as_ref()?;
+        Some(inner.reused_node_generations.get(&id).copied().unwrap_or(0))
     }
 
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
@@ -2338,6 +2353,25 @@ impl Default for DomTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_node_slots_have_distinct_allocation_identities() {
+        let tree = DomTree::new();
+        let retained = tree.new_node(NodeData::Text { contents: "retained".into() });
+        let removed = tree.new_node(NodeData::Text { contents: "removed".into() });
+        let old = tree.node_allocation_generation(removed).unwrap();
+        tree.remove(removed);
+        assert_eq!(tree.node_allocation_generation(removed), None);
+        let reused = tree.new_node(NodeData::Text { contents: "new".into() });
+        assert_eq!(reused, removed);
+        assert_ne!(tree.node_allocation_generation(reused), Some(old));
+        assert_eq!(tree.node_allocation_generation(retained), Some(0));
+        tree.remove(reused);
+        let next = tree.new_node(NodeData::Text { contents: "next".into() });
+        assert_eq!(next, reused);
+        assert_ne!(tree.node_allocation_generation(next), Some(old));
+        assert_eq!(tree.node_allocation_generation(retained), Some(0));
+    }
 
     #[test]
     fn cssom_stylesheet_storage_is_released_when_owner_is_detached() {
