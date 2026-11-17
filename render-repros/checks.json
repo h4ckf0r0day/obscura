@@ -214,12 +214,7 @@
     {"name": "picture image stays in inline flow", "color": "#1971c2", "x": 60, "y": 260, "width": 40, "height": 20},
     {"name": "content after picture remains on the same line", "color": "#e8590c", "x": 100, "y": 260, "width": 70, "height": 20},
     {"name": "authored block picture starts a new row", "color": "#1971c2", "x": 0, "y": 340, "width": 40, "height": 20},
-    {"name": "content after block picture follows below", "color": "#e8590c", "x": 0, "y": 360, "width": 70, "height": 20},
-    {"name": "transparent link image fills its containing block", "color": "#1971c2", "x": 0, "y": 420, "width": 240, "height": 120},
-    {"name": "transparent linked picture fills its containing block", "color": "#1971c2", "x": 0, "y": 580, "width": 240, "height": 120},
-    {"name": "transparent inline wrapper retains its shadow", "color": "#c92a2a", "count": 1},
-    {"name": "transparent inline mixed padding stays resolved", "color": "#f76707", "x": 26, "y": 820, "width": 40, "height": 20},
-    {"name": "transparent inline mixed margin stays resolved", "color": "#1098ad", "x": 26, "y": 900, "width": 40, "height": 20}
+    {"name": "content after block picture follows below", "color": "#e8590c", "x": 0, "y": 360, "width": 70, "height": 20}
   ],
   "item-self-alignment": [
     {"name": "flex item centers itself on cross axis", "color": "#087f5b", "x": 0, "y": 40, "width": 40, "height": 20},

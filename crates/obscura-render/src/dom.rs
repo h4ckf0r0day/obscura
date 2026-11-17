@@ -10441,27 +10441,7 @@ fn is_flattenable_inline(
         && !style.is_replaced_box
         && style.before_pseudo.is_none()
         && style.after_pseudo.is_none()
-        // Transparent colors still need a box for spacing and paint effects.
-        && style.background_color.is_none_or(|[_, _, _, alpha]| {
-            alpha == 0
-                && style.margin == crate::Edges::default()
-                && style.padding == crate::Edges::default()
-                && style.margin_percent.iter().all(Option::is_none)
-                && style.padding_percent.iter().all(Option::is_none)
-                && style.box_shadow.is_none()
-                && style.outline.used_width() == 0.0
-                && style.background_gradient.is_none()
-                && style.background_radial_gradient.is_none()
-                && style.background_conic_gradient.is_none()
-                && style.background_gradient_layers.is_empty()
-                && style.waapi_sample_state.is_none()
-                && style.opacity.is_none_or(|opacity| opacity >= 1.0)
-                && !style.establishes_positioning_containing_block()
-                && style.transform_ops.is_empty()
-                && style.individual_translate.is_none()
-                && style.individual_rotate.is_none()
-                && style.individual_scale.is_none()
-        })
+        && style.background_color.is_none()
         && style.background_image.is_none()
         && style.mask_image.is_none()
         && style.border == crate::Edges::default()
@@ -20355,23 +20335,6 @@ mod tests {
     }
 
     #[test]
-    fn transparent_link_images_use_the_containing_block_width() {
-        for background in ["", "background-color:transparent", "background-color:rgba(255,0,0,0)"] {
-            for picture in [false, true] {
-                let image = "<img id=art src=hero.svg style='width:100%;max-width:100%'>";
-                let content = if picture { format!("<picture>{image}</picture>") } else { image.into() };
-                let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}#shell{{width:240px}}</style><div id=shell><a style='{background}'>{content}</a></div>"));
-                let art = tree.get_element_by_id("art").unwrap();
-                let intrinsic = HashMap::from([(art, (100.0, 40.0))]);
-                let laid = layout_dom_with_images(&tree, (400.0, 200.0), &intrinsic);
-                let rect = laid.rects[&art];
-                assert!((rect.width - 240.0).abs() < 0.01 && (rect.height - 96.0).abs() < 0.01,
-                    "background={background}, picture={picture}: {rect:?}");
-            }
-        }
-    }
-
-    #[test]
     fn picture_default_and_author_override_participate_in_inline_flow() {
         for block in [false, true] {
             let display = if block { "display:block" } else { "" };
@@ -20389,60 +20352,6 @@ mod tests {
             }
             assert_eq!(laid.styles[&node("picture")].display,
                 if block { crate::Display::Block } else { crate::Display::Inline });
-        }
-    }
-
-    #[cfg(feature = "paint")]
-    #[test]
-    fn transparent_inline_wrappers_keep_their_decorations() {
-        let cases = [
-            ("shadow", "box-shadow:6px 6px 0 red", ""),
-            ("outline", "outline:4px solid red", ""),
-            ("border", "border:4px solid red", ""),
-            ("gradient", "background-image:linear-gradient(red,red);padding:6px", ""),
-            ("radial", "background-image:radial-gradient(red,red);padding:6px", ""),
-            ("conic", "background-image:conic-gradient(red,red);padding:6px", ""),
-            ("layers", "background-image:linear-gradient(red,red),radial-gradient(blue,blue);padding:6px", ""),
-            ("pseudo", "", "a::before{content:'';display:inline-block;width:10px;height:20px;background:red}"),
-        ];
-        let mut missing = Vec::new();
-        for (name, decoration, pseudo) in cases {
-            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0;background:white}}a{{background-color:transparent;{decoration}}}span{{display:inline-block;width:40px;height:20px;background:blue}}{pseudo}</style><div style='padding:20px'><a><span></span></a></div>"));
-            let pixmap = crate::paint_dom(&tree, (100.0, 80.0), None).unwrap();
-            let red = pixmap.pixels().iter().filter(|pixel| pixel.red() > 240 && pixel.green() < 10 && pixel.blue() < 10).count();
-            if red <= 50 { missing.push((name, red)); }
-        }
-        assert!(missing.is_empty(), "inline decorations must remain painted: {missing:?}");
-    }
-
-    #[test]
-    fn transparent_inline_wrappers_keep_spacing_and_containing_blocks() {
-        for (spacing, offset) in [
-            ("padding-left:6px", 6.0), ("margin-left:6px", 6.0),
-            ("padding-left:10%", 10.0), ("margin-left:10%", 10.0),
-            ("padding-left:calc(2px + 4px)", 6.0), ("margin-left:.375em", 6.0),
-        ] {
-            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}#host{{width:100px;padding-left:20px}}a{{background-color:transparent;{spacing}}}span{{display:inline-block;width:40px;height:20px}}</style><div id=host><a><span id=art></span></a></div>"));
-            let laid = layout_dom(&tree, (160.0, 80.0));
-            let art = laid.rects[&tree.get_element_by_id("art").unwrap()];
-            assert!((art.x - 20.0 - offset).abs() < 0.01, "{spacing}: {art:?}");
-        }
-        for effect in ["filter:blur(0px)", "backdrop-filter:blur(0px)", "perspective:100px", "will-change:transform"] {
-            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}a{{background-color:transparent;{effect}}}span{{display:inline-block;width:40px;height:20px}}i{{position:fixed;left:0;top:0;width:10px;height:10px}}</style><div style='padding:20px'><a><span></span><i id=fixed></i></a></div>"));
-            let laid = layout_dom(&tree, (100.0, 80.0));
-            let rect = laid.rects[&tree.get_element_by_id("fixed").unwrap()];
-            assert!((rect.x - 20.0).abs() < 0.01 && (rect.y - 20.0).abs() < 0.01, "{effect}: {rect:?}");
-        }
-    }
-
-    #[cfg(feature = "paint")]
-    #[test]
-    fn transparent_inline_wrappers_keep_composited_children() {
-        for effect in ["opacity:.5", "transform:translateX(6px)", "translate:6px", "rotate:0deg", "scale:1"] {
-            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0;background:white}}a{{background-color:transparent;{effect}}}span{{display:inline-block;width:40px;height:20px;background:blue}}</style><div style='padding:20px'><a><span></span></a></div>"));
-            let pixmap = crate::paint_dom(&tree, (100.0, 80.0), None).unwrap();
-            let blue = pixmap.pixels().iter().filter(|pixel| pixel.blue() > 240 && pixel.red() < 200 && pixel.green() < 200).count();
-            assert!(blue > 50, "{effect} must keep its child visible: {blue} blue pixels");
         }
     }
 
