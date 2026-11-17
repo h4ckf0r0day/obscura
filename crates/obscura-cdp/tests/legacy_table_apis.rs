@@ -232,3 +232,52 @@ async fn section_setters_keep_standard_placement_and_reject_invalid_values() {
     })()"#).await, json!([["caption","colgroup","thead","tbody","tfoot"],
         ["HierarchyRequestError","TypeError","TypeError","TypeError","HierarchyRequestError"],[true,true,1],null,null]));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn document_forms_is_live_named_collection_with_stable_wrapper_identity() {
+    assert_eq!(evaluate(r#"(() => {
+        const forms = document.forms;
+        const initial = [
+            forms instanceof HTMLCollection, !(forms instanceof NodeList),
+            forms === document.forms, typeof forms.namedItem, forms.length,
+            Object.prototype.toString.call(forms)
+        ];
+        const form = document.createElement('form');
+        form.id = 'loginForm';
+        form.setAttribute('name', 'signIn');
+        document.body.appendChild(form);
+        const named = [
+            forms.length, forms[0] === form, forms.item(0) === form,
+            forms.namedItem('loginForm') === form,
+            forms.namedItem('signIn') === form,
+            forms.signIn === form,
+            document.querySelector('form') === form
+        ];
+        const submit = [];
+        form.addEventListener('submit', event => {
+            submit.push(event.target === form,
+                event.currentTarget === form,
+                event.target === forms.namedItem('loginForm'),
+                event.target === document.querySelector('form'));
+            event.preventDefault();
+        });
+        // The actual interactive submission path must preserve the same
+        // wrapper observed by a framework's onSubmit handler.
+        form.requestSubmit();
+        form.setAttribute('name', 'renamed');
+        const renamed = [forms.signIn === undefined,
+            forms.renamed === form, forms.namedItem('signIn') === null];
+        form.remove();
+        const removed = [forms.length, forms.item(0) === null,
+            forms.namedItem('loginForm') === null];
+        document.body.appendChild(form);
+        return {initial, named, submit, renamed, removed,
+            restored: forms[0] === form && document.forms === forms};
+    })()"#).await, json!({
+        "initial":[true,true,true,"function",0,"[object HTMLCollection]"],
+        "named":[1,true,true,true,true,true,true],
+        "submit":[true,true,true,true],
+        "renamed":[true,true,true], "removed":[0,true,true],
+        "restored":true
+    }));
+}

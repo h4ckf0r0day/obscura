@@ -7240,7 +7240,7 @@ class Document extends Node {
     if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
     return this._styleSheetList;
   }
-  get forms() { return this.querySelectorAll("form"); }
+  get forms() { return _documentLiveCollection(this, 'forms', 'form'); }
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
@@ -15411,14 +15411,21 @@ function _tableRowsGetter() {
   _tableRowCollections.set(this, collection);
   return collection;
 }
-function _createTableCollection(table, op) {
+// The same live, named HTMLCollection machinery works for document.forms:
+// unlike querySelectorAll's static NodeList, document.forms is a [SameObject]
+ // collection with namedItem and live updates as forms enter/leave the tree.
+function _createTableCollection(table, op, selector = null) {
   let epoch = -1;
   let elements = [];
   function refresh() {
     if (epoch !== _domMutationEpoch) {
-      const ids = _domParse(op, table._nid);
-      if (ids === null) throw new TypeError('Illegal invocation');
-      elements = ids.map(_wrapEl);
+      if (selector !== null) {
+        elements = Array.from(table.querySelectorAll(selector));
+      } else {
+        const ids = _domParse(op, table._nid);
+        if (ids === null) throw new TypeError('Illegal invocation');
+        elements = ids.map(_wrapEl);
+      }
       epoch = _domMutationEpoch;
     }
     return elements;
@@ -15486,6 +15493,24 @@ function _createTableCollection(table, op) {
   refresh();
   return collection;
 }
+// A collection belongs to its Document, not to the caller or to a particular
+// query. The cached wrapper also preserves element identity for event handlers
+// comparing event.target with document.forms.namedItem(...).
+const _documentLiveCollections = new WeakMap();
+function _documentLiveCollection(doc, name, selector) {
+  let collections = _documentLiveCollections.get(doc);
+  if (!collections) {
+    collections = new Map();
+    _documentLiveCollections.set(doc, collections);
+  }
+  let collection = collections.get(name);
+  if (!collection) {
+    collection = _createTableCollection(doc, null, selector);
+    collections.set(name, collection);
+  }
+  return collection;
+}
+
 Object.defineProperty(HTMLTableElement, 'length', {value: 0, configurable: true});
 Object.defineProperty(_tableRowsGetter, 'name', {value: 'get rows', configurable: true});
 Object.defineProperty(HTMLTableElement.prototype, 'rows', {
