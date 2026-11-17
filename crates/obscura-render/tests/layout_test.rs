@@ -488,6 +488,28 @@ fn css_table_mixed_children_are_not_discarded() {
 }
 
 #[test]
+fn closed_html_dialogs_use_a_ua_display_rule_below_author_styles() {
+    let tree = parse_html(r#"<!doctype html><style>
+        html,body{margin:0} dialog{width:80px;height:30px}
+        #authored{display:block} #contents{display:contents}
+        #contents > div{width:20px;height:10px}
+    </style><dialog id=closed><div id=closed_child>hidden</div></dialog>
+    <dialog id=opened open></dialog><dialog id=authored></dialog>
+    <dialog id=contents><div id=visible_child></div></dialog>
+    <svg><dialog id=svg_dialog></dialog></svg>"#);
+    let layout = layout_dom(&tree, (400.0,300.0));
+    for name in ["closed", "closed_child"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(name).unwrap()), "{name} generated a box");
+    }
+    for name in ["opened", "authored"] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!((rect.width,rect.height),(80.0,30.0), "{name}");
+    }
+    assert!(layout.rects.contains_key(&tree.get_element_by_id("visible_child").unwrap()));
+    assert_ne!(layout.styles[&tree.get_element_by_id("svg_dialog").unwrap()].display, obscura_render::Display::None);
+}
+
+#[test]
 fn table_rowspans_are_clipped_to_the_originating_row_group() {
     let tree = parse_html(
         r#"
@@ -2039,6 +2061,50 @@ fn absolute_inline_svg_keeps_percentage_width_and_view_box_ratio() {
     assert!((art.x - 640.0).abs() < 0.01, "percentage width must anchor from the right: {art:?}");
     assert!((art.width - 160.0).abs() < 0.01, "percentage width: {art:?}");
     assert!((art.height - 160.0).abs() < 0.01, "viewBox ratio: {art:?}");
+}
+
+/// `span 0` is an invalid grid line (CSS Grid 1 section 8.3), so the
+/// declaration is ignored: the earlier placement wins, or the item stays
+/// auto-placed. Shopify themes reach it through
+/// `grid-column: span var(--menu-content-columns-desktop) / -1` with the
+/// variable at 0; that once gave taffy a zero-track grid area and aborted the
+/// whole page ("slice index starts at 13 but ends at 12").
+#[test]
+fn grid_placement_with_zero_span_is_ignored() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             .grid{--n:0;display:grid;grid-template-columns:repeat(6,1fr);width:600px}
+             #literal{grid-column:span 0 / -1}
+             #variable{grid-column:span var(--n) / -1}
+             #kept{grid-column:2 / 4;grid-column:span 0 / -1}
+             #side{grid-column-start:3;grid-column-start:span 0}
+           </style></head><body>
+             <div class="grid"><div id="literal">x</div></div>
+             <div class="grid"><div id="variable">x</div></div>
+             <div class="grid"><div id="kept">x</div></div>
+             <div class="grid"><div id="side">x</div></div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["literal", "variable"] {
+        let r = rect(id);
+        assert!(
+            r.x.abs() < 0.01 && (r.width - 100.0).abs() < 0.01,
+            "{id}: an ignored declaration leaves the item auto-placed in the first track: {r:?}"
+        );
+    }
+    let kept = rect("kept");
+    assert!(
+        (kept.x - 100.0).abs() < 0.01 && (kept.width - 200.0).abs() < 0.01,
+        "the earlier valid grid-column must win: {kept:?}"
+    );
+    let side = rect("side");
+    assert!(
+        (side.x - 200.0).abs() < 0.01 && (side.width - 100.0).abs() < 0.01,
+        "the earlier valid grid-column-start must win: {side:?}"
+    );
 }
 
 /// Chromium 150 includes collapsed descendant margins in a grid item's

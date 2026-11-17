@@ -511,7 +511,8 @@ pub fn retained_attribute_mutation_kind(
             | "valign"
             | "viewbox"
             | "width"
-    ) || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
+    ) || (local == "dialog" && name == "open")
+        || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
         || (matches!(local.as_str(), "select" | "font") && name == "size")
         || (local == "textarea" && matches!(name.as_str(), "cols" | "rows" | "wrap"))
         || matches!(name.as_str(), "dir" | "lang" | "xml:lang")
@@ -2782,6 +2783,11 @@ fn cascade_node_style(
                 _ => {}
             }
         }
+        if elem.local.as_ref() == "dialog" && elem.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+            && node.get_attribute("open").is_none()
+        {
+            style.display = crate::Display::None;
+        }
         // UA rule `[hidden]:not([hidden=until-found]) { display: none }`.
         // Applied before the author cascade so a matching author `display`
         // still wins (UA origin, per the HTML rendering spec). Sites ship
@@ -4098,6 +4104,9 @@ fn retained_style_plan(
         }
 
         let map = sheet.invalidation_map();
+        if map.has_dynamic_attribute_reads() {
+            return RetainedStylePlan::Full;
+        }
         let mut dependencies = Vec::new();
         dependencies.extend_from_slice(map.attribute_dependencies(&name));
         if name == "id" {
@@ -4183,10 +4192,6 @@ pub(crate) fn can_retain_layout_for_metadata(
         return false;
     }
 
-    let nodes = tree.descendants(tree.document());
-    if nodes.iter().any(|node| tree.shadow_root(*node).is_some()) {
-        return false;
-    }
     let sources = document_stylesheet_sources(tree, viewport, crate::CssMediaType::Screen);
     let (sheet, cache_hit) =
         cache.get_or_parse(tree, &sources, viewport, crate::CssMediaType::Screen);
@@ -4198,6 +4203,36 @@ pub(crate) fn can_retain_layout_for_metadata(
                 has_animation_damage: false,
             } if dirty.is_empty()
         )
+        && shadow_stylesheets_ignore_attributes(
+            tree,
+            viewport,
+            mutations.iter().filter_map(|mutation| match mutation {
+                RetainedStyleMutation::Attribute(attribute) => Some(attribute.name.as_str()),
+                _ => None,
+            }),
+        )
+}
+
+/// Shadow trees compile their own stylesheets, and `:host` or `::slotted`
+/// rules there can match light-DOM nodes. An attribute write is invisible to
+/// every shadow tree only when no shadow sheet depends on that attribute.
+fn shadow_stylesheets_ignore_attributes<'a>(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    names: impl Iterator<Item = &'a str> + Clone,
+) -> bool {
+    collect_shadow_stylesheet_sources(tree, viewport, crate::CssMediaType::Screen)
+        .values()
+        .flatten()
+        .all(|source| {
+            let bytes = source.as_bytes();
+            // shortcut: uncertain source spellings use full layout; avoid parsing
+            // shadow CSS twice when a dependency already requires that fallback.
+            !bytes.contains(&b'\\')
+                && !bytes.windows(4).any(|part| part.eq_ignore_ascii_case(b"attr"))
+                && names.clone().all(|name| !name.is_empty()
+                    && !bytes.windows(name.len()).any(|part| part.eq_ignore_ascii_case(name.as_bytes())))
+        })
 }
 
 fn image_source_attribute(name: &str) -> bool {
@@ -4235,14 +4270,15 @@ pub(crate) fn image_source_updates_without_style_damage(
         }
         names.push(name);
     }
-    if images.is_empty()
-        || tree.descendants(tree.document()).iter().any(|node| tree.shadow_root(*node).is_some())
-    {
+    if images.is_empty() {
         return None;
     }
     let sources = document_stylesheet_sources(tree, viewport, crate::CssMediaType::Screen);
     let (sheet, cache_hit) = cache.get_or_parse(tree, &sources, viewport, crate::CssMediaType::Screen);
-    if !cache_hit || names.iter().any(|name| !sheet.invalidation_map().attribute_dependencies(name).is_empty()) {
+    if !cache_hit || sheet.invalidation_map().has_dynamic_attribute_reads()
+        || names.iter().any(|name| !sheet.invalidation_map().attribute_dependencies(name).is_empty())
+        || !shadow_stylesheets_ignore_attributes(tree, viewport, names.iter().map(String::as_str))
+    {
         return None;
     }
     images.sort_unstable_by_key(|node| node.index());
@@ -4469,6 +4505,25 @@ fn collect_shadow_stylesheets(
     viewport: (f32, f32),
     media_type: crate::CssMediaType,
 ) -> HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>> {
+    collect_shadow_stylesheet_sources(tree, viewport, media_type)
+        .into_iter()
+        .map(|(root, sources)| {
+            let sheet = crate::css::Stylesheet::parse_for_viewport_and_media(
+                tree, &sources, viewport, media_type,
+            );
+            (root, std::sync::Arc::new(sheet))
+        })
+        .collect()
+}
+
+fn collect_shadow_stylesheet_sources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
+) -> HashMap<NodeId, Vec<String>> {
+    if !tree.has_shadow_roots() {
+        return HashMap::new();
+    }
     let external = tree.external_stylesheets();
     let mut roots = Vec::new();
     let mut stack = vec![tree.document()];
@@ -4521,10 +4576,7 @@ fn collect_shadow_stylesheets(
                     sources.push(tree.text_content(node_id));
                 }
             }
-            let sheet = crate::css::Stylesheet::parse_for_viewport_and_media(
-                tree, &sources, viewport, media_type,
-            );
-            (root, std::sync::Arc::new(sheet))
+            (root, sources)
         })
         .collect()
 }
@@ -18263,6 +18315,32 @@ mod tests {
             let mut resource = changes.to_vec();
             resource.push(RetainedStyleMutation::Resource);
             assert!(image_source_updates_without_style_damage(&tree, viewport, &mut cache, &resource).is_none());
+        }
+    }
+
+    #[test]
+    fn metadata_retain_checks_shadow_stylesheets() {
+        for (css, reusable) in [
+            ("span { width: 80px }", true),
+            (":host([data-state]) { width: 160px }", false),
+            ("::slotted([data-state]) { width: 160px }", false),
+            ("span::before { content: attr(data-state) }", false),
+        ] {
+            let tree = parse_html(&format!(
+                "<x-host><template shadowrootmode=open><style>{css}</style>\
+                 <span>shadow</span><slot></slot></template><p id=target>text</p></x-host>"
+            ));
+            let target = tree.get_element_by_id("target").unwrap();
+            let viewport = (500.0, 300.0);
+            let mut cache = crate::css::StylesheetCache::default();
+            let _ = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree, viewport, &HashMap::new(), &[], &mut cache,
+            );
+            let mutation = RetainedStyleMutation::Attribute(AttributeStyleMutation {
+                node: target, name: "data-state".into(), old_value: None, new_value: Some("1".into()),
+            });
+            assert_eq!(can_retain_layout_for_metadata(&tree, viewport, &mut cache, &[mutation]),
+                reusable, "{css}");
         }
     }
 

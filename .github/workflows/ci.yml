@@ -171,11 +171,12 @@ jobs:
       - name: Build render release
         run: cargo build --release -p obscura-cli --bins --features render
 
-      - name: Test render configuration
-        run: cargo nextest run --release --features render --no-fail-fast
-
+      # Workspace tests can rebuild this executable with dev-dependency features.
       - name: Stage candidate binary for comparison
         run: install -D -m 0755 target/release/obscura "$RUNNER_TEMP/obscura-ci/obscura-pr"
+
+      - name: Test render configuration
+        run: cargo nextest run --release --features render --no-fail-fast
 
       - name: Checkout pinned obstacle course
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

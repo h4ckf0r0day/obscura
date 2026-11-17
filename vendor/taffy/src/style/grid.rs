@@ -497,6 +497,10 @@ impl<S: CheapCloneStr> GridPlacement<S> {
     pub fn into_origin_zero_placement_ignoring_named(&self, explicit_track_count: u16) -> OriginZeroGridPlacement {
         match self {
             Self::Auto => OriginZeroGridPlacement::Auto,
+            // A span of zero is invalid (CSS Grid 1 section 8.3: "Negative integers or zero are invalid"),
+            // and it would give the item a grid area of zero tracks, which track sizing indexes as an
+            // inverted range. Treat it as Auto, like the invalid line zero below.
+            Self::Span(0) => OriginZeroGridPlacement::Auto,
             Self::Span(span) => OriginZeroGridPlacement::Span(*span),
             // Grid line zero is an invalid index, so it gets treated as Auto
             // See: https://developer.mozilla.org/en-US/docs/Web/CSS/grid-row-start#values
@@ -529,6 +533,10 @@ impl NonNamedGridPlacement {
     ) -> OriginZeroGridPlacement {
         match self {
             Self::Auto => OriginZeroGridPlacement::Auto,
+            // A span of zero is invalid (CSS Grid 1 section 8.3: "Negative integers or zero are invalid"),
+            // and it would give the item a grid area of zero tracks, which track sizing indexes as an
+            // inverted range. Treat it as Auto, like the invalid line zero below.
+            Self::Span(0) => OriginZeroGridPlacement::Auto,
             Self::Span(span) => OriginZeroGridPlacement::Span(*span),
             // Grid line zero is an invalid index, so it gets treated as Auto
             // See: https://developer.mozilla.org/en-US/docs/Web/CSS/grid-row-start#values
