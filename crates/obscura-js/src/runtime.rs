@@ -1331,7 +1331,10 @@ impl ObscuraJsRuntime {
         // A page transport makes the renderer cache-only; see
         // `ops::fresh_render_resources` for why layout must not fetch itself.
         #[cfg(feature = "render")]
-        state.render_resources.set_sync_loading_enabled(false);
+        {
+            state.render_resources.set_sync_loading_enabled(false);
+            state.render_resources.set_document_scoped(true);
+        }
     }
 
     /// Install the owning page's passive on_request/on_response callback
@@ -1347,7 +1350,10 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         state.stealth_client = Some(client);
         #[cfg(feature = "render")]
-        state.render_resources.set_sync_loading_enabled(false);
+        {
+            state.render_resources.set_sync_loading_enabled(false);
+            state.render_resources.set_document_scoped(true);
+        }
     }
 
     pub fn set_dom(&self, dom: DomTree) {
@@ -2226,6 +2232,15 @@ impl ObscuraJsRuntime {
         profile: crate::ops::ImageRequestProfile,
         bytes: Option<std::sync::Arc<[u8]>>,
     ) {
+        let generation = self.state.borrow().render_resources.html_image_request_generation(&url, profile);
+        self.seed_shared_render_image_resource_for_request(url, profile, bytes, generation);
+    }
+
+    #[cfg(feature = "render")]
+    fn seed_shared_render_image_resource_for_request(
+        &mut self, url: String, profile: crate::ops::ImageRequestProfile,
+        bytes: Option<std::sync::Arc<[u8]>>, generation: Option<u64>,
+    ) {
         let mut state = self.state.borrow_mut();
         match bytes {
             Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
@@ -2237,13 +2252,13 @@ impl ObscuraJsRuntime {
                 };
                 state
                     .render_resources
-                    .seed_image_shared(url, profile, bytes);
+                    .seed_image_shared_for_request(url, profile, bytes, generation);
                 state.activity_generation = state.activity_generation.wrapping_add(1);
                 if needs_geometry {
                     crate::ops::invalidate_render_resource_geometry(&mut state);
                 }
             }
-            _ => state.render_resources.seed_image_missing(url, profile),
+            _ => state.render_resources.seed_image_missing_for_request(url, profile, generation),
         }
     }
 
@@ -2368,7 +2383,7 @@ impl ObscuraJsRuntime {
         for (url, profile, _) in pending.into_iter().chain(backlog).chain(queued) {
             state.render_resources.stop_resource(&url, profile);
         }
-        for ((_, url, profile), (cancel, _)) in images {
+        for ((_, url, profile, _), (cancel, _)) in images {
             state.render_resources.stop_resource(&url, Some(profile));
             let _ = cancel.send(());
         }
@@ -2430,10 +2445,14 @@ impl ObscuraJsRuntime {
         let limiter = state.render_resource_limiter.clone();
         let notify = state.render_resource_notify.clone();
         let started = requests.len();
+        let requests: Vec<_> = requests.into_iter().map(|(url, profile, is_font)| {
+            let image_generation = profile.and_then(|profile| state.render_resources.begin_html_image_request(&url, profile));
+            (url, profile, is_font, image_generation)
+        }).collect();
         let task = tokio::spawn(async move {
             use deno_core::futures::StreamExt as _;
             let loads = deno_core::futures::stream::iter(requests.into_iter().map(
-                |(raw, profile, is_font)| {
+                |(raw, profile, is_font, image_request_generation)| {
                 let http_client = http_client.clone();
                 #[cfg(feature = "stealth")]
                 let stealth_client = stealth_client.clone();
@@ -2452,6 +2471,7 @@ impl ObscuraJsRuntime {
                                 generation,
                                 url: raw,
                                 profile,
+                                image_request_generation,
                                 is_font,
                                 response: None,
                                 };
@@ -2510,6 +2530,7 @@ impl ObscuraJsRuntime {
                         generation,
                         url: raw,
                         profile,
+                        image_request_generation,
                         is_font,
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
@@ -2529,6 +2550,7 @@ impl ObscuraJsRuntime {
                             generation,
                             url: fallback.0,
                             profile: fallback.1,
+                            image_request_generation,
                             is_font: fallback.2,
                             response: None,
                         })
@@ -2631,7 +2653,7 @@ impl ObscuraJsRuntime {
             };
             tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
             match load.profile {
-                Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
+                Some(profile) => self.seed_shared_render_image_resource_for_request(load.url, profile, bytes, load.image_request_generation),
                 None => self.seed_shared_render_resource(load.url, bytes),
             }
             if let Some(response) = load.response {
@@ -6166,6 +6188,7 @@ mod tests {
                 generation,
                 url: url.clone(),
                 profile: None,
+                image_request_generation: None,
                 is_font: false,
                 response: Some(crate::ops::RenderResourceResponse {
                     url: url.clone(),
@@ -19862,6 +19885,104 @@ mod tests {
             serde_json::json!([true, 0, 0, ["error"], "EncodingError"])
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_src_reassignment_retries_a_failed_document_resource() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="retry" src="transient.png" width="20" height="30">"#,
+            move |_url: &str| {
+                (loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0)
+                    .then(|| png.clone())
+            },
+        );
+        rt.state.borrow_mut().render_resources.set_document_scoped(true);
+        rt.set_viewport(80.0, 60.0);
+        rt.execute_script("observe-image-retry", r#"
+            globalThis.__retryEvents = [];
+            const retry = document.getElementById('retry');
+            retry.onload = () => __retryEvents.push('load');
+            retry.onerror = () => __retryEvents.push('error');
+            void retry.complete;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[retry.complete, retry.naturalWidth, __retryEvents]").unwrap(),
+            serde_json::json!([true, 0, ["error"]]),
+        );
+        rt.evaluate(r#"(() => {
+            for (let index = 0; index < 20; index++) {
+                void retry.complete;
+                void retry.naturalWidth;
+                void retry.getBoundingClientRect().width;
+            }
+        })()"#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "reading the failed image must not retry it");
+
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        rt.evaluate("[retry.complete, retry.naturalWidth, retry.getBoundingClientRect().width]").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "unchanged HTML image queries must not retry after the generic cache window");
+        rt.screenshot_prepared((80.0, 60.0), Some("http://example.com/page/index.html"))
+            .expect("paint the failed image");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "painting the unchanged failed image must not retry its loader");
+        assert!(!rt.state.borrow().render_resources.has_sync_misses(),
+            "painting an unchanged failed HTML image must not request it again");
+
+        rt.execute_script("retry-image-source", "retry.src = retry.src;").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[retry.complete, retry.naturalWidth, retry.naturalHeight, __retryEvents]").unwrap(),
+            serde_json::json!([true, 2, 3, ["error", "load"]]),
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        rt.execute_script("reuse-loaded-image", "retry.src = retry.src;").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2,
+            "a loaded image must still reuse its bytes");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_parser_image_retries_without_reviving_the_failed_element() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<div id="host"><img id="old" src="transient.png"></div>"#,
+            move |_: &str| (loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0)
+                .then(|| png.clone()),
+        );
+        rt.state.borrow_mut().render_resources.set_document_scoped(true);
+        rt.execute_script("fail-first-image", "globalThis.old = document.getElementById('old'); void old.complete;").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[old.complete, old.naturalWidth]").unwrap(), serde_json::json!([true, 0]));
+        rt.execute_script("insert-new-image", r#"
+            document.getElementById('host').innerHTML = '<img id="fresh" src="transient.png">';
+            globalThis.fresh = document.getElementById('fresh');
+            void fresh.complete;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[fresh.complete, fresh.naturalWidth, old.complete, old.naturalWidth]").unwrap(),
+            serde_json::json!([true, 2, true, 0]));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        rt.execute_script("replace-parser-image", r#"
+            document.getElementById('host').innerHTML = '<img id="replacement" src="transient.png">';
+            globalThis.replacement = document.getElementById('replacement'); void replacement.complete;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[replacement.complete, replacement.naturalWidth, old.naturalWidth]").unwrap(),
+            serde_json::json!([true, 2, 0]));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[cfg(feature = "render")]
