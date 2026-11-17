@@ -8,11 +8,25 @@
   .row:after { clear: both }
   #offset { float: left; width: 83.33333333%; margin-left: 8.33333333% }
   #plain  { float: left; width: 83.33333333% }
-  #inner  { width: 300px; height: 40px }
+  #inner  { width: 300px; height: 40px; background: #087f5b }
   #after  { height: 20px }
+  #nested, #nested * { box-sizing: border-box }
+  #nested { width: 600px; margin: 22px auto 0; padding: 0 15px }
+  .band { margin-left: -15px; margin-right: -15px }
+  .band:before, .band:after { content: " "; display: table }
+  .band:after { clear: both }
+  .nested-full, #nested-left, #nested-right { float: left; padding: 0 15px }
+  .nested-full { width: 100% }
+  #nested-left { width: 41.66666667%; height: 100px; background: #c92a2a }
+  #nested-right { width: 50%; height: 80px; margin-left: 8.33333333%; margin-top: 10px; background: #1971c2 }
+  #nested-after { width: 600px; height: 10px; margin: 0 auto; background: #f76707 }
 </style></head>
 <body>
   <div class="row" id="row-offset"><div id="offset"><div id="inner">offset</div></div></div>
   <div class="row" id="row-plain"><div id="plain"><div>plain</div></div></div>
   <div id="after">after</div>
+  <div id="nested"><div class="band"><div class="nested-full">
+    <div class="band"><div id="nested-left"></div><div id="nested-right"></div></div>
+  </div></div></div>
+  <div id="nested-after"></div>
 </body></html>

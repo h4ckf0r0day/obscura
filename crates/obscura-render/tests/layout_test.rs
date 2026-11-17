@@ -5121,3 +5121,69 @@ fn percentage_float_margins_resolve_against_containing_width_on_every_side() {
         assert!((rect("after").y - expected_height).abs() < 1.0, "{margin}: following flow overlaps");
     }
 }
+
+#[test]
+fn nested_offset_float_uses_the_expanded_row_width() {
+    let tree = parse_html(r#"<!doctype html><style>
+        * { box-sizing:border-box } body { margin:0 }
+        .container { width:1170px; margin:0 auto; padding:0 15px }
+        .row { margin-left:-15px; margin-right:-15px }
+        .row::before, .row::after { content:' '; display:table }
+        .row::after { clear:both }
+        .full, #left, #right { float:left; padding:0 15px }
+        .full { width:100% }
+        #left { width:41.66666667%; height:520px }
+        #right { width:50%; margin-left:8.33333333%; margin-top:35px; height:470px }
+        </style><div class=container><div class=row><div class=full>
+            <div class=row><div id=left></div><div id=right></div></div>
+        </div></div></div>"#);
+    let layout = layout_dom(&tree, (1440.0, 1000.0));
+    let left = layout.rects[&tree.get_element_by_id("left").unwrap()];
+    let right = layout.rects[&tree.get_element_by_id("right").unwrap()];
+    assert!((left.width - 487.5).abs() < 1.0, "{left:?}");
+    assert!((right.width - 585.0).abs() < 1.0, "{right:?}");
+    assert!((right.x - 720.0).abs() < 1.0, "{right:?}");
+    assert!((right.y - left.y - 35.0).abs() < 1.0, "{left:?} {right:?}");
+}
+
+#[test]
+fn native_float_fit_allows_roundoff_but_not_real_overflow() {
+    use taffy::{compute::FloatContext, Clear, FloatDirection, Size};
+
+    // The parsed 41.66666667% column is one rounding step wider than 487.5px.
+    let first_width = 1170.0 * (41.66666667_f32 / 100.0);
+    for (width, insets) in [
+        (1170.0, [0.0, 0.0]),
+        (1140.0, [-15.0, -15.0]),
+        (1140.0, [-15.25, -15.25]),
+        (1170.0, [0.25, 0.25]),
+    ] {
+        for direction in [FloatDirection::Left, FloatDirection::Right] {
+            for extra in [0.0, 1.0 / 64.0, 1.0] {
+                let mut context = FloatContext::new();
+                context.set_width(width);
+                context.place_floated_box(
+                    Size { width: first_width, height: 20.0 },
+                    0.0, insets, direction, Clear::None,
+                );
+                let second_width = width - insets[0] - insets[1] - 487.5 + extra;
+                let second = context.place_floated_box(
+                    Size { width: second_width, height: 20.0 },
+                    0.0, insets, direction, Clear::None,
+                );
+                assert_eq!(second.y, if extra == 0.0 { 0.0 } else { 20.0 },
+                    "width={width}, insets={insets:?}, direction={direction:?}, extra={extra}: {second:?}");
+            }
+        }
+    }
+    // At large coordinates, one f32 step is real visible overflow, not a subpixel rounding allowance.
+    for direction in [FloatDirection::Left, FloatDirection::Right] {
+        let mut context = FloatContext::new();
+        context.set_width(1_048_576.0);
+        context.place_floated_box(Size { width: 524_288.125, height: 20.0 },
+            0.0, [0.0, 0.0], direction, Clear::None);
+        let next = context.place_floated_box(Size { width: 524_288.0, height: 20.0 },
+            0.0, [0.0, 0.0], direction, Clear::None);
+        assert_eq!(next.y, 20.0, "visible overflow must still wrap: {next:?}");
+    }
+}
