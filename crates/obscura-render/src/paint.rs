@@ -394,8 +394,12 @@ impl RenderResourceCache {
     }
 
     fn observe_html_image(&self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile, outcome: Option<bool>) {
-        if !self.document_scoped || url.starts_with("data:") { return; }
+        if !self.document_scoped { return; }
         let mut requests = self.html_image_requests.borrow_mut();
+        if url.starts_with("data:") {
+            requests.forget(node);
+            return;
+        }
         if outcome == Some(true) {
             requests.observe_success(node);
         } else {
@@ -12757,6 +12761,27 @@ mod tests {
         assert!(cache.failed_html_image(&tree, retained, "https://assets.test/other.svg", profile));
         assert_eq!(cache.cached_image_element_metadata(&tree, replacement, (80.0, 60.0), Some("https://assets.test/")),
             Some((url.into(), 1.0, false, None)));
+    }
+
+    #[test]
+    fn responsive_data_image_selection_discards_the_previous_network_attempt() {
+        let tree = parse_html(r#"<picture><source media="(max-width:500px)"
+            srcset="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='23'%20height='17'/%3E">
+            <img id="image" src="retry.svg"></picture>"#);
+        let node = tree.get_element_by_id("image").unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let mut cache = RenderResourceCache::with_loader(move |_: &str| {
+            (loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0)
+                .then(|| br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"/>"#.to_vec())
+        });
+        cache.set_document_scoped(true);
+        assert_eq!(cache.image_element_metadata(&tree, node, (800.0, 600.0), Some("https://assets.test/")).unwrap().2, None);
+        assert_eq!(cache.image_element_metadata(&tree, node, (400.0, 600.0), Some("https://assets.test/")).unwrap().2, Some((23.0, 17.0)));
+        assert!(cache.html_image_requests.borrow().nodes.is_empty(),
+            "inline image selection must release the previous network attempt");
+        assert_eq!(cache.image_element_metadata(&tree, node, (800.0, 600.0), Some("https://assets.test/")).unwrap().2, Some((23.0, 17.0)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
