@@ -105,7 +105,7 @@ pub struct ObscuraModuleLoader {
     /// module before polling anything else, so once the last one has taken it
     /// later loads find the module in deno_core's map. A failed fetch is not
     /// cached: a later request fetches it again.
-    inflight: Rc<RefCell<HashMap<String, WeakShared<ModuleFetch>>>>,
+    inflight: RefCell<InflightModules>,
 }
 
 /// A fetched module body, cheap to clone into each waiting graph load.
@@ -116,6 +116,12 @@ struct FetchedModule {
 }
 
 type ModuleFetch = LocalBoxFuture<'static, Result<FetchedModule, String>>;
+
+#[derive(Default)]
+struct InflightModules {
+    fetches: HashMap<String, WeakShared<ModuleFetch>>,
+    cleanup_at: usize,
+}
 
 impl ObscuraModuleLoader {
     pub fn new(base_url: &str) -> Self {
@@ -144,7 +150,7 @@ impl ObscuraModuleLoader {
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
             loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
-            inflight: Rc::new(RefCell::new(HashMap::new())),
+            inflight: RefCell::new(InflightModules::default()),
         }
     }
 
@@ -162,7 +168,7 @@ impl ObscuraModuleLoader {
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
             loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
-            inflight: Rc::new(RefCell::new(HashMap::new())),
+            inflight: RefCell::new(InflightModules::default()),
         }
     }
 
@@ -287,8 +293,14 @@ impl ModuleLoader for ObscuraModuleLoader {
         let requested_specifier = module_specifier.clone();
         let fetch = {
             let mut inflight = self.inflight.borrow_mut();
-            inflight.retain(|_, fetch| fetch.upgrade().is_some());
-            match inflight.get(&url).and_then(WeakShared::upgrade) {
+            // Sweeping on every load makes wide, pending module graphs quadratic.
+            if inflight.fetches.len() >= inflight.cleanup_at {
+                inflight.fetches.retain(|_, fetch| fetch.upgrade().is_some());
+                let cleanup_at = inflight.fetches.len().saturating_mul(2).max(32);
+                inflight.fetches.shrink_to(cleanup_at);
+                inflight.cleanup_at = cleanup_at;
+            }
+            match inflight.fetches.get(&url).and_then(WeakShared::upgrade) {
                 Some(fetch) => fetch,
                 None => {
                     let page_network = self.page_network();
@@ -299,7 +311,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     .boxed_local()
                     .shared();
                     if let Some(weak) = fetch.downgrade() {
-                        inflight.insert(url, weak);
+                        inflight.fetches.insert(url, weak);
                     }
                     fetch
                 }
@@ -452,5 +464,52 @@ async fn fetch_module(
             Ok(FetchedModule { found, code: Arc::from(code) })
         }
         Err(error) => Err(io_err(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inflight_registry_stays_bounded_and_reuses_live_fetches() {
+        let loader = ObscuraModuleLoader::new("https://module-cache.test/");
+        let queue = |path: &str| {
+            let url = ModuleSpecifier::parse(&format!("https://module-cache.test/{path}")).unwrap();
+            loader.load(&url, None, ModuleLoadOptions {
+                is_dynamic_import: true,
+                is_synchronous: false,
+                requested_module_type: deno_core::RequestedModuleType::None,
+            })
+        };
+        // Keep the network futures unpolled, as happens when a wide graph
+        // queues its dependencies before the event loop can advance them.
+        let live = (0..128).map(|index| queue(&format!("live-{index}.js"))).collect::<Vec<_>>();
+        let first_url = "https://module-cache.test/live-0.js";
+        let first = loader.inflight.borrow().fetches[first_url].upgrade().unwrap();
+
+        for index in 0..2048 {
+            drop(queue(&format!("canceled-{index}.js")));
+        }
+        let repeated = queue("live-0.js");
+        {
+            let inflight = loader.inflight.borrow();
+            let again = inflight.fetches[first_url].upgrade().unwrap();
+            assert!(first.ptr_eq(&again), "cleanup must preserve a live shared fetch");
+            assert!(inflight.fetches.len() <= 2 * live.len() + 32, "canceled loads must not grow the registry indefinitely");
+        }
+        assert_eq!(loader.activity.pending.load(std::sync::atomic::Ordering::Relaxed), live.len() + 1);
+
+        drop(first);
+        drop(repeated);
+        drop(live);
+        for index in 0..2048 {
+            drop(queue(&format!("later-{index}.js")));
+        }
+        let inflight = loader.inflight.borrow();
+        assert!(inflight.fetches.len() <= 64, "an idle registry must return to a small batch");
+        assert!(inflight.fetches.capacity() <= 128, "later sweeps must not scan a large stale table");
+        assert!(inflight.fetches.values().all(|fetch| fetch.upgrade().is_none()), "registry entries must not keep canceled fetches alive");
+        assert_eq!(loader.activity.pending.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }
