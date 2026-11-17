@@ -20338,6 +20338,27 @@ mod tests {
     }
 
     #[test]
+    fn picture_default_and_author_override_participate_in_inline_flow() {
+        for block in [false, true] {
+            let display = if block { "display:block" } else { "" };
+            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}span{{display:inline-block;width:20px;height:20px}}</style><div><span id=before></span><picture id=picture style='{display}'><img id=art src=hero.svg style='width:24px;height:12px'></picture><span id=after></span></div>"));
+            let node = |id: &str| tree.get_element_by_id(id).unwrap();
+            let intrinsic = HashMap::from([(node("art"), (24.0, 12.0))]);
+            let laid = layout_dom_with_images(&tree, (400.0, 200.0), &intrinsic);
+            let before = laid.rects[&node("before")];
+            let after = laid.rects[&node("after")];
+            if block {
+                assert!(after.y > before.y + 20.0, "{before:?} {after:?}");
+            } else {
+                assert!((before.y - after.y).abs() < 0.01, "{before:?} {after:?}");
+                assert!(laid.rects[&node("art")].x >= before.x + before.width);
+            }
+            assert_eq!(laid.styles[&node("picture")].display,
+                if block { crate::Display::Block } else { crate::Display::Inline });
+        }
+    }
+
+    #[test]
     fn cyclic_percentage_image_keeps_natural_intrinsic_contribution() {
         // A `width:100%` image inside a content-sized flex item is a cyclic
         // percentage: intrinsic flex sizing cannot resolve it against the
