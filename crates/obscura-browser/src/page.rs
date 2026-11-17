@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
 use obscura_js::ops::{OriginStorage, max_live_frames, NavigationTiming};
-use obscura_js::runtime::ObscuraJsRuntime;
+use obscura_js::runtime::{HistoryUpdate, ObscuraJsRuntime};
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
     ResourceType, Response, ResponseCallback,
@@ -191,8 +191,23 @@ pub struct NetworkEvent {
 
 #[derive(Debug, Clone)]
 pub struct StoredResponseBody {
-    pub body: String,
+    /// Raw response bytes. The CDP wire form (lossy text or base64, per
+    /// `base64_encoded`) is produced on read by `cdp_body`, so the common
+    /// case — a body that no CDP client ever asks for — pays no decode at
+    /// store time and holds one copy instead of two.
+    pub body: Vec<u8>,
     pub base64_encoded: bool,
+}
+
+impl StoredResponseBody {
+    /// The body as CDP `Network.getResponseBody` reports it.
+    pub fn cdp_body(&self) -> String {
+        if self.base64_encoded {
+            BASE64.encode(&self.body)
+        } else {
+            String::from_utf8_lossy(&self.body).into_owned()
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -597,6 +612,7 @@ fn rebase_css_urls(css: &str, base: &url::Url) -> String {
 /// Extract network-backed `url(...)` assets while respecting CSS comments and
 /// strings. Linked sheets have already been rebased before materialization;
 /// inline declarations are resolved against the document base here.
+#[cfg(any(feature = "render", test))]
 fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
     let mut urls = Vec::new();
     let mut index = 0usize;
@@ -689,6 +705,7 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
 ///
 /// Shared by the generic scan and the `@font-face` path so the two cannot
 /// disagree about quoting, fragments, `data:` or an unresolved `var()`.
+#[cfg(any(feature = "render", test))]
 fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
     let raw = raw.trim();
     let value = if raw.len() >= 2
@@ -727,6 +744,7 @@ fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
 ///
 /// A malformed block is left to the normal scanner, so this cannot swallow the
 /// rules that follow it.
+#[cfg(any(feature = "render", test))]
 fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)> {
     if !css.get(..10)?.eq_ignore_ascii_case("@font-face") {
         return None;
@@ -751,6 +769,7 @@ fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)
 
 /// Byte offset of the brace closing the block that `css` opens, or `None` when
 /// the block is unterminated. Braces inside strings do not count.
+#[cfg(any(feature = "render", test))]
 fn css_block_end(css: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
@@ -788,6 +807,7 @@ fn css_block_end(css: &str) -> Option<usize> {
 /// Value of the last declaration named `name` in a declaration block. Last
 /// rather than first, because that is what the cascade resolves to and what
 /// `obscura-render` reads.
+#[cfg(any(feature = "render", test))]
 fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
     let mut found = None;
     let mut start = 0usize;
@@ -833,6 +853,7 @@ fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// The `url(...)` values of one declaration, unquoted, in source order.
+#[cfg(any(feature = "render", test))]
 fn css_url_values(value: &str) -> Vec<&str> {
     let lower = value.to_ascii_lowercase();
     let mut out = Vec::new();
@@ -862,6 +883,7 @@ fn css_url_values(value: &str) -> Vec<&str> {
 
 /// Whether the renderer can decode a font source, by the same extension rule
 /// `obscura-render` applies before it will even consider one.
+#[cfg(any(feature = "render", test))]
 fn font_source_is_decodable(src: &str) -> bool {
     let path = src
         .split(['?', '#'])
@@ -875,6 +897,7 @@ fn font_source_is_decodable(src: &str) -> bool {
 /// terminating semicolon. Semicolons inside quoted URLs, comments, or `url()`
 /// parentheses do not end the rule. A malformed import is left to the normal
 /// scanner so this helper cannot swallow following declarations.
+#[cfg(any(feature = "render", test))]
 fn css_import_rule_len(css: &str) -> Option<usize> {
     let prefix = css.get(..7)?;
     if !prefix.eq_ignore_ascii_case("@import") {
@@ -926,6 +949,7 @@ fn css_import_rule_len(css: &str) -> Option<usize> {
     None
 }
 
+#[cfg(any(feature = "render", test))]
 fn render_resource_is_font(url: &url::Url) -> bool {
     let path = url.path().to_ascii_lowercase();
     [".woff", ".woff2", ".ttf", ".otf", ".eot"]
@@ -976,7 +1000,7 @@ fn split_css_imports(css: &str) -> (Vec<StylesheetImport>, String) {
 /// statement body (the text between `@import` and `;`).
 fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
     let s = stmt.trim();
-    let is_url_fn = s.len() >= 4 && s[..4].eq_ignore_ascii_case("url(");
+    let is_url_fn = s.get(..4).is_some_and(|head| head.eq_ignore_ascii_case("url("));
     let (url, media) = if is_url_fn {
         let rest = &s[4..];
         let end = rest.find(')')?;
@@ -1097,7 +1121,7 @@ impl Page {
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
-            );
+            ).with_user_agent(context.user_agent_override.clone());
             client.allow_file_access = context.allow_file_access;
             Some(Arc::new(client))
         } else {
@@ -1265,9 +1289,17 @@ impl Page {
                 // New-document scripts must be installed before the published
                 // child context can be observed, including while its external
                 // scripts are still loading.
-                for source in &self.preload_scripts {
-                    if let Err(error) = realm.execute_script(js, source) {
-                        tracing::debug!("frame {} preload failed: {error}", frame.url);
+                if frame.url != "about:blank" {
+                    for source in &self.preload_scripts {
+                        if let Err(error) = realm.execute_script(js, source) {
+                            tracing::debug!("frame {} preload failed: {error}", frame.url);
+                        }
+                    }
+                    if !self.preload_scripts.is_empty() {
+                        let watchdog = js.arm_watchdog(std::time::Duration::from_secs(5));
+                        let result = realm.execute_script(js, "globalThis.__obscura_init_frames();");
+                        js.disarm_watchdog(watchdog);
+                        if let Err(error) = result { tracing::debug!("frame initialization failed: {error}"); }
                     }
                 }
             }
@@ -1352,22 +1384,25 @@ impl Page {
             self.pending_frame_work.pop_front();
             return true;
         };
-        if let Some(js) = self.js.as_mut() {
-            for problem in self.frames[index]
-                .run_document_scripts(js, |url| sources.get(url).cloned())
-            {
-                tracing::debug!("frame {}: {}", frame_url, problem);
+        // Initial blank documents finish synchronously during insertion.
+        if frame_url != "about:blank" {
+            if let Some(js) = self.js.as_mut() {
+                for problem in self.frames[index]
+                    .run_document_scripts(js, |url| sources.get(url).cloned())
+                {
+                    tracing::debug!("frame {}: {}", frame_url, problem);
+                }
+                if let Err(error) = self.frames[index].dispatch_load_events(js) {
+                    tracing::debug!("frame {} load events failed: {error}", frame_url);
+                }
             }
-            if let Err(error) = self.frames[index].dispatch_load_events(js) {
-                tracing::debug!("frame {} load events failed: {error}", frame_url);
-            }
+            self.execute_frame_owner_script(parent_frame_id, &format!(
+                "(function(){{ const frame = globalThis.__obscura_frameElements[{frame_id}]; \
+                 if (frame && frame.isConnected && frame._frameId === {frame_id}) \
+                   frame.dispatchEvent(new Event('load')); }})()"
+            ));
         }
         self.pending_frame_work.pop_front();
-        self.execute_frame_owner_script(parent_frame_id, &format!(
-            "(function(){{ const frame = globalThis.__obscura_frameElements[{frame_id}]; \
-             if (frame && frame.isConnected && frame._frameId === {frame_id}) \
-               frame.dispatchEvent(new Event('load')); }})()"
-        ));
         true
     }
 
@@ -1393,8 +1428,9 @@ impl Page {
             if message.target_frame_id == 0 {
                 let Some(js) = self.js.as_mut() else { continue };
                 let script = format!(
-                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
+                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin}, {});",
                     message.source_frame_id,
+                    message.source_context_id.map_or(-1i64, i64::from),
                 );
                 if let Err(error) = js.execute_script("<frame-message>", &script) {
                     tracing::debug!("message to the page failed: {error}");
@@ -1412,13 +1448,7 @@ impl Page {
                 continue;
             };
             let Some(js) = self.js.as_mut() else { continue };
-            if let Err(error) = self.frames[index].deliver_message(
-                js,
-                &message.data_json,
-                &message.origin,
-                message.source_frame_id,
-                &message.target_origin,
-            ) {
+            if let Err(error) = self.frames[index].deliver_queued_message(js, &message) {
                 tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
             }
         }
@@ -1436,7 +1466,8 @@ impl Page {
             "if (globalThis.__obscura_frameElements[{frame_id}] &&\
              globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
                globalThis.__obscura_frameElements[{frame_id}]._frameId = 0;\
-               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
+               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin &&\
+                   !globalThis.__obscura_frameElements[{frame_id}]._iframeOpaque)\
                  globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
              }}\
              delete globalThis.__obscura_frameObjects[{frame_id}];\
@@ -1620,9 +1651,24 @@ impl Page {
         for _ in 0..queued {
             scripts_ran |= self.run_next_pending_frame().await;
         }
+        let navigated = self.advance_frame_navigations();
         let delivered = self.deliver_frame_messages();
         self.release_detached_frames();
-        queued_new || scripts_ran || delivered
+        queued_new || scripts_ran || delivered || navigated
+    }
+
+    fn advance_frame_navigations(&mut self) -> bool {
+        if self.frames.is_empty() { return false; }
+        let pending = match &self.js { Some(js) => js.take_pending_frame_navigations(), None => return false };
+        let changed = !pending.is_empty();
+        for (id, url, method, body) in pending {
+            let Some(frame) = self.frames.iter().find(|frame| frame.frame_id() == id) else { continue; };
+            let owner = frame.parent_frame_id();
+            let script = format!("(function(){{const frame=globalThis.__obscura_frameElements[{id}];                if(frame && frame._frameId==={id} && frame.isConnected) frame._loadIframeSrc({},{{method:{},body:{}}});}})()",
+                serde_json::to_string(&url).unwrap(), serde_json::to_string(&method).unwrap(), serde_json::to_string(&body).unwrap());
+            self.execute_frame_owner_script(owner, &script);
+        }
+        changed
     }
 
     /// URLs of the page's live child frames, in creation order.
@@ -1771,6 +1817,80 @@ impl Page {
             .unwrap_or([255, 255, 255, 255])
     }
 
+    async fn intercept_navigation(&self, url: &Url, method: &str, body: &str, initiator: Option<&Url>) -> Result<Option<Response>, PageError> {
+        use obscura_js::ops::{InterceptedRequest, InterceptResolution};
+        if !self.intercept_enabled || !matches!(url.scheme(), "http" | "https")
+            || (!self.intercept_block_patterns.is_empty() && !self.intercept_block_patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str()))) {
+            return Ok(None);
+        }
+        let Some(tx) = &self.intercept_tx else { return Ok(None); };
+        let request_headers = self.http_client.extra_headers.read().await.clone();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let request = InterceptedRequest {request_id: format!("{}.{}", self.id, self.network_event_counter + 1),
+            page_id: self.id.clone(), url: url.to_string(), method: method.into(), headers: request_headers.clone(),
+            resource_type: "Document".into(), resolver};
+        if tx.send(request).is_err() { return Ok(None); }
+        let response = match resolution.await {
+            Ok(InterceptResolution::Fulfill {status, headers: supplied, body, body_base64}) => {
+                let bytes = if body_base64.is_empty() { body.into_bytes() } else {
+                    BASE64.decode(body_base64).map_err(|error| PageError::NetworkError(error.to_string()))?
+                };
+                if bytes.len() > ResourceRequest::navigation().max_response_bytes {
+                    return Err(PageError::NetworkError("Fulfilled document exceeds the response body limit".into()));
+                }
+                let mut headers = std::collections::HashMap::new();
+                for (name, value) in supplied {
+                    let name = name.to_ascii_lowercase();
+                    if name == "set-cookie" {
+                        headers.entry(name).and_modify(|cookies: &mut String| {
+                            cookies.push('\n'); cookies.push_str(&value);
+                        }).or_insert(value);
+                    } else { headers.insert(name, value); }
+                }
+                if let Some(cookies) = headers.get("set-cookie") {
+                    for cookie in cookies.lines() { self.context.cookie_jar.set_cookie(cookie, url); }
+                }
+                let response = Response {url: url.clone(), status, headers, body: bytes, redirected_from: Vec::new()};
+                let request = obscura_net::RequestInfo {url: url.clone(), method: method.into(), headers: request_headers,
+                    resource_type: ResourceType::Document};
+                self.callbacks.fire_request(&request).await;
+                self.callbacks.fire_response(&request, &response).await;
+                response
+            }
+            Ok(InterceptResolution::Continue {url: rewrite, method: changed_method, headers, body: changed_body}) => {
+                let target = match rewrite { Some(value) => Url::parse(&value).map_err(|error| PageError::InvalidUrl(error.to_string()))?, None => url.clone() };
+                if target.scheme() != url.scheme() {
+                    return Err(PageError::NetworkError("Interception cannot change a navigation's URL scheme".into()));
+                }
+                let method = changed_method.as_deref().unwrap_or(method);
+                let body = changed_body.or_else(|| (method == "POST" || !body.is_empty()).then(|| body.as_bytes().to_vec()));
+                self.fetch_navigation_from_document(&target, method, body, headers, initiator).await
+                    .map_err(|error| PageError::NetworkError(error.to_string()))?
+            }
+            Ok(InterceptResolution::Fail {reason}) => {
+                let mut error = String::from("net::ERR_");
+                for (index, ch) in reason.chars().enumerate() {
+                    if index > 0 && ch.is_ascii_uppercase() { error.push('_'); }
+                    error.push(ch.to_ascii_uppercase());
+                }
+                return Err(PageError::NetworkError(error));
+            }
+            Err(_) => return Err(PageError::NetworkError("net::ERR_ABORTED".into())),
+        };
+        Ok(Some(response))
+    }
+
+    async fn fetch_navigation_from_document(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<std::collections::HashMap<String, String>>, initiator: Option<&Url>,
+    ) -> Result<Response, ObscuraNetError> {
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            return client.fetch_navigation_request_from_document(url, method, body, headers, initiator, Some(&self.callbacks)).await;
+        }
+        self.http_client.fetch_navigation_request_from_document(url, method, body, headers, initiator, Some(&self.callbacks)).await
+    }
+
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
@@ -1826,7 +1946,7 @@ impl Page {
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            rt.set_user_agent(self.context.user_agent_override.as_deref().unwrap_or(obscura_net::STEALTH_USER_AGENT));
             rt.set_platform(
                 obscura_net::STEALTH_NAVIGATOR_PLATFORM,
                 obscura_net::STEALTH_UA_PLATFORM,
@@ -1899,6 +2019,7 @@ impl Page {
         }
 
         rt.set_navigation_timing(self.navigation_timing.clone());
+        rt.set_frame_preload_scripts(&self.preload_scripts);
         rt.run_page_init();
         rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
@@ -2350,6 +2471,16 @@ impl Page {
                                 }
                                 _ => continue,
                             };
+                            // HTML "prepare the script element": a classic
+                            // script with `nomodule` does not run in a browser
+                            // that supports module scripts. Sites ship a modern
+                            // module build beside a nomodule legacy build;
+                            // running both mixes their webpack runtimes.
+                            if matches!(kind, ScriptKind::Classic)
+                                && node.get_attribute("nomodule").is_some()
+                            {
+                                continue;
+                            }
 
                             let inline_code = if src.is_none() {
                                 dom.text_content(sid)
@@ -2566,6 +2697,10 @@ impl Page {
                 if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
                     tracing::debug!("Preload script error: {}", e);
                 }
+            }
+            if !preload_sources.is_empty() {
+                let _ = js.execute_script_with_timeout("<frame-init>", "globalThis.__obscura_init_frames();",
+                    std::time::Duration::from_secs(5));
             }
         }
 
@@ -3051,7 +3186,7 @@ impl Page {
 
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ""),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, "", None),
         )
         .await
         {
@@ -3246,6 +3381,37 @@ impl Page {
         self.push_history_entry(url, false);
     }
 
+    pub(crate) fn apply_history_update(&mut self, update: HistoryUpdate) {
+        let HistoryUpdate::Entries { start, index, old_length, truncate_forward, first, urls, .. } = update else { return; };
+        let Some(end) = first.checked_add(urls.len()) else { return; };
+        let length = if truncate_forward { end } else { old_length };
+        if first > old_length || index >= length || (!truncate_forward && end > old_length) { return; }
+        let current_url = self.url_string();
+        if urls.iter().any(|url| cross_scheme_to_file(&current_url, url)) { return; }
+        if self.history.is_empty() && start == 0 {
+            self.history.push(current_url);
+        }
+        let Some(document_end) = start.checked_add(old_length).filter(|&end| end <= self.history.len()) else { return; };
+        let Some(changed_end) = start.checked_add(end) else { return; };
+        self.history.splice(start + first..changed_end.min(document_end), urls);
+        self.document_history_start = start;
+        self.history_index = start + index;
+        if truncate_forward {
+            self.history.truncate(start + length);
+        }
+    }
+
+    /// Traverse an entry belonging to the live document without replacing its runtime.
+    pub fn traverse_same_document_history(&mut self, index: usize) -> bool {
+        self.sync_history_updates();
+        let Some(url) = self.history.get(index) else { return false; };
+        let expression = format!("globalThis.__obscuraHistory.traverse({}, {})", index,
+            serde_json::to_string(url).unwrap_or_default());
+        if self.evaluate(&expression) != serde_json::json!(true) { return false; }
+        self.sync_virtual_url();
+        true
+    }
+
     fn push_history_entry(&mut self, url: String, new_document: bool) {
         if url.is_empty() {
             return;
@@ -3278,6 +3444,13 @@ impl Page {
         self.history = history;
         self.history_index = index;
         self.document_history_start = index;
+        if self.history.is_empty() {
+            let url = self.url_string();
+            if let Some(js) = self.js.as_mut() {
+                let _ = js.execute_script("<reset-history>", &format!(
+                    "globalThis.__obscuraHistory.reset({})", serde_json::to_string(&url).unwrap_or_default()));
+            }
+        }
         self.sync_js_session_history();
     }
 
@@ -3327,7 +3500,9 @@ impl Page {
         method: &str,
         body: &str,
         initial_referrer: &str,
+        initial_initiator: Option<&Url>,
     ) -> Result<(), PageError> {
+        self.sync_history_updates();
         // file:// is a local file read. Every client route (CLI, CDP's
         // Page.navigate/reload/history and Target.createTarget, the MCP
         // tools) ends up here, so the context's opt-in is enforced once
@@ -3338,10 +3513,13 @@ impl Page {
                 "file:// navigation is disabled for this browser context: {url_str}"
             )));
         }
+        let deadline = tokio::time::Instant::now() + self.navigation_timeout();
+        self.network_events.clear();
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         let mut document_referrer = initial_referrer.to_string();
+        let mut document_initiator = initial_initiator.cloned();
         let chain_limit = self.navigation_chain_limit();
         for chain in 0..chain_limit {
             self.navigate_single(
@@ -3350,6 +3528,8 @@ impl Page {
                 &current_method,
                 &current_body,
                 &document_referrer,
+                document_initiator.as_ref(),
+                deadline,
             )
             .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
@@ -3373,6 +3553,7 @@ impl Page {
                     current_url,
                     next_url
                 );
+                document_initiator = self.url.clone();
                 document_referrer = self
                     .url
                     .as_ref()
@@ -3406,6 +3587,8 @@ impl Page {
         method: &str,
         body: &str,
         referrer: &str,
+        initiator: Option<&Url>,
+        deadline: tokio::time::Instant,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
         self.navigation_timing = NavigationTiming::default();
@@ -3415,7 +3598,9 @@ impl Page {
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
         self.url = Some(url.clone());
-        self.network_events.clear();
+        let page_id = self.id.as_str();
+        self.network_events.retain(|event| event.intercepted && event.resource_type == "Document"
+            && event.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.')));
 
         if self.context.obey_robots {
             if url.scheme() == "http" || url.scheme() == "https" {
@@ -3466,12 +3651,20 @@ impl Page {
                         tracing::debug!("Preload script error on about:blank: {}", e);
                     }
                 }
+                if !preload_sources.is_empty() {
+                    let _ = js.execute_script_with_timeout("<frame-init>", "globalThis.__obscura_init_frames();",
+                        std::time::Duration::from_secs(5));
+                }
             }
             return Ok(());
         }
 
         self.navigation_timing.record("fetchStart");
-        let response = if url.scheme() == "data" {
+        let intercepted = self.intercept_navigation(&url, method, body, initiator).await.map_err(|error| {
+            self.lifecycle = LifecycleState::Failed; error
+        })?;
+        let was_intercepted = intercepted.is_some();
+        let response = if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
             let content_type = url_str
                 .strip_prefix("data:")
                 .and_then(|s| s.split(',').next())
@@ -3490,10 +3683,11 @@ impl Page {
                 body: body_bytes,
                 redirected_from: Vec::new(),
             })
-        } else if method == "POST" {
-            self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
-                .await
+        } else if method == "POST" || initiator.is_some() {
+            self.fetch_navigation_from_document(
+                &url, if method == "POST" { "POST" } else { "GET" },
+                (method == "POST").then(|| body.as_bytes().to_vec()), None, initiator,
+            ).await
         } else {
             self.do_fetch(&url).await
         }
@@ -3508,8 +3702,8 @@ impl Page {
         // corrupts them (issue #340). Text-like types stay as text.
         let main_is_binary = !is_text_like_content_type(response.content_type());
         self.record_network_event_with_body(
-            response.url.as_str(),
-            "GET",
+            if was_intercepted && response.redirected_from.is_empty() { url.as_str() } else { response.url.as_str() },
+            method,
             "Document",
             response.status,
             &response.headers,
@@ -3517,8 +3711,26 @@ impl Page {
             main_is_binary,
         );
 
+        if was_intercepted {
+            if let Some(event) = self.network_events.last_mut() { event.intercepted = true; }
+        }
         if !response.redirected_from.is_empty() {
             self.url = Some(response.url.clone());
+        }
+
+        // An HTTP error status with no body at all (a bare 429/403/503 from a
+        // rate limiter or WAF) is not a document. Chrome fails that navigation
+        // with net::ERR_HTTP_RESPONSE_CODE_FAILURE and shows its own error
+        // page, so Page.navigate / page.goto reject. Parsing the empty body
+        // instead commits `<html><head></head><body></body></html>` as a
+        // successful load and the block looks like an empty site. An error
+        // status that carries a body (a real 404 page) still renders.
+        if response.status >= 400 && response.body.is_empty() {
+            self.lifecycle = LifecycleState::Failed;
+            return Err(PageError::NetworkError(format!(
+                "net::ERR_HTTP_RESPONSE_CODE_FAILURE: HTTP {} with an empty body for {}",
+                response.status, response.url
+            )));
         }
 
         // Honor the response charset: HTTP Content-Type → <meta charset> sniff
@@ -3681,27 +3893,30 @@ impl Page {
                 _ => 0,
             };
 
-            self.wait_for_network_idle(threshold).await;
+            self.wait_for_network_idle_until(threshold, deadline).await?;
         }
 
         Ok(())
     }
 
-    async fn wait_for_network_idle(&mut self, threshold: u32) {
-        // Same hazard as the post-script settle: a synchronous poll can pin
-        // the thread past the 5s network-idle deadline, so arm a watchdog
-        // that terminates the isolate ~500ms past it.
-        let netidle_wd = self
-            .js
-            .as_mut()
-            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    #[cfg(test)]
+    async fn wait_for_network_idle(&mut self, threshold: u32) -> Result<(), PageError> {
+        let deadline = tokio::time::Instant::now() + self.navigation_timeout();
+        self.wait_for_network_idle_until(threshold, deadline).await
+    }
+
+    async fn wait_for_network_idle_until(&mut self, threshold: u32, deadline: tokio::time::Instant) -> Result<(), PageError> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let netidle_wd = self.js.as_mut().map(|js| js.arm_watchdog(remaining));
         let mut idle_since: Option<tokio::time::Instant> = None;
 
-        loop {
+        let reached_idle = loop {
             let active = self.http_client.active_requests();
+            #[cfg(feature = "stealth")]
+            let active = active + self.stealth_client.as_ref().map_or(0, |client| client.active_requests());
             let now = tokio::time::Instant::now();
 
+            if now >= deadline { break false; }
             if active <= threshold {
                 if idle_since.is_none() {
                     idle_since = Some(now);
@@ -3709,18 +3924,10 @@ impl Page {
                 if now.duration_since(idle_since.unwrap())
                     >= tokio::time::Duration::from_millis(500)
                 {
-                    break;
+                    break true;
                 }
             } else {
                 idle_since = None;
-            }
-
-            if now >= deadline {
-                tracing::debug!(
-                    "Network idle timeout reached with {} active requests",
-                    active
-                );
-                break;
             }
 
             // An idle runtime can stay parked. Wake at the existing quiet
@@ -3744,14 +3951,21 @@ impl Page {
                     std::future::pending::<()>(),
                 ).await;
             }
-        }
+        };
 
+        let mut terminated = false;
         if let Some(token) = netidle_wd {
             if let Some(js) = self.js.as_mut() {
-                js.disarm_watchdog(token);
+                terminated = js.disarm_watchdog(token);
             }
         }
-        self.lifecycle = LifecycleState::NetworkIdle;
+        if reached_idle && !terminated {
+            self.lifecycle = LifecycleState::NetworkIdle;
+            Ok(())
+        } else {
+            self.lifecycle = LifecycleState::Failed;
+            Err(PageError::NetworkError("network idle exceeded the navigation deadline".into()))
+        }
     }
 
     /// Builds the child frames of the document that just loaded.
@@ -4454,10 +4668,27 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        self.evaluate_for_cdp_in_frame_with_timeout(
+            None, expression, return_by_value, await_promise, await_timeout_ms,
+        ).await
+    }
+
+    #[doc(hidden)]
+    pub async fn evaluate_for_cdp_in_frame_with_timeout(
+        &mut self,
+        frame_id: Option<u32>,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         if let Some(js) = &mut self.js {
-            let evaluation = js.start_cdp_evaluation(expression, return_by_value, await_promise)?;
+            let evaluation = js.start_cdp_evaluation_in_frame(
+                frame_id, expression, return_by_value, await_promise,
+            )?;
             self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.evaluate").await
         } else {
+            if frame_id.is_some() { return Err("JavaScript runtime unavailable".into()); }
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
                 thrown: false,
@@ -4535,8 +4766,26 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        self.call_function_on_for_cdp_in_frame_with_timeout(
+            None, function_declaration, object_id, args, return_by_value,
+            await_promise, await_timeout_ms,
+        ).await
+    }
+
+    #[doc(hidden)]
+    pub async fn call_function_on_for_cdp_in_frame_with_timeout(
+        &mut self,
+        frame_id: Option<u32>,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        args: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-        let evaluation = js.start_cdp_call(
+        let evaluation = js.start_cdp_call_in_frame(
+            frame_id,
             function_declaration,
             object_id,
             args,
@@ -4653,15 +4902,10 @@ impl Page {
         if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
             return;
         }
-        let body = if base64_encoded {
-            BASE64.encode(body)
-        } else {
-            String::from_utf8_lossy(body).to_string()
-        };
         self.response_bodies.insert(
             request_id.clone(),
             StoredResponseBody {
-                body,
+                body: body.to_vec(),
                 base64_encoded,
             },
         );
@@ -4675,13 +4919,21 @@ impl Page {
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
         self.response_bodies.get(request_id).cloned().or_else(|| {
-            self.js
+            let body = self
+                .js
                 .as_ref()?
-                .get_network_response_body(request_id)
-                .map(|body| StoredResponseBody {
-                    body: body.body,
-                    base64_encoded: body.base64_encoded,
-                })
+                .get_network_response_body(request_id)?;
+            // The JS-side store holds the lossy/base64 text form; convert to
+            // raw bytes so the page-side store stays uniformly lazy.
+            let raw = if body.base64_encoded {
+                BASE64.decode(body.body.as_bytes()).ok()?
+            } else {
+                body.body.into_bytes()
+            };
+            Some(StoredResponseBody {
+                body: raw,
+                base64_encoded: body.base64_encoded,
+            })
         })
     }
 
@@ -4694,22 +4946,20 @@ impl Page {
     /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
     /// dropped) or the id is unknown.
     pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
-        let stored = if let Some(body) = self.response_bodies.remove(request_id) {
+        if let Some(body) = self.response_bodies.remove(request_id) {
             self.response_body_order.retain(|id| id != request_id);
-            body
+            // Raw bytes are what this returns; the base64 flag only says how
+            // CDP would report the body, not how it is stored.
+            return Some(body.body);
+        }
+        let b = self
+            .js
+            .as_ref()?
+            .get_network_response_body(request_id)?;
+        if b.base64_encoded {
+            BASE64.decode(b.body.as_bytes()).ok()
         } else {
-            self.js
-                .as_ref()?
-                .get_network_response_body(request_id)
-                .map(|b| StoredResponseBody {
-                    body: b.body,
-                    base64_encoded: b.base64_encoded,
-                })?
-        };
-        if stored.base64_encoded {
-            BASE64.decode(stored.body.as_bytes()).ok()
-        } else {
-            Some(stored.body.into_bytes())
+            Some(b.body.into_bytes())
         }
     }
 
@@ -4754,8 +5004,15 @@ impl Page {
         self.sync_js_network_events();
         let max_entries = response_body_entry_limit();
         for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
+            // The JS-side store holds the lossy/base64 text form; convert to
+            // raw bytes so the page-side store stays uniformly lazy.
+            let raw = if body.base64_encoded {
+                BASE64.decode(body.body.as_bytes()).unwrap_or_default()
+            } else {
+                body.body.into_bytes()
+            };
             self.response_bodies.insert(id.clone(), StoredResponseBody {
-                body: body.body,
+                body: raw,
                 base64_encoded: body.base64_encoded,
             });
             self.response_body_order.push_back(id);
@@ -4891,6 +5148,7 @@ impl Page {
     }
 
     pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
+        if let Some(js) = &self.js { js.set_frame_preload_scripts(&scripts); }
         self.preload_scripts = scripts;
     }
 
@@ -4901,7 +5159,7 @@ impl Page {
         self.preload_scripts.push(script.to_string());
     }
 
-    /// Enable CDP-Fetch-style interception of JS-initiated `fetch()`/XHR.
+    /// Enable CDP-Fetch-style interception of HTTP document navigation and JS `fetch()`/XHR.
     /// Returns a receiver yielding every such request; resolve each through its
     /// `resolver` with `InterceptResolution::{Continue, Fulfill, Fail}` to pass,
     /// mock, or block it. Works in stealth and non-stealth. Mirrors how the CDP
@@ -5009,7 +5267,9 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
-        let source_url = self.url.as_ref().and_then(|source| {
+        self.sync_history_updates();
+        let initiator = self.url.clone();
+        let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
         }).unwrap_or_default();
         let nav_timeout = self.navigation_timeout();
@@ -5017,7 +5277,7 @@ impl Page {
         tokio::time::timeout(
             nav_timeout,
             self.navigate_with_wait_post_inner(
-                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url,
+                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url, initiator.as_ref(),
             ),
         ).await.map_err(|_| {
             self.lifecycle = crate::lifecycle::LifecycleState::Failed;
@@ -5073,11 +5333,119 @@ mod tests {
         register_linked_stylesheet_script, script_response_is_executable, split_css_imports,
         stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
         LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
+        Page, BrowserContext, LifecycleState, HistoryUpdate, BASE64,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
+    use std::sync::Arc;
     use obscura_dom::parse_html;
+
+    #[cfg(feature = "stealth")]
+    #[test]
+    fn stealth_navigator_uses_the_explicit_context_user_agent() {
+        let context=std::sync::Arc::new(crate::BrowserContext::with_storage_and_network("stealth-identity".into(),None,true,Some("TestingUA/1.0".into()),None,false));
+        let mut page=super::Page::new("stealth-identity".into(),context);
+        page.url=Some(url::Url::parse("https://example.test/").unwrap());
+        page.dom=Some(parse_html("<html><body></body></html>"));page.init_js();
+        assert_eq!(page.evaluate_script("navigator.userAgent").unwrap(),serde_json::json!("TestingUA/1.0"));
+    }
+
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_fulfills_before_transport_and_preserves_bytes() {
+        use obscura_js::ops::InterceptResolution;
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let context = Arc::new(BrowserContext::new("document-interception".into()));
+        let mut page = Page::new("document-interception".into(), context);
+        let mut requests = page.enable_interception();
+        let bytes = b"<!doctype html><title>Fulfilled</title><p>replacement</p>".to_vec();
+        let expected = bytes.clone();
+        let (result, ()) = tokio::join!(page.navigate("http://127.0.0.1:9/original"), async {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv()).await.unwrap().unwrap();
+            assert_eq!(request.resource_type, "Document");
+            assert_eq!(request.method, "GET");
+            request.resolver.send(InterceptResolution::Fulfill {status: 201,
+                headers: [("content-type".into(), "text/html".into()),
+                    ("Set-Cookie".into(), "first=1; Path=/".into()),
+                    ("set-cookie".into(), "second=2; Path=/".into())].into(),
+                body: "not the decoded body".into(), body_base64: BASE64.encode(bytes)}).ok().unwrap();
+        });
+        result.unwrap();
+        assert_eq!(page.title, "Fulfilled");
+        let document = page.network_events.iter().find(|event| event.resource_type == "Document").unwrap();
+        assert_eq!(document.status, 201);assert!(document.intercepted);
+        assert_eq!(page.response_bodies.get(&document.request_id).unwrap().body, expected);
+        let mut set_cookies = document.response_headers.get("set-cookie").unwrap().lines().collect::<Vec<_>>();
+        set_cookies.sort_unstable();
+        assert_eq!(set_cookies, ["first=1; Path=/", "second=2; Path=/"]);
+        let cookies = page.context.cookie_jar.get_cookie_header(&url::Url::parse("http://127.0.0.1:9/original").unwrap());
+        assert!(cookies.split("; ").any(|cookie| cookie == "first=1"), "{cookies}");
+        assert!(cookies.split("; ").any(|cookie| cookie == "second=2"), "{cookies}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_continues_with_request_local_overrides() {
+        assert_navigation_interception_continues_with_request_local_overrides(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_continues_with_request_local_overrides_in_stealth() {
+        assert_navigation_interception_continues_with_request_local_overrides(true).await;
+    }
+
+    async fn assert_navigation_interception_continues_with_request_local_overrides(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/changed", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();let mut chunk = [0; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();assert!(n>0);
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes==b"\r\n\r\n") {
+                    if request.len()>=end+4+3 {break;}
+                }
+            }
+            let head=String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(head.starts_with("post /changed http/1.1"));
+            assert!(head.contains("content-type: application/octet-stream"));
+            assert!(head.contains("x-navigation: isolated"));
+            assert!(request.ends_with(&[0,255,128]));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 24\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<title>continued</title>").await.unwrap();
+        });
+        let context=Arc::new(BrowserContext::with_storage_and_network("continued-navigation".into(),None,stealth,None,None,true));
+        let mut page=Page::new("continued-navigation".into(),context);
+        let mut requests=page.enable_interception();
+        let (result,())=tokio::join!(page.navigate("http://127.0.0.1:9/original"),async {
+            let request=tokio::time::timeout(std::time::Duration::from_secs(2),requests.recv()).await.unwrap().unwrap();
+            request.resolver.send(InterceptResolution::Continue {url:Some(target),method:Some("POST".into()),
+                headers:Some([("content-type".into(),"application/octet-stream".into()),("x-navigation".into(),"isolated".into())].into()),
+                body:Some(vec![0,255,128])}).ok().unwrap();
+        });
+        result.unwrap();server.await.unwrap();
+        assert_eq!(page.title,"continued");
+        assert_eq!(page.url_string(),"http://127.0.0.1:9/original","a network rewrite does not rewrite the document URL");
+        assert!(page.http_client.extra_headers.read().await.is_empty(),"per-request headers cannot leak to another page");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_can_fail_without_contacting_transport() {
+        use obscura_js::ops::InterceptResolution;
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let context = Arc::new(BrowserContext::new("aborted-navigation".into()));
+        let mut page = Page::new("aborted-navigation".into(), context);
+        let mut requests = page.enable_interception();
+        let (result, ()) = tokio::join!(page.navigate("http://127.0.0.1:9/aborted"), async {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv()).await.unwrap().unwrap();
+            request.resolver.send(InterceptResolution::Fail {reason: "Aborted".into()}).ok().unwrap();
+        });
+        assert!(result.unwrap_err().to_string().contains("ERR_ABORTED"));
+        assert_eq!(page.lifecycle, LifecycleState::Failed);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn blank_navigation_has_no_doctype_and_starts_in_quirks_mode() {
@@ -5148,7 +5516,7 @@ mod tests {
         "#).unwrap();
         let started = tokio::time::Instant::now();
         tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
-            .await.expect("quiet page must finish within its normal window");
+            .await.expect("quiet page must finish within its normal window").expect("network idle reached");
         assert!(started.elapsed() >= std::time::Duration::from_millis(500));
         assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::NetworkIdle);
         assert_eq!(page.js.as_mut().unwrap().evaluate("[__idleTicks, __idleObserved]").unwrap(),
@@ -5192,7 +5560,7 @@ mod tests {
         assert_eq!(page.http_client.active_requests(), 2);
         let started = tokio::time::Instant::now();
         tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(2))
-            .await.expect("two active requests must not force the five-second deadline");
+            .await.expect("two active requests must not force the five-second deadline").expect("network idle reached");
         assert!(started.elapsed() >= std::time::Duration::from_millis(500));
         assert_eq!(page.http_client.active_requests(), 2, "threshold two must allow both held requests");
         release_a.send(()).unwrap();
@@ -5214,7 +5582,7 @@ mod tests {
             *recorded.lock().unwrap() = Some(tokio::time::Instant::now());
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
-            .await.expect("completed request must permit network idle");
+            .await.expect("completed request must permit network idle").expect("network idle reached");
         release_task.await.unwrap();
         assert!(completed.lock().unwrap().unwrap().elapsed() >= std::time::Duration::from_millis(490),
             "an active request must prevent an earlier quiet-window start");
@@ -5236,25 +5604,84 @@ mod tests {
             *recorded.lock().unwrap() = Some(tokio::time::Instant::now());
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
-            .await.expect("a completed late request must permit network idle");
+            .await.expect("a completed late request must permit network idle").expect("network idle reached");
         request_task.await.unwrap();
         assert!(completed.lock().unwrap().unwrap().elapsed() >= std::time::Duration::from_millis(490),
             "new traffic must reset the original quiet window");
     }
 
+    #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
-    async fn network_idle_keeps_five_second_deadline_for_stuck_request() {
+    async fn network_idle_counts_active_stealth_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "stealth-idle".into(), None, true, None, None, true,
+        ));
+        let mut page = super::Page::new("stealth-idle".into(), context);
+        page.set_navigation_timeout(std::time::Duration::from_millis(700));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = socket.read(&mut bytes).await.unwrap();
+                assert!(read > 0 && request.len() < 16384);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            ready_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        });
+        let client = page.stealth_client.as_ref().unwrap().clone();
+        let request = tokio::spawn(async move { client.fetch(&url).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx).await.unwrap().unwrap();
+        assert_eq!(page.http_client.active_requests(), 0);
+        assert_eq!(page.stealth_client.as_ref().unwrap().active_requests(), 1);
+        let result = page.wait_for_network_idle(0).await;
+        release_tx.send(()).unwrap();
+        assert_eq!(request.await.unwrap().status, 200);
+        server.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::Failed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_uses_navigation_deadline_without_reporting_false_idle() {
         let mut page = network_idle_test_page();
+        page.set_navigation_timeout(std::time::Duration::from_millis(80));
         let (release, fetch) = network_idle_held_request(page.http_client.clone()).await;
-        let started = tokio::time::Instant::now();
-        tokio::time::timeout(std::time::Duration::from_secs(7), page.wait_for_network_idle(0))
-            .await.expect("network-idle deadline must still finish");
-        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), page.wait_for_network_idle(0))
+            .await.expect("configured deadline must finish");
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::Failed);
         assert_eq!(page.http_client.active_requests(), 1);
-        release.send(()).unwrap();
-        fetch.await.unwrap();
+        release.send(()).unwrap();fetch.await.unwrap();
         assert_eq!(page.js.as_mut().unwrap().evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_does_not_stop_at_five_seconds_when_budget_remains() {
+        use std::future::Future;
+        let mut page = network_idle_test_page();
+        page.set_navigation_timeout(std::time::Duration::from_secs(8));
+        let (release, fetch) = network_idle_held_request(page.http_client.clone()).await;
+        tokio::time::pause();
+        let mut wait = Box::pin(page.wait_for_network_idle(0));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        assert!(wait.as_mut().poll(&mut context).is_pending(), "five seconds is not a successful idle result");
+        tokio::time::resume();release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait).await.unwrap().unwrap();
+        fetch.await.unwrap();
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::NetworkIdle);
+    }
+
     fn install_linked_stylesheet(
         runtime: &mut obscura_js::runtime::ObscuraJsRuntime,
         index: usize,
@@ -5713,17 +6140,146 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_preserves_owning_document_metadata() {
+        assert_form_navigation_preserves_owning_document_metadata(false, false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_interception_preserves_owning_document_metadata() {
+        assert_form_navigation_preserves_owning_document_metadata(false, true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_interception_preserves_empty_post() {
+        assert_form_navigation_preserves_owning_document_metadata(false, true, true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_preserves_owning_document_metadata_in_stealth() {
+        assert_form_navigation_preserves_owning_document_metadata(true, false, false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_interception_preserves_owning_document_metadata_in_stealth() {
+        assert_form_navigation_preserves_owning_document_metadata(true, true, false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_interception_preserves_empty_post_in_stealth() {
+        assert_form_navigation_preserves_owning_document_metadata(true, true, true).await;
+    }
+
+    async fn assert_form_navigation_preserves_owning_document_metadata(stealth: bool, intercepted: bool, empty: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut socket, _) = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 2048];
+                loop {
+                    let read = tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut chunk)).await.unwrap().unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head.lines().find_map(|line| line.strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                tx.send(String::from_utf8(request).unwrap()).unwrap();
+                let response = if index == 0 {
+                    let fields = if empty { "" } else { "<input name=confirm value='token+value'><input name=same value=first><input name=same value=second>" };
+                    let body = format!("<form id=f method=post action=/submit>{fields}</form><script>document.getElementById('f').submit()</script>");
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: confirm=fixture; Path=/; SameSite=Strict\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                } else if index == 1 {
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let context = Arc::new(BrowserContext::with_storage_and_network("form-origin".into(), None, stealth, None, None, true));
+        let mut page = Page::new("form-origin".into(), context);
+        page.http_client.extra_headers.write().await.extend([
+            ("Origin".into(), "http://forged.example".into()), ("x-native-client".into(), "ordinary".into()),
+        ]);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            page.stealth_client.as_ref().unwrap().extra_headers.write().await.extend([
+                ("Origin".into(), "http://forged.example".into()), ("x-native-client".into(), "stealth".into()),
+            ]);
+        }
+        let resolver = if intercepted {
+            let mut requests = page.enable_interception();
+            Some(tokio::spawn(async move {
+                for _ in 0..3 {
+                    let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
+                    let rewrite = (request.method == "POST").then(|| request.url.replace("/submit", "/continued"));
+                    request.resolver.send(obscura_js::ops::InterceptResolution::Continue {
+                        url: rewrite, method: None, headers: None, body: None,
+                    }).ok().unwrap();
+                }
+            }))
+        } else { None };
+        page.navigate(&format!("{origin}/source?keep=1")).await.unwrap();
+        assert_eq!(page.url_string(), format!("{origin}/final"));
+        page.navigate(&format!("{origin}/direct")).await.unwrap();
+        server.await.unwrap();
+        if let Some(resolver) = resolver { resolver.await.unwrap(); }
+        let mut requests = Vec::new();
+        while let Ok(request) = rx.try_recv() { requests.push(request); }
+        assert_eq!(requests.len(), 4);
+        for request in &requests[1..3] {
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.starts_with("post "));
+            assert!(headers.contains("sec-fetch-site: same-origin\r\n"));
+            assert!(headers.contains(&format!("origin: {origin}\r\n")));
+            assert!(headers.contains(&format!("referer: {origin}/source?keep=1\r\n")));
+            assert!(headers.contains("cookie: confirm=fixture\r\n"));
+            assert!(headers.contains("content-type: application/x-www-form-urlencoded\r\n"));
+            assert!(headers.contains(if stealth { "x-native-client: stealth\r\n" } else { "x-native-client: ordinary\r\n" }));
+            assert_eq!(body, if empty { "" } else { "confirm=token%2Bvalue&same=first&same=second" });
+        }
+        if intercepted { assert!(requests[1].starts_with("POST /continued ")); }
+        let direct = requests[3].to_ascii_lowercase();
+        assert!(direct.starts_with("get /direct "));
+        assert!(direct.contains("sec-fetch-site: none\r\n"));
+        assert!(!direct.contains("\r\norigin:"));
+        assert!(!direct.contains("\r\nreferer:"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn document_navigation_referrer_survives_http_redirects() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
 
+            let mut requests = Vec::new();
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 2048];
-                let length = stream.read(&mut request).unwrap();
-                let request_text = String::from_utf8_lossy(&request[..length]);
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    assert!(request.len() < 1024 * 1024);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") { break; }
+                }
+                let request_text = String::from_utf8(request).unwrap();
                 let path = request_text
                     .lines()
                     .next()
@@ -5748,7 +6304,9 @@ mod tests {
                     _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
                 };
                 stream.write_all(response.as_bytes()).unwrap();
+                requests.push(request_text);
             }
+            requests
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
@@ -5773,6 +6331,62 @@ mod tests {
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
         );
+        for request in server.join().unwrap().iter().skip(1) {
+            let request = request.to_ascii_lowercase();
+            assert!(request.starts_with("get "));
+            assert!(request.contains("sec-fetch-site: same-origin\r\n"));
+            assert!(request.contains(&format!("referer: {source}\r\n")));
+            assert!(!request.contains("\r\norigin:"));
+        }
+    }
+
+    // A bare HTTP error (rate limiter, WAF) with no body must fail the
+    // navigation like Chrome's net::ERR_HTTP_RESPONSE_CODE_FAILURE instead of
+    // committing an empty document; an error status with a body still renders.
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_body_http_error_fails_navigation_but_error_page_renders() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let response = if request.starts_with("GET /blocked ") {
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    let body = "<html><body><h1>Not here</h1></body></html>";
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "empty-http-error".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("empty-http-error".to_string(), context);
+        let error = page
+            .navigate(&format!("http://{address}/blocked"))
+            .await
+            .expect_err("an empty 429 must not become an empty document");
+        assert!(error.to_string().contains("ERR_HTTP_RESPONSE_CODE_FAILURE"), "{error}");
+        assert!(error.to_string().contains("429"), "{error}");
+        assert_eq!(page.lifecycle, crate::LifecycleState::Failed);
+
+        page.navigate(&format!("http://{address}/missing")).await.unwrap();
+        let heading = page.evaluate("document.querySelector('h1').textContent");
+        assert_eq!(heading.as_str(), Some("Not here"));
     }
 
     // #1231: a text/plain or text/markdown response is a plain-text document.
@@ -6083,6 +6697,158 @@ mod tests {
         assert_eq!(page.url_string(), two);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_keeps_entries_when_the_cursor_moves() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-cursor");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { globalThis.marker=42; history.pushState({n:1}, '', '#one'); history.pushState({n:2}, '', '#two'); })()");
+        page.sync_virtual_url();
+        let entries = vec![url.to_string(), format!("{url}#one"), format!("{url}#two")];
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("history.back()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("[marker, history.state.n, history.length]"), serde_json::json!([42, 1, 3]));
+        page.evaluate("history.replaceState({n:3}, '', '#replaced')");
+        page.sync_virtual_url();
+        assert_eq!(page.history.len(), 3);
+        assert_eq!(page.history[1], format!("{url}#replaced"));
+        page.evaluate("history.forward()");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 2);
+        assert_eq!(page.evaluate("history.state.n"), serde_json::json!(2.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_keeps_distinct_entries_with_the_same_url() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-same-url");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState({n:1}, ''); history.pushState({n:2}, ''); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(); 3]);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("history.back()");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("history.state.n"), serde_json::json!(1.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_sync_ignores_authored_json_serialization() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-json-override");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState({n:1}, '', '#one'); JSON.stringify=()=> '\"forged\"'; Array.prototype.toJSON=()=> 'forged'; })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.url_string(), format!("{url}#one"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_keeps_native_document_position_when_authors_patch_array_map() {
+        let one = "data:text/html,<title>one</title>";
+        let two = "data:text/html,<title>two</title>";
+        let mut page = page_without_chain_limit("history-native-position");
+        page.navigate(one).await.unwrap();
+        page.navigate(two).await.unwrap();
+        page.evaluate("(() => { const map=Array.prototype.map; Array.prototype.map=function(...args){if(this.length===3 && this.every(v=>typeof v==='string' && /^\\d+$/.test(v)))throw new Error('authored map');return Reflect.apply(map,this,args);}; history.pushState(1,'','#one'); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![one.to_string(), two.to_string(), format!("{two}#one")]);
+        assert_eq!(page.history_index, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_metadata_is_bounded_by_entries() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-metadata");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { for(let i=0;i<10000;i++) history.replaceState(i, '', '#'+i); })()");
+        let update = page.js.as_mut().unwrap().take_history_update().unwrap();
+        assert!(matches!(update, HistoryUpdate::Entries { urls, .. }
+            if urls.len() == 1 && urls[0].len() < 512), "one entry must not retain a mutation log");
+        page.evaluate("history.replaceState(null, '', '#last')");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![format!("{url}#last")]);
+        assert_eq!(page.history_index, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_does_not_transfer_unchanged_entries() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-incremental-sync");
+        page.navigate(url).await.unwrap();
+        for index in 0..1000 {
+            page.evaluate(&format!("history.pushState({index}, '', '#{index}')"));
+            page.sync_virtual_url();
+        }
+        page.evaluate("history.replaceState(null, '', '#last')");
+        let update = page.js.as_mut().unwrap().take_history_update().unwrap();
+        assert!(matches!(update, HistoryUpdate::Entries { urls, .. }
+            if urls.len() == 1 && urls[0].len() < 512), "one changed entry must not transfer the unchanged history");
+        page.evaluate("history.replaceState(null, '', '#verified')");
+        page.sync_virtual_url();
+        assert_eq!(page.history.len(), 1001);
+        assert_eq!(page.history[0], url);
+        assert_eq!(page.history[1000], format!("{url}#verified"));
+        page.evaluate("history.go(-500)");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 500);
+        assert_eq!(page.url_string(), format!("{url}#499"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_keeps_only_surviving_batched_changes() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-batched-changes");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState(1, '', '#one'); history.pushState(2, '', '#two'); history.pushState(3, '', '#three'); })()");
+        page.sync_virtual_url();
+        page.evaluate("(() => { history.replaceState(4, '', '#discarded'); history.go(-2); history.pushState(5, '', '#last'); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one"), format!("{url}#last")]);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("(() => { history.back(); history.replaceState(6, '', '#changed'); history.forward(); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#changed"), format!("{url}#last")]);
+        assert_eq!(page.history_index, 2);
+        assert_eq!(page.url_string(), format!("{url}#last"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_does_not_commit_a_pending_location_navigation() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-location-preview");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState(1, '', '#one'); location.href='https://example.org/next'; })()");
+        page.sync_history_updates();
+        assert_eq!(page.url_string(), format!("{url}#one"));
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_urls_keep_the_committed_origin_during_pending_navigation() {
+        let mut page = import_map_test_page("history-committed-origin", "http://example.com/current", "<title>history</title>");
+        let result = page.evaluate("(() => { location.href='https://other.example/next'; let error=null; try { history.pushState({}, '', 'https://other.example/spoof'); } catch(e) { error=e.name; } history.pushState({n:1}, '', '/kept'); location.href='https://other.example/again'; history.replaceState({n:2}, ''); return {error,href:location.href,state:history.state}; })()");
+        assert_eq!(result, serde_json::json!({"error":"SecurityError","href":"http://example.com/kept","state":{"n":2}}));
+        page.sync_history_updates();
+        assert_eq!(page.url_string(), "http://example.com/kept");
+        assert!(page.history.iter().all(|url| url.starts_with("http://example.com/")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_rejects_non_url_page_values() {
+        let mut page = page_without_chain_limit("history-url-type");
+        page.navigate("data:text/html,<title>history</title>").await.unwrap();
+        page.evaluate("globalThis.__virtualUrl = new Array(100000)");
+        assert!(matches!(page.js.as_mut().unwrap().take_history_update().unwrap(),
+            HistoryUpdate::Url(url) if url.is_empty()));
+    }
+
     /// Same-document entries sit between the documents: a push drops the
     /// forward documents, and back() past the document's own entries loads
     /// the previous document.
@@ -6106,7 +6872,8 @@ mod tests {
         page.evaluate("history.go(-2)");
         assert!(!page.process_pending_navigation().await.unwrap());
         page.evaluate("history.back()");
-        assert!(!page.process_pending_navigation().await.unwrap());
+        assert!(page.process_pending_navigation().await.unwrap());
+        assert_eq!(page.url_string(), one);
         assert_eq!(page.evaluate("location.hash"), serde_json::json!(""));
     }
 
@@ -7143,6 +7910,171 @@ mod tests {
         }
     }
 
+    async fn spawn_form_target_server() -> (
+        String, tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let sent = sent.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0; 2048];
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        if count == 0 { return; }
+                        request.extend_from_slice(&buffer[..count]);
+                        let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") else { continue };
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                        }).unwrap_or(0);
+                        if request.len() < end + 4 + length { continue; }
+                        sent.send((headers.lines().next().unwrap().to_string(),
+                            String::from_utf8_lossy(&request[end + 4..]).to_string())).unwrap();
+                        break;
+                    }
+                    let body = "<title>Child response</title><p>submitted</p><script>globalThis.formRan=true</script>";
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (base, requests)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_submission_to_named_iframe_keeps_the_top_document() {
+        let (base, mut requests) = spawn_form_target_server().await;
+        for method in ["GET", "POST"] {
+            for dynamic in [false, true] {
+                let frame = if dynamic { "" } else { "<iframe name='sink'></iframe>" };
+                let html = format!("<title>Top document</title>{frame}<form action='/submit' method='{method}' target='sink'><input name='value' value='hello world'></form>");
+                let mut page = import_map_test_page("named-form", &base, &html);
+                page.evaluate_script(&format!(r#"(() => {{
+                    if ({dynamic}) {{ const frame = document.createElement('iframe'); frame.name = 'sink'; document.body.appendChild(frame); }}
+                    document.forms[0].submit(); return true;
+                }})()"#)).unwrap();
+                assert!(!page.has_pending_navigation(), "{method}, dynamic={dynamic}: submission targeted the top document");
+                pump_srcdoc_frames(&mut page).await;
+                let expected = if method == "POST" {
+                    ("POST /submit HTTP/1.1", "value=hello+world")
+                } else {
+                    ("GET /submit?value=hello+world HTTP/1.1", "")
+                };
+                let request = requests.try_recv().expect("form request reached the server");
+                assert_eq!(request, (expected.0.to_string(), expected.1.to_string()));
+                assert_eq!(page.evaluate_script("[document.title, document.querySelector('iframe').contentDocument.title, document.querySelector('iframe').contentWindow.formRan]").unwrap(),
+                    serde_json::json!(["Top document", "Child response", true]));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn named_iframe_form_navigation_preserves_targets_and_origin_checks() {
+        let (base, mut requests) = spawn_form_target_server().await;
+        let (other, mut cross_requests) = spawn_form_target_server().await;
+        let mut page = import_map_test_page("named-form-overrides", &base,
+            "<base target='sink'><title>Top document</title><iframe name='sink' srcdoc='initial'></iframe><form action='/submit' method='POST' target='_self'><input name='x' value='1'><button id='send' formtarget='sink'>Send</button></form>");
+        for _ in 0..2 {
+            page.evaluate_script("document.forms[0].requestSubmit(document.getElementById('send'))").unwrap();
+            assert!(!page.has_pending_navigation());
+            pump_srcdoc_frames(&mut page).await;
+            assert_eq!(requests.try_recv().unwrap(), ("POST /submit HTTP/1.1".into(), "x=1".into()));
+            assert_eq!(page.evaluate_script("document.querySelector('iframe').contentDocument.title").unwrap(),
+                serde_json::json!("Child response"));
+        }
+        page.evaluate_script(&format!("document.forms[0].removeAttribute('target'); document.forms[0].action = '{other}/cross'; document.forms[0].submit()" )).unwrap();
+        assert!(!page.has_pending_navigation());
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(cross_requests.try_recv().unwrap(), ("POST /cross HTTP/1.1".into(), "x=1".into()));
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const frame = document.querySelector('iframe');
+            let readable = false;
+            try { readable = !!frame.contentWindow.document?.body; } catch (_) {}
+            return [document.title, frame.contentDocument === null, readable];
+        })()"#).unwrap(), serde_json::json!(["Top document", true, false]));
+    }
+
+    #[test]
+    fn foreign_iframe_elements_do_not_create_browsing_contexts() {
+        let mut page = import_map_test_page("foreign-frame", "https://parent.test",
+            "<body><svg><iframe id='foreign'></iframe></svg></body>");
+        assert!(!page.js.as_ref().unwrap().has_pending_frame_tasks(), "parser-created SVG iframe");
+        page.evaluate_script(r#"(() => {
+            const root = document.createElement('div');
+            root.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'iframe'));
+            document.body.appendChild(root);
+            root.innerHTML = '<svg><iframe></iframe></svg>';
+            return true;
+        })()"#).unwrap();
+        assert!(!page.js.as_ref().unwrap().has_pending_frame_tasks(), "inserted SVG iframe");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_iframe_load_runs_while_an_unrelated_timer_is_pending() {
+        for inserted in [false, true] {
+            let html = if inserted { "<body></body>" } else {
+                "<body><iframe id='f' onload='globalThis.loads = (globalThis.loads || 0) + 1'></iframe></body>"
+            };
+            let mut page = import_map_test_page("blank-frame-load", "https://parent.test", html);
+            page.set_preload_scripts(vec!["globalThis.eval = () => undefined;".into(),
+            "globalThis.preloadCount = (globalThis.preloadCount || 0) + 1;".into()]);
+            page.evaluate_script(&format!(r#"(() => {{
+                globalThis.loads = globalThis.loads || 0;
+                if ({inserted}) {{
+                    const frame = document.createElement('iframe');
+                    frame.id = 'f'; frame.onload = () => loads++;
+                    document.body.appendChild(frame);
+                }}
+                setTimeout(() => {{}}, 60000);
+                return true;
+            }})()"#)).unwrap();
+            assert_eq!(page.evaluate_script("loads").unwrap().as_f64(), Some(1.0),
+                "initial blank load must fire during insertion, without getters");
+            tokio::time::timeout(std::time::Duration::from_secs(2),
+                page.run_autonomous_event_loop_turn()).await
+                .expect("frame adoption must not wait for an unrelated timer").unwrap();
+            assert_eq!(page.frame_urls(), ["about:blank"]);
+            assert_eq!(page.evaluate_script("[document.getElementById('f').contentDocument.URL, loads]").unwrap(),
+                serde_json::json!(["about:blank", 1]));
+            if inserted {
+                assert_eq!(page.evaluate_script("document.getElementById('f').contentWindow.preloadCount").unwrap().as_f64(),
+                    Some(1.0), "initial-frame preloads run once");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_blank_iframe_load_runs_after_parent_initialization_scripts() {
+        let mut page = import_map_test_page("parser-frame-order", "https://parent.test", "<body></body>");
+        page.set_preload_scripts(vec!["globalThis.preloadMarker = 'ready';".into()]);
+        page.navigate("data:text/html,<body><iframe onload='globalThis.observed = [window.preloadMarker, this.contentWindow.preloadMarker]'></iframe></body>").await.unwrap();
+        assert_eq!(page.evaluate_script("observed").unwrap(), serde_json::json!(["ready", "ready"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_iframe_load_observes_preloads_and_precedes_append_return() {
+        let mut page = import_map_test_page("blank-frame-order", "https://parent.test", "<body></body>");
+        page.set_preload_scripts(vec!["globalThis.preloadCount = (globalThis.preloadCount || 0) + 1;".into()]);
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const events = []; const frame = document.createElement('iframe');
+            frame.onload = () => events.push(['load', frame.contentDocument.readyState, frame.contentWindow.preloadCount]);
+            document.body.appendChild(frame); events.push(['after']);
+            return events;
+        })()"#).unwrap(), serde_json::json!([["load", "complete", 1], ["after"]]));
+        page.set_preload_scripts(vec!["globalThis.preloadCount = 7;".into()]);
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const parent = document.querySelector('iframe').contentDocument;
+            const nested = parent.createElement('iframe'); parent.body.appendChild(nested);
+            return nested.contentWindow.preloadCount;
+        })()"#).unwrap().as_f64(), Some(7.0), "existing parent frames see updated initialization scripts");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn iframe_srcdoc_loads_parser_and_inserted_documents_in_their_own_realms() {
         let mut page = import_map_test_page("srcdoc", "https://parent.test",
@@ -7172,6 +8104,99 @@ mod tests {
             "https://assets.test/dir/", "https://assets.test/dir/next", "parent", "undefined",
             [["about:srcdoc", "yes", 42]], true, "CSS1Compat"]));
         assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
+    }
+
+    /// A child realm's node ids index its own document. Native ops that
+    /// resolved the page's document instead left a frame's `<img>` without a
+    /// load or error event, returned a null 2D context for a frame's canvas,
+    /// and silently dropped every script that frame code inserted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_realm_node_ops_resolve_the_frame_document() {
+        let mut page = import_map_test_page("frame-node-ops", "https://parent.test",
+            "<body><p>parent</p></body>");
+        page.evaluate_script(r#"(() => {
+            const frame = document.createElement('iframe'); frame.id = 'child';
+            frame.srcdoc = `<body><script>
+                globalThis.results = {};
+                const ctx = document.createElement('canvas').getContext('2d');
+                results.canvas = ctx ? 'context' : 'null';
+                const inserted = document.createElement('script');
+                inserted.textContent = 'results.script = "ran"';
+                document.head.appendChild(inserted);
+                const image = new Image();
+                image.onload = () => { results.image = 'load'; };
+                image.onerror = () => { results.image = 'error'; };
+                image.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+            <\/script></body>`;
+            document.body.appendChild(frame);
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        let mut value = serde_json::Value::Null;
+        for _ in 0..20 {
+            value = page.evaluate_script(
+                "JSON.stringify(document.getElementById('child').contentWindow.results)").unwrap();
+            if value.as_str().is_some_and(|json| json.contains("image")) { break; }
+            page.js.as_mut().unwrap().run_event_loop_bounded(20).await.unwrap();
+        }
+        let results: serde_json::Value = serde_json::from_str(value.as_str().unwrap()).unwrap();
+        assert_eq!(results, serde_json::json!({"canvas": "context", "script": "ran", "image": "load"}));
+    }
+
+    /// A page script can call a frame's own Location methods (lazy-load
+    /// scripts do `iframe.contentWindow.location.replace(src)`). The running
+    /// context is then the page's, so the navigation was queued on the top
+    /// document, which loaded the iframe's URL in place of its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_location_navigation_loads_the_child_and_ignores_detached_windows() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];socket.read(&mut request).unwrap();
+            let body = "<!doctype html><title>Child after</title><p>after</p>";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let mut page = import_map_test_page("frame-location-commit", &base,
+            "<title>Parent</title><iframe srcdoc='<p>before</p>'></iframe>");
+        pump_srcdoc_frames(&mut page).await;
+        page.evaluate_script(&format!("document.querySelector('iframe').contentWindow.location.replace({});1",serde_json::to_string(&format!("{base}/after")).unwrap())).unwrap();
+        assert!(!page.has_pending_navigation());
+        for _ in 0..20 {
+            page.advance_frames().await;
+            if let Some(js)=page.js.as_mut() {js.run_event_loop_bounded(20).await.unwrap();}
+            if page.frame_urls().iter().any(|url|url.ends_with("/after")) { break; }
+        }
+        assert_eq!(page.frame_urls(),vec![format!("{base}/after")]);
+        assert_eq!(page.evaluate_in_frame(0,"document.body.textContent").unwrap(),serde_json::json!("after"));
+        assert_eq!(page.evaluate_script("document.title").unwrap(),serde_json::json!("Parent"));
+        page.evaluate_script("globalThis.stale=document.querySelector('iframe').contentWindow;document.querySelector('iframe').remove();1").unwrap();
+        page.advance_frames().await;
+        page.evaluate_script("stale.location.assign('https://other.test/');1").unwrap();
+        assert!(!page.has_pending_navigation(),"a discarded child cannot navigate the top document");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigating_a_frame_from_the_page_keeps_the_top_document() {
+        let mut page = import_map_test_page("frame-location-from-page", "https://parent.test",
+            "<title>Top document</title><body><iframe srcdoc='<form id=f action=/x></form>'></iframe></body>");
+        pump_srcdoc_frames(&mut page).await;
+        for call in [
+            "location.replace('https://embed.test/video')",
+            "location.assign('https://embed.test/video')",
+            "location.href = 'https://embed.test/video'",
+            "location.reload()",
+            "document.getElementById('f').submit()",
+        ] {
+            page.evaluate_script(&format!("document.querySelector('iframe').contentWindow.{call}; 1")).unwrap();
+            assert!(!page.has_pending_navigation(), "{call} queued a navigation on the top document");
+        }
+        assert_eq!(page.evaluate_script("[location.href, document.title]").unwrap(),
+            serde_json::json!(["https://parent.test/app/index.html", "Top document"]));
+        // The top document still navigates itself.
+        page.evaluate_script("location.href = 'https://other.test/'; 1").unwrap();
+        assert!(page.has_pending_navigation());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7393,6 +8418,62 @@ mod tests {
             &format!("() => {script}"), None, &[], true, true, 2_000,
         ).await.unwrap();
         assert_eq!(called.value.unwrap(), serde_json::json!(["function", true]));
+    }
+
+    // Anti-bot scripts walk `parent` from a frame's window until they reach
+    // their own; a chain that never gets there hangs the page for good.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loaded_frame_parent_chain_reaches_the_page() {
+        let (base, _, _) = spawn_slow_frame_script_server().await;
+        let mut page = import_map_test_page("frame-parent", &base, "<html><body></body></html>");
+        let script = "new Promise(resolve => { const frame = document.createElement('iframe'); \
+            frame.onload = () => { const w = frame.contentWindow; \
+                resolve([w.parent === window, w.top === window, \
+                    w.parent.parent === window]); }; \
+            frame.src = '/child.html'; document.body.appendChild(frame); })";
+        let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
+        assert_eq!(evaluated.value.unwrap(), serde_json::json!([true, true, true]));
+    }
+
+    // Issue #1490: cross-origin child frame sees parent.frames.length,
+    // parent.length, indexed access to self/siblings, and named access to siblings.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_child_frame_sees_parent_frames_and_named_siblings() {
+        let (base, _, _) = spawn_slow_frame_script_server().await;
+        let mut page = import_map_test_page(
+            "cross-origin-frames",
+            &base,
+            "<html><body>\
+                <iframe name=\"a\" src=\"/child.html?a\"></iframe>\
+                <iframe name=\"b\" src=\"/child.html?b\"></iframe>\
+            </body></html>",
+        );
+        let script = "new Promise(resolve => {\
+            const iframes = document.querySelectorAll('iframe');\
+            let loaded = 0;\
+            const onLoaded = () => {\
+                if (++loaded === 2) {\
+                    const a = iframes[0].contentWindow;\
+                    const b = iframes[1].contentWindow;\
+                    resolve([\
+                        a.parent.frames.length,\
+                        a.parent.length,\
+                        a.parent.frames[0] === a,\
+                        a.parent.frames[1] === a,\
+                        typeof a.parent.frames.b,\
+                        b.parent.frames.length,\
+                        b.parent.frames[1] === b,\
+                        b.parent.frames.b === b,\
+                    ]);\
+                }\
+            };\
+            iframes[0].onload = onLoaded;\
+            iframes[1].onload = onLoaded;\
+        })";
+        let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
+        assert_eq!(evaluated.value.unwrap(), serde_json::json!([
+            2, 2, true, false, "object", 2, true, true
+        ]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7961,6 +9042,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value, Some(serde_json::json!(2.0)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nomodule_classic_scripts_do_not_run() {
+        let mut page = import_map_test_page(
+            "nomodule",
+            "http://127.0.0.1:9",
+            r#"<html><head>
+                <script>globalThis.__ran = ['classic'];</script>
+                <script nomodule>globalThis.__ran.push('nomodule-inline');</script>
+                <script type="module">globalThis.__ran.push('module');</script>
+                <script nomodule type="text/javascript">globalThis.__ran.push('nomodule-typed');</script>
+                <script>
+                  const dynamic = document.createElement('script');
+                  dynamic.setAttribute('nomodule', '');
+                  dynamic.textContent = "globalThis.__ran.push('nomodule-dynamic')";
+                  document.head.appendChild(dynamic);
+                  const plain = document.createElement('script');
+                  plain.textContent = "globalThis.__ran.push('dynamic')";
+                  document.head.appendChild(plain);
+                </script>
+            </head><body></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(None).await;
+        let ran = page.js.as_mut().unwrap().evaluate("globalThis.__ran").unwrap();
+        assert_eq!(ran, serde_json::json!(["classic", "dynamic", "module"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_xmlns_attribute_has_no_prefix() {
+        let mut page = import_map_test_page(
+            "xmlns",
+            "http://127.0.0.1:9",
+            r#"<html><body><div id=w><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg></div></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(None).await;
+        let result = page.js.as_mut().unwrap().evaluate(r#"(() => {
+            const attr = document.querySelector('svg').attributes[0];
+            return [attr.name, attr.localName, attr.prefix, attr.namespaceURI,
+                document.getElementById('w').innerHTML,
+                document.querySelector('svg').getAttribute('xmlns')];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "xmlns", "xmlns", null, "http://www.w3.org/2000/xmlns/",
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>"#,
+            "http://www.w3.org/2000/svg"
+        ]));
     }
 
     fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
@@ -10357,6 +11485,18 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn parse_import_url_accepts_non_ascii_without_url_function() {
+        // A statement whose fourth byte falls inside a multi-byte character
+        // must not be sliced there.
+        assert_eq!(
+            parse_import_url(" \"Guía.css\""),
+            Some(StylesheetImport { url: "Guía.css".to_string(), media: None })
+        );
+        assert_eq!(parse_import_url("aí;"), None);
+        assert_eq!(parse_import_url("é"), None);
     }
 
     #[test]

@@ -47,6 +47,22 @@ The format is stable. Inspect with `jq`:
 jq '.[] | select(.domain == "example.com")' ./obscura-data/cookies.json
 ```
 
+## Keep the profile private
+
+`cookies.json` holds live session tokens in plaintext. For a logged-in site the
+cookie value is the login, so anyone who can read the file can act as you.
+Treat the profile directory like a credential store: keep it out of version
+control, backups you share and container images.
+
+On unix, a directory Obscura creates to save into is owner-only (0700) and
+`cookies.json` is written with mode 0600. A directory that already exists keeps
+its mode. On Windows a new directory inherits the permissions of its parent, so
+keep the profile somewhere only your user can read, such as your home folder.
+
+If the cookies cannot be saved (for example the directory cannot be created),
+Obscura logs an error saying they will not be persisted. `--quiet` turns the log
+off, so check that `cookies.json` appears when persistence matters.
+
 ## When state is written
 
 - After every navigation completes (CDP `Page.navigate`, MCP `browser_navigate`),
