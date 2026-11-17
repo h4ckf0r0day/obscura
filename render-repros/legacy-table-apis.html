@@ -16,6 +16,12 @@ tfoot { background: #eee; }
   <tbody><tr><td>First</td><td>1</td></tr></tbody>
 </table>
 <p id="result">RUNNING</p>
+<table id="spans">
+  <thead><tr><th>A</th><th>B</th><th>C</th></tr></thead>
+  <tbody><tr><td id="empty">No records found</td></tr>
+    <tr><td id="tall">Two rows</td><td>First</td><td>Third</td></tr>
+    <tr><td>Second</td><td>Last</td></tr></tbody>
+</table>
 <script>
 const table = document.getElementById('t');
 const select = document.getElementById('s');
@@ -33,4 +39,6 @@ const values = [select.length, select[select.selectedIndex].value,
   row.cells[1].cellIndex, table.tBodies.length, body.rows.length];
 document.getElementById('result').textContent = 'Result: ' + values.join(',');
 document.documentElement.dataset.legacyTableResult = JSON.stringify(values);
+document.getElementById('empty').colSpan = 3;
+document.getElementById('tall').rowSpan = 2;
 </script>

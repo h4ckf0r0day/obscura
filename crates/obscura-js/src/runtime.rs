@@ -5691,6 +5691,97 @@ mod tests {
     }
 
     #[test]
+    fn table_cell_colspan_and_rowspan_reflect_through_the_idl_surface() {
+        let mut rt = setup_runtime(r#"<table><tbody>
+            <tr><td id="plain">a</td><td id="markup" colspan="4" rowspan="2">b</td></tr>
+            <tr><td id="invalid" colspan="abc">c</td><th id="setter">d</th></tr>
+        </tbody></table>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('setter');
+            cell.colSpan = 5; cell.rowSpan = 2;
+            const plain = document.getElementById('plain'), markup = document.getElementById('markup');
+            return [plain.colSpan, plain.rowSpan, plain.getAttribute('colspan'),
+                markup.colSpan, markup.rowSpan, document.getElementById('invalid').colSpan,
+                cell.colSpan, cell.rowSpan, cell.getAttribute('colspan'), cell.getAttribute('rowspan')];
+        })()"#).unwrap(), serde_json::json!([1,1,null,4,2,1,5,2,"5","2"]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('setter');
+            const read = ['0', '-1', '-0', '+2', '\v2', '1001', '65535', '999999999999999999999999999999999999'];
+            return read.map(value => {
+                cell.setAttribute('colspan', value); cell.setAttribute('rowspan', value);
+                return [cell.colSpan, cell.rowSpan];
+            });
+        })()"#).unwrap(), serde_json::json!([[1,0],[1,1],[1,0],[2,2],[1,1],[1000,1001],[1000,65534],[1000,65534]]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('setter'); cell.setAttribute('rowspan', '-0');
+            return Object.is(cell.rowSpan, -0);
+        })()"#).unwrap(), serde_json::json!(false));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('setter');
+            return [0, -1, 2.9, 1001, 65535, 2147483647, 2147483648, 4294967296, NaN, Infinity].map(value => {
+                cell.colSpan = value; cell.rowSpan = value;
+                return [cell.colSpan, cell.rowSpan, cell.getAttribute('colspan'), cell.getAttribute('rowspan')];
+            });
+        })()"#).unwrap(), serde_json::json!([[1,0,"0","0"],[1,1,"1","1"],[2,2,"2","2"],
+            [1000,1001,"1001","1001"],[1000,65534,"65535","65535"],
+            [1000,65534,"2147483647","2147483647"],[1,1,"1","1"],[1,0,"0","0"],[1,0,"0","0"],[1,0,"0","0"]]));
+    }
+
+    #[test]
+    fn table_cell_spans_keep_brands_and_borrowed_child_realm_accessors() {
+        let mut rt = setup_runtime("<table><tr><td>Parent</td></tr></table><div id='other'></div>");
+        let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<table><tr><th>Child</th></tr></table>").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const cell = child.querySelector('th');
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLTableCellElement.prototype, 'colSpan');
+            descriptor.set.call(cell, 3);
+            const errors = [];
+            for (const action of [() => descriptor.get.call(document.getElementById('other')),
+                () => descriptor.set.call({}, 2), () => { cell.rowSpan = 1n; }, () => { cell.colSpan = Symbol(); }]) {
+                try { action(); errors.push(false); } catch (error) { errors.push(error.name === 'TypeError'); }
+            }
+            return [descriptor.get.call(cell), cell.getAttribute('colspan'),
+                'colSpan' in document.getElementById('other'), Object.hasOwn(Element.prototype, 'rowSpan'), errors];
+        })()"#).unwrap(), serde_json::json!([3,"3",false,false,[true,true,true,true]]));
+    }
+
+    #[test]
+    fn table_cell_spans_bypass_overridden_attribute_methods() {
+        let mut rt = setup_runtime("<table><tr><td colspan='4' rowspan='2'></td></tr></table>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.querySelector('td');
+            const getAttribute = Element.prototype.getAttribute;
+            cell.getAttribute = () => '9';
+            cell.setAttribute = () => { throw new Error('overridden'); };
+            const before = [cell.colSpan, cell.rowSpan];
+            cell.colSpan = 3; cell.rowSpan = 0;
+            const own = [cell.colSpan, cell.rowSpan, getAttribute.call(cell, 'colspan'), getAttribute.call(cell, 'rowspan')];
+            delete cell.getAttribute; delete cell.setAttribute;
+            Element.prototype.getAttribute = () => '8';
+            Element.prototype.setAttribute = () => { throw new Error('prototype overridden'); };
+            cell.colSpan = 2; cell.rowSpan = 3;
+            return [before, own, cell.colSpan, cell.rowSpan,
+                getAttribute.call(cell, 'colspan'), getAttribute.call(cell, 'rowspan')];
+        })()"#).unwrap(), serde_json::json!([[4,2],[3,0,"3","0"],2,3,"2","3"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn table_cell_span_assignment_updates_layout() {
+        let mut rt = setup_runtime(r#"<table id="table" style="width:600px;table-layout:fixed;border-collapse:collapse">
+            <thead><tr><th>A</th><th>B</th><th>C</th></tr></thead>
+            <tbody><tr><td id="empty">No records found</td></tr></tbody></table>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('empty');
+            const before = cell.getBoundingClientRect().width;
+            cell.colSpan = 3;
+            return [before, cell.getBoundingClientRect().width, document.getElementById('table').getBoundingClientRect().width];
+        })()"#).unwrap(), serde_json::json!([200,600,600]));
+    }
+
+    #[test]
     fn native_select_factory_preserves_child_clones_and_custom_upgrade_identity() {
         let mut rt = setup_runtime("<html><body><select id='custom' is='native-select'><option value='a'>A</option></select></body></html>");
         let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,

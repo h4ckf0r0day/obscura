@@ -15469,6 +15469,37 @@ _defineTableGetter('HTMLTableRowElement', 'cells', 'table_row_cells', true);
 _defineTableGetter('HTMLTableRowElement', 'rowIndex', 'table_row_index');
 _defineTableGetter('HTMLTableRowElement', 'sectionRowIndex', 'table_section_row_index');
 _defineTableGetter('HTMLTableCellElement', 'cellIndex', 'table_cell_index');
+const _tableAttributeGet = Element.prototype.getAttribute;
+const _tableAttributeSet = Element.prototype.setAttribute;
+function _defineTableSpan(member, attr, minimum, maximum) {
+  const getter = function () {
+    const foreign = _tableMemberReceiver(this, 'HTMLTableCellElement', member, 'get');
+    if (foreign) return foreign.call(this);
+    if (_tableMemberValue(this, 'table_interface') !== 'HTMLTableCellElement') throw new TypeError('Illegal invocation');
+    const parsed = /^[ \t\n\f\r]*([+-]?[0-9]+)/.exec(_tableAttributeGet.call(this, attr) || '');
+    if (!parsed) return 1;
+    const value = +parsed[1];
+    return value < 0 ? 1 : value <= minimum ? minimum : value > maximum ? maximum : value;
+  };
+  const setter = function (value) {
+    const foreign = _tableMemberReceiver(this, 'HTMLTableCellElement', member, 'set');
+    if (foreign) return foreign.call(this, value);
+    if (_tableMemberValue(this, 'table_interface') !== 'HTMLTableCellElement') throw new TypeError('Illegal invocation');
+    // Reflection stores the unsigned value; only the getter applies span limits.
+    const number = value >>> 0;
+    _tableAttributeSet.call(this, attr, String(number <= 2147483647 ? number : 1));
+  };
+  for (const [accessor, implementation] of [['get', getter], ['set', setter]]) {
+    Object.defineProperty(implementation, 'name', {value: accessor + ' ' + member, configurable: true});
+    _markNative(implementation);
+    _tableRealmMembers['HTMLTableCellElement.' + member + '.' + accessor] = implementation;
+  }
+  Object.defineProperty(HTMLTableCellElement.prototype, member, {
+    get: getter, set: setter, enumerable: true, configurable: true,
+  });
+}
+_defineTableSpan('colSpan', 'colspan', 1, 1000);
+_defineTableSpan('rowSpan', 'rowspan', 0, 65534);
 function _defineTableMethod(iface, member, implementation) {
   const method = function (...args) {
     const foreign = _tableMemberReceiver(this, iface, member);
