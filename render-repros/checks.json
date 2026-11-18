@@ -442,6 +442,9 @@
     {"name": "system-ui 700 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 180, "width": 83, "height": 24},
     {"name": "system-ui 700 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 180, "width": 83, "height": 24},
     {"name": "MissingFont, Arial 400 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 220, "width": 76, "height": 24},
-    {"name": "MissingFont, Arial 400 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 220, "width": 76, "height": 24}
+    {"name": "MissingFont, Arial 400 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 220, "width": 76, "height": 24},
+    {"name": "short input keeps its border box around clipped text", "color": "#a61e4d", "x": 20, "y": 280, "width": 102, "height": 30},
+    {"name": "short placeholder keeps its border box around clipped text", "color": "#5f3dc4", "x": 200, "y": 280, "width": 102, "height": 30},
+    {"name": "short textarea keeps its border box around clipped text", "color": "#e8590c", "x": 380, "y": 280, "width": 102, "height": 30}
   ]
 }

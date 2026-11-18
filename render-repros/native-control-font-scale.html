@@ -8,6 +8,11 @@ body { margin: 0; background: white }
   height: 24px; padding: 0; border: 0; white-space: nowrap }
 span { left: 20px; background: #087f5b }
 button { left: 200px; background: #1971c2 }
+input, textarea { position: absolute; top: 280px; box-sizing: content-box;
+  width: 80px; height: 8px; padding: 8px; border: 3px solid #a61e4d;
+  font: 32px Arial; line-height: 8px; color: blue; background: #eee;
+  white-space: pre; overflow: visible; resize: none }
+input::placeholder, textarea::placeholder { color: blue; opacity: 1 }
 </style>
 <div class=row style="top:20px;font-family:Arial;font-weight:400"><span>abcdefghij</span><button>abcdefghij</button></div>
 <div class=row style="top:60px;font-family:Arial;font-weight:400"><span>AVATAR Toffee</span><button>AVATAR Toffee</button></div>
@@ -15,3 +20,6 @@ button { left: 200px; background: #1971c2 }
 <div class=row style="top:140px;font-family:Courier New;font-weight:700"><span>abcdefghij</span><button>abcdefghij</button></div>
 <div class=row style="top:180px;font-family:system-ui;font-weight:700"><span>abcdefghij</span><button>abcdefghij</button></div>
 <div class=row style="top:220px;font-family:MissingFont, Arial;font-weight:400"><span>café Ωmega</span><button>café Ωmega</button></div>
+<input style="left:20px" value="abcdefghijabcdefghij">
+<input style="left:200px;border-color:#5f3dc4" placeholder="abcdefghijabcdefghij">
+<textarea style="left:380px;border-color:#e8590c" placeholder="abcdefghijabcdefghij" wrap=off></textarea>

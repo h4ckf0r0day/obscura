@@ -5678,6 +5678,30 @@ fn paint_laid_dom_scrolled(
                 .or_else(|| node.get_attribute("value"));
             let has_value = value.is_some_and(|v| !v.is_empty())
                 || (name.local.as_ref() == "textarea" && !tree.text_content(nid).is_empty());
+            let single_line = name.local.as_ref() == "input";
+            let text_x = rect.x + style.padding.left + style.border.left;
+            // Single-line editors clip horizontally to the content box, but
+            // glyph ink may use the vertical padding. Textareas use the
+            // padding box on both axes. Preserve the ancestor overflow clip.
+            let text_clip = crate::Rect {
+                x: rect.x + style.border.left + if single_line { style.padding.left } else { 0.0 },
+                y: rect.y + style.border.top,
+                width: (rect.width - style.border.left - style.border.right
+                    - if single_line { style.padding.left + style.padding.right } else { 0.0 }).max(0.0),
+                height: (rect.height - style.border.top - style.border.bottom).max(0.0),
+            }.intersect(&visible_rect).unwrap_or_default();
+            let text_y = |size| {
+                let font = FontRef::try_from_slice(crate::inline::bundled_font_bytes(
+                    style.font_family.as_deref(), crate::style::used_font_weight(style) >= 600)).unwrap();
+                let font_height = font.as_scaled(native_font_scale(&font, size)).height();
+                let line_height = if single_line {
+                    (rect.height - style.border.top - style.border.bottom
+                        - style.padding.top - style.padding.bottom).max(0.0)
+                } else {
+                    crate::inline::used_line_height(style)
+                };
+                rect.y + style.border.top + style.padding.top + (line_height - font_height) / 2.0
+            };
             // A text `<input>`'s value is not a DOM text node either, so it
             // needs painting from its live state, falling back to the attribute.
             // Without this the
@@ -5689,8 +5713,6 @@ fn paint_laid_dom_scrolled(
                 if let Some(value) = value {
                     if !value.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
-                        let text_x = rect.x + style.padding.left + style.border.left;
-                        let text_y = rect.y + style.padding.top + style.border.top;
                         let color = style.color.unwrap_or([0, 0, 0, 255]);
                         let masked;
                         let shown = if input_type
@@ -5706,14 +5728,14 @@ fn paint_laid_dom_scrolled(
                                 &mut pixmap,
                                 shown,
                                 text_x,
-                                text_y,
+                                text_y(fsize),
                                 color,
                                 fsize,
                                 crate::style::used_font_weight(style) >= 600,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
                                 style.word_spacing.unwrap_or(0.0),
-                                clip,
+                                Some(text_clip),
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -5725,8 +5747,6 @@ fn paint_laid_dom_scrolled(
                 if let Some(placeholder) = node.get_attribute("placeholder") {
                     if !placeholder.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
-                        let text_x = rect.x + style.padding.left + style.border.left;
-                        let text_y = rect.y + style.padding.top + style.border.top;
                         let placeholder_style = style.placeholder_pseudo.as_deref();
                         let mut color = placeholder_style
                             .and_then(|pseudo| pseudo.color)
@@ -5741,14 +5761,14 @@ fn paint_laid_dom_scrolled(
                                 &mut pixmap,
                                 placeholder,
                                 text_x,
-                                text_y,
+                                text_y(fsize),
                                 color,
                                 fsize,
                                 crate::style::used_font_weight(style) >= 600,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
                                 style.word_spacing.unwrap_or(0.0),
-                                clip,
+                                Some(text_clip),
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -17602,6 +17622,75 @@ mod tests {
                 let native = bounds(true);
                 assert!((reference.0 - native.0).abs() <= 2 && (reference.1 - native.1).abs() <= 2,
                     "{family}, weight={weight}, {control}: inline={reference:?}, native={native:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_input_text_respects_its_box_and_ancestor_clip() {
+        for control in [
+            "<input id=control value=abcdefghijabcdefghij>",
+            "<input id=control placeholder=abcdefghijabcdefghij>",
+            "<textarea id=control placeholder=abcdefghijabcdefghij wrap=off></textarea>",
+        ] {
+            for height in [8.0, 40.0] {
+                for clipped in [false, true] {
+                    let overflow = if clipped { "hidden" } else { "visible" };
+                    let tree = parse_html(&format!(r#"<style>
+                        body{{margin:0;background:white}}
+                        #parent{{position:absolute;left:20px;top:20px;width:60px;height:40px;overflow:{overflow}}}
+                        #control{{position:absolute;left:10px;top:6px;box-sizing:content-box;
+                        width:80px;height:{height}px;padding:8px;border:3px solid red;
+                        font:32px Arial;line-height:{height}px;color:blue;background:white;
+                        white-space:pre;overflow:visible;resize:none}}
+                        #control::placeholder{{color:blue;opacity:1}}
+                        </style><div id=parent>{control}</div>"#));
+                    let mut resources = RenderResourceCache::with_loader(|_: &str| None);
+                    let mut prepared = prepare_dom(&tree, (220.0, 140.0), None, &mut resources).unwrap();
+                    let rect = prepared.document_rect(tree.get_element_by_id("control").unwrap()).unwrap();
+                    // Chrome clips single-line text to the content width but
+                    // allows ink into vertical padding. A textarea clips to its
+                    // padding box on both axes.
+                    let textarea = control.starts_with("<textarea");
+                    let mut allowed = crate::Rect {
+                        x: rect.x + if textarea { 3.0 } else { 11.0 },
+                        y: rect.y + 3.0,
+                        width: rect.width - if textarea { 6.0 } else { 22.0 },
+                        height: rect.height - 6.0,
+                    };
+                    if clipped {
+                        let parent = prepared.document_rect(tree.get_element_by_id("parent").unwrap()).unwrap();
+                        allowed = allowed.intersect(&parent).unwrap();
+                    }
+                    let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+                    for scale in [1.0, 2.0] {
+                        let pixmap = paint_prepared_region_with_scroll(&tree, &mut prepared,
+                            &mut resources, &scroll, CaptureRegion::new(0.0, 0.0, 220.0, 140.0, scale)).unwrap();
+                        let mut count = 0;
+                        let mut min_y = u32::MAX;
+                        let mut max_y = 0;
+                        for y in 0..pixmap.height() {
+                            for x in 0..pixmap.width() {
+                                let p = pixmap.pixel(x, y).unwrap();
+                                if p.blue() > 200 && p.red() < 50 && p.green() < 50 {
+                                    let cx = (x as f32 + 0.5) / scale;
+                                    let cy = (y as f32 + 0.5) / scale;
+                                    assert!(cx >= allowed.x && cx < allowed.x + allowed.width
+                                        && cy >= allowed.y && cy < allowed.y + allowed.height,
+                                        "text outside clip: {control}, height={height}, clipped={clipped}, scale={scale}, ({cx},{cy}), {allowed:?}");
+                                    count += 1;
+                                    min_y = min_y.min(y);
+                                    max_y = max_y.max(y);
+                                }
+                            }
+                        }
+                        assert!(count > 30, "clipping must leave visible text: {control}, height={height}, clipped={clipped}, scale={scale}");
+                        if !clipped && height == 8.0 {
+                            assert!((max_y - min_y + 1) as f32 / scale >= 20.0,
+                                "short controls must retain the centered glyph ink visible in Chrome: {control}, scale={scale}");
+                        }
+                    }
+                }
             }
         }
     }
