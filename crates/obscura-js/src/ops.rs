@@ -10136,12 +10136,19 @@ fn op_computed_style(
         return String::new();
     };
     let custom = prepared.computed_custom_properties(nid).unwrap_or_default();
-    let mut object = serde_json::Map::with_capacity(snapshot.len() + custom.len());
+    let mut object = serde_json::Map::with_capacity(snapshot.len() + custom.len() + 4);
     for (name, value) in snapshot {
         object.insert(name.to_string(), serde_json::Value::String(value));
     }
     for (name, value) in custom {
         object.insert(name, serde_json::Value::String(value));
+    }
+    if let (Some(prepared), Some(dom)) = (gs.prepared_render.as_ref(), gs.dom.as_ref()) {
+        if let Some(insets) = prepared.resolved_insets(dom, nid) {
+            for (name, value) in ["top", "right", "bottom", "left"].into_iter().zip(insets) {
+                object.insert(name.to_string(), serde_json::Value::String(value));
+            }
+        }
     }
     serde_json::json!([true, object]).to_string()
 }

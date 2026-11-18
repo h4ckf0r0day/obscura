@@ -10256,10 +10256,6 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
           return r.width != null ? `${r.width}px` : null;
         case 'height': case 'block-size':
           return r.height != null ? `${r.height}px` : null;
-        case 'left': return r.left != null ? `${r.left}px` : null;
-        case 'top': return r.top != null ? `${r.top}px` : null;
-        case 'right': return r.right != null ? `${r.right}px` : null;
-        case 'bottom': return r.bottom != null ? `${r.bottom}px` : null;
         case 'client-width': case 'offset-width':
           return r.width != null ? `${r.width}px` : null;
         case 'client-height': case 'offset-height':
@@ -10272,6 +10268,7 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   const defaultsKebab = {
     display: 'block', visibility: 'visible', opacity: '1',
     position: 'static', overflow: 'visible',
+    top: 'auto', right: 'auto', bottom: 'auto', left: 'auto',
     transform: 'none', 'transform-origin': '0px 0px',
     transition: 'none', animation: 'none',
     float: 'none', clear: 'none',

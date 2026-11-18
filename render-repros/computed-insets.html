@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Computed insets</title>
+<style>
+body { margin:0 }
+#parent { position:absolute; left:20px; top:100px; width:400px; height:200px; padding:10px; border:4px solid #343a40 }
+.probe { width:40px; height:20px }
+#plain { background:#868e96 }
+#authored { top:5px; left:10%; background:#adb5bd }
+#relative { position:relative; top:5px; left:7px; background:#f08c00 }
+#scrollport { position:absolute; left:500px; top:100px; width:300px; height:100px; padding:10px; border:2px solid #343a40; overflow:auto }
+#nested { position:sticky; top:10%; left:10% }
+#absolute { position:absolute; top:80px; left:212px; background:#1971c2 }
+</style>
+<div id="parent">
+  <div id="plain" class="probe"></div>
+  <div id="authored" class="probe"></div>
+  <div id="relative" class="probe"></div>
+  <div id="absolute" class="probe"></div>
+</div>
+<div id="scrollport"><div id="nested" class="probe"></div><div style="height:400px"></div></div>
+<script>
+(() => {
+  const cases = [
+    ['plain', ['auto','auto','auto','auto'], '#2f9e44'],
+    ['authored', ['5px','auto','auto','10%'], '#099268'],
+    ['relative', ['5px','-7px','-5px','7px'], '#0ca678'],
+    ['absolute', ['80px','168px','120px','212px'], '#12b886'],
+    ['nested', ['10px','auto','auto','30px'], '#20c997']
+  ];
+  cases.forEach(([id, expected, color], index) => {
+    const style = getComputedStyle(document.getElementById(id));
+    const actual = [style.top, style.right, style.bottom, style.left];
+    const marker = document.createElement('div');
+    const passed = actual.every((value, side) => value === expected[side]);
+    marker.style.cssText = `position:absolute;left:${20 + index * 60}px;top:20px;width:40px;height:20px;background:${passed ? color : '#e03131'}`;
+    document.body.appendChild(marker);
+  });
+})();
+</script>

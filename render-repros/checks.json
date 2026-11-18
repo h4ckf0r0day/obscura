@@ -438,6 +438,17 @@
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},
     {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110}
   ],
+  "computed-insets": [
+    {"name": "static insets default to auto", "color": "#2f9e44", "x": 20, "y": 20, "width": 40, "height": 20},
+    {"name": "static authored insets keep computed values", "color": "#099268", "x": 80, "y": 20, "width": 40, "height": 20},
+    {"name": "relative auto sides resolve opposite offsets", "color": "#0ca678", "x": 140, "y": 20, "width": 40, "height": 20},
+    {"name": "absolute insets use containing block distances", "color": "#12b886", "x": 200, "y": 20, "width": 40, "height": 20},
+    {"name": "sticky percentages use scroll container content axes", "color": "#20c997", "x": 260, "y": 20, "width": 40, "height": 20},
+    {"name": "static geometry stays in normal flow", "color": "#868e96", "x": 34, "y": 114, "width": 40, "height": 20},
+    {"name": "static authored insets preserve geometry", "color": "#adb5bd", "x": 34, "y": 134, "width": 40, "height": 20},
+    {"name": "relative geometry includes its offset", "color": "#f08c00", "x": 41, "y": 159, "width": 40, "height": 20},
+    {"name": "absolute geometry uses the padding box", "color": "#1971c2", "x": 236, "y": 184, "width": 40, "height": 20}
+  ],
   "native-control-font-scale": [
     {"name": "Arial 400 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 20, "width": 64, "height": 24},
     {"name": "Arial 400 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 20, "width": 64, "height": 24},

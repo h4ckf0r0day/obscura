@@ -2009,6 +2009,132 @@ impl PreparedRender {
         Some(non_geometric_computed_style(self.layout.styles.get(&id)?))
     }
 
+    /// CSSOM insets use containing-block distances, before transforms and
+    /// scrolling. Keep this separate from size/observer snapshots, which do
+    /// not need to find a positioned element's containing block.
+    pub fn resolved_insets(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<[String; 4]> {
+        let style = self.layout.styles.get(&id)?;
+        let computed = std::array::from_fn(|index| {
+            style.inset_expressions[index].as_ref().filter(|value| value.contains('%'))
+                .cloned().unwrap_or_else(|| {
+                dimension_css(style.inset[index].unwrap_or_default(), "auto")
+            })
+        });
+        let rect = self.layout.rects.get(&id);
+        if style.position.is_none() || style.display == crate::Display::None
+            || style.display_contents || rect.is_none()
+        {
+            return Some(computed);
+        }
+        let rect = rect.unwrap();
+        let absolute = style.position == Some(taffy::Position::Absolute);
+        let inline = style.ignores_used_box_sizes();
+        let percentage: [bool; 4] = std::array::from_fn(|index| {
+            matches!(style.inset[index], Some(crate::Dimension::Percent(_)))
+                || style.inset_expressions[index].as_ref().is_some_and(|value| value.contains('%'))
+        });
+        let mut containing = crate::Rect {
+            x: 0.0, y: 0.0, width: self.viewport.0, height: self.viewport.1,
+        };
+        let needs_containing = (!inline && percentage.iter().any(|value| *value))
+            || (absolute && style.inset.iter()
+                .any(|value| matches!(value, None | Some(crate::Dimension::Auto))));
+        let sticky_container = style.position_sticky.then(|| {
+            self.scroll_tree.movement_owner.get(id.index()).copied().flatten()
+                .map(|owner| &self.scroll_tree.containers[owner.index()])
+        }).flatten();
+        if needs_containing {
+            if let Some(container) = sticky_container.filter(|container| {
+                container.node.is_some() || !(percentage[1] || percentage[3])
+            }) {
+                let padding = container.node.and_then(|node| self.layout.styles.get(&node))
+                    .map_or_else(crate::Edges::default, |style| style.padding);
+                containing.width = (container.client_size.0 - padding.left - padding.right).max(0.0);
+                containing.height = (container.client_size.1 - padding.top - padding.bottom).max(0.0);
+            } else {
+                let mut ancestor = Some(id);
+                for _ in 0..=tree.len() {
+                    let Some(parent) = ancestor else { break; };
+                    ancestor = crate::dom::rendered_parent(tree, parent);
+                    let Some(parent_style) = self.layout.styles.get(&parent) else { continue; };
+                    if ancestor == Some(tree.document()) {
+                        containing = crate::dom::initial_containing_block(
+                            self.viewport, parent_style.scrollbar_gutters);
+                    }
+                    if parent == id || style.position_sticky || parent_style.display_contents { continue; }
+                    let is_containing = if absolute {
+                        parent_style.establishes_positioning_containing_block()
+                            || (!style.position_fixed && parent_style.position.is_some())
+                    } else {
+                        !parent_style.ignores_used_box_sizes()
+                    };
+                    if !is_containing { continue; }
+                    let Some(parent_rect) = self.layout.rects.get(&parent) else { continue; };
+                    containing = crate::Rect {
+                        x: parent_rect.x + parent_style.border.left,
+                        y: parent_rect.y + parent_style.border.top,
+                        width: (parent_rect.width - parent_style.border.left
+                            - parent_style.border.right).max(0.0),
+                        height: (parent_rect.height - parent_style.border.top
+                            - parent_style.border.bottom).max(0.0),
+                    };
+                    if !absolute {
+                        containing.width = (containing.width - parent_style.padding.left
+                            - parent_style.padding.right).max(0.0);
+                        containing.height = (containing.height - parent_style.padding.top
+                            - parent_style.padding.bottom).max(0.0);
+                    }
+                    break;
+                }
+            }
+        }
+        let values: [Option<f32>; 4] = std::array::from_fn(|index| {
+            if inline && percentage[index] { return None; }
+            let basis = if index % 2 == 0 { containing.height } else { containing.width };
+            if let Some(expression) = style.inset_expressions[index].as_deref() {
+                return crate::style::resolve_contextual_length(expression,
+                    style.font_size.unwrap_or(16.0), self.root_font_size,
+                    self.viewport.0 / 100.0, self.viewport.1 / 100.0, basis);
+            }
+            match style.inset[index] {
+                Some(crate::Dimension::Px(value)) => Some(value),
+                Some(crate::Dimension::Percent(value)) => Some(value * basis),
+                _ => None,
+            }
+        });
+        Some(std::array::from_fn(|index| {
+            let opposite = (index + 2) % 4;
+            // Ordinary inline boxes retain unresolved percentages and their
+            // opposing auto sides, but pixel offsets still have used values.
+            if inline && (percentage[index] || percentage[opposite]) {
+                return computed[index].clone();
+            }
+            if let Some(value) = values[index] { return css_px(value); }
+            if style.position_sticky { return computed[index].clone(); }
+            if !absolute { return css_px(-values[opposite].unwrap_or(0.0)); }
+            let (size, box_size, start_margin, end_margin) = if index % 2 == 0 {
+                (containing.height, rect.height, style.margin.top, style.margin.bottom)
+            } else {
+                (containing.width, rect.width, style.margin.left, style.margin.right)
+            };
+            let value = if let Some(other) = values[opposite] {
+                size - other - box_size - start_margin - end_margin
+            } else {
+                match index {
+                    0 => rect.y - containing.y - style.margin.top,
+                    1 => containing.x + size - rect.x - box_size - style.margin.right,
+                    2 => containing.y + size - rect.y - box_size - style.margin.bottom,
+                    _ => rect.x - containing.x - style.margin.left,
+                }
+            };
+            css_px(value)
+        }))
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,

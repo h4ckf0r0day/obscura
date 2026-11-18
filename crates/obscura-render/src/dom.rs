@@ -14,6 +14,19 @@ use taffy::prelude::*;
 
 use crate::{Rect, to_taffy_style};
 
+pub(crate) fn initial_containing_block(viewport: (f32, f32), root_gutters: u8) -> Rect {
+    // Classic stable gutters reduce percentage bases, while vw/media queries
+    // retain the full viewport. Both edges also shift the layout origin.
+    const CLASSIC_SCROLLBAR_GUTTER: f32 = 15.0;
+    let root_gutters = root_gutters.min(2);
+    Rect {
+        x: if root_gutters == 2 { CLASSIC_SCROLLBAR_GUTTER } else { 0.0 },
+        y: 0.0,
+        width: (viewport.0 - CLASSIC_SCROLLBAR_GUTTER * f32::from(root_gutters)).max(0.0),
+        height: viewport.1,
+    }
+}
+
 pub(crate) fn word_spacing_advance(text: &str, spacing: f32) -> f32 {
     if spacing == 0.0 { return 0.0; }
     text.chars().filter(|c| matches!(c, ' ' | '\u{00a0}')).count() as f32 * spacing
@@ -5362,22 +5375,10 @@ fn layout_dom_once(
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
     let mut generated_rects: Vec<Option<Rect>> = Vec::new();
     if let Some(root_id) = root {
-        // Headless Chromium's classic scrollbar gutter is 15 CSS pixels.
-        // `scrollbar-gutter:stable` reserves it even when the scrollbar track
-        // is hidden, and Gecko subtracts the platform gutter from the viewport
-        // containing block. Media queries and vw still see the full visual
-        // viewport; percentages and auto widths use this reduced ICB.
-        const CLASSIC_SCROLLBAR_GUTTER: f32 = 15.0;
-        let root_gutters = styles
-            .get(&root_id)
-            .map_or(0, |style| style.scrollbar_gutters.min(2));
-        let initial_cb_width =
-            (viewport.0 - CLASSIC_SCROLLBAR_GUTTER * f32::from(root_gutters)).max(0.0);
-        let initial_cb_x = if root_gutters == 2 {
-            CLASSIC_SCROLLBAR_GUTTER
-        } else {
-            0.0
-        };
+        let initial_cb = initial_containing_block(viewport,
+            styles.get(&root_id).map_or(0, |style| style.scrollbar_gutters));
+        let initial_cb_width = initial_cb.width;
+        let initial_cb_x = initial_cb.x;
         // Top-down inheritance of the properties CSS inherits by default.
         #[derive(Clone)]
         struct Inherited {

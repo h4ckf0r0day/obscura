@@ -1,0 +1,20 @@
+<!doctype html>
+<style>
+body { margin:0; font:16px Arial }
+.parent { position:relative; width:400px; height:200px; margin:27px; padding:13px; border:3px solid black }
+.item { width:40px; height:20px }
+</style>
+<div class=parent><div id=ltr class=item style="position:absolute;top:5px;bottom:7px;left:10px;right:20px"></div></div>
+<div class=parent style="direction:rtl"><div id=rtl class=item style="position:absolute;top:5px;bottom:7px;left:10px;right:20px"></div></div>
+<div class=parent><div id=center class=item style="position:absolute;inset:0;margin:auto"></div></div>
+<div class=parent><div id=startauto class=item style="position:absolute;top:10px;left:12px;margin:auto"></div></div>
+<div class=parent><div id=endauto class=item style="position:absolute;bottom:7px;right:9px;margin:auto"></div></div>
+<div class=parent style="transform:translate(20px,30px)"><div id=allauto class=item style="position:absolute;transform:translate(5px,7px)"></div></div>
+<div class=parent style="transform:translate(20px,30px)"><div id=fixedcb class=item style="position:fixed;top:10px;left:12px"></div></div>
+<div class=parent><span style="position:relative;top:3px;left:5px"><span id=inline class=item style="position:relative;top:10%;left:10%">text</span></span></div>
+<div class=parent><span style="position:relative;top:3px;left:5px"><span id=inlinepx class=item style="position:relative;top:5px;left:7px">text</span></span></div>
+<div class=parent><span style="position:relative;top:3px;left:5px"><div id=blockchild class=item style="position:relative;top:5px;left:10%"></div></span></div>
+<div class=parent><span style="position:relative;top:3px;left:5px"><span id=inlineblock class=item style="display:inline-block;position:relative;top:5px;left:10%">text</span></span></div>
+<div class=parent><div id=stickyend class=item style="position:sticky;bottom:10%;right:10%"></div></div>
+<div class=parent><div id=math class=item style="top:min(2em,40px);right:max(2px,1em);bottom:clamp(5px,2em,50px);left:calc(2em + 5px)"></div></div>
+<div class=parent><div id=absmath class=item style="position:absolute;top:min(2em,40px);left:clamp(5px,2em,50px)"></div></div>
