@@ -5075,3 +5075,115 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
+#[test]
+fn a_float_keeps_its_percentage_width_when_it_has_a_percentage_margin() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/float-percentage-margin.html"
+    ));
+    let layout = layout_dom(&tree, (1400.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let offset = rect("offset");
+    let plain = rect("plain");
+    let row = rect("row-offset");
+    assert!((offset.width - 1000.0).abs() < 1.0, "width: {}", offset.width);
+    assert!((offset.x - 100.0).abs() < 1.0, "offset: {}", offset.x);
+    assert!((offset.width - plain.width).abs() < 1.0);
+    assert!(row.height > 0.0, "the row must contain its float");
+}
+
+#[test]
+fn percentage_float_margins_resolve_against_containing_width_on_every_side() {
+    for (float, margin, expected_x, expected_height) in [
+        ("left", "margin-left:8.33333333%", 100.0, 40.0),
+        ("left", "margin-left:-8.33333333%", -100.0, 40.0),
+        ("left", "margin-right:8.33333333%", 0.0, 40.0),
+        ("left", "margin-top:8.33333333%", 0.0, 140.0),
+        ("left", "margin-bottom:8.33333333%", 0.0, 140.0),
+        ("right", "margin-left:8.33333333%", 200.0, 40.0),
+        ("right", "margin-right:8.33333333%", 100.0, 40.0),
+    ] {
+        let html = format!(
+            r#"<style>
+              body{{margin:0}} #row{{width:1200px}}
+              #row::after{{content:" ";display:table;clear:both}}
+              #column{{float:{float};width:83.33333333%;{margin}}}
+              #inner{{width:300px;height:40px}} #after{{height:20px}}
+            </style><div id="row"><div id="column"><div id="inner"></div></div></div><div id="after"></div>"#
+        );
+        let tree = parse_html(&html);
+        let layout = layout_dom(&tree, (1400.0, 1000.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        let column = rect("column");
+        let row = rect("row");
+        assert!((column.width - 1000.0).abs() < 1.0, "{margin}: {}", column.width);
+        assert!((column.x - expected_x).abs() < 1.0, "{margin}: {}", column.x);
+        assert!((row.height - expected_height).abs() < 1.0, "{margin}: {}", row.height);
+        assert!((rect("after").y - expected_height).abs() < 1.0, "{margin}: following flow overlaps");
+    }
+}
+
+#[test]
+fn nested_offset_float_uses_the_expanded_row_width() {
+    let tree = parse_html(r#"<!doctype html><style>
+        * { box-sizing:border-box } body { margin:0 }
+        .container { width:1170px; margin:0 auto; padding:0 15px }
+        .row { margin-left:-15px; margin-right:-15px }
+        .row::before, .row::after { content:' '; display:table }
+        .row::after { clear:both }
+        .full, #left, #right { float:left; padding:0 15px }
+        .full { width:100% }
+        #left { width:41.66666667%; height:520px }
+        #right { width:50%; margin-left:8.33333333%; margin-top:35px; height:470px }
+        </style><div class=container><div class=row><div class=full>
+            <div class=row><div id=left></div><div id=right></div></div>
+        </div></div></div>"#);
+    let layout = layout_dom(&tree, (1440.0, 1000.0));
+    let left = layout.rects[&tree.get_element_by_id("left").unwrap()];
+    let right = layout.rects[&tree.get_element_by_id("right").unwrap()];
+    assert!((left.width - 487.5).abs() < 1.0, "{left:?}");
+    assert!((right.width - 585.0).abs() < 1.0, "{right:?}");
+    assert!((right.x - 720.0).abs() < 1.0, "{right:?}");
+    assert!((right.y - left.y - 35.0).abs() < 1.0, "{left:?} {right:?}");
+}
+
+#[test]
+fn native_float_fit_allows_roundoff_but_not_real_overflow() {
+    use taffy::{compute::FloatContext, Clear, FloatDirection, Size};
+
+    // The parsed 41.66666667% column is one rounding step wider than 487.5px.
+    let first_width = 1170.0 * (41.66666667_f32 / 100.0);
+    for (width, insets) in [
+        (1170.0, [0.0, 0.0]),
+        (1140.0, [-15.0, -15.0]),
+        (1140.0, [-15.25, -15.25]),
+        (1170.0, [0.25, 0.25]),
+    ] {
+        for direction in [FloatDirection::Left, FloatDirection::Right] {
+            for extra in [0.0, 1.0 / 64.0, 1.0] {
+                let mut context = FloatContext::new();
+                context.set_width(width);
+                context.place_floated_box(
+                    Size { width: first_width, height: 20.0 },
+                    0.0, insets, direction, Clear::None,
+                );
+                let second_width = width - insets[0] - insets[1] - 487.5 + extra;
+                let second = context.place_floated_box(
+                    Size { width: second_width, height: 20.0 },
+                    0.0, insets, direction, Clear::None,
+                );
+                assert_eq!(second.y, if extra == 0.0 { 0.0 } else { 20.0 },
+                    "width={width}, insets={insets:?}, direction={direction:?}, extra={extra}: {second:?}");
+            }
+        }
+    }
+    // At large coordinates, one f32 step is real visible overflow, not a subpixel rounding allowance.
+    for direction in [FloatDirection::Left, FloatDirection::Right] {
+        let mut context = FloatContext::new();
+        context.set_width(1_048_576.0);
+        context.place_floated_box(Size { width: 524_288.125, height: 20.0 },
+            0.0, [0.0, 0.0], direction, Clear::None);
+        let next = context.place_floated_box(Size { width: 524_288.0, height: 20.0 },
+            0.0, [0.0, 0.0], direction, Clear::None);
+        assert_eq!(next.y, 20.0, "visible overflow must still wrap: {next:?}");
+    }
+}

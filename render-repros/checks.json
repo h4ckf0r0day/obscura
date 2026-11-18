@@ -178,6 +178,12 @@
     {"name": "later block remains in float band", "color": "#1098ad", "x": 0, "y": 230, "width": 650, "height": 70},
     {"name": "clear moves below float bottom", "color": "#a61e4d", "x": 0, "y": 400, "width": 900, "height": 50}
   ],
+  "float-percentage-margin": [
+    {"name": "offset column paints its intrinsic child", "color": "#087f5b", "x": 100, "y": 0, "width": 300, "height": 40},
+    {"name": "nested first column keeps its percentage width", "color": "#c92a2a", "x": 150, "y": 100, "width": 250, "height": 100},
+    {"name": "nested offset column stays beside its sibling", "color": "#1971c2", "x": 450, "y": 110, "width": 300, "height": 80},
+    {"name": "clearance contains the nested float band", "color": "#f76707", "x": 150, "y": 200, "width": 600, "height": 10}
+  ],
   "float-bfc-continuation": [
     {"name": "float keeps its BFC band across wrappers", "color": "#1971c2", "x": 650, "y": 0, "width": 250, "height": 400},
     {"name": "direct flow uses the first available band", "color": "#087f5b", "x": 0, "y": 0, "width": 650, "height": 250},
