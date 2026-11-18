@@ -3960,6 +3960,69 @@ fn cyclic_percentage_flex_row_keeps_its_intrinsic_content_width() {
     );
 }
 
+#[cfg(feature = "paint")]
+#[test]
+fn cyclic_functional_width_keeps_text_and_control_intrinsic_contributions() {
+    let tree = parse_html(r#"<!doctype html><body style="margin:0;font:14px Arial">
+        <div style="display:flex;width:1560px"><div id="textwrap"><div><span>
+          <div id="text" style="width:calc(100% - 32px);height:20px">hello world</div>
+        </span></div></div></div>
+        <div style="display:flex;width:1560px"><div id="wrap"><div><label><span>
+          <input id="control" style="width:calc(100% - 32px);padding-left:25px;
+            height:30px;margin:0;border:1px solid #999">
+        </span></label></div></div></div>
+        <input id="auto" style="padding-left:25px;height:30px;margin:0;border:1px solid #999">
+        <div style="width:1560px"><div><label><span>
+          <input id="noflex" style="width:calc(100% - 32px);padding-left:25px;
+            height:30px;margin:0;border:1px solid #999">
+        </span></label></div></div>
+        <div style="display:flex;width:1560px"><div id="buttonwrap">
+          <input id="button" type="BuTtOn" style="box-sizing:border-box;
+            width:calc(100% - 20px);height:20px;padding:0;margin:0;border:2px solid">
+        </div></div>
+        <div style="display:flex;width:1560px"><div id="gridbuttonwrap"><div style="display:grid">
+          <input id="gridbutton" type="BuTtOn" style="box-sizing:border-box;
+            width:calc(100% - 20px);height:20px;padding:0;margin:0;border:2px solid">
+        </div></div></div>
+        </body>"#);
+    let layout = layout_dom(&tree, (1600.0, 900.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+
+    // Chromium: 66.9375px max-content wrapper, then calc(100% - 32px).
+    assert_eq!(width("textwrap"), 67.0);
+    assert_eq!(width("text"), 35.0);
+    assert_eq!(width("noflex"), 1557.0);
+    // The control contributes its auto width, then resolves its content width
+    // against the wrapper. Its 29px padding/border leaves a 3px outer delta.
+    assert_eq!(width("wrap"), width("auto"));
+    assert_eq!(width("control"), width("wrap") - 3.0);
+    assert_eq!(width("buttonwrap"), 4.0);
+    assert_eq!(width("button"), 4.0);
+    assert_eq!(width("gridbuttonwrap"), 4.0);
+    assert_eq!(width("gridbutton"), 4.0);
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn cyclic_fixed_table_width_keeps_its_column_sizing_mode() {
+    for (width, basis) in [("100%", 200), ("calc(100%)", 200), ("50%", 400),
+        ("calc(50%)", 400), ("calc(100% - 20px)", 220)]
+    {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            body{{margin:0;font:14px Arial}}table{{width:{width};table-layout:fixed;border-collapse:collapse}}
+            td{{padding:0;height:20px}}
+            </style><div style="display:flex;width:800px"><div style="flex:0 0 {basis}px">
+            <table id="table"><colgroup><col style="width:80px"><col style="width:120px"></colgroup>
+            <tr><td id="first">VeryLongUnbreakableText</td><td id="second">other</td></tr>
+            </table></div></div>"#));
+        let layout = layout_dom(&tree, (1000.0, 300.0));
+        for (id, expected) in [("table", 200.0), ("first", 80.0), ("second", 120.0)] {
+            let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+            assert_eq!(rect.width, expected, "width={width}, id={id}: {rect:?}");
+        }
+    }
+}
+
 /// Chromium resolves both spellings to the same 163px content width: the
 /// percentage is cyclic while the link's flex-item width is being measured,
 /// then resolves against that link's final width. Carbon Ads uses the bare

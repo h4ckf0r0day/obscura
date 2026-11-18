@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Cyclic inline sizes keep intrinsic contributions under flex</title>
+<style>
+body { margin:20px; font:14px Arial; }
+.row { display:flex; width:800px; margin-bottom:20px; }
+.text { width:calc(100% - 32px); height:20px; }
+#text { background:#087f5b; }
+#bounded { max-width:40px; }
+#bounded .text { background:#1971c2; }
+#nested { display:flex; width:calc(100%); padding-bottom:6px; background:#c2255c; }
+#cell { flex:0 0 calc(200px + 100px); height:14px; }
+input { box-sizing:border-box; width:calc(100% - 20px); height:20px;
+  margin:0; padding:0; border:2px solid #7048e8; }
+table { table-layout:fixed; width:50%; border-collapse:collapse; }
+td { height:20px; padding:0; }
+#first { background:#e8590c; }
+#second { background:#0b7285; }
+</style>
+<div class="row"><div><div><span><div id="text" class="text">hello world</div></span></div></div></div>
+<div class="row"><div id="bounded"><div class="text">hello world</div></div></div>
+<div class="row"><div><div id="nested"><div id="cell"></div></div></div></div>
+<div class="row"><div><input placeholder="Search"></div></div>
+<div class="row"><div style="flex:0 0 400px"><table>
+  <colgroup><col style="width:80px"><col style="width:120px"></colgroup>
+  <tr><td id="first">VeryLongUnbreakableText</td><td id="second">other</td></tr>
+</table></div></div>

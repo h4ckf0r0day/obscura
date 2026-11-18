@@ -6725,6 +6725,7 @@ fn layout_dom_once(
                     intrinsic_height,
                     horizontal_edges,
                     vertical_edges,
+                    native_control_percentage_uses_intrinsic(&node),
                 );
                 continue;
             }
@@ -6768,6 +6769,7 @@ fn layout_dom_once(
                     intrinsic_height,
                     horizontal_edges,
                     vertical_edges,
+                    native_control_percentage_uses_intrinsic(&node),
                 );
                 continue;
             }
@@ -6834,6 +6836,7 @@ fn layout_dom_once(
                 intrinsic_height,
                 horizontal_edges,
                 vertical_edges,
+                native_control_percentage_uses_intrinsic(&node),
             );
         }
 
@@ -12294,6 +12297,20 @@ enum ContainerAutoBlockSize {
     StretchedGridItem,
 }
 
+fn native_control_percentage_uses_intrinsic(node: &obscura_dom::tree::Node) -> bool {
+    let Some(name) = node.as_element() else { return false; };
+    match name.local.as_ref() {
+        "select" | "textarea" => true,
+        "input" => {
+            // These controls' default auto widths do not model inner content.
+            let kind = node.get_attribute("type").unwrap_or("text").trim();
+            !["color", "button", "submit", "reset", "image"].into_iter()
+                .any(|excluded| kind.eq_ignore_ascii_case(excluded))
+        }
+        _ => false,
+    }
+}
+
 /// Assign a native control's intrinsic border-box size to its auto axes.
 /// The intrinsic figures are border boxes (Chromium's control metrics), so
 /// a content-box control receives the content part. An authored width or
@@ -12306,11 +12323,17 @@ fn assign_native_control_size(
     intrinsic_height: f32,
     horizontal_edges: f32,
     vertical_edges: f32,
+    percentage_uses_intrinsic: bool,
 ) {
     let (stretch_inline, stretch_block) = stretched_grid_item;
     let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
-    if stretch_inline || stretch_block {
+    if stretch_inline || stretch_block
+        || (percentage_uses_intrinsic
+            && (matches!(style.width, crate::Dimension::Percent(_))
+                || style.size_expressions[0].as_deref().is_some_and(|value| value.contains('%'))))
+    {
         // Stretch controls the final size, not the intrinsic track contribution.
+        // A cyclic authored width also needs the control's auto contribution.
         // Measure content axes independently; native controls have no natural ratio.
         style.intrinsic_size = Some((
             (intrinsic_width - horizontal_edges).max(0.0),
@@ -12609,9 +12632,9 @@ fn definite_row_flex_intrinsic_width(
 /// min-content floor. Gecko instead measures the flex item first, then reflows
 /// its descendants under the item's final main size.
 ///
-/// Keep the non-percentage part for the intrinsic pass (percentage basis zero),
-/// and remember enough information to resolve the complete expression after
-/// flex sizing has selected the item's used width.
+/// Preferred widths behave as auto for intrinsic contributions. Replaced
+/// widths and minimums retain the percentage-zero value; final flex reflow
+/// restores the authored sizing after selecting the item's used width.
 fn defer_cyclic_flex_inline_sizes(
     tree: &DomTree,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
@@ -12717,11 +12740,20 @@ fn defer_cyclic_flex_inline_sizes(
             // A cyclic percentage preferred size uses the container's
             // max-content contribution. Preserve that contribution for a
             // definite no-wrap row; a zero width would erase all of its fixed
-            // cells. Other cyclic forms retain the percentage-zero intrinsic
-            // value and are restored after outer flex sizing.
+            // cells. Other non-replaced preferred widths behave as auto,
+            // preserving text and native control intrinsic contributions.
             let intrinsic = crate::Dimension::Px(definite_row_width.unwrap_or(intrinsic).max(0.0));
             match slot {
-                0 => style.width = intrinsic,
+                0 => style.width = if definite_row_width.is_some()
+                    || (style.is_table_box && style.table_layout_fixed)
+                    || style.replaced_intrinsic.is_some() || style.has_replaced_sizing
+                    || (style.is_replaced_box && !(style.intrinsic_size.is_some()
+                        && tree.with_node(id, native_control_percentage_uses_intrinsic).unwrap_or(false)))
+                {
+                    intrinsic
+                } else {
+                    crate::Dimension::Auto
+                },
                 2 => style.min_width = intrinsic,
                 // A cyclic percentage max-size behaves as its initial value
                 // during intrinsic contribution sizing; treating 50% as a
