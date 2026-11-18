@@ -303,6 +303,8 @@ pub struct FormControlState {
 struct NodeAllocationGenerations {
     reused: HashMap<NodeId, u64>,
     next: u64,
+    // EOF state shares this rare allocation without enlarging ordinary DOM storage.
+    parser_started_scripts: HashSet<NodeId>,
 }
 
 pub(crate) struct DomTreeInner {
@@ -314,8 +316,6 @@ pub(crate) struct DomTreeInner {
     form_controls: HashMap<NodeId, FormControlState>,
     // Only parser-associated controls outside their form subtree need records.
     parser_form_owners: HashMap<NodeId, NodeId>,
-    // EOF state follows original nodes and parser transfers, not explicit DOM clones.
-    parser_started_scripts: HashSet<NodeId>,
     external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     external_stylesheet_generation: u64,
     hovered: Option<NodeId>,
@@ -358,7 +358,6 @@ impl DomTree {
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
                 parser_form_owners: HashMap::new(),
-                parser_started_scripts: HashSet::new(),
                 external_stylesheets: HashMap::new(),
                 external_stylesheet_generation: 0,
                 hovered: None,
@@ -582,15 +581,19 @@ impl DomTree {
     /// EOF in script text makes the element already started, even before a
     /// JavaScript realm is installed. This state follows the node, not its markup.
     pub fn parser_script_already_started(&self, node: NodeId) -> bool {
-        self.inner.borrow().parser_started_scripts.contains(&node)
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| metadata.parser_started_scripts.contains(&node))
     }
 
     pub fn has_parser_started_scripts(&self) -> bool {
-        !self.inner.borrow().parser_started_scripts.is_empty()
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| !metadata.parser_started_scripts.is_empty())
     }
 
     pub(crate) fn mark_parser_script_started(&self, node: NodeId) {
-        self.inner.borrow_mut().parser_started_scripts.insert(node);
+        self.inner.borrow_mut().node_generations
+            .get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()))
+            .parser_started_scripts.insert(node);
     }
 
     pub(crate) fn set_allow_declarative_shadow_roots(&self, allow: bool) {
@@ -1307,7 +1310,9 @@ impl DomTree {
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
-                inner.parser_started_scripts.remove(&id);
+                if let Some(metadata) = inner.node_generations.as_mut() {
+                    metadata.parser_started_scripts.remove(&id);
+                }
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -2238,7 +2243,8 @@ impl DomTree {
             let (node_data, parser_started) = {
                 let source_inner = source.inner.borrow();
                 match source_inner.nodes.get(src_id.index()) {
-                    Some(Some(node)) => (node.data.clone(), source_inner.parser_started_scripts.contains(&src_id)),
+                    Some(Some(node)) => (node.data.clone(), source_inner.node_generations.as_ref()
+                        .is_some_and(|metadata| metadata.parser_started_scripts.contains(&src_id))),
                     _ => continue,
                 }
             };

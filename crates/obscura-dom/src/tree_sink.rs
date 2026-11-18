@@ -487,6 +487,8 @@ mod tests {
         let source = parse_html("<body><section><script id=eof>window.runs++;");
         let script = source.get_element_by_id("eof").unwrap();
         let section = source.query_selector("section").unwrap().unwrap();
+        assert_eq!(source.node_allocation_generation(script), Some(0));
+        assert_eq!(source.node_allocation_generation(section), Some(0));
         let clone = source.clone_node(section, true).unwrap();
         let cloned_script = source.children(clone)[0];
         assert!(!source.parser_script_already_started(cloned_script));
@@ -501,11 +503,25 @@ mod tests {
 
         let data = source.get_node(script).unwrap().data;
         let text = source.children(script)[0];
+        assert_eq!(source.node_allocation_generation(text), Some(0));
+        let retained = source.new_node(NodeData::Text { contents: String::new() });
+        source.remove(retained);
+        let reused = source.new_node(NodeData::Text { contents: String::new() });
+        assert_eq!(reused, retained);
+        let retained_generation = source.node_allocation_generation(retained).unwrap();
+        assert!(retained_generation > 0);
         source.remove(script);
+        assert!(!source.has_parser_started_scripts());
+        assert_eq!(source.node_allocation_generation(retained), Some(retained_generation));
+        assert_eq!(source.node_allocation_generation(script), None);
+        let mut previous_generation = retained_generation;
         for _ in 0..2 {
             let reused = source.new_node(data.clone());
             assert!(reused == script || reused == text);
             assert!(!source.parser_script_already_started(reused));
+            let generation = source.node_allocation_generation(reused).unwrap();
+            assert!(generation > previous_generation);
+            previous_generation = generation;
         }
     }
 
