@@ -2453,6 +2453,9 @@ impl Page {
                     let mut scripts = Vec::new();
 
                     for sid in script_ids {
+                        if dom.parser_script_already_started(sid) {
+                            continue;
+                        }
                         if let Some(node) = dom.get_node(sid) {
                             let src = node.get_attribute("src").map(|s| s.to_string());
                             let script_type = node
@@ -8814,6 +8817,35 @@ mod tests {
             Some(0.0),
             "a reference to the discarded frame survived, so its context cannot be collected"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eof_scripts_are_not_fetched_or_executed() {
+        use std::sync::atomic::Ordering;
+
+        for module in [false, true] {
+            for external in [false, true] {
+                for complete in [false, true] {
+                    let (url, requests) = spawn_script_resource_cache_server(false);
+                    let mut page = frame_page("eof-script");
+                    page.url = Some(url::Url::parse(&url).unwrap());
+                    let kind = if module { "type=module" } else { "" };
+                    let source = if external { "src=/shared.js" } else { "" };
+                    let end = if complete { "</script>" } else { "" };
+                    page.dom = Some(parse_html(&format!(
+                        "<!doctype html><body><script {kind} {source}>globalThis.__runs=(globalThis.__runs||0)+1;{end}"
+                    )));
+                    page.init_js();
+                    page.execute_scripts().await;
+                    assert_eq!(
+                        page.js.as_mut().unwrap().evaluate("globalThis.__runs||0").unwrap(),
+                        serde_json::json!(if complete { 1.0 } else { 0.0 }),
+                        "module={module}, external={external}, complete={complete}"
+                    );
+                    assert_eq!(requests.load(Ordering::SeqCst), usize::from(complete && external));
+                }
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
