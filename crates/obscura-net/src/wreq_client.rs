@@ -16,12 +16,11 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
-    cors_required, document_body_deadline, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
+    cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_origin_header, request_referrer, response_too_large,
-    keeps_partial_body, note_body_truncated, BodyCut,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
     validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, SsrfGuardResolver,
+    BodyReadFailure, ResourceRequest, Response, SsrfGuardResolver,
 };
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
@@ -135,8 +134,19 @@ async fn read_wreq_body_limited(
     response: wreq::Response,
     url: &Url,
     limit: usize,
-    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
+    let mut body = Vec::new();
+    read_wreq_body_into(response, url, limit, &mut body).await.map_err(|failure| failure.error)?;
+    Ok(body)
+}
+
+#[cfg(feature = "stealth")]
+async fn read_wreq_body_into(
+    response: wreq::Response,
+    url: &Url,
+    limit: usize,
+    body: &mut Vec<u8>,
+) -> Result<(), BodyReadFailure> {
     if response
         .headers()
         .get("content-length")
@@ -144,7 +154,7 @@ async fn read_wreq_body_limited(
         .and_then(|value| value.trim().parse::<u64>().ok())
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(response_too_large(url, limit));
+        return Err(BodyReadFailure::failed(response_too_large(url, limit)));
     }
 
     let capacity = response
@@ -154,43 +164,20 @@ async fn read_wreq_body_limited(
         .min(limit);
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
-    let mut body = Vec::with_capacity(capacity);
-    loop {
-        let next = match deadline {
-            Some(at) => match tokio::time::timeout_at(at, stream.next()).await {
-                Ok(next) => next,
-                Err(_) if !body.is_empty() => {
-                    note_body_truncated(url, body.len(), BodyCut::Deadline);
-                    break;
-                }
-                Err(_) => {
-                    return Err(ObscuraNetError::Network(
-                        "Failed to read body: deadline reached before any body arrived".into(),
-                    ))
-                }
-            },
-            None => stream.next().await,
-        };
-        let chunk = match next {
-            Some(Ok(chunk)) => chunk,
-            None => break,
-            Some(Err(error)) if keeps_partial_body(deadline, error.is_timeout(), body.len()) => {
-                note_body_truncated(url, body.len(), BodyCut::RequestTimeout);
-                break;
+    body.reserve_exact(capacity);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            BodyReadFailure {
+                timeout: error.is_timeout(),
+                error: ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error))),
             }
-            Some(Err(error)) => {
-                return Err(ObscuraNetError::Network(format!(
-                    "Failed to read body: {}",
-                    error_chain(&error)
-                )))
-            }
-        };
+        })?;
         if chunk.len() > limit.saturating_sub(body.len()) {
-            return Err(response_too_large(url, limit));
+            return Err(BodyReadFailure::failed(response_too_large(url, limit)));
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(())
 }
 
 #[cfg(feature = "stealth")]
@@ -387,6 +374,7 @@ impl StealthHttpClient {
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
+        let document_request = crate::DocumentRequest::claim(request.resource_type);
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes, self.allow_file_access).await;
         }
@@ -552,21 +540,28 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes, document_body_deadline(&request))
-                .await?;
-            drop(in_flight);
-
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
-                body,
+                body: Vec::new(),
                 redirected_from: redirects,
             };
-            if let Some(callbacks) = callbacks {
-                callbacks.fire_response(&request_info, &response).await;
+            let mut captured = document_request.response(response, method.as_str(), referer.as_deref().unwrap_or(""));
+            let read = {
+                let response = captured.get_mut();
+                read_wreq_body_into(resp, &response.url, request.max_response_bytes, &mut response.body).await
+            };
+            if let Err(failure) = read {
+                captured.failed(failure.timeout);
+                return Err(failure.error);
             }
-            return Ok(response);
+            captured.complete();
+            drop(in_flight);
+            if let Some(callbacks) = callbacks {
+                callbacks.fire_response(&request_info, captured.get()).await;
+            }
+            return Ok(captured.finish());
         }
 
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
@@ -687,7 +682,7 @@ impl StealthHttpClient {
             headers: response_headers,
             body: Box::pin(async move {
                 let _in_flight = in_flight;
-                read_wreq_body_limited(resp, &body_url, max_body_bytes, None).await
+                read_wreq_body_limited(resp, &body_url, max_body_bytes).await
             }),
         })
     }

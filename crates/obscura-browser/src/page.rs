@@ -3,11 +3,11 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
-use obscura_js::ops::{OriginStorage, max_live_frames, NavigationTiming};
+use obscura_js::ops::{CachedNetworkResponseBody, OriginStorage, max_live_frames, NavigationTiming, StoredNetworkResponseBody};
 use obscura_js::runtime::{HistoryUpdate, ObscuraJsRuntime};
 use obscura_net::{
-    CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
-    ResourceType, Response, ResponseCallback,
+    CallbackRegistry, DocumentInterruption, DocumentProgress, DocumentRequest, InterruptedDocument,
+    ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest, ResourceType, Response, ResponseCallback,
 };
 use url::Url;
 
@@ -191,16 +191,15 @@ pub struct NetworkEvent {
 
 #[derive(Debug, Clone)]
 pub struct StoredResponseBody {
-    /// Raw response bytes. The CDP wire form (lossy text or base64, per
-    /// `base64_encoded`) is produced on read by `cdp_body`, so the common
-    /// case — a body that no CDP client ever asks for — pays no decode at
-    /// store time and holds one copy instead of two.
+    /// Raw response bytes. MIME/charset-decoded CDP presentation is available
+    /// through `Page::get_response_body_for_cdp` without changing these bytes.
     pub body: Vec<u8>,
     pub base64_encoded: bool,
 }
 
 impl StoredResponseBody {
-    /// The body as CDP `Network.getResponseBody` reports it.
+    /// The raw body's UTF-8/base64 view. Use `Page::get_response_body_for_cdp`
+    /// for the response's MIME type and charset decoding.
     pub fn cdp_body(&self) -> String {
         if self.base64_encoded {
             BASE64.encode(&self.body)
@@ -329,7 +328,7 @@ pub struct Page {
     /// to the entry instead of appending a new one.
     pending_history_traversal: std::sync::Mutex<Option<usize>>,
     pub network_events: Vec<NetworkEvent>,
-    response_bodies: std::collections::HashMap<String, StoredResponseBody>,
+    response_bodies: std::collections::HashMap<String, CachedNetworkResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
@@ -378,51 +377,6 @@ const DEFAULT_NAVIGATION_CHAIN_LIMIT: usize = 10;
 
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
-}
-
-/// Run a navigation under its deadline. The outer `Err` is the deadline
-/// itself; the inner result is the navigation's own.
-///
-/// A document still arriving near the deadline is cut a little before it and
-/// parsed as far as it got, as a browser shows a partly loaded page; without
-/// this the deadline left an empty document. Such a navigation still reports
-/// the deadline, with the partial document in place.
-async fn within_navigation_deadline<F>(
-    nav_timeout: std::time::Duration,
-    navigation: F,
-) -> Result<Result<(), PageError>, PageError>
-where
-    F: std::future::Future<Output = Result<(), PageError>>,
-{
-    let nav_timeout_ms = duration_millis_u64(nav_timeout);
-    let body_deadline = tokio::time::Instant::now()
-        + nav_timeout.saturating_sub(document_body_reserve(nav_timeout));
-    let (result, cut) = obscura_net::with_body_deadline(
-        body_deadline,
-        tokio::time::timeout(nav_timeout, navigation),
-    )
-    .await;
-    match (result, cut) {
-        (Ok(Ok(())), Some(obscura_net::BodyCut::Deadline)) => Err(PageError::NetworkError(format!(
-            "navigation exceeded {nav_timeout_ms}ms deadline; the document was still arriving and is kept as far as it got"
-        ))),
-        (Ok(Ok(())), Some(obscura_net::BodyCut::RequestTimeout)) => Err(PageError::NetworkError(
-            "document request timed out while the document was still arriving; it is kept as far as it got".into(),
-        )),
-        (Ok(result), _) => Ok(result),
-        (Err(_), _) => Err(PageError::NetworkError(format!(
-            "navigation exceeded {nav_timeout_ms}ms deadline"
-        ))),
-    }
-}
-
-/// The share of a navigation's deadline kept for parsing and running a
-/// document cut at the deadline: a tenth, between half a second and five.
-fn document_body_reserve(nav_timeout: std::time::Duration) -> std::time::Duration {
-    (nav_timeout / 10).clamp(
-        std::time::Duration::from_millis(500),
-        std::time::Duration::from_secs(5),
-    )
 }
 
 fn navigation_timeout_from_env_value(value: Option<&str>) -> std::time::Duration {
@@ -1685,6 +1639,10 @@ impl Page {
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
     async fn advance_frames(&mut self) -> bool {
+        if self.js.as_ref().map_or_else(
+            || self.dom.as_ref().is_some_and(DomTree::is_document_incomplete),
+            ObscuraJsRuntime::document_is_incomplete,
+        ) { return false; }
         let mut queued_new = self.queue_pending_frames();
         self.release_detached_frames();
         if self.pending_frame_work.is_empty() && self.queue_pending_frames() {
@@ -1877,6 +1835,8 @@ impl Page {
         if tx.send(request).is_err() { return Ok(None); }
         let response = match resolution.await {
             Ok(InterceptResolution::Fulfill {status, headers: supplied, body, body_base64}) => {
+                DocumentProgress::mark_intercepted(None);
+                let document_request = DocumentRequest::claim(ResourceType::Document);
                 let bytes = if body_base64.is_empty() { body.into_bytes() } else {
                     BASE64.decode(body_base64).map_err(|error| PageError::NetworkError(error.to_string()))?
                 };
@@ -1896,17 +1856,21 @@ impl Page {
                     for cookie in cookies.lines() { self.context.cookie_jar.set_cookie(cookie, url); }
                 }
                 let response = Response {url: url.clone(), status, headers, body: bytes, redirected_from: Vec::new()};
+                let referrer = initiator.map(|source| navigation_referrer(source, url)).unwrap_or_default();
+                let mut captured = document_request.response(response, method, &referrer);
+                captured.complete();
                 let request = obscura_net::RequestInfo {url: url.clone(), method: method.into(), headers: request_headers,
                     resource_type: ResourceType::Document};
                 self.callbacks.fire_request(&request).await;
-                self.callbacks.fire_response(&request, &response).await;
-                response
+                self.callbacks.fire_response(&request, captured.get()).await;
+                captured.finish()
             }
             Ok(InterceptResolution::Continue {url: rewrite, method: changed_method, headers, body: changed_body}) => {
                 let target = match rewrite { Some(value) => Url::parse(&value).map_err(|error| PageError::InvalidUrl(error.to_string()))?, None => url.clone() };
                 if target.scheme() != url.scheme() {
                     return Err(PageError::NetworkError("Interception cannot change a navigation's URL scheme".into()));
                 }
+                DocumentProgress::mark_intercepted((target != *url).then_some(url));
                 let method = changed_method.as_deref().unwrap_or(method);
                 let body = changed_body.or_else(|| (method == "POST" || !body.is_empty()).then(|| body.as_bytes().to_vec()));
                 self.fetch_navigation_from_document(&target, method, body, headers, initiator).await
@@ -1951,6 +1915,7 @@ impl Page {
             .await
     }
     fn init_js(&mut self) {
+        let incomplete = self.dom.as_ref().is_some_and(DomTree::is_document_incomplete);
         // init_js is also the new-document path.  Only resume_js explicitly
         // takes these IDs out before entering here and restores them after the
         // same DomTree is installed; a navigation must never inherit IDs from
@@ -1980,6 +1945,7 @@ impl Page {
             &self.url_string(),
             self.context.proxy_url.clone(),
         );
+        rt.set_watchdog_scope(&self.id);
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
         rt.set_content_type(&self.content_type);
@@ -2065,7 +2031,7 @@ impl Page {
 
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.set_frame_preload_scripts(&self.preload_scripts);
-        rt.run_page_init();
+        if incomplete { rt.run_incomplete_page_init(); } else { rt.run_page_init(); }
         rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
             "<device-metrics>",
@@ -2499,6 +2465,9 @@ impl Page {
                     let mut scripts = Vec::new();
 
                     for sid in script_ids {
+                        if dom.parser_script_already_started(sid) {
+                            continue;
+                        }
                         if let Some(node) = dom.get_node(sid) {
                             let src = node.get_attribute("src").map(|s| s.to_string());
                             let script_type = node
@@ -3226,20 +3195,79 @@ impl Page {
         // one slow primary GET plus one slow JS-redirect chain step. Override
         // with `OBSCURA_NAV_TIMEOUT_MS=NN`, or set a page-scoped deadline when
         // the automation request already has an explicit timeout.
-        let nav_timeout = self.navigation_timeout();
-        let result = within_navigation_deadline(
-            nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, "", None),
-        )
-        .await
-        .unwrap_or_else(|deadline| {
-            self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-            Err(deadline)
-        });
+        let result = self.within_navigation_deadline(url_str, wait_until, method, body, "", None).await;
         if result.is_ok() {
             self.push_history(self.url_string());
         }
         result
+    }
+
+    async fn within_navigation_deadline(
+        &mut self, url: &str, wait: crate::lifecycle::WaitUntil, method: &str, body: &str,
+        referrer: &str, initiator: Option<&Url>,
+    ) -> Result<(), PageError> {
+        let timeout = self.navigation_timeout();
+        let progress = DocumentProgress::default();
+        let outcome = tokio::time::timeout(timeout,
+            self.navigate_with_wait_post_inner(url, wait, method, body, referrer, initiator, &progress)).await;
+        let expired = outcome.is_err();
+        let mut result = outcome.unwrap_or_else(|_| {
+            self.lifecycle = LifecycleState::Failed;
+            Err(PageError::NetworkError(format!("navigation exceeded {}ms deadline", duration_millis_u64(timeout))))
+        });
+        if result.is_err() {
+            if let Some(interrupted) = progress.take().filter(|document|
+                expired || document.cause == DocumentInterruption::BodyTimeout)
+            {
+                let timeout_kind = if expired { "navigation deadline" } else { "document body timeout" };
+                self.retain_interrupted_document(interrupted);
+                if let Err(PageError::NetworkError(message)) = &mut result {
+                    message.push_str(&format!("; received HTML retained after {timeout_kind}"));
+                }
+            }
+        }
+        result
+    }
+
+    fn retain_interrupted_document(&mut self, interrupted: InterruptedDocument) {
+        let InterruptedDocument { response, method, referrer, body_complete, intercepted,
+            intercepted_document_url, .. } = interrupted;
+        let (text, encoding) = obscura_net::decode_response_with_name(&response.body, response.content_type());
+        let dom = parse_html(&text);
+        dom.mark_document_incomplete(true);
+        self.title = dom.query_selector("title").ok().flatten()
+            .map(|title| dom.text_content(title)).unwrap_or_default();
+        self.encoding = encoding.into();
+        self.content_type = base_content_type(response.content_type()).unwrap_or_default();
+        self.url = Some(if response.redirected_from.is_empty() {
+            intercepted_document_url.unwrap_or_else(|| response.url.clone())
+        } else { response.url.clone() });
+        self.referrer = referrer;
+        // No author/preload/frame code runs after the expired navigation. Drop
+        // frame handles before their isolate and create fresh globals lazily.
+        self.retire_render_resources();
+        self.pending_frame_work.clear();
+        self.frames.clear();
+        self.js = None;
+        self.suspended_started_script_ids.clear();
+        self.suspended_cdp_object_state = obscura_js::runtime::CdpObjectState::default();
+        self.dom = Some(dom);
+        self.lifecycle = LifecycleState::Failed;
+        self.document_timeline_origin = std::time::Instant::now();
+        self.navigation_timing.record("domLoading");
+        let document_url = self.url_string();
+        let request_id = self.record_network_event_inner(&document_url, &method,
+            "Document", response.status, &response.headers, response.body.len());
+        if let Some(event) = self.network_events.last_mut() {
+            event.intercepted = intercepted;
+            if !body_complete { event.error_text = Some("net::ERR_TIMED_OUT".into()); }
+        }
+        if body_complete {
+            self.navigation_timing.record("responseEnd");
+            self.store_response_body_with(request_id, response.body.len(), || {
+                CachedNetworkResponseBody::raw(&response.body, response.content_type())
+            });
+        }
     }
 
     /// Drive the JS event loop after navigation so deferred work can run:
@@ -3539,6 +3567,7 @@ impl Page {
         body: &str,
         initial_referrer: &str,
         initial_initiator: Option<&Url>,
+        progress: &DocumentProgress,
     ) -> Result<(), PageError> {
         self.sync_history_updates();
         // file:// is a local file read. Every client route (CLI, CDP's
@@ -3568,6 +3597,7 @@ impl Page {
                 &document_referrer,
                 document_initiator.as_ref(),
                 deadline,
+                progress,
             )
             .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
@@ -3627,6 +3657,7 @@ impl Page {
         referrer: &str,
         initiator: Option<&Url>,
         deadline: tokio::time::Instant,
+        progress: &DocumentProgress,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
         self.navigation_timing = NavigationTiming::default();
@@ -3634,8 +3665,6 @@ impl Page {
         // The previous document's background loads end with the document.
         self.retire_render_resources();
         self.lifecycle = LifecycleState::Loading;
-        self.referrer = referrer.to_string();
-        self.url = Some(url.clone());
         let page_id = self.id.as_str();
         self.network_events.retain(|event| event.intercepted && event.resource_type == "Document"
             && event.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.')));
@@ -3677,6 +3706,7 @@ impl Page {
 
         if url.scheme() == "about" {
             self.navigate_blank();
+            self.referrer = referrer.to_string();
             self.init_js();
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
             // Runtime.addBinding shim) must run on about:blank too —
@@ -3698,62 +3728,62 @@ impl Page {
         }
 
         self.navigation_timing.record("fetchStart");
-        let intercepted = self.intercept_navigation(&url, method, body, initiator).await.map_err(|error| {
-            self.lifecycle = LifecycleState::Failed; error
-        })?;
-        let was_intercepted = intercepted.is_some();
-        let response = if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
-            let content_type = url_str
-                .strip_prefix("data:")
-                .and_then(|s| s.split(',').next())
-                .unwrap_or("text/html")
-                .split(';')
-                .next()
-                .unwrap_or("text/html")
-                .to_string();
-            let body_bytes = decode_data_uri(url_str).unwrap_or_default();
-            let mut headers = std::collections::HashMap::new();
-            headers.insert("content-type".to_string(), content_type);
-            Ok(obscura_net::Response {
-                url: url.clone(),
-                status: 200,
-                headers,
-                body: body_bytes,
-                redirected_from: Vec::new(),
+        let response = progress.scope(async {
+            let intercepted = self.intercept_navigation(&url, method, body, initiator).await.map_err(|error| {
+                self.lifecycle = LifecycleState::Failed; error
+            })?;
+            let was_intercepted = intercepted.is_some();
+            if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
+                let content_type = url_str
+                    .strip_prefix("data:")
+                    .and_then(|s| s.split(',').next())
+                    .unwrap_or("text/html")
+                    .split(';')
+                    .next()
+                    .unwrap_or("text/html")
+                    .to_string();
+                let body_bytes = decode_data_uri(url_str).unwrap_or_default();
+                let mut headers = std::collections::HashMap::new();
+                headers.insert("content-type".to_string(), content_type);
+                Ok(obscura_net::Response {
+                    url: url.clone(),
+                    status: 200,
+                    headers,
+                    body: body_bytes,
+                    redirected_from: Vec::new(),
+                })
+            } else if method == "POST" || initiator.is_some() {
+                self.fetch_navigation_from_document(
+                    &url, if method == "POST" { "POST" } else { "GET" },
+                    (method == "POST").then(|| body.as_bytes().to_vec()), None, initiator,
+                ).await
+            } else {
+                self.do_fetch(&url).await
+            }
+            .map(|response| (response, was_intercepted))
+            .map_err(|e| {
+                self.lifecycle = LifecycleState::Failed;
+                PageError::NetworkError(e.to_string())
             })
-        } else if method == "POST" || initiator.is_some() {
-            self.fetch_navigation_from_document(
-                &url, if method == "POST" { "POST" } else { "GET" },
-                (method == "POST").then(|| body.as_bytes().to_vec()), None, initiator,
-            ).await
-        } else {
-            self.do_fetch(&url).await
-        }
-        .map_err(|e| {
-            self.lifecycle = LifecycleState::Failed;
-            PageError::NetworkError(e.to_string())
-        })?;
+        }).await;
+        let (response, was_intercepted) = response?;
         self.navigation_timing.record("responseEnd");
 
-        // Store binary main resources (images, PDFs, octet-stream) base64 so
-        // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
-        // corrupts them (issue #340). Text-like types stay as text.
-        let main_is_binary = !is_text_like_content_type(response.content_type());
-        self.record_network_event_with_body(
+        // Keep transport bytes for streams; DevTools decoding happens on read.
+        let request_id = self.record_network_event_inner(
             if was_intercepted && response.redirected_from.is_empty() { url.as_str() } else { response.url.as_str() },
             method,
             "Document",
             response.status,
             &response.headers,
-            &response.body,
-            main_is_binary,
+            response.body.len(),
         );
+        self.store_response_body_with(request_id, response.body.len(), || {
+            CachedNetworkResponseBody::raw(&response.body, response.content_type())
+        });
 
         if was_intercepted {
             if let Some(event) = self.network_events.last_mut() { event.intercepted = true; }
-        }
-        if !response.redirected_from.is_empty() {
-            self.url = Some(response.url.clone());
         }
 
         // An HTTP error status with no body at all (a bare 429/403/503 from a
@@ -3798,6 +3828,8 @@ impl Page {
             .map(|title_id| dom.text_content(title_id))
             .unwrap_or_default();
 
+        self.url = Some(if response.redirected_from.is_empty() { url.clone() } else { response.url.clone() });
+        self.referrer = referrer.to_string();
         self.dom = Some(dom);
         self.init_js();
         let author_stylesheets = self.fetch_stylesheets().await;
@@ -4935,18 +4967,23 @@ impl Page {
     }
 
     fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
+        self.store_response_body_with(request_id, body.len(), || CachedNetworkResponseBody::Bytes {
+            bytes: body.to_vec(), base64_encoded,
+        });
+    }
+
+    fn store_response_body_with(
+        &mut self,
+        request_id: String,
+        source_len: usize,
+        make_stored: impl FnOnce() -> CachedNetworkResponseBody,
+    ) {
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
-        if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
+        if max_entries == 0 || max_bytes == 0 || source_len > max_bytes {
             return;
         }
-        self.response_bodies.insert(
-            request_id.clone(),
-            StoredResponseBody {
-                body: body.to_vec(),
-                base64_encoded,
-            },
-        );
+        self.response_bodies.insert(request_id.clone(), make_stored());
         self.response_body_order.push_back(request_id);
         while self.response_body_order.len() > max_entries {
             if let Some(oldest) = self.response_body_order.pop_front() {
@@ -4956,49 +4993,29 @@ impl Page {
     }
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
-        self.response_bodies.get(request_id).cloned().or_else(|| {
-            let body = self
-                .js
-                .as_ref()?
-                .get_network_response_body(request_id)?;
-            // The JS-side store holds the lossy/base64 text form; convert to
-            // raw bytes so the page-side store stays uniformly lazy.
-            let raw = if body.base64_encoded {
-                BASE64.decode(body.body.as_bytes()).ok()?
-            } else {
-                body.body.into_bytes()
-            };
-            Some(StoredResponseBody {
-                body: raw,
-                base64_encoded: body.base64_encoded,
-            })
+        let (body, base64_encoded) = if let Some(body) = self.response_bodies.get(request_id) {
+            body.raw_bytes()?
+        } else {
+            self.js.as_ref()?.get_network_response_body_raw(request_id)?
+        };
+        Some(StoredResponseBody { body, base64_encoded })
+    }
+
+    pub fn get_response_body_for_cdp(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
+        self.response_bodies.get(request_id).map(CachedNetworkResponseBody::decoded).or_else(|| {
+            self.js.as_ref()?.get_network_response_body(request_id)
         })
     }
 
-    /// Take a stored response body as raw bytes for CDP streaming
-    /// (Fetch.takeResponseBodyAsStream). Removes it from the in-memory cache and
-    /// transfers ownership to the caller, so a large body is held once and freed
-    /// when the stream is closed rather than lingering in this long-running
-    /// process (issue #360). Binary bodies are stored base64 (byte-exact); text
-    /// bodies return their UTF-8 bytes. Returns None if the body was never
-    /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
-    /// dropped) or the id is unknown.
+    /// Transfer original response bytes to a CDP stream, removing the cached
+    /// entry. The body's MIME type and charset affect only the text getter.
+    /// Returns None for unknown, evicted, or oversized bodies.
     pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
         if let Some(body) = self.response_bodies.remove(request_id) {
             self.response_body_order.retain(|id| id != request_id);
-            // Raw bytes are what this returns; the base64 flag only says how
-            // CDP would report the body, not how it is stored.
-            return Some(body.body);
+            return body.into_bytes();
         }
-        let b = self
-            .js
-            .as_ref()?
-            .get_network_response_body(request_id)?;
-        if b.base64_encoded {
-            BASE64.decode(b.body.as_bytes()).ok()
-        } else {
-            Some(b.body.into_bytes())
-        }
+        self.js.as_ref()?.take_network_response_body_raw(request_id)
     }
 
     /// Make the body stored under `from_id` also retrievable under `to_id`.
@@ -5041,18 +5058,8 @@ impl Page {
         // Completed module and JS requests must survive the realm's teardown.
         self.sync_js_network_events();
         let max_entries = response_body_entry_limit();
-        for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
-            // The JS-side store holds the lossy/base64 text form; convert to
-            // raw bytes so the page-side store stays uniformly lazy.
-            let raw = if body.base64_encoded {
-                BASE64.decode(body.body.as_bytes()).unwrap_or_default()
-            } else {
-                body.body.into_bytes()
-            };
-            self.response_bodies.insert(id.clone(), StoredResponseBody {
-                body: raw,
-                base64_encoded: body.base64_encoded,
-            });
+        for (id, body) in self.js.as_ref().unwrap().take_cached_network_response_bodies() {
+            self.response_bodies.insert(id.clone(), body);
             self.response_body_order.push_back(id);
         }
         while self.response_body_order.len() > max_entries {
@@ -5310,16 +5317,8 @@ impl Page {
         let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
         }).unwrap_or_default();
-        let nav_timeout = self.navigation_timeout();
-        within_navigation_deadline(
-            nav_timeout,
-            self.navigate_with_wait_post_inner(
-                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url, initiator.as_ref(),
-            ),
-        ).await.map_err(|deadline| {
-            self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-            deadline
-        })??;
+        self.within_navigation_deadline(url, crate::lifecycle::WaitUntil::Load,
+            method, body, &source_url, initiator.as_ref()).await?;
         self.push_history(self.url_string());
         Ok(())
     }
@@ -5412,7 +5411,7 @@ mod tests {
         assert_eq!(page.title, "Fulfilled");
         let document = page.network_events.iter().find(|event| event.resource_type == "Document").unwrap();
         assert_eq!(document.status, 201);assert!(document.intercepted);
-        assert_eq!(page.response_bodies.get(&document.request_id).unwrap().body, expected);
+        assert_eq!(page.get_response_body(&document.request_id).unwrap().body, expected);
         let mut set_cookies = document.response_headers.get("set-cookie").unwrap().lines().collect::<Vec<_>>();
         set_cookies.sort_unstable();
         assert_eq!(set_cookies, ["first=1; Path=/", "second=2; Path=/"]);
@@ -5684,53 +5683,6 @@ mod tests {
         server.await.unwrap();
         assert!(result.unwrap_err().to_string().contains("deadline"));
         assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::Failed);
-    }
-
-    /// A document still arriving at the navigation deadline is parsed as far
-    /// as it got; the navigation still reports the deadline.
-    async fn navigation_deadline_keeps_the_partial_document(stealth: bool) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "partial-document".into(), None, stealth, None, None, true,
-        ));
-        let mut page = super::Page::new("partial-document".into(), context);
-        page.set_navigation_timeout(std::time::Duration::from_secs(2));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = [0u8; 2048];
-            let _ = socket.read(&mut bytes).await;
-            let _ = socket.write_all(concat!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n",
-                "6d\r\n<!doctype html><title>partial</title><h1 id=head>arrived</h1><script>document.body.dataset.ran='yes'</script>\r\n",
-            ).as_bytes()).await;
-            let _ = socket.flush().await;
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        });
-        let started = std::time::Instant::now();
-        let error = page
-            .navigate_with_wait(&url, crate::lifecycle::WaitUntil::Load)
-            .await
-            .expect_err("the navigation did not finish");
-        assert!(error.to_string().contains("kept as far as it got"), "{error}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
-        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::Failed);
-        assert_eq!(
-            page.evaluate("[document.title, !!document.getElementById('head'), document.body.dataset.ran]"),
-            serde_json::json!(["partial", true, "yes"])
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn navigation_deadline_keeps_the_partial_document_rustls() {
-        navigation_deadline_keeps_the_partial_document(false).await;
-    }
-
-    #[cfg(feature = "stealth")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn navigation_deadline_keeps_the_partial_document_stealth() {
-        navigation_deadline_keeps_the_partial_document(true).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8925,6 +8877,35 @@ mod tests {
             Some(0.0),
             "a reference to the discarded frame survived, so its context cannot be collected"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eof_scripts_are_not_fetched_or_executed() {
+        use std::sync::atomic::Ordering;
+
+        for module in [false, true] {
+            for external in [false, true] {
+                for complete in [false, true] {
+                    let (url, requests) = spawn_script_resource_cache_server(false);
+                    let mut page = frame_page("eof-script");
+                    page.url = Some(url::Url::parse(&url).unwrap());
+                    let kind = if module { "type=module" } else { "" };
+                    let source = if external { "src=/shared.js" } else { "" };
+                    let end = if complete { "</script>" } else { "" };
+                    page.dom = Some(parse_html(&format!(
+                        "<!doctype html><body><script {kind} {source}>globalThis.__runs=(globalThis.__runs||0)+1;{end}"
+                    )));
+                    page.init_js();
+                    page.execute_scripts().await;
+                    assert_eq!(
+                        page.js.as_mut().unwrap().evaluate("globalThis.__runs||0").unwrap(),
+                        serde_json::json!(if complete { 1.0 } else { 0.0 }),
+                        "module={module}, external={external}, complete={complete}"
+                    );
+                    assert_eq!(requests.load(Ordering::SeqCst), usize::from(complete && external));
+                }
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12149,29 +12130,6 @@ impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
     }
-}
-
-/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
-/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
-/// be base64-encoded so Network.getResponseBody returns intact bytes.
-fn is_text_like_content_type(content_type: Option<&str>) -> bool {
-    let ct = match content_type {
-        Some(c) => c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase(),
-        // No Content-Type: assume text (matches the HTML-parse default).
-        None => return true,
-    };
-    if ct.is_empty() {
-        return true;
-    }
-    ct.starts_with("text/")
-        || ct == "application/json"
-        || ct == "application/xml"
-        || ct == "application/xhtml+xml"
-        || ct == "application/javascript"
-        || ct == "application/ecmascript"
-        || ct == "image/svg+xml"
-        || ct.ends_with("+json")
-        || ct.ends_with("+xml")
 }
 
 /// Lowercased MIME type of a Content-Type header, without parameters.

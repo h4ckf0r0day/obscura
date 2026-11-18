@@ -75,7 +75,10 @@ impl Segment {
     /// Whether the segment can fit the passed floated box (in the horizontal axis)
     fn fits_float_width(&self, floated_box: Size<f32>, direction: FloatDirection, bfc_width: f32) -> bool {
         let slot = direction as usize;
-        self.insets[slot] == 0.0 || (bfc_width - floated_box.width - self.inset_sum()) >= 0.0
+        // Percentage sizes can meet at a band edge with a small f32 rounding error.
+        // Keep the allowance below a layout subpixel even at large coordinates.
+        let tolerance = (bfc_width.abs() * f32::EPSILON).min(1.0 / 1024.0);
+        self.insets[slot] == 0.0 || (bfc_width - floated_box.width - self.inset_sum()) >= -tolerance
     }
 
     /// The total space taken up by both insets
@@ -114,7 +117,8 @@ impl FloatFitter {
     /// Given the currently accounted for insets, check whether there is an x position
     /// such that the box fits horizontally
     fn fits_horiontally(&self, width: f32) -> bool {
-        self.insets == [0.0, 0.0] || self.bfc_width - self.insets[0] - self.insets[1] - width >= 0.0
+        let tolerance = (self.bfc_width.abs() * f32::EPSILON).min(1.0 / 1024.0);
+        self.insets == [0.0, 0.0] || self.bfc_width - self.insets[0] - self.insets[1] - width >= -tolerance
     }
 
 }

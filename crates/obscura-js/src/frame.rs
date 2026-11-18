@@ -403,6 +403,7 @@ impl FrameRealm {
             .ok_or_else(|| "could not list frame scripts: missing document".to_string())?;
         let nodes = dom.query_selector_all("script")?;
         Ok(nodes.into_iter().filter_map(|id| {
+            if dom.parser_script_already_started(id) { return None; }
             let text = dom.text_content(id);
             dom.with_node(id, |node| DocumentScript {
                 src: node.get_attribute("src").unwrap_or("").to_string(),
@@ -972,6 +973,30 @@ mod tests {
             frame.evaluate(&mut parent, "navigator.userAgent").unwrap(),
             serde_json::json!(user_agent)
         );
+    }
+
+    #[test]
+    fn frame_eof_scripts_are_not_fetched_or_executed() {
+        let mut parent = page("https://parent.example/", "<body></body>");
+        for (index, (external, complete)) in [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter().enumerate()
+        {
+            let src = if external { "src=/script.js" } else { "" };
+            let end = if complete { "</script>" } else { "" };
+            let frame = FrameRealm::new(&mut parent, index as u32 + 1, 0,
+                "https://child.example/", &format!("<body><script {src}>window.runs=1;{end}"))
+                .expect("frame realm");
+            let expected_urls = if external && complete { vec!["https://child.example/script.js"] } else { vec![] };
+            assert_eq!(frame.external_script_urls(&mut parent), expected_urls);
+            let requested = RefCell::new(Vec::new());
+            assert!(frame.run_document_scripts(&mut parent, |url| {
+                requested.borrow_mut().push(url.to_string());
+                Some("window.runs=1;".into())
+            }).is_empty());
+            assert_eq!(requested.into_inner(), expected_urls);
+            assert_eq!(frame.evaluate(&mut parent, "window.runs||0").unwrap(),
+                serde_json::json!(if complete { 1 } else { 0 }));
+        }
     }
 
     /// The capability the frame realm exists for: scripts that arrived with the

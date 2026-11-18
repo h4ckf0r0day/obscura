@@ -107,7 +107,7 @@ pub async fn handle(
                 ctx.commit_default_context(&page_id, &frame_id, &origin);
             }
 
-            ctx.sessions.insert(session_id.clone(), page_id.clone());
+            ctx.attach_session(session_id.clone(), page_id.clone());
 
             if let Some(page) = ctx.get_page(&page_id) {
                 ctx.pending_events.push(CdpEvent::new(
@@ -152,8 +152,7 @@ pub async fn handle(
             // implicit "browser" target. Returning Unknown method aborts
             // the connect handshake before any user code runs.
             let session_id = format!("browser-{}", uuid::Uuid::new_v4());
-            ctx.sessions
-                .insert(session_id.clone(), "browser".to_string());
+            ctx.attach_session(session_id.clone(), "browser".to_string());
 
             ctx.pending_events.push(CdpEvent::new(
                 "Target.attachedToTarget",
@@ -183,8 +182,7 @@ pub async fn handle(
                 return Err("Target not found".to_string());
             }
             let session_id = ctx.next_target_session(target_id);
-            ctx.sessions
-                .insert(session_id.clone(), target_id.to_string());
+            ctx.attach_session(session_id.clone(), target_id.to_string());
 
             if let Some(page) = ctx.get_page(target_id) {
                 let params = json!({
@@ -224,7 +222,7 @@ pub async fn handle(
         "setAutoAttach" => Ok(json!({})),
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                let page_id = ctx.sessions.remove(session_id);
+                let page_id = ctx.detach_session(session_id);
                 ctx.dom_documents.remove(&Some(session_id.to_string()));
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);

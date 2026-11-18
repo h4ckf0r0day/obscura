@@ -7624,7 +7624,7 @@ class HTMLImageElement extends Element {
     const hasMetadataLoader = typeof __obscuraCore.ops.op_load_image_metadata === "function";
     this._adoptImageCandidate(hasMetadataLoader ? "" : this.src);
     this._imageCompletionDeferred = true;
-    this._refreshImageFromCache(true);
+    this._refreshImageFromCache(true, true);
     if (!this._imageComplete) this._queueImageRequest();
   }
 
@@ -7686,11 +7686,11 @@ class HTMLImageElement extends Element {
     }
   }
 
-  _refreshImageFromCache(deferCompletion) {
+  _refreshImageFromCache(deferCompletion, sourceChanged) {
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true, _realmFrameId));
+      const metadata = JSON.parse(op(this._nid >>> 0, !sourceChanged, _realmFrameId));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
@@ -10256,10 +10256,6 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
           return r.width != null ? `${r.width}px` : null;
         case 'height': case 'block-size':
           return r.height != null ? `${r.height}px` : null;
-        case 'left': return r.left != null ? `${r.left}px` : null;
-        case 'top': return r.top != null ? `${r.top}px` : null;
-        case 'right': return r.right != null ? `${r.right}px` : null;
-        case 'bottom': return r.bottom != null ? `${r.bottom}px` : null;
         case 'client-width': case 'offset-width':
           return r.width != null ? `${r.width}px` : null;
         case 'client-height': case 'offset-height':
@@ -10272,6 +10268,7 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   const defaultsKebab = {
     display: 'block', visibility: 'visible', opacity: '1',
     position: 'static', overflow: 'visible',
+    top: 'auto', right: 'auto', bottom: 'auto', left: 'auto',
     transform: 'none', 'transform-origin': '0px 0px',
     transition: 'none', animation: 'none',
     float: 'none', clear: 'none',
@@ -15469,6 +15466,37 @@ _defineTableGetter('HTMLTableRowElement', 'cells', 'table_row_cells', true);
 _defineTableGetter('HTMLTableRowElement', 'rowIndex', 'table_row_index');
 _defineTableGetter('HTMLTableRowElement', 'sectionRowIndex', 'table_section_row_index');
 _defineTableGetter('HTMLTableCellElement', 'cellIndex', 'table_cell_index');
+const _tableAttributeGet = Element.prototype.getAttribute;
+const _tableAttributeSet = Element.prototype.setAttribute;
+function _defineTableSpan(member, attr, minimum, maximum) {
+  const getter = function () {
+    const foreign = _tableMemberReceiver(this, 'HTMLTableCellElement', member, 'get');
+    if (foreign) return foreign.call(this);
+    if (_tableMemberValue(this, 'table_interface') !== 'HTMLTableCellElement') throw new TypeError('Illegal invocation');
+    const parsed = /^[ \t\n\f\r]*([+-]?[0-9]+)/.exec(_tableAttributeGet.call(this, attr) || '');
+    if (!parsed) return 1;
+    const value = +parsed[1];
+    return value < 0 ? 1 : value <= minimum ? minimum : value > maximum ? maximum : value;
+  };
+  const setter = function (value) {
+    const foreign = _tableMemberReceiver(this, 'HTMLTableCellElement', member, 'set');
+    if (foreign) return foreign.call(this, value);
+    if (_tableMemberValue(this, 'table_interface') !== 'HTMLTableCellElement') throw new TypeError('Illegal invocation');
+    // Reflection stores the unsigned value; only the getter applies span limits.
+    const number = value >>> 0;
+    _tableAttributeSet.call(this, attr, String(number <= 2147483647 ? number : 1));
+  };
+  for (const [accessor, implementation] of [['get', getter], ['set', setter]]) {
+    Object.defineProperty(implementation, 'name', {value: accessor + ' ' + member, configurable: true});
+    _markNative(implementation);
+    _tableRealmMembers['HTMLTableCellElement.' + member + '.' + accessor] = implementation;
+  }
+  Object.defineProperty(HTMLTableCellElement.prototype, member, {
+    get: getter, set: setter, enumerable: true, configurable: true,
+  });
+}
+_defineTableSpan('colSpan', 'colspan', 1, 1000);
+_defineTableSpan('rowSpan', 'rowspan', 0, 65534);
 function _defineTableMethod(iface, member, implementation) {
   const method = function (...args) {
     const foreign = _tableMemberReceiver(this, iface, member);
@@ -19652,7 +19680,7 @@ globalThis.__obscura_init_frames = function() {
 
 };
 
-globalThis.__obscura_init = (function() {
+globalThis.__obscura_init = (function(skipFrames) {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _realmContextId = __obscuraCore.ops.op_frame_context(_realmFrameId);
@@ -19743,7 +19771,7 @@ globalThis.__obscura_init = (function() {
   // wrongly changes everything after it.
   _installFramingRelationships();
 
-  if (JSON.parse(__obscuraCore.ops.op_frame_preload_scripts()).length === 0) globalThis.__obscura_init_frames();
+  if (!skipFrames && JSON.parse(__obscuraCore.ops.op_frame_preload_scripts()).length === 0) globalThis.__obscura_init_frames();
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
