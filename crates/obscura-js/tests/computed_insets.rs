@@ -71,7 +71,7 @@ fn computed_insets_resolve_percentages_against_the_relevant_box() {
     })()"#).unwrap(), json!([
         ["20px","-40px","-20px","40px"], ["22px","338px","178px","42px"],
         ["60px","auto","auto","80px"], ["calc(10% + 5px)","auto","37px","32px"],
-        ["12px","auto","auto","32px"]
+        ["10px","auto","auto","30px"]
     ]));
 }
 
@@ -150,6 +150,46 @@ fn computed_insets_use_stable_gutters_without_changing_viewport_units() {
         });
         rt.evaluate(&format!("document.documentElement.setAttribute('style','scrollbar-gutter:{gutter};width:500px;margin:20px')")).unwrap();
         assert_eq!(rt.evaluate(read).unwrap(), expected, "authored root size, {gutter}");
+    }
+}
+
+#[cfg(feature = "render")]
+#[test]
+fn computed_sticky_percentages_use_the_scroll_container_content_box() {
+    let cases = [
+        ("direct", "width:300px;height:100px;overflow:auto", None, 10.0, 30.0),
+        ("padding", "width:300px;height:100px;padding:10px;overflow:auto", None, 10.0, 30.0),
+        ("border", "width:300px;height:100px;padding:10px;border:3px solid;overflow:auto", None, 10.0, 30.0),
+        ("small", "width:300px;height:100px;padding:10px;overflow:auto", Some("width:200px;height:60px"), 10.0, 30.0),
+        ("large", "width:300px;height:100px;padding:10px;overflow:auto", Some("width:500px;height:200px"), 10.0, 30.0),
+        ("innerpadding", "width:300px;height:100px;padding:10px;overflow:auto", Some("width:200px;height:60px;padding:20px;border:2px solid"), 10.0, 30.0),
+        ("borderbox", "box-sizing:border-box;width:300px;height:100px;padding:10px;border:3px solid;overflow:auto", None, 7.39062, 27.3906),
+        ("root", "width:400px;height:200px;padding:13px;border:3px solid", None, 60.0, 80.0),
+        ("rootnested", "width:300px;height:100px;padding:10px", Some("width:200px;height:60px"), 60.0, 80.0),
+        ("innerscroll", "width:300px;height:100px;padding:10px;overflow:auto", Some("width:200px;height:60px;padding:20px;overflow:auto"), 6.0, 20.0),
+    ];
+    let mut html = "<!doctype html><style>body{margin:0;min-height:1400px}</style>".to_string();
+    for (id, outer, inner, _, _) in cases {
+        let mut item = format!("<div id='{id}' style='position:sticky;top:10%;left:10%;width:40px;height:20px'></div>");
+        if let Some(inner) = inner {
+            item = format!("<div style='{inner}'>{item}<div style='height:400px'></div></div>");
+        }
+        html.push_str(&format!("<div style='{outer}'>{item}<div style='height:400px'></div></div>"));
+    }
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_viewport(800.0, 600.0);
+    rt.set_dom(obscura_dom::parse_html(&html));
+    rt.run_page_init();
+    for (id, _, _, top, left) in cases {
+        let actual = rt.evaluate(&format!(r#"(() => {{
+            const c = getComputedStyle(document.getElementById('{id}'));
+            return [parseFloat(c.top),parseFloat(c.left),c.right,c.bottom];
+        }})()"#)).unwrap();
+        // Chromium 157 rounds used lengths to 1/64px; native layout uses f32.
+        assert!((actual[0].as_f64().unwrap() - top).abs() < 0.02, "{id}: {actual}");
+        assert!((actual[1].as_f64().unwrap() - left).abs() < 0.02, "{id}: {actual}");
+        assert_eq!(actual[2], "auto", "{id}");
+        assert_eq!(actual[3], "auto", "{id}");
     }
 }
 

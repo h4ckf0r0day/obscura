@@ -8,6 +8,8 @@ body { margin:0 }
 #plain { background:#868e96 }
 #authored { top:5px; left:10%; background:#adb5bd }
 #relative { position:relative; top:5px; left:7px; background:#f08c00 }
+#scrollport { position:absolute; left:500px; top:100px; width:300px; height:100px; padding:10px; border:2px solid #343a40; overflow:auto }
+#nested { position:sticky; top:10%; left:10% }
 #absolute { position:absolute; top:80px; left:212px; background:#1971c2 }
 </style>
 <div id="parent">
@@ -16,13 +18,15 @@ body { margin:0 }
   <div id="relative" class="probe"></div>
   <div id="absolute" class="probe"></div>
 </div>
+<div id="scrollport"><div id="nested" class="probe"></div><div style="height:400px"></div></div>
 <script>
 (() => {
   const cases = [
     ['plain', ['auto','auto','auto','auto'], '#2f9e44'],
     ['authored', ['5px','auto','auto','10%'], '#099268'],
     ['relative', ['5px','-7px','-5px','7px'], '#0ca678'],
-    ['absolute', ['80px','168px','120px','212px'], '#12b886']
+    ['absolute', ['80px','168px','120px','212px'], '#12b886'],
+    ['nested', ['10px','auto','auto','30px'], '#20c997']
   ];
   cases.forEach(([id, expected, color], index) => {
     const style = getComputedStyle(document.getElementById(id));

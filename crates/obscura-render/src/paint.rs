@@ -2051,8 +2051,10 @@ impl PreparedRender {
             if let Some(container) = sticky_container.filter(|container| {
                 container.node.is_some() || !(percentage[1] || percentage[3])
             }) {
-                containing.width = container.client_size.0;
-                containing.height = container.client_size.1;
+                let padding = container.node.and_then(|node| self.layout.styles.get(&node))
+                    .map_or_else(crate::Edges::default, |style| style.padding);
+                containing.width = (container.client_size.0 - padding.left - padding.right).max(0.0);
+                containing.height = (container.client_size.1 - padding.top - padding.bottom).max(0.0);
             } else {
                 let mut ancestor = Some(id);
                 for _ in 0..=tree.len() {
