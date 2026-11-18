@@ -6,8 +6,8 @@ use obscura_js::frame::FrameRealm;
 use obscura_js::ops::{CachedNetworkResponseBody, OriginStorage, max_live_frames, NavigationTiming, StoredNetworkResponseBody};
 use obscura_js::runtime::{HistoryUpdate, ObscuraJsRuntime};
 use obscura_net::{
-    CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
-    ResourceType, Response, ResponseCallback,
+    CallbackRegistry, DocumentInterruption, DocumentProgress, DocumentRequest, InterruptedDocument,
+    ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest, ResourceType, Response, ResponseCallback,
 };
 use url::Url;
 
@@ -1639,6 +1639,10 @@ impl Page {
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
     async fn advance_frames(&mut self) -> bool {
+        if self.js.as_ref().map_or_else(
+            || self.dom.as_ref().is_some_and(DomTree::is_document_incomplete),
+            ObscuraJsRuntime::document_is_incomplete,
+        ) { return false; }
         let mut queued_new = self.queue_pending_frames();
         self.release_detached_frames();
         if self.pending_frame_work.is_empty() && self.queue_pending_frames() {
@@ -1831,6 +1835,8 @@ impl Page {
         if tx.send(request).is_err() { return Ok(None); }
         let response = match resolution.await {
             Ok(InterceptResolution::Fulfill {status, headers: supplied, body, body_base64}) => {
+                DocumentProgress::mark_intercepted(None);
+                let document_request = DocumentRequest::claim(ResourceType::Document);
                 let bytes = if body_base64.is_empty() { body.into_bytes() } else {
                     BASE64.decode(body_base64).map_err(|error| PageError::NetworkError(error.to_string()))?
                 };
@@ -1850,17 +1856,21 @@ impl Page {
                     for cookie in cookies.lines() { self.context.cookie_jar.set_cookie(cookie, url); }
                 }
                 let response = Response {url: url.clone(), status, headers, body: bytes, redirected_from: Vec::new()};
+                let referrer = initiator.map(|source| navigation_referrer(source, url)).unwrap_or_default();
+                let mut captured = document_request.response(response, method, &referrer);
+                captured.complete();
                 let request = obscura_net::RequestInfo {url: url.clone(), method: method.into(), headers: request_headers,
                     resource_type: ResourceType::Document};
                 self.callbacks.fire_request(&request).await;
-                self.callbacks.fire_response(&request, &response).await;
-                response
+                self.callbacks.fire_response(&request, captured.get()).await;
+                captured.finish()
             }
             Ok(InterceptResolution::Continue {url: rewrite, method: changed_method, headers, body: changed_body}) => {
                 let target = match rewrite { Some(value) => Url::parse(&value).map_err(|error| PageError::InvalidUrl(error.to_string()))?, None => url.clone() };
                 if target.scheme() != url.scheme() {
                     return Err(PageError::NetworkError("Interception cannot change a navigation's URL scheme".into()));
                 }
+                DocumentProgress::mark_intercepted((target != *url).then_some(url));
                 let method = changed_method.as_deref().unwrap_or(method);
                 let body = changed_body.or_else(|| (method == "POST" || !body.is_empty()).then(|| body.as_bytes().to_vec()));
                 self.fetch_navigation_from_document(&target, method, body, headers, initiator).await
@@ -1905,6 +1915,7 @@ impl Page {
             .await
     }
     fn init_js(&mut self) {
+        let incomplete = self.dom.as_ref().is_some_and(DomTree::is_document_incomplete);
         // init_js is also the new-document path.  Only resume_js explicitly
         // takes these IDs out before entering here and restores them after the
         // same DomTree is installed; a navigation must never inherit IDs from
@@ -2020,7 +2031,7 @@ impl Page {
 
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.set_frame_preload_scripts(&self.preload_scripts);
-        rt.run_page_init();
+        if incomplete { rt.run_incomplete_page_init(); } else { rt.run_page_init(); }
         rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
             "<device-metrics>",
@@ -3184,27 +3195,79 @@ impl Page {
         // one slow primary GET plus one slow JS-redirect chain step. Override
         // with `OBSCURA_NAV_TIMEOUT_MS=NN`, or set a page-scoped deadline when
         // the automation request already has an explicit timeout.
-        let nav_timeout = self.navigation_timeout();
-        let nav_timeout_ms = duration_millis_u64(nav_timeout);
-
-        let result = match tokio::time::timeout(
-            nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, "", None),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                Err(PageError::NetworkError(format!(
-                    "navigation exceeded {nav_timeout_ms}ms deadline"
-                )))
-            }
-        };
+        let result = self.within_navigation_deadline(url_str, wait_until, method, body, "", None).await;
         if result.is_ok() {
             self.push_history(self.url_string());
         }
         result
+    }
+
+    async fn within_navigation_deadline(
+        &mut self, url: &str, wait: crate::lifecycle::WaitUntil, method: &str, body: &str,
+        referrer: &str, initiator: Option<&Url>,
+    ) -> Result<(), PageError> {
+        let timeout = self.navigation_timeout();
+        let progress = DocumentProgress::default();
+        let outcome = tokio::time::timeout(timeout,
+            self.navigate_with_wait_post_inner(url, wait, method, body, referrer, initiator, &progress)).await;
+        let expired = outcome.is_err();
+        let mut result = outcome.unwrap_or_else(|_| {
+            self.lifecycle = LifecycleState::Failed;
+            Err(PageError::NetworkError(format!("navigation exceeded {}ms deadline", duration_millis_u64(timeout))))
+        });
+        if result.is_err() {
+            if let Some(interrupted) = progress.take().filter(|document|
+                expired || document.cause == DocumentInterruption::BodyTimeout)
+            {
+                let timeout_kind = if expired { "navigation deadline" } else { "document body timeout" };
+                self.retain_interrupted_document(interrupted);
+                if let Err(PageError::NetworkError(message)) = &mut result {
+                    message.push_str(&format!("; received HTML retained after {timeout_kind}"));
+                }
+            }
+        }
+        result
+    }
+
+    fn retain_interrupted_document(&mut self, interrupted: InterruptedDocument) {
+        let InterruptedDocument { response, method, referrer, body_complete, intercepted,
+            intercepted_document_url, .. } = interrupted;
+        let (text, encoding) = obscura_net::decode_response_with_name(&response.body, response.content_type());
+        let dom = parse_html(&text);
+        dom.mark_document_incomplete(true);
+        self.title = dom.query_selector("title").ok().flatten()
+            .map(|title| dom.text_content(title)).unwrap_or_default();
+        self.encoding = encoding.into();
+        self.content_type = base_content_type(response.content_type()).unwrap_or_default();
+        self.url = Some(if response.redirected_from.is_empty() {
+            intercepted_document_url.unwrap_or_else(|| response.url.clone())
+        } else { response.url.clone() });
+        self.referrer = referrer;
+        // No author/preload/frame code runs after the expired navigation. Drop
+        // frame handles before their isolate and create fresh globals lazily.
+        self.retire_render_resources();
+        self.pending_frame_work.clear();
+        self.frames.clear();
+        self.js = None;
+        self.suspended_started_script_ids.clear();
+        self.suspended_cdp_object_state = obscura_js::runtime::CdpObjectState::default();
+        self.dom = Some(dom);
+        self.lifecycle = LifecycleState::Failed;
+        self.document_timeline_origin = std::time::Instant::now();
+        self.navigation_timing.record("domLoading");
+        let document_url = self.url_string();
+        let request_id = self.record_network_event_inner(&document_url, &method,
+            "Document", response.status, &response.headers, response.body.len());
+        if let Some(event) = self.network_events.last_mut() {
+            event.intercepted = intercepted;
+            if !body_complete { event.error_text = Some("net::ERR_TIMED_OUT".into()); }
+        }
+        if body_complete {
+            self.navigation_timing.record("responseEnd");
+            self.store_response_body_with(request_id, response.body.len(), || {
+                CachedNetworkResponseBody::raw(&response.body, response.content_type())
+            });
+        }
     }
 
     /// Drive the JS event loop after navigation so deferred work can run:
@@ -3504,6 +3567,7 @@ impl Page {
         body: &str,
         initial_referrer: &str,
         initial_initiator: Option<&Url>,
+        progress: &DocumentProgress,
     ) -> Result<(), PageError> {
         self.sync_history_updates();
         // file:// is a local file read. Every client route (CLI, CDP's
@@ -3533,6 +3597,7 @@ impl Page {
                 &document_referrer,
                 document_initiator.as_ref(),
                 deadline,
+                progress,
             )
             .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
@@ -3592,6 +3657,7 @@ impl Page {
         referrer: &str,
         initiator: Option<&Url>,
         deadline: tokio::time::Instant,
+        progress: &DocumentProgress,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
         self.navigation_timing = NavigationTiming::default();
@@ -3599,8 +3665,6 @@ impl Page {
         // The previous document's background loads end with the document.
         self.retire_render_resources();
         self.lifecycle = LifecycleState::Loading;
-        self.referrer = referrer.to_string();
-        self.url = Some(url.clone());
         let page_id = self.id.as_str();
         self.network_events.retain(|event| event.intercepted && event.resource_type == "Document"
             && event.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.')));
@@ -3642,6 +3706,7 @@ impl Page {
 
         if url.scheme() == "about" {
             self.navigate_blank();
+            self.referrer = referrer.to_string();
             self.init_js();
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
             // Runtime.addBinding shim) must run on about:blank too —
@@ -3663,41 +3728,45 @@ impl Page {
         }
 
         self.navigation_timing.record("fetchStart");
-        let intercepted = self.intercept_navigation(&url, method, body, initiator).await.map_err(|error| {
-            self.lifecycle = LifecycleState::Failed; error
-        })?;
-        let was_intercepted = intercepted.is_some();
-        let response = if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
-            let content_type = url_str
-                .strip_prefix("data:")
-                .and_then(|s| s.split(',').next())
-                .unwrap_or("text/html")
-                .split(';')
-                .next()
-                .unwrap_or("text/html")
-                .to_string();
-            let body_bytes = decode_data_uri(url_str).unwrap_or_default();
-            let mut headers = std::collections::HashMap::new();
-            headers.insert("content-type".to_string(), content_type);
-            Ok(obscura_net::Response {
-                url: url.clone(),
-                status: 200,
-                headers,
-                body: body_bytes,
-                redirected_from: Vec::new(),
+        let response = progress.scope(async {
+            let intercepted = self.intercept_navigation(&url, method, body, initiator).await.map_err(|error| {
+                self.lifecycle = LifecycleState::Failed; error
+            })?;
+            let was_intercepted = intercepted.is_some();
+            if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
+                let content_type = url_str
+                    .strip_prefix("data:")
+                    .and_then(|s| s.split(',').next())
+                    .unwrap_or("text/html")
+                    .split(';')
+                    .next()
+                    .unwrap_or("text/html")
+                    .to_string();
+                let body_bytes = decode_data_uri(url_str).unwrap_or_default();
+                let mut headers = std::collections::HashMap::new();
+                headers.insert("content-type".to_string(), content_type);
+                Ok(obscura_net::Response {
+                    url: url.clone(),
+                    status: 200,
+                    headers,
+                    body: body_bytes,
+                    redirected_from: Vec::new(),
+                })
+            } else if method == "POST" || initiator.is_some() {
+                self.fetch_navigation_from_document(
+                    &url, if method == "POST" { "POST" } else { "GET" },
+                    (method == "POST").then(|| body.as_bytes().to_vec()), None, initiator,
+                ).await
+            } else {
+                self.do_fetch(&url).await
+            }
+            .map(|response| (response, was_intercepted))
+            .map_err(|e| {
+                self.lifecycle = LifecycleState::Failed;
+                PageError::NetworkError(e.to_string())
             })
-        } else if method == "POST" || initiator.is_some() {
-            self.fetch_navigation_from_document(
-                &url, if method == "POST" { "POST" } else { "GET" },
-                (method == "POST").then(|| body.as_bytes().to_vec()), None, initiator,
-            ).await
-        } else {
-            self.do_fetch(&url).await
-        }
-        .map_err(|e| {
-            self.lifecycle = LifecycleState::Failed;
-            PageError::NetworkError(e.to_string())
-        })?;
+        }).await;
+        let (response, was_intercepted) = response?;
         self.navigation_timing.record("responseEnd");
 
         // Keep transport bytes for streams; DevTools decoding happens on read.
@@ -3715,9 +3784,6 @@ impl Page {
 
         if was_intercepted {
             if let Some(event) = self.network_events.last_mut() { event.intercepted = true; }
-        }
-        if !response.redirected_from.is_empty() {
-            self.url = Some(response.url.clone());
         }
 
         // An HTTP error status with no body at all (a bare 429/403/503 from a
@@ -3762,6 +3828,8 @@ impl Page {
             .map(|title_id| dom.text_content(title_id))
             .unwrap_or_default();
 
+        self.url = Some(if response.redirected_from.is_empty() { url.clone() } else { response.url.clone() });
+        self.referrer = referrer.to_string();
         self.dom = Some(dom);
         self.init_js();
         let author_stylesheets = self.fetch_stylesheets().await;
@@ -5249,17 +5317,8 @@ impl Page {
         let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
         }).unwrap_or_default();
-        let nav_timeout = self.navigation_timeout();
-        let nav_timeout_ms = duration_millis_u64(nav_timeout);
-        tokio::time::timeout(
-            nav_timeout,
-            self.navigate_with_wait_post_inner(
-                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url, initiator.as_ref(),
-            ),
-        ).await.map_err(|_| {
-            self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-            PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
-        })??;
+        self.within_navigation_deadline(url, crate::lifecycle::WaitUntil::Load,
+            method, body, &source_url, initiator.as_ref()).await?;
         self.push_history(self.url_string());
         Ok(())
     }

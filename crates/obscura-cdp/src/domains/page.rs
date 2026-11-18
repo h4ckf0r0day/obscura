@@ -730,19 +730,27 @@ pub(crate) fn queue_screencast_frame(
     };
     let attached_session = Some(cdp_session_id.to_string());
     let (viewport, scroll, raster, activity_generation) = {
+        // An automatic capture must not activate a deferred document's realm.
         let page = ctx
-            .get_session_page_mut(&attached_session)
+            .get_session_page(&attached_session)
             .ok_or("No page for session")?;
         let animation_sample = page.live_animation_sample();
         let viewport = page.viewport;
         let scroll = page.screenshot_scroll_offset();
         let (region, output) = screencast_capture_region(viewport, scroll, &state);
-        let raster = page
-            .screenshot_region_raster_with_animation_sample(
-                region,
-                animation_sample,
-            )
-            .map_err(capture_error_message)?;
+        let raster = if page.js.is_none() {
+            // Recovered HTML can be painted without activating its scripts.
+            // Keep the viewport allocation bound before the DOM-only fallback.
+            obscura_browser::validate_capture_region(obscura_browser::CaptureRegion::new(
+                0.0, 0.0, viewport.0, viewport.1, 1.0,
+            )).map_err(capture_error_message)?;
+            let png = page.screenshot_with_animation_sample(viewport, animation_sample)
+                .ok_or("Could not paint recovered document")?;
+            image::load_from_memory(&png).map_err(|error| error.to_string())?.into_rgba8()
+        } else {
+            page.screenshot_region_raster_with_animation_sample(region, animation_sample)
+                .map_err(capture_error_message)?
+        };
         let raster = if raster.dimensions() == output {
             raster
         } else {
@@ -801,7 +809,7 @@ pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
         }
         let attached_session = Some(cdp_session_id.clone());
         let (activity_generation, css_animation_active) = {
-            let Some(page) = ctx.get_session_page_mut(&attached_session) else {
+            let Some(page) = ctx.get_session_page(&attached_session) else {
                 continue;
             };
             let Some(js) = page.js.as_ref() else {
@@ -1023,8 +1031,10 @@ pub fn emit_navigation_events(
             });
         }
         if let Some(error_text) = &net_event.error_text {
-            ctx.pending_events.push(network_loading_failed(net_event, rid, es.clone(), error_text));
-            continue;
+            if net_event.resource_type != "Document" || net_event.status == 0 {
+                ctx.pending_events.push(network_loading_failed(net_event, rid, es.clone(), error_text));
+                continue;
+            }
         }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
@@ -1032,11 +1042,15 @@ pub fn emit_navigation_events(
                 && net_event.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.')) { rid.as_str() } else { loader_id }, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
             session_id: es.clone(),
         });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFinished".into(),
-            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
-            session_id: es.clone(),
-        });
+        if let Some(error_text) = &net_event.error_text {
+            ctx.pending_events.push(network_loading_failed(net_event, rid, es.clone(), error_text));
+        } else {
+            ctx.pending_events.push(CdpEvent {
+                method: "Network.loadingFinished".into(),
+                params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
+                session_id: es.clone(),
+            });
+        }
     }
 
     // A recorder can stop as soon as navigation completes. Give the new
@@ -1285,9 +1299,9 @@ pub(crate) fn emit_navigation_failure(
     fan_out_network_events(ctx, page_id, session_id, start);
 }
 
-pub(crate) fn emit_aborted_navigation(
+pub(crate) fn emit_uncommitted_navigation_failure(
     ctx: &mut CdpContext, session_id: &Option<String>, frame_id: &str,
-    loader_id: &str, url: &str, method: &str, page_id: &str, request_started: bool,
+    loader_id: &str, url: &str, method: &str, page_id: &str, request_started: bool, error_text: &str,
 ) {
     let start = ctx.pending_events.len();
     let ts = timestamp();
@@ -1302,7 +1316,7 @@ pub(crate) fn emit_aborted_navigation(
     ctx.pending_events.push(CdpEvent {
         method: "Network.loadingFailed".into(), session_id: session_id.clone(),
         params: json!({"requestId": loader_id, "timestamp": ts, "type": "Document",
-            "errorText": "net::ERR_ABORTED", "canceled": true}),
+            "errorText": error_text, "canceled": error_text == "net::ERR_ABORTED"}),
     });
     ctx.pending_events.push(CdpEvent {
         method: "Page.frameStoppedLoading".into(), session_id: session_id.clone(),
@@ -1374,12 +1388,13 @@ async fn do_navigate(
     let preload_page = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
     let preload_scripts = ctx.preload_sources_for_page(&preload_page);
 
-    let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
+    let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle, result, committed) = {
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
         let frame_id = page.frame_id.clone();
         let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+        let previous_document = page.with_dom(|dom| dom.form_cache_generation_handle());
 
         // Preloads (addBinding shims, addScriptToEvaluateOnNewDocument sources)
         // must run BEFORE the page's own scripts (CDP contract). Hand them to
@@ -1391,15 +1406,17 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
-        if nav_method == "POST" && !nav_body.is_empty() {
+        let result = if nav_method == "POST" && !nav_body.is_empty() {
             page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())
         } else {
             page.navigate_with_wait(url, wait_until)
                 .await
-                .map_err(|e| e.to_string())?;
-        }
+                .map_err(|e| e.to_string())
+        };
+        let committed = page.with_dom(|dom| previous_document.as_ref().is_none_or(|previous|
+            !std::sync::Arc::ptr_eq(previous, &dom.form_cache_generation_handle()))).unwrap_or(false);
 
         let reached_network_idle = page.lifecycle.is_network_idle();
         // Fold in script-initiated requests (fetch/XHR/dynamic resource) so they
@@ -1415,8 +1432,20 @@ async fn do_navigate(
             page_url,
             page_id,
             reached_network_idle,
+            result,
+            committed,
         )
     };
+
+    if result.is_err() && !committed {
+        let error = result.as_ref().unwrap_err();
+        let error = error.strip_prefix("Network error: ").unwrap_or(error);
+        let error_text = if error.starts_with("net::ERR_") { error } else { "net::ERR_FAILED" };
+        let method = params.get("__method").and_then(Value::as_str).unwrap_or("GET");
+        emit_uncommitted_navigation_failure(ctx, session_id, &frame_id, &loader_id, url, method,
+            &page_id, false, error_text);
+        return Err(result.unwrap_err());
+    }
 
     emit_navigation_events(
         ctx,
@@ -1429,6 +1458,8 @@ async fn do_navigate(
         wait_until,
         reached_network_idle,
     );
+
+    result?;
 
     Ok(json!({
         "frameId": frame_id,

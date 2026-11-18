@@ -2743,6 +2743,19 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// An interrupted document can expose its DOM without starting author frames.
+    pub fn run_incomplete_page_init(&mut self) {
+        let _ = self.execute_script_with_timeout(
+            "<obscura:page-init>",
+            "globalThis.__documentReadyState__='loading';globalThis.__obscura_init(true);",
+            std::time::Duration::from_secs(5),
+        );
+    }
+
+    pub fn document_is_incomplete(&self) -> bool {
+        self.state.borrow().dom.as_ref().is_some_and(DomTree::is_document_incomplete)
+    }
+
     pub fn navigation_timing(&self) -> crate::ops::NavigationTiming {
         self.state.borrow().navigation_timing.clone()
     }

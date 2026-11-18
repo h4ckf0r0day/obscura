@@ -305,6 +305,7 @@ struct NodeAllocationGenerations {
     next: u64,
     // EOF state shares this rare allocation without enlarging ordinary DOM storage.
     parser_started_scripts: HashSet<NodeId>,
+    incomplete_document: bool,
 }
 
 pub(crate) struct DomTreeInner {
@@ -588,6 +589,21 @@ impl DomTree {
     pub fn has_parser_started_scripts(&self) -> bool {
         self.inner.borrow().node_generations.as_ref()
             .is_some_and(|metadata| !metadata.parser_started_scripts.is_empty())
+    }
+
+    pub fn is_document_incomplete(&self) -> bool {
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| metadata.incomplete_document)
+    }
+
+    pub fn mark_document_incomplete(&self, incomplete: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if incomplete {
+            inner.node_generations.get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()))
+                .incomplete_document = true;
+        } else if let Some(metadata) = inner.node_generations.as_mut() {
+            metadata.incomplete_document = false;
+        }
     }
 
     pub(crate) fn mark_parser_script_started(&self, node: NodeId) {

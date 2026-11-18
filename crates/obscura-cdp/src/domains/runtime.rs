@@ -189,18 +189,23 @@ async fn emit_post_eval_nav(
         .ok_or("No page")?;
     // The connection processor owns the Fetch reply channel. Let it perform
     // document navigation outside dispatch so destination requests can resume.
-    if server_managed_navigation && page.has_pending_navigation() {
+    let pending = page.has_pending_navigation();
+    if server_managed_navigation && pending {
         return Ok(());
     }
+    let previous_document = if pending { page.with_dom(|dom| dom.form_cache_generation_handle()) } else { None };
     let navigation = page
         .process_pending_navigation_outcome()
         .await
-        .map_err(|e| e.to_string())?;
-    if navigation == PendingNavigationOutcome::None {
+        .map_err(|e| e.to_string());
+    if matches!(navigation, Ok(PendingNavigationOutcome::None)) {
         return Ok(());
     }
+    let committed = page.with_dom(|dom| previous_document.as_ref().is_none_or(|previous|
+        !std::sync::Arc::ptr_eq(previous, &dom.form_cache_generation_handle()))).unwrap_or(false);
+    let page_id = page.id.clone();
     let (frame_id, page_url, page_id, network_events, reached_idle) = {
-        let p = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+        let p = ctx.get_page_mut(&page_id).ok_or("No page")?;
         (
             p.frame_id.clone(),
             p.url_string(),
@@ -209,11 +214,19 @@ async fn emit_post_eval_nav(
             p.lifecycle.is_network_idle(),
         )
     };
-    if navigation == PendingNavigationOutcome::SameDocument {
+    if matches!(navigation, Ok(PendingNavigationOutcome::SameDocument)) {
         super::page::emit_same_document_navigation(ctx, session_id, &frame_id, &page_url);
         return Ok(());
     }
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    if navigation.is_err() && !committed {
+        ctx.pending_events.push(crate::types::CdpEvent {
+            method: "Page.frameStoppedLoading".into(),
+            params: json!({"frameId": frame_id}),
+            session_id: session_id.clone(),
+        });
+        return Err(navigation.unwrap_err());
+    }
     super::page::emit_navigation_events(
         ctx,
         session_id,
@@ -225,7 +238,7 @@ async fn emit_post_eval_nav(
         WaitUntil::Load,
         reached_idle,
     );
-    Ok(())
+    navigation.map(|_| ())
 }
 
 pub async fn handle(

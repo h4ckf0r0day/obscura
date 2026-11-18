@@ -2621,6 +2621,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
     }
     if cmd == "document_lifecycle" {
         let mut state = shared.borrow_mut();
+        if arg1 == "load" {
+            if let Some(dom) = &state.dom { dom.mark_document_incomplete(false); }
+        }
         // Page lifecycle collection is independent of Runtime.enable.
         // The queue remains bounded; CDP filters delivery by Page subscription.
         if matches!(arg1.as_str(), "init" | "DOMContentLoaded" | "load") {

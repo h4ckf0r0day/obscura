@@ -19680,7 +19680,7 @@ globalThis.__obscura_init_frames = function() {
 
 };
 
-globalThis.__obscura_init = (function() {
+globalThis.__obscura_init = (function(skipFrames) {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _realmContextId = __obscuraCore.ops.op_frame_context(_realmFrameId);
@@ -19771,7 +19771,7 @@ globalThis.__obscura_init = (function() {
   // wrongly changes everything after it.
   _installFramingRelationships();
 
-  if (JSON.parse(__obscuraCore.ops.op_frame_preload_scripts()).length === 0) globalThis.__obscura_init_frames();
+  if (!skipFrames && JSON.parse(__obscuraCore.ops.op_frame_preload_scripts()).length === 0) globalThis.__obscura_init_frames();
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

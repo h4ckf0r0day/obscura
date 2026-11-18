@@ -839,26 +839,49 @@ fn reject_oversized_content_length(
 
 /// Read a response with a cap on both advertised and decoded body bytes.
 pub async fn read_reqwest_body_limited(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     url: &Url,
     limit: usize,
 ) -> Result<Vec<u8>, ObscuraNetError> {
-    reject_oversized_content_length(response.headers(), url, limit)?;
+    let mut body = Vec::new();
+    read_reqwest_body_into(response, url, limit, &mut body).await.map_err(|failure| failure.error)?;
+    Ok(body)
+}
+
+pub(crate) struct BodyReadFailure {
+    pub error: ObscuraNetError,
+    pub timeout: bool,
+}
+
+impl BodyReadFailure {
+    pub(crate) fn failed(error: ObscuraNetError) -> Self { Self { error, timeout: false } }
+}
+
+async fn read_reqwest_body_into(
+    mut response: reqwest::Response,
+    url: &Url,
+    limit: usize,
+    body: &mut Vec<u8>,
+) -> Result<(), BodyReadFailure> {
+    reject_oversized_content_length(response.headers(), url, limit).map_err(BodyReadFailure::failed)?;
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(0)
         .min(limit);
-    let mut body = Vec::with_capacity(capacity);
+    body.reserve_exact(capacity);
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
+        BodyReadFailure {
+            timeout: error.is_timeout(),
+            error: ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error))),
+        }
     })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
-            return Err(response_too_large(url, limit));
+            return Err(BodyReadFailure::failed(response_too_large(url, limit)));
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(())
 }
 
 pub struct ObscuraHttpClient {
@@ -1514,6 +1537,7 @@ impl ObscuraHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
+        let document_request = crate::DocumentRequest::claim(request.resource_type);
 
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes, self.allow_file_access()).await;
@@ -1778,27 +1802,30 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
-                resp,
-                &current_url,
-                request.max_response_bytes,
-            )
-            .await?;
-            drop(in_flight);
-
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
-                body: body_bytes,
+                body: Vec::new(),
                 redirected_from: redirects,
             };
+            let mut captured = document_request.response(response, method.as_str(), referer.as_deref().unwrap_or(""));
+            let read = {
+                let response = captured.get_mut();
+                read_reqwest_body_into(resp, &response.url, request.max_response_bytes, &mut response.body).await
+            };
+            if let Err(failure) = read {
+                captured.failed(failure.timeout);
+                return Err(failure.error);
+            }
+            captured.complete();
+            drop(in_flight);
 
             if let Some(cbs) = callbacks {
-                cbs.fire_response(&request_info, &response).await;
+                cbs.fire_response(&request_info, captured.get()).await;
             }
 
-            return Ok(response);
+            return Ok(captured.finish());
         }
 
         Err(ObscuraNetError::TooManyRedirects(current_url.to_string()))
@@ -1867,6 +1894,10 @@ pub enum ObscuraNetError {
     #[error("Response body exceeded {limit} byte limit: {url}")]
     ResponseTooLarge { url: String, limit: usize },
 }
+
+#[cfg(test)]
+#[path = "document_progress_tests.rs"]
+mod document_progress_tests;
 
 #[cfg(test)]
 mod resource_cache_tests {

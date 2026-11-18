@@ -2051,6 +2051,7 @@ async fn process_with_interception(
     let mut document_request_started = false;
 
     let previous_url = page.url.clone();
+    let previous_document = page.with_dom(|dom| dom.form_cache_generation_handle());
     let previous_lifecycle = page.lifecycle;
     let navigation_url = url_owned.clone();
     let navigation_method = nav_method.clone();
@@ -2210,8 +2211,8 @@ async fn process_with_interception(
     // (it drains `deferred` before pulling the next message off `rx`).
 
     let mut page = page_back.expect("navigation task should return the page");
-    let committed = page.network_events.iter().any(|event| event.resource_type == "Document")
-        || page.js.as_ref().is_some_and(|js| previous_url.as_ref().is_some_and(|url| js.document_url() != url.as_str()));
+    let committed = page.with_dom(|dom| previous_document.as_ref().is_none_or(|previous|
+        !Arc::ptr_eq(previous, &dom.form_cache_generation_handle()))).unwrap_or(false);
     if cancelled {
         page.stop_loading();
         if committed {
@@ -2229,16 +2230,17 @@ async fn process_with_interception(
     // alongside the static navigation subresources (#406).
     page.sync_js_network_events();
     let network_events: Vec<_> = page.network_events.drain(..).collect();
-    let failed_document = if document_request_started && navigate_result.is_err()
-        && !network_events.iter().any(|event| event.request_id == loader_id && event.resource_type == "Document") {
-        Some(loader_id.clone())
-    } else { None };
+    let failed_document = (committed && document_request_started && (cancelled || navigate_result.is_err())
+        && !network_events.iter().any(|event| event.request_id == loader_id && event.resource_type == "Document"))
+        .then(|| loader_id.clone());
     let navigation_error = navigate_result.as_ref().err().cloned();
     let page_url = page.url_string();
-    loader_id = network_events.iter().rev().find(|event| event.resource_type == "Document" && event.url == page_url
-        && event.request_id.strip_prefix(&page_id).is_some_and(|suffix| suffix.starts_with('.')))
-        .map(|event| if event.intercepted { event.request_id.clone() } else { initial_loader_id.clone() })
-        .unwrap_or_else(|| failed_document.clone().unwrap_or(initial_loader_id));
+    if committed {
+        loader_id = network_events.iter().rev().find(|event| event.resource_type == "Document" && event.url == page_url
+            && event.request_id.strip_prefix(&page_id).is_some_and(|suffix| suffix.starts_with('.')))
+            .map(|event| if event.intercepted { event.request_id.clone() } else { initial_loader_id.clone() })
+            .unwrap_or(initial_loader_id);
+    }
     let page_id_for_events = page.id.clone();
     let reached_network_idle = page.lifecycle.is_network_idle();
 
@@ -2269,17 +2271,21 @@ async fn process_with_interception(
     // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
     // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
     // to the WS reply channel.
-    if !(cancelled && !committed) {
-        if let (Some(request_id), Some(error)) = (&failed_document, &navigation_error) {
+    if !committed && (cancelled || navigation_error.is_some()) {
+        let error = navigation_error.as_deref().unwrap_or("net::ERR_ABORTED");
+        let error = error.strip_prefix("Network error: ").unwrap_or(error);
+        let error_text = if error.starts_with("net::ERR_") { error } else { "net::ERR_FAILED" };
+        crate::domains::page::emit_uncommitted_navigation_failure(ctx, &session_for_events, &frame_id,
+            &loader_id, &navigation_url, &navigation_method, &page_id_for_events, document_request_started, error_text);
+    } else {
+        if let Some(request_id) = &failed_document {
+            let error = if cancelled { "net::ERR_ABORTED" }
+                else { navigation_error.as_deref().unwrap_or("net::ERR_FAILED") };
             let error = error.strip_prefix("Network error: ").unwrap_or(error);
             let error_text = if error.starts_with("net::ERR_") { error } else { "net::ERR_FAILED" };
-            crate::domains::page::emit_navigation_failure(ctx, &session_for_events, request_id, &page_id_for_events, error_text);
+            crate::domains::page::emit_navigation_failure(ctx, &session_for_events, request_id,
+                &page_id_for_events, error_text);
         }
-    }
-    if cancelled && !committed {
-        crate::domains::page::emit_aborted_navigation(ctx, &session_for_events, &frame_id,
-            &loader_id, &navigation_url, &navigation_method, &page_id_for_events, document_request_started);
-    } else {
         crate::domains::page::emit_navigation_events(
             ctx,
             &session_for_events,
