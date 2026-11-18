@@ -5187,3 +5187,99 @@ fn native_float_fit_allows_roundoff_but_not_real_overflow() {
         assert_eq!(next.y, 20.0, "visible overflow must still wrap: {next:?}");
     }
 }
+
+#[test]
+fn functional_flex_basis_uses_the_final_main_axis() {
+    for (parent, basis, expected) in [
+        ("display:flex;width:1200px", "flex-basis:calc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0 0 calc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0\t0\tcalc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:min(50%, 300px)", (300.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:max(25%, 120px)", (300.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:clamp(120px, 60%, 900px)", (720.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(200px + 20px)", (220.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px;height:800px", "flex-basis:calc(50% - 20px)", (500.0, 380.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:calc(50% - 20px);height:90px", (500.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:50%;height:90px", (500.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:auto;height:90px", (500.0, 90.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(50% - 20px);flex-basis:80px", (80.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(50% - 20px);flex:none;width:160px", (160.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0 0 calc(50% - 20px);flex:initial;width:70px", (70.0, 20.0)),
+        ("display:flex;width:1200px", "flex:calc(50% - 20px)", (1200.0, 20.0)),
+    ] {
+        let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}div{{min-width:0;min-height:0}}</style><div id=parent style='{parent}'><div id=item style='flex-shrink:0;{basis}'><div style='width:40px;height:20px'></div></div></div>"));
+        let layout = layout_dom(&tree, (1400.0, 900.0));
+        let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+        assert!((rect.width - expected.0).abs() < 0.01 && (rect.height - expected.1).abs() < 0.01,
+            "parent={parent}, basis={basis}: {rect:?}, expected={expected:?}");
+        if parent.contains("flex-direction:column") && !parent.contains("height:") {
+            assert_eq!(layout.rects[&tree.get_element_by_id("parent").unwrap()].height, expected.1,
+                "container {parent};{basis}");
+        }
+    }
+}
+
+#[test]
+fn functional_flex_basis_follows_a_nested_flex_items_used_width() {
+    let tree = parse_html("<!doctype html><style>body{margin:0}div{min-width:0;min-height:0}</style><div style='display:flex;width:1200px'><div style='flex:0 0 300px'></div><div style='flex:1'><div style='display:flex;width:100%'><div id=item style='flex:0 0 calc(100% - 20px);height:20px'></div></div></div></div>");
+    let layout = layout_dom(&tree, (1400.0, 900.0));
+    let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+    assert!((rect.width - 880.0).abs() < 0.01, "{rect:?}");
+}
+
+#[test]
+fn functional_flex_basis_preserves_fixed_intrinsic_rows() {
+    for basis in ["300px", "calc(300px)", "calc(200px + 100px)", "min(300px, 400px)"] {
+        let tree = parse_html(&format!("<!doctype html><style>html,body{{margin:0}}#outer{{display:flex;width:768px}}#parent{{flex:0 0 auto;width:auto}}#item{{display:flex;width:100%}}#cell{{flex:0 0 {basis};height:20px}}</style><div id=outer><div id=parent><div><div id=item><div id=cell></div></div></div></div></div>"));
+        let layout = layout_dom(&tree, (800.0, 600.0));
+        for id in ["parent", "item", "cell"] {
+            let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+            assert_eq!(rect.width, 300.0, "{basis};{id}: {rect:?}");
+            assert_eq!(rect.height, 20.0, "{basis};{id}: {rect:?}");
+        }
+    }
+}
+
+#[test]
+fn functional_flex_basis_preserves_content_aspect_ratio_transfer() {
+    for basis in ["50%", "calc(50% - 10px)", "auto"] {
+        for (width, height, expected_cross) in [
+            ("width:100px", "", 100.0),
+            ("width:100px", "height:90px", 100.0),
+            ("", "height:90px", 300.0),
+        ] {
+            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}div{{min-width:0;min-height:0}}</style><div id=parent style='display:flex;flex-direction:column;width:300px'><div id=item style='flex:0 0 {basis};aspect-ratio:2;{width};{height}'></div></div>"));
+            let layout = layout_dom(&tree, (800.0, 600.0));
+            let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            let expected_main = if basis == "auto" && !height.is_empty() { 90.0 } else { expected_cross / 2.0 };
+            assert_eq!(rect.width, expected_cross, "{basis};{width};{height}: {rect:?}");
+            assert_eq!(rect.height, expected_main, "{basis};{width};{height}: {rect:?}");
+            assert_eq!(layout.rects[&tree.get_element_by_id("parent").unwrap()].height, expected_main,
+                "container {basis};{width};{height}");
+        }
+    }
+}
+
+#[test]
+fn functional_flex_basis_resolves_after_intrinsic_row_ratio_sizing() {
+    for (basis, fraction, offset) in [("50%", 0.5, 0.0), ("calc(50% - 10px)", 0.5, 10.0), ("auto", 1.0, 0.0)] {
+        for (width, expected_parent) in [("width:90px", 90.0), ("", 200.0)] {
+            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}div{{min-width:0;min-height:0}}</style><div id=parent style='display:inline-flex'><div id=item style='height:100px;aspect-ratio:2;flex:0 0 {basis};{width}'></div></div>"));
+            let layout = layout_dom(&tree, (800.0, 600.0));
+            let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            assert_eq!(layout.rects[&tree.get_element_by_id("parent").unwrap()].width, expected_parent);
+            assert_eq!(rect.width, expected_parent * fraction - offset, "{basis};{width}: {rect:?}");
+            assert_eq!(rect.height, 100.0, "{basis};{width}: {rect:?}");
+        }
+    }
+}
+
+#[test]
+fn a_functional_zero_basis_preserves_intrinsic_column_content() {
+    for basis in ["0px", "calc(0px)"] {
+        let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}</style><div id=parent style='display:flex;flex-direction:column;width:500px'><div id=item style='flex:1 1 {basis};overflow:auto'><div style='height:100px'></div></div></div>"));
+        let layout = layout_dom(&tree, (1400.0, 900.0));
+        let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+        assert_eq!(rect.height, 100.0, "{basis}: {rect:?}");
+    }
+}

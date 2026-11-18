@@ -1,4 +1,12 @@
 {
+  "functional-flex-basis": [
+    {"name": "calc longhand uses the container width", "color": "#087f5b", "x": 20, "y": 20, "width": 400, "height": 20},
+    {"name": "min shorthand retains the percentage until layout", "color": "#1971c2", "x": 20, "y": 50, "width": 200, "height": 20},
+    {"name": "max shorthand resolves against the same width", "color": "#e8590c", "x": 20, "y": 80, "width": 200, "height": 20},
+    {"name": "clamp uses the final percentage basis", "color": "#7048e8", "x": 20, "y": 110, "width": 360, "height": 20},
+    {"name": "nested basis uses the remaining flex width", "color": "#c2255c", "x": 170, "y": 140, "width": 430, "height": 20},
+    {"name": "column percentage uses the vertical main axis", "color": "#0b7285", "x": 650, "y": 20, "width": 40, "height": 130}
+  ],
   "deep-parser-layout": [
     {"name": "fragment depth matches Chromium without losing the last element", "color": "#3186e8", "x": 545, "width": 80, "height": 20}
   ],

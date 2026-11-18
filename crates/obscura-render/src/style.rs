@@ -1440,9 +1440,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.order = order;
             }
         }
-        "flex-basis" => {
-            style.flex_basis = dimension_value(value.trim());
-        }
+        "flex-basis" => set_flex_basis(style, value),
         "flex" => parse_flex_shorthand(style, value),
         "position" => match value {
             "absolute" => {
@@ -3031,7 +3029,8 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         "word-spacing" => lower == "normal" || parse_word_spacing_length(value).is_some(),
         "height" | "block-size" | "min-width" | "min-inline-size" | "min-height"
         | "min-block-size" | "max-width" | "max-inline-size" | "max-height" | "max-block-size"
-        | "flex-basis" => dimension(value, true),
+        => dimension(value, true),
+        "flex-basis" => parse_flex_basis(value).is_some(),
         "margin" | "margin-inline" | "margin-block" => dimensions(value, true, 4),
         "margin-top"
         | "margin-right"
@@ -3182,29 +3181,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
 }
 
 fn supports_flex_value(value: &str) -> bool {
-    let lower = value.trim().to_ascii_lowercase();
-    if matches!(lower.as_str(), "none" | "auto" | "initial") {
-        return true;
-    }
-    let tokens = split_ws_paren(value);
-    if tokens.is_empty() || tokens.len() > 3 {
-        return false;
-    }
-    let mut numbers = 0usize;
-    for token in tokens {
-        if token
-            .parse::<f32>()
-            .ok()
-            .is_some_and(|number| number.is_finite() && number >= 0.0)
-        {
-            numbers += 1;
-        } else if matches!(dimension_value(token), crate::Dimension::Auto)
-            && !token.eq_ignore_ascii_case("auto")
-        {
-            return false;
-        }
-    }
-    numbers <= 2
+    flex_shorthand_value(value).is_some()
 }
 
 fn supports_transform_value(value: &str) -> bool {
@@ -4152,6 +4129,34 @@ impl GridCalcExpression {
         self.rem_px.store(rem_px.to_bits(), Ordering::Relaxed);
         self.context_initialized.store(true, Ordering::Release);
     }
+
+    fn resolve(&self, basis: f32) -> f32 {
+        use std::sync::atomic::Ordering;
+        resolve_contextual_length(
+            &self.expression,
+            f32::from_bits(self.em_px.load(Ordering::Relaxed)),
+            f32::from_bits(self.rem_px.load(Ordering::Relaxed)),
+            f32::from_bits(self.vw.load(Ordering::Relaxed)),
+            f32::from_bits(self.vh.load(Ordering::Relaxed)),
+            basis,
+        )
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0)
+    }
+
+    pub(crate) fn fixed_flex_basis(&self) -> Option<f32> {
+        (!self.expression.contains('%')).then(|| self.resolve(0.0))
+    }
+
+    pub(crate) fn flex_basis_dimension(self: &std::sync::Arc<Self>) -> taffy::Dimension {
+        if let Some(length) = self.fixed_flex_basis() {
+            taffy::Dimension::length(length)
+        } else {
+            // The owner is retained in the input style map, as for grid handles.
+            taffy::Dimension::calc(std::sync::Arc::as_ptr(self).cast())
+        }
+    }
 }
 
 pub(crate) fn set_grid_calc_context(
@@ -4161,34 +4166,23 @@ pub(crate) fn set_grid_calc_context(
     vw: f32,
     vh: f32,
 ) {
-    for expression in style.grid_calc_expressions.iter().flatten() {
+    for expression in style.grid_calc_expressions.iter().flatten().chain(style.flex_basis_calc.iter()) {
         expression.set_context(em_px, rem_px, vw, vh);
     }
 }
 
-/// Resolve an Arc-backed grid calc handle installed in Taffy.
+/// Resolve an Arc-backed CSS calc handle installed in Taffy.
 ///
 /// # Safety
 ///
 /// `value` must point to a live `GridCalcExpression`. `LayoutStyle` retains
-/// the Arc owners for the entire lifetime of every layout tree computation.
+/// grid and flex-basis Arc owners throughout every layout tree computation.
 #[allow(unsafe_code)]
 pub(crate) fn resolve_grid_calc(value: *const (), basis: f32) -> f32 {
     // SAFETY: upheld by `new_taffy_tree` and the Arc ownership documented on
-    // `LayoutStyle::grid_calc_expressions`.
+    // `LayoutStyle`'s grid and flex-basis expression owners.
     let calc = unsafe { &*value.cast::<GridCalcExpression>() };
-    use std::sync::atomic::Ordering;
-    resolve_contextual_length(
-        &calc.expression,
-        f32::from_bits(calc.em_px.load(Ordering::Relaxed)),
-        f32::from_bits(calc.rem_px.load(Ordering::Relaxed)),
-        f32::from_bits(calc.vw.load(Ordering::Relaxed)),
-        f32::from_bits(calc.vh.load(Ordering::Relaxed)),
-        basis,
-    )
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0)
-        .max(0.0)
+    calc.resolve(basis)
 }
 
 /// Parse a track list into taffy sizing functions plus the `[line-name]` map
@@ -8391,74 +8385,93 @@ fn parse_url(value: &str) -> Option<String> {
     }
 }
 
-/// `flex: none|auto|<grow>|<grow> <shrink>|<grow> <shrink> <basis>`. This is
-/// the shorthand form almost all real-world flexbox CSS actually uses (far
-/// more often than the flex-grow/flex-shrink longhands); leaving it
-/// unhandled silently drops grow/shrink from every rule written this way.
-/// flex-basis is not modeled as a distinct field from width, so a basis
-/// length in the shorthand is parsed (to keep the number-only forms working)
-/// but otherwise not separately applied; auto is a reasonable approximation
-/// for the common case where basis is 0 or unspecified.
-fn parse_flex_shorthand(style: &mut LayoutStyle, value: &str) {
-    match value.trim() {
-        "none" => {
-            style.flex_grow = Some(0.0);
-            style.flex_shrink = Some(0.0);
-            style.flex_basis = crate::Dimension::Auto;
-            return;
-        }
-        "auto" => {
-            style.flex_grow = Some(1.0);
-            style.flex_shrink = Some(1.0);
-            style.flex_basis = crate::Dimension::Auto;
-            return;
-        }
-        "initial" => {
-            style.flex_grow = Some(0.0);
-            style.flex_shrink = Some(1.0);
-            style.flex_basis = crate::Dimension::Auto;
-            return;
-        }
-        _ => {}
+type ParsedFlexBasis = (crate::Dimension, Option<std::sync::Arc<GridCalcExpression>>);
+
+fn parse_flex_basis(value: &str) -> Option<ParsedFlexBasis> {
+    let value = value.trim();
+    if value.contains('(') {
+        return GridCalcExpression::parse(value)
+            .map(|calc| (crate::Dimension::Auto, Some(std::sync::Arc::new(calc))));
     }
-    // Grammar: `flex: <grow> <shrink>? || <basis>`. Bare numbers are grow then
-    // shrink; a token with a unit / `auto` / a third numeric is the basis
-    // (e.g. `flex: 0 0 260px`, the fixed-width sidebar idiom).
-    let mut numbers: Vec<f32> = Vec::new();
-    let mut basis: Option<crate::Dimension> = None;
-    for tok in value.split_whitespace() {
-        if let Ok(n) = tok.parse::<f32>() {
-            if numbers.len() < 2 {
-                numbers.push(n);
-            } else {
-                basis = Some(dimension_value(tok));
-            }
+    if ["auto", "initial", "unset", "inherit", "revert", "revert-layer"]
+        .iter().any(|keyword| value.eq_ignore_ascii_case(keyword))
+    {
+        return Some((crate::Dimension::Auto, None));
+    }
+    let dimension = dimension_value(value);
+    use crate::Dimension::*;
+    let number = match dimension {
+        Px(number) | Percent(number) | Em(number) | Ex(number) | Rem(number)
+        | Vw(number) | Vh(number) | Vmin(number) | Vmax(number) => number,
+        Auto => return None,
+    };
+    (number.is_finite() && number >= 0.0).then_some((dimension, None))
+}
+
+fn set_flex_basis(style: &mut LayoutStyle, value: &str) {
+    if let Some((basis, calc)) = parse_flex_basis(value) {
+        style.flex_basis = basis;
+        style.flex_basis_calc = calc;
+    }
+}
+
+fn flex_shorthand_value(value: &str) -> Option<(f32, f32, ParsedFlexBasis)> {
+    let auto = || (crate::Dimension::Auto, None);
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") { return Some((0.0, 0.0, auto())); }
+    if value.eq_ignore_ascii_case("auto") { return Some((1.0, 1.0, auto())); }
+    if ["initial", "unset", "revert", "revert-layer"]
+        .iter().any(|keyword| value.eq_ignore_ascii_case(keyword))
+    {
+        return Some((0.0, 1.0, auto()));
+    }
+    let tokens = split_ws_paren(value);
+    let number = |token: &str| token.parse::<f32>().ok()
+        .filter(|number| number.is_finite() && *number >= 0.0);
+    let zero = || (crate::Dimension::Px(0.0), None);
+    let basis = |token: &str| {
+        if ["initial", "inherit", "unset", "revert", "revert-layer"]
+            .iter().any(|keyword| token.eq_ignore_ascii_case(keyword))
+        {
+            None
         } else {
-            basis = Some(dimension_value(tok));
-        }
-    }
-    match numbers.as_slice() {
-        [grow] => {
-            style.flex_grow = Some(*grow);
-            style.flex_shrink = Some(1.0);
-        }
-        [grow, shrink, ..] => {
-            style.flex_grow = Some(*grow);
-            style.flex_shrink = Some(*shrink);
-        }
-        [] => {}
-    }
-    // Explicit basis wins; otherwise numbers-only shorthand implies basis 0
-    // (per spec `flex: 1` == `1 1 0%`), while a bare basis keeps grow/shrink 1.
-    style.flex_basis = match basis {
-        Some(b) => b,
-        None if !numbers.is_empty() => crate::Dimension::Px(0.0),
-        None => {
-            style.flex_grow = Some(1.0);
-            style.flex_shrink = Some(1.0);
-            crate::Dimension::Auto
+            parse_flex_basis(token)
         }
     };
+    match tokens.as_slice() {
+        [a] => match number(a) {
+            Some(grow) => Some((grow, 1.0, zero())),
+            None => Some((1.0, 1.0, basis(a)?)),
+        },
+        [a, b] => match (number(a), number(b)) {
+            (Some(grow), Some(shrink)) => Some((grow, shrink, zero())),
+            (Some(grow), None) => Some((grow, 1.0, basis(b)?)),
+            (None, Some(grow)) => Some((grow, 1.0, basis(a)?)),
+            _ => None,
+        },
+        [a, b, c] => {
+            if let Some(grow) = number(a) {
+                Some((grow, number(b)?, basis(c)?))
+            } else {
+                Some((number(b)?, number(c)?, basis(a)?))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Commit all shorthand components together so invalid values preserve the cascade.
+fn parse_flex_shorthand(style: &mut LayoutStyle, value: &str) {
+    if value.trim().eq_ignore_ascii_case("inherit") {
+        set_flex_basis(style, value);
+        return;
+    }
+    if let Some((grow, shrink, (basis, calc))) = flex_shorthand_value(value) {
+        style.flex_grow = Some(grow);
+        style.flex_shrink = Some(shrink);
+        style.flex_basis = basis;
+        style.flex_basis_calc = calc;
+    }
 }
 
 /// Parse `flex-flow: <flex-direction> || <flex-wrap>`. The two constituents
@@ -8854,6 +8867,41 @@ fn split_ws_paren(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn functional_flex_basis_owners_follow_winning_declarations() {
+        let initial = "flex:0 0 calc(50% - 1em)";
+        for reset in ["flex-basis:80px", "flex:none", "flex:auto", "flex:initial", "flex:1 1 0"] {
+            let style = compute_style("div", Some(&format!("{initial};{reset}")));
+            assert!(style.flex_basis_calc.is_none(), "{reset}");
+        }
+        for invalid in ["flex-basis:bananas", "flex-basis:-20px", "flex-basis:calc(1px + bananas)",
+            "flex:-1", "flex:0 0 bananas", "flex:0 0 calc(1px) extra", "flex:10px 20px",
+            "flex:1 initial", "flex:0 0 inherit"]
+        {
+            let style = compute_style("div", Some(&format!("{initial};{invalid}")));
+            let calc = style.flex_basis_calc.as_ref().expect(invalid);
+            set_grid_calc_context(&style, 20.0, 16.0, 10.0, 10.0);
+            assert_eq!(calc.resolve(600.0), 280.0, "{invalid}");
+            assert_eq!(style.flex_grow, Some(0.0));
+            assert_eq!(style.flex_shrink, Some(0.0));
+        }
+
+        assert!(!supports_declaration("flex", "1 initial"));
+        assert!(!supports_declaration("flex", "0 0 inherit"));
+
+        let mut style = compute_style("div", Some(initial));
+        set_grid_calc_context(&style, 20.0, 16.0, 10.0, 10.0);
+        let retained = style.clone();
+        let owner = std::sync::Arc::downgrade(style.flex_basis_calc.as_ref().unwrap());
+        let native = crate::to_taffy_style(&style);
+        apply_declarations_with_locked_color_scheme(&mut style, "flex:none");
+        assert!(style.flex_basis_calc.is_none());
+        assert_eq!(resolve_grid_calc(native.flex_basis.into_raw().calc_value(), 600.0), 280.0);
+        drop(native);
+        drop(retained);
+        assert!(owner.upgrade().is_none());
+    }
 
     #[test]
     fn direction_parses_inherited_state_and_supports_only_real_values() {

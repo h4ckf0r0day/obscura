@@ -6885,12 +6885,14 @@ fn layout_dom_once(
                     style.flex_basis,
                     crate::Dimension::Px(value) | crate::Dimension::Percent(value)
                         if value == 0.0
-                );
+                ) || style.flex_basis_calc.as_ref()
+                    .is_some_and(|calc| calc.fixed_flex_basis() == Some(0.0));
                 if zero_basis
                     && style.height == crate::Dimension::Auto
                     && style.min_height == crate::Dimension::Auto
                 {
                     style.flex_basis = crate::Dimension::Auto;
+                    style.flex_basis_calc = None;
                 }
             }
         }
@@ -12573,13 +12575,17 @@ fn definite_row_flex_intrinsic_width(
         {
             return None;
         }
-        let basis = match child_style.flex_basis {
-            crate::Dimension::Px(value) => value,
-            crate::Dimension::Auto => match child_style.width {
+        let basis = if let Some(calc) = &child_style.flex_basis_calc {
+            calc.fixed_flex_basis()?
+        } else {
+            match child_style.flex_basis {
                 crate::Dimension::Px(value) => value,
+                crate::Dimension::Auto => match child_style.width {
+                    crate::Dimension::Px(value) => value,
+                    _ => return None,
+                },
                 _ => return None,
-            },
-            _ => return None,
+            }
         };
         let edges = child_style.padding.left
             + child_style.padding.right
@@ -12793,7 +12799,9 @@ where
         // natural inline size instead, so lift such an item to its deferred
         // images' natural width before pinning. An item with a definite
         // width or flex-basis keeps its already-correct measurement.
-        if style.width == crate::Dimension::Auto && style.flex_basis == crate::Dimension::Auto {
+        if style.width == crate::Dimension::Auto && style.flex_basis == crate::Dimension::Auto
+            && style.flex_basis_calc.is_none()
+        {
             let natural_floor = deferred
                 .iter()
                 .filter(|entry| entry.flex_item == flex_item && entry.slot == 0)
@@ -17845,6 +17853,42 @@ mod tests {
             }
             assert_eq!(inactive.rects, full.rects, "{pseudo} reset geometry");
         }
+    }
+
+    #[test]
+    fn retained_functional_flex_basis_refreshes_font_and_viewport_context() {
+        let tree = parse_html("<!doctype html><style>body{margin:0}#parent{display:flex;width:100%;font-size:20px}#item{flex:0 0 calc(50% - 1em + 10vw);height:20px}</style><div id=parent><div id=item></div></div>");
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let item = tree.get_element_by_id("item").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree, (400.0, 200.0), &HashMap::new(), &[], &mut cache,
+        );
+        assert_eq!(initial.rects[&item].width, 220.0);
+        let old_owner = initial.styles[&item].flex_basis_calc.clone().unwrap();
+        tree.with_node_mut(parent, |node| node.set_attribute("style", "font-size:40px".into()));
+        let mutation = AttributeStyleMutation {
+            node: parent, name: "style".into(), old_value: None,
+            new_value: Some("font-size:40px".into()),
+        }.into();
+        let mut changed = layout_dom_with_web_fonts_and_retained_styles(
+            &tree, (400.0, 200.0), &HashMap::new(), &[], &mut cache,
+            RetainedStyleMaps {
+                styles: std::mem::take(&mut initial.styles),
+                custom_properties: std::mem::take(&mut initial.custom_properties),
+            }, &[mutation],
+        );
+        assert_eq!(changed.rects[&item].width, 200.0);
+        assert!(!std::sync::Arc::ptr_eq(&old_owner, changed.styles[&item].flex_basis_calc.as_ref().unwrap()));
+        let resized = layout_dom_with_web_fonts_and_retained_styles(
+            &tree, (800.0, 200.0), &HashMap::new(), &[], &mut cache,
+            RetainedStyleMaps {
+                styles: std::mem::take(&mut changed.styles),
+                custom_properties: std::mem::take(&mut changed.custom_properties),
+            }, &[],
+        );
+        assert_eq!(resized.rects[&item].width, 440.0);
+        assert_eq!(resized.rects, layout_dom(&tree, (800.0, 200.0)).rects);
     }
 
     #[test]
