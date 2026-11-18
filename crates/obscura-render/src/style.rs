@@ -8393,8 +8393,8 @@ fn parse_flex_basis(value: &str) -> Option<ParsedFlexBasis> {
         return GridCalcExpression::parse(value)
             .map(|calc| (crate::Dimension::Auto, Some(std::sync::Arc::new(calc))));
     }
-    if matches!(value.to_ascii_lowercase().as_str(),
-        "auto" | "initial" | "unset" | "inherit" | "revert" | "revert-layer")
+    if ["auto", "initial", "unset", "inherit", "revert", "revert-layer"]
+        .iter().any(|keyword| value.eq_ignore_ascii_case(keyword))
     {
         return Some((crate::Dimension::Auto, None));
     }
@@ -8417,11 +8417,13 @@ fn set_flex_basis(style: &mut LayoutStyle, value: &str) {
 
 fn flex_shorthand_value(value: &str) -> Option<(f32, f32, ParsedFlexBasis)> {
     let auto = || (crate::Dimension::Auto, None);
-    match value.trim().to_ascii_lowercase().as_str() {
-        "none" => return Some((0.0, 0.0, auto())),
-        "auto" => return Some((1.0, 1.0, auto())),
-        "initial" | "unset" | "revert" | "revert-layer" => return Some((0.0, 1.0, auto())),
-        _ => {}
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") { return Some((0.0, 0.0, auto())); }
+    if value.eq_ignore_ascii_case("auto") { return Some((1.0, 1.0, auto())); }
+    if ["initial", "unset", "revert", "revert-layer"]
+        .iter().any(|keyword| value.eq_ignore_ascii_case(keyword))
+    {
+        return Some((0.0, 1.0, auto()));
     }
     let tokens = split_ws_paren(value);
     let number = |token: &str| token.parse::<f32>().ok()

@@ -749,22 +749,6 @@ fn determine_flex_base_size(
             },
         };
 
-        // Known dimensions for child sizing
-        let child_known_dimensions = {
-            let mut ckd = child.size.with_main(dir, None);
-            if child.align_self == AlignSelf::STRETCH
-                && !child.margin_is_auto.cross_start(constants.dir)
-                && !child.margin_is_auto.cross_end(constants.dir)
-                && ckd.cross(dir).is_none()
-            {
-                ckd.set_cross(
-                    dir,
-                    cross_axis_available_space.into_option().maybe_sub(child.margin.cross_axis_sum(dir)),
-                );
-            }
-            ckd
-        };
-
         let container_width = constants.node_inner_size.main(dir);
         let box_sizing_adjustment = if child_style.box_sizing() == BoxSizing::ContentBox {
             let padding = child_style.padding().resolve_or_zero(container_width, |val, basis| tree.calc(val, basis));
@@ -782,6 +766,29 @@ fn determine_flex_base_size(
 
         drop(child_style);
 
+        // Known dimensions for child sizing
+        let child_known_dimensions = {
+            let mut ckd = child.size.with_main(dir, None);
+            // A provisional ratio transfer from the authored main size is
+            // not a definite cross size when measuring a content basis.
+            if flex_basis.is_none() && !flex_basis_is_auto
+                && child.aspect_ratio.is_some() && child.cross_size_is_auto
+            {
+                ckd.set_cross(dir, None);
+            }
+            if child.align_self == AlignSelf::STRETCH
+                && !child.margin_is_auto.cross_start(constants.dir)
+                && !child.margin_is_auto.cross_end(constants.dir)
+                && ckd.cross(dir).is_none()
+            {
+                ckd.set_cross(
+                    dir,
+                    cross_axis_available_space.into_option().maybe_sub(child.margin.cross_axis_sum(dir)),
+                );
+            }
+            ckd
+        };
+
         child.flex_basis = 'flex_basis: {
             // A. If the item has a definite used flex basis, that’s the flex base size.
 
@@ -790,12 +797,19 @@ fn determine_flex_base_size(
             //    then the flex base size is calculated from its inner
             //    cross size and the flex item’s intrinsic aspect ratio.
 
-            // Note: `child.size` has already been resolved against aspect_ratio in generate_anonymous_flex_items
-            // So B will just work here by using main_size without special handling for aspect_ratio
-            let main_size = child.size.main(dir);
-            // Only auto retrieves the authored main size. An unresolved
-            // percentage basis uses content instead, including calc().
-            if let Some(flex_basis) = flex_basis.or(if flex_basis_is_auto { main_size } else { None }) {
+            // Only auto retrieves the authored main size. A content basis may
+            // instead transfer a definite cross size through the aspect ratio.
+            if let Some(flex_basis) = flex_basis.or_else(|| {
+                if flex_basis_is_auto {
+                    child.size.main(dir)
+                } else {
+                    maybe_apply_preferred_aspect_ratio(
+                        child_known_dimensions,
+                        child.aspect_ratio,
+                        child.aspect_ratio_adjustment,
+                    ).main(dir)
+                }
+            }) {
                 break 'flex_basis flex_basis;
             };
 
@@ -1077,7 +1091,18 @@ fn determine_container_main_size(
                         // Spec modification: https://www.w3.org/TR/css-flexbox-1/#change-2016-max-contribution
                         // Issue: https://github.com/w3c/csswg-drafts/issues/1435
                         // Gentest: padding_border_overrides_size_flex_basis_0.html
-                        let clamping_basis = Some(item.flex_basis).maybe_max(style_preferred);
+                        let basis = tree.get_flexbox_child_style(item.node).flex_basis();
+                        let content_basis = !basis.is_auto() && basis.maybe_resolve(
+                            constants.node_inner_size.main(dir), |value, basis| tree.calc(value, basis),
+                        ).is_none();
+                        let clamping_basis = if content_basis {
+                            // A percentage with an indefinite basis contributes
+                            // content, not a definite flex-basis clamp. Preferred
+                            // inline sizes still constrain row contributions.
+                            if constants.is_row { style_preferred } else { None }
+                        } else {
+                            Some(item.flex_basis).maybe_max(style_preferred)
+                        };
                         let flex_basis_min = clamping_basis.filter(|_| item.flex_shrink == 0.0);
                         let flex_basis_max = clamping_basis.filter(|_| item.flex_grow == 0.0);
 
@@ -1139,7 +1164,7 @@ fn determine_container_main_size(
                                     child_known_dimensions,
                                     constants.node_inner_size,
                                     child_available_space,
-                                    SizingMode::InherentSize,
+                                    if content_basis { SizingMode::ContentSize } else { SizingMode::InherentSize },
                                     dir.main_axis(),
                                     Line::FALSE,
                                 ) + item.margin.main_axis_sum(constants.dir);
@@ -1171,8 +1196,15 @@ fn determine_container_main_size(
                             if diff > 0.0 {
                                 diff / f32_max(1.0, item.flex_grow)
                             } else if diff < 0.0 {
-                                let scaled_shrink_factor = f32_max(1.0, item.flex_shrink * item.inner_flex_basis);
-                                diff / scaled_shrink_factor
+                                let scaled_shrink_factor = if content_basis {
+                                    // Match the reconstruction below even when
+                                    // an inflexible item's content contribution
+                                    // is smaller than its ratio-derived basis.
+                                    f32_max(1.0, item.flex_shrink) * item.inner_flex_basis
+                                } else {
+                                    f32_max(1.0, item.flex_shrink * item.inner_flex_basis)
+                                };
+                                if scaled_shrink_factor > 0.0 { diff / scaled_shrink_factor } else { 0.0 }
                             } else {
                                 // We are assuming that diff is 0.0 here and that we haven't accidentally introduced a NaN
                                 0.0
