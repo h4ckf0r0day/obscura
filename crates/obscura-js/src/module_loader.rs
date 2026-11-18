@@ -19,7 +19,7 @@ use deno_core::ModuleSpecifier;
 use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
-use crate::ops::{ObscuraState, JsNetworkEvent, StoredNetworkResponseBody, FetchNetworkGuard, record_network_completion};
+use crate::ops::{ObscuraState, JsNetworkEvent, CachedNetworkResponseBody, StoredNetworkResponseBody, FetchNetworkGuard, record_network_completion};
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -441,14 +441,14 @@ async fn fetch_module(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs_f64(),
                         error_text: None,
-                    }, || match std::str::from_utf8(&resp.body) {
+                    }, |_| CachedNetworkResponseBody::Encoded(match std::str::from_utf8(&resp.body) {
                         Ok(body) => StoredNetworkResponseBody {
                             body: body.to_string(), base64_encoded: false,
                         },
                         Err(_) => StoredNetworkResponseBody {
                             body: BASE64.encode(&resp.body), base64_encoded: true,
                         },
-                    });
+                    }));
                 }
             }
             if !(200..=299).contains(&resp.status) {

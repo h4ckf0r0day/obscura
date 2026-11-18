@@ -169,6 +169,16 @@ and group geometry. Full anonymous-table fixup for mixed content is not implemen
 unsupported CSS table structures retain ordinary box layout rather than dropping
 their non-table children.
 
+## Response bodies
+
+`Network.getResponseBody` decodes recognized text MIME types using their charset
+and byte order mark. Binary, untyped, or undecodable bodies use Base64.
+`Fetch.takeResponseBodyAsStream` transfers the original response bytes, including
+legacy text encodings.
+
+For Rust callers, `Page::get_response_body` keeps raw bytes;
+`Page::get_response_body_for_cdp` returns the decoded CDP presentation.
+
 ## Current limits
 
 - Pages on one CDP connection serialize JavaScript work. Separate connections
