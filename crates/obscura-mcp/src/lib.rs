@@ -12,6 +12,7 @@ use anyhow::Result;
 #[cfg(feature = "render")]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_browser::{BrowserContext, Page};
+use obscura_browser::page::PendingNavigationOutcome;
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -60,6 +61,12 @@ impl RpcResponse {
     }
 }
 
+struct ElementRef {
+    node_id: NodeId,
+    // Native consumers may free an arena slot and reuse its numeric id.
+    allocation_generation: u64,
+}
+
 pub struct BrowserState {
     /// Open tabs keyed by tab_id (e.g. "tab-1"). BTreeMap so list ordering
     /// is stable across calls (agents reason about "tab #2" deterministically).
@@ -75,9 +82,9 @@ pub struct BrowserState {
     /// Element-ref table from the last `browser_snapshot` on the ACTIVE
     /// tab. Agents click / fill / type by `ref` (e.g. `"e3"`) instead of
     /// guessing a CSS selector. Refs are stable within a snapshot; the
-    /// table is wiped on every navigation / tab switch and refilled on
-    /// the next snapshot call.
-    interactive_refs: HashMap<String, NodeId>,
+    /// table is wiped on document navigation attempts / tab switches and
+    /// refilled on the next snapshot call.
+    interactive_refs: HashMap<String, ElementRef>,
     ref_generation: u64,
 }
 
@@ -170,14 +177,15 @@ impl BrowserState {
 
     // Complete navigation outside the cancelable wait: it consumes pending state before I/O.
     async fn finish_active_page_turn(&mut self, reached_idle: bool) -> Result<bool, String> {
-        let navigated = self.page_mut()
-            .process_pending_navigation()
+        let navigation = self.page_mut()
+            .process_pending_navigation_outcome()
             .await
+            .inspect_err(|_| self.interactive_refs.clear())
             .map_err(|error| error.to_string())?;
-        if navigated {
+        if navigation == PendingNavigationOutcome::Document {
             self.interactive_refs.clear();
         }
-        Ok(reached_idle && !navigated)
+        Ok(reached_idle && navigation == PendingNavigationOutcome::None)
     }
 
     /// Consume a navigation that a synthesized interaction just queued,
@@ -198,14 +206,17 @@ impl BrowserState {
     /// written before any pump turn could run, so the tool would answer
     /// "Clicked" while the request has not left the process.
     async fn settle_synthetic_navigation(&mut self) -> Result<(), String> {
-        let navigated = self
+        let navigation = self
             .page_mut()
-            .process_pending_navigation()
+            .process_pending_navigation_outcome()
             .await
+            .inspect_err(|_| self.interactive_refs.clear())
             .map_err(|error| error.to_string())?;
-        if navigated {
+        if navigation == PendingNavigationOutcome::Document {
             // The ref table names elements in a document that has gone away.
             self.interactive_refs.clear();
+        }
+        if navigation != PendingNavigationOutcome::None {
             // One slice on the landed document, so a tool that reads the URL
             // or the text next sees the new page rather than an empty one.
             self.page_mut()
@@ -222,14 +233,15 @@ impl BrowserState {
     /// the page isn't re-rendered without it. Returns `Err` if the ref
     /// hasn't been registered (caller must call browser_snapshot first).
     fn ref_to_selector(&self, r: &str) -> Result<String, String> {
-        let node_id = *self.interactive_refs.get(r).ok_or_else(|| format!(
+        let reference = self.interactive_refs.get(r).ok_or_else(|| format!(
                 "unknown ref '{r}'; call browser_snapshot first to refresh the ref table"
             ))?;
         let selector = format!("[data-obscura-ref=\"{r}\"]");
         let same_node = self.active_tab.as_ref()
             .and_then(|id| self.tabs.get(id))
             .and_then(|page| page.with_dom(|dom| {
-                dom.query_selector(&selector).ok().flatten() == Some(node_id)
+                dom.node_allocation_generation(reference.node_id) == Some(reference.allocation_generation)
+                    && dom.query_selector(&selector).ok().flatten() == Some(reference.node_id)
             }))
             .unwrap_or(false);
         if !same_node {
@@ -1011,6 +1023,8 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
+    // A timed-out load can already have replaced the document's arena.
+    state.interactive_refs.clear();
     let ua = state.user_agent.clone();
     let operator_hints = state.operator_network_hints;
     let page = state.page_mut();
@@ -1030,8 +1044,6 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
         })?;
 
     let summary = format!("Navigated to {} — \"{}\"", page.url_string(), page.title);
-    // DOM changed — invalidate the ref table. Next snapshot will rebuild.
-    state.interactive_refs.clear();
     Ok(summary)
 }
 
@@ -1088,9 +1100,6 @@ async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, St
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
-        // A click can navigate or rewrite the DOM; the old ref table may
-        // no longer match. Conservative: invalidate. Next snapshot rebuilds.
-        state.interactive_refs.clear();
         state.settle_synthetic_navigation().await?;
         Ok(format!("Clicked '{selector}'"))
     }
@@ -1449,7 +1458,7 @@ fn accessibility_context(page: &Page) -> Option<obscura_browser::accessibility::
 
 fn interactive_lines(state: &BrowserState, context: &obscura_browser::accessibility::AccessibilityContext, limit: usize) -> Vec<String> {
     let Some(page) = state.active_tab.as_ref().and_then(|id| state.tabs.get(id)) else { return Vec::new(); };
-    let refs: HashMap<_, _> = state.interactive_refs.iter().map(|(reference, id)| (id.raw(), reference.as_str())).collect();
+    let refs: HashMap<_, _> = state.interactive_refs.iter().map(|(reference, node)| (node.node_id.raw(), reference.as_str())).collect();
     page.with_dom(|dom| dom.descendants(dom.document()).into_iter().filter_map(|id| {
         let reference = refs.get(&id.raw())?;
         let ax = context.describe_node(dom, id)?;
@@ -1507,9 +1516,12 @@ fn rebuild_interactive_refs(state: &mut BrowserState) -> Result<(), String> {
     for r in refs {
         let selector = format!("[data-obscura-ref=\"{r}\"]");
         let page = state.page_mut();
-        let nid = page.with_dom(|dom| dom.query_selector(&selector).ok().flatten());
-        if let Some(Some(node_id)) = nid {
-            state.interactive_refs.insert(r, node_id);
+        let node = page.with_dom(|dom| {
+            let node_id = dom.query_selector(&selector).ok().flatten()?;
+            Some(ElementRef { node_id, allocation_generation: dom.node_allocation_generation(node_id)? })
+        }).flatten();
+        if let Some(node) = node {
+            state.interactive_refs.insert(r, node);
         }
     }
     Ok(())
@@ -1529,11 +1541,11 @@ async fn tool_back(state: &mut BrowserState) -> Result<String, String> {
     page.set_history_index(prev_idx);
     let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
     let stash = (page.history.clone(), page.history_index);
-    page.navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
+    state.interactive_refs.clear();
+    state.page_mut().navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     let page = state.page_mut();
     page.history = stash.0;
     page.history_index = stash.1;
-    state.interactive_refs.clear();
     Ok(format!("Back to {url}"))
 }
 
@@ -1547,11 +1559,11 @@ async fn tool_forward(state: &mut BrowserState) -> Result<String, String> {
     page.set_history_index(next_idx);
     let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
     let stash = (page.history.clone(), page.history_index);
-    page.navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
+    state.interactive_refs.clear();
+    state.page_mut().navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     let page = state.page_mut();
     page.history = stash.0;
     page.history_index = stash.1;
-    state.interactive_refs.clear();
     Ok(format!("Forward to {url}"))
 }
 
@@ -1561,8 +1573,8 @@ async fn tool_reload(state: &mut BrowserState) -> Result<String, String> {
         return Err("Nothing to reload.".to_string());
     }
     let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
-    state.page_mut().navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     state.interactive_refs.clear();
+    state.page_mut().navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     Ok(format!("Reloaded {url}"))
 }
 
@@ -1804,7 +1816,6 @@ async fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String
         if result.as_str() != Some("ok") {
             return Err(format!("Submit target not found: {sel}"));
         }
-        state.interactive_refs.clear();
     }
 
     state.settle_synthetic_navigation().await?;
@@ -1857,8 +1868,6 @@ fn tool_scroll(args: &Value, state: &mut BrowserState) -> Result<String, String>
         amt = amt,
     );
     let res = evaluate_tool_script(state.page_mut(), &js)?;
-    // A scroll can reveal new DOM (infinite scroll); invalidate refs.
-    state.interactive_refs.clear();
     Ok(format!("Scrolled {direction}. {}", res.as_str().unwrap_or("")))
 }
 
@@ -2829,6 +2838,126 @@ mod tests {
         }), &mut state).await.expect("reorder same node");
         tool_click(&json!({"ref": reference}), &mut state).await.expect("same node ref");
         assert_eq!(state.page_mut().evaluate("window.clicked"), json!("target"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_survive_actions_that_stay_on_the_page() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(concat!(
+            "data:text/html,<button id=more onclick=\"window.clicks=(window.clicks||0)+1;history.pushState({},'',String.fromCharCode(35)+'route')\">More</button>",
+            "<input id=quantity><form onsubmit=\"event.preventDefault()\"><input id=email><button id=send>Send</button></form>",
+            "<a id=next href=\"data:text/html,<button id=landed>Landed</button>\">Next</a>",
+        )).await.expect("test page");
+        tool_interactive_elements(&json!({}), &mut state).expect("listing");
+        let refs = state.page_mut().evaluate(r#"(function(){
+            return ['more','quantity','email','send','next'].map(function(id){
+                return document.getElementById(id).getAttribute('data-obscura-ref');
+            });
+        })()"#);
+        let more = refs[0].as_str().unwrap();
+        let quantity = refs[1].as_str().unwrap();
+        tool_click(&json!({"ref": more}), &mut state).await.expect("non-navigating click");
+        tool_fill(&json!({"ref": quantity, "value": "3"}), &mut state).await.expect("ref survives click");
+        tool_scroll(&json!({"direction": "down", "amount": 1}), &mut state).expect("scroll");
+        tool_click(&json!({"ref": more}), &mut state).await.expect("ref survives scroll");
+        tool_fill_form(&json!({"fields": [{"ref": refs[2], "value": "test@example.test"}], "submit_ref": refs[3]}), &mut state)
+            .await.expect("prevented submit");
+        tool_fill(&json!({"ref": quantity, "value": "4"}), &mut state).await.expect("ref survives submit");
+        assert_eq!(state.page_mut().evaluate("[window.clicks,document.getElementById('quantity').value]"), json!([2, "4"]));
+        state.page_mut().evaluate("history.replaceState({},'',String.fromCharCode(35)+'later')");
+        assert!(!state.finish_active_page_turn(true).await.expect("same-document history turn"));
+        state.ref_to_selector(quantity).expect("ref survives background same-document navigation");
+
+        tool_click(&json!({"ref": refs[4]}), &mut state).await.expect("navigating click");
+        assert_eq!(state.page_mut().evaluate("!!document.getElementById('landed')"), json!(true));
+        assert!(state.ref_to_selector(more).unwrap_err().contains("unknown ref"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_reject_reused_arena_slots() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<input id=target>").await.expect("test page");
+        tool_snapshot(&json!({}), &mut state).expect("snapshot");
+        let reference = state.interactive_refs.keys().next().unwrap().clone();
+        let old_node = state.page_mut().with_dom(|dom| {
+            let id = dom.query_selector("#target").unwrap().unwrap();
+            dom.remove(id);
+            id
+        }).unwrap();
+        // Native consumers may free an arena slot; its numeric id can then
+        // name a different action, even with a copied ref attribute.
+        state.page_mut().evaluate(&format!(r#"(function(){{
+            var replacement=document.createElement('input'); replacement.id='replacement';
+            replacement.setAttribute('data-obscura-ref',{}); document.body.appendChild(replacement);
+            return true;
+        }})()"#, serde_json::to_string(&reference).unwrap()));
+        assert_eq!(state.page_mut().with_dom(|dom| dom.query_selector("#replacement").unwrap()), Some(Some(old_node)));
+        let error = tool_fill(&json!({"ref": reference, "value": "wrong action"}), &mut state).await.unwrap_err();
+        assert!(error.contains("stale ref"), "{error}");
+        assert_eq!(state.page_mut().evaluate("document.getElementById('replacement').value"), json!(""));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_retire_after_failed_document_navigation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        for route in ["navigate", "click", "background"] {
+            let mut state = BrowserState::new(None, None, false);
+            state.page_mut().navigate("data:text/html,<input id=target><button id=go>Go</button>").await.unwrap();
+            tool_snapshot(&json!({}), &mut state).unwrap();
+            let reference = state.page_mut().evaluate("document.getElementById('target').getAttribute('data-obscura-ref')").as_str().unwrap().to_string();
+            let old_node = state.page_mut().with_dom(|dom| dom.query_selector("#target").unwrap().unwrap()).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/replacement", listener.local_addr().unwrap());
+            let html = format!("<input id=target data-obscura-ref={reference}><script src=/hang></script>");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                socket.read(&mut request).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len()).as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+                let (hanging_script, _) = listener.accept().await.unwrap();
+                std::future::pending::<()>().await;
+                drop(hanging_script);
+            });
+            state.page_mut().set_navigation_timeout(std::time::Duration::from_millis(300));
+            let result = match route {
+                "navigate" => tool_navigate(&json!({"url": url}), &mut state).await.map(|_| ()),
+                "click" => {
+                    state.page_mut().evaluate(&format!("document.getElementById('go').onclick=function(){{location.href={};}}", serde_json::to_string(&url).unwrap()));
+                    tool_click(&json!({"selector":"#go"}), &mut state).await.map(|_| ())
+                }
+                _ => {
+                    state.page_mut().evaluate(&format!("location.href={}", serde_json::to_string(&url).unwrap()));
+                    state.finish_active_page_turn(true).await.map(|_| ())
+                }
+            };
+            server.abort();
+            let _ = server.await;
+            assert!(result.unwrap_err().contains("deadline"), "{route}");
+            assert_eq!(state.page_mut().evaluate("[!!document.querySelector('script[src=\"/hang\"]'),!!document.getElementById('go')]"), json!([true, false]), "replacement committed before timeout: {route}");
+            assert_eq!(state.page_mut().with_dom(|dom| dom.query_selector("#target").unwrap()), Some(Some(old_node)), "replacement reuses the numeric id: {route}");
+            assert!(state.ref_to_selector(&reference).unwrap_err().contains("unknown ref"), "{route}");
+            assert_eq!(state.page_mut().evaluate("document.getElementById('target').value"), json!(""));
+            tool_snapshot(&json!({}), &mut state).unwrap();
+            let fresh = state.interactive_refs.keys().next().unwrap();
+            assert_ne!(fresh, &reference, "retired tokens must never name the replacement");
+            assert!(state.ref_to_selector(&reference).is_err());
+        }
+
+        // An error before a replacement commits also retires refs: callers
+        // must refresh rather than guessing which phase of a load failed.
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<input id=retained>").await.unwrap();
+        tool_snapshot(&json!({}), &mut state).unwrap();
+        let reference = state.interactive_refs.keys().next().unwrap().clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/unreachable", listener.local_addr().unwrap());
+        drop(listener);
+        state.page_mut().evaluate(&format!("location.href={}", serde_json::to_string(&url).unwrap()));
+        assert!(state.finish_active_page_turn(true).await.is_err());
+        assert_eq!(state.page_mut().evaluate("!!document.getElementById('retained')"), json!(true));
+        assert!(state.ref_to_selector(&reference).unwrap_err().contains("unknown ref"));
     }
 
     #[tokio::test(flavor = "current_thread")]
