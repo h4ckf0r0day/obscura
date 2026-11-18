@@ -61,6 +61,11 @@ pub(crate) async fn start_awaited_evaluation(
     command_budget_ms: u64,
 ) -> Result<Option<DeferredEvaluation>, String> {
     let field = if method == "evaluate" { "contextId" } else { "executionContextId" };
+    let script_source = if method == "runScript" {
+        compiled_script_source(ctx, session_id, params)?
+    } else {
+        String::new()
+    };
     let frame_id = validate_context(params, field, ctx, session_id, method)?;
     let return_by_value = params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false);
     let timeout_ms = params.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
@@ -74,6 +79,8 @@ pub(crate) async fn start_awaited_evaluation(
             frame_id, params.get("expression").and_then(Value::as_str).ok_or("expression required")?,
             return_by_value, true,
         )?
+    } else if method == "runScript" {
+        js.start_cdp_evaluation_in_frame(frame_id, &script_source, return_by_value, true)?
     } else {
         js.start_cdp_call_in_frame(
             frame_id,
@@ -227,6 +234,78 @@ async fn emit_post_eval_nav(
     Ok(())
 }
 
+/// The source stored by `Runtime.compileScript` for `params.scriptId`, if the
+/// calling session is the one that compiled it.
+fn compiled_script_source(
+    ctx: &CdpContext,
+    session_id: &Option<String>,
+    params: &Value,
+) -> Result<String, String> {
+    let script_id = params
+        .get("scriptId")
+        .and_then(|v| v.as_str())
+        .ok_or("scriptId required")?;
+    ctx.compiled_scripts
+        .get(script_id)
+        .filter(|script| &script.session_id == session_id)
+        .map(|script| script.source.clone())
+        .ok_or_else(|| "No script with given id".to_string())
+}
+
+async fn evaluate_source(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    params: &Value,
+    context_key: &str,
+    method: &str,
+    source: &str,
+) -> Result<Value, String> {
+    let return_by_value = params
+        .get("returnByValue")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let frame_id = validate_context(params, context_key, ctx, session_id, method)?;
+
+    let await_promise = params
+        .get("awaitPromise")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // CDP `timeout` field (milliseconds). Default to Chrome's
+    // protocolTimeout (30s) so long evaluations don't pin the V8 lock
+    // indefinitely and starve every other CDP command on the same
+    // session.
+    let timeout_ms = params
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30_000);
+
+    let info = match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        with_live_peers(ctx, session_id, |page| page.evaluate_for_cdp_in_frame_with_timeout(
+            frame_id,
+            source,
+            return_by_value,
+            await_promise,
+            timeout_ms,
+        )),
+    )
+    .await
+    {
+        Ok(Ok(info)) => info,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {
+            return Err(format!(
+                "Runtime.{method} exceeded {timeout_ms}ms timeout"
+            ));
+        }
+    };
+    emit_post_eval_nav(ctx, session_id).await?;
+
+    Ok(evaluation_reply(&info))
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -287,50 +366,49 @@ pub async fn handle(
                 .get("expression")
                 .and_then(|v| v.as_str())
                 .ok_or("expression required")?;
-            let return_by_value = params
-                .get("returnByValue")
+            evaluate_source(ctx, session_id, params, "contextId", method, expression).await
+        }
+        "compileScript" => {
+            let expression = params
+                .get("expression")
+                .and_then(|v| v.as_str())
+                .ok_or("expression required")?;
+            let persist = params
+                .get("persistScript")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            let frame_id = validate_context(params, "contextId", ctx, session_id, "evaluate")?;
-
-            let await_promise = params
-                .get("awaitPromise")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            // CDP `timeout` field (milliseconds). Default to Chrome's
-            // protocolTimeout (30s) so long evaluations don't pin the V8 lock
-            // indefinitely and starve every other CDP command on the same
-            // session.
-            let timeout_ms = params
-                .get("timeout")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(30_000);
-
-            let info = match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                with_live_peers(ctx, session_id, |page| page.evaluate_for_cdp_in_frame_with_timeout(
-                    frame_id,
-                    expression,
-                    return_by_value,
-                    await_promise,
-                    timeout_ms,
-                )),
-            )
-            .await
-            {
-                Ok(Ok(info)) => info,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(format!(
-                        "Runtime.evaluate exceeded {timeout_ms}ms timeout"
-                    ));
-                }
-            };
-            emit_post_eval_nav(ctx, session_id).await?;
-
-            Ok(evaluation_reply(&info))
+                .ok_or("persistScript required")?;
+            let source_url = params.get("sourceURL").and_then(|v| v.as_str()).unwrap_or("");
+            let js = ctx
+                .get_session_page_mut(session_id)
+                .and_then(|page| page.js.as_mut())
+                .ok_or("No JavaScript runtime")?;
+            if let Err(error) = js.check_script_syntax(expression, source_url) {
+                return Ok(json!({
+                    "exceptionDetails": {
+                        "exceptionId": 1,
+                        "text": error.text,
+                        "lineNumber": error.line,
+                        "columnNumber": error.column,
+                    }
+                }));
+            }
+            if !persist {
+                return Ok(json!({}));
+            }
+            ctx.compiled_script_counter += 1;
+            let script_id = format!("compiled-{}", ctx.compiled_script_counter);
+            ctx.compiled_scripts.insert(
+                script_id.clone(),
+                crate::dispatch::CompiledScript {
+                    session_id: session_id.clone(),
+                    source: expression.to_string(),
+                },
+            );
+            Ok(json!({ "scriptId": script_id }))
+        }
+        "runScript" => {
+            let source = compiled_script_source(ctx, session_id, params)?;
+            evaluate_source(ctx, session_id, params, "executionContextId", method, &source).await
         }
         "callFunctionOn" => {
             let function_declaration = params

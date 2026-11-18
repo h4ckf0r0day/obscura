@@ -2320,7 +2320,7 @@ async fn process_cdp_message_with_pending(
 
     service_live_page_render_resources(ctx);
     let mut evaluation = None;
-    let is_awaited = matches!(req.method.as_str(), "Runtime.evaluate" | "Runtime.callFunctionOn")
+    let is_awaited = matches!(req.method.as_str(), "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.runScript")
         && req.params.get("awaitPromise").and_then(|value| value.as_bool()) == Some(true);
     let response = if pending_runtime.as_ref().is_some_and(|pending| pending.len() >= MAX_DEFERRED_MESSAGES) && is_awaited {
         crate::types::CdpResponse::error(req.id, -32000, "Too many pending evaluations".into(), req.session_id.clone())

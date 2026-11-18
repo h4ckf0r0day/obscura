@@ -13,6 +13,11 @@ pub(crate) const LIFECYCLE_PHASES: [&str; 5] = [
     "commit", "DOMContentLoaded", "load", "networkAlmostIdle", "networkIdle",
 ];
 
+pub(crate) struct CompiledScript {
+    pub session_id: Option<String>,
+    pub source: String,
+}
+
 #[cfg(feature = "render")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScreencastFormat {
@@ -82,6 +87,10 @@ pub struct CdpContext {
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub(crate) preload_script_pages: HashMap<String, String>,
     pub preload_counter: u32,
+    /// Scripts kept by `Runtime.compileScript`, keyed by script id. Only the
+    /// owning session may run one.
+    pub(crate) compiled_scripts: HashMap<String, CompiledScript>,
+    pub(crate) compiled_script_counter: u32,
     // Which sessions asked for each `Runtime.addBinding` name. A binding is a
     // session-scoped subscription in CDP, and a client discards any event whose
     // sessionId is not one it holds, so the call has to go back to the session
@@ -206,6 +215,8 @@ impl CdpContext {
             lifecycle_enabled_sessions: HashSet::new(),
             lifecycle_timestamps: HashMap::new(),
             preload_counter: 0,
+            compiled_scripts: HashMap::new(),
+            compiled_script_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
             isolated_worlds: Vec::new(),
@@ -868,7 +879,7 @@ pub(crate) async fn dispatch_with_deferred(
         "DOMSnapshot" => {
             domains::domsnapshot::handle(method, &req.params, ctx, &req.session_id).await
         }
-        "Runtime" if deferred.is_some() && matches!(method, "evaluate" | "callFunctionOn")
+        "Runtime" if deferred.is_some() && matches!(method, "evaluate" | "callFunctionOn" | "runScript")
             && req.params.get("awaitPromise").and_then(|value| value.as_bool()) == Some(true) => {
             match domains::runtime::start_awaited_evaluation(method, &req.params, ctx, &req.session_id, cmd_budget_ms).await {
                 Ok(Some(evaluation)) if evaluation.ready(ctx) => evaluation.finish(ctx, &req.session_id).await,

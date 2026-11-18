@@ -61,6 +61,7 @@ integration_tests!(
     page_close_destroys_target,
     page_frame_contract,
     runtime_by_value_undefined,
+    runtime_compile_run_script,
     runtime_console_events,
     runtime_get_properties_objectid_escaping,
     runtime_primitives,
