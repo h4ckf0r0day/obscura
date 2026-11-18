@@ -1215,7 +1215,7 @@ async fn run_fetch(
     // The browser layer refuses file:// unless the context opts in. A local
     // user running `obscura fetch file://...` on their own files is the
     // intended case; only network-facing servers (serve, mcp) keep it off.
-    context.allow_file_access = true;
+    context.set_allow_file_access(true);
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -1333,6 +1333,7 @@ async fn run_fetch(
     // pages stay fast.
     settle_page(&mut page, wait_secs, wait_is_fixed).await;
 
+    #[cfg(feature = "render")]
     let mut deferred_eval_output = None;
     let initial_controlled_scroll = if eval_at_capture_boundary {
         controlled_scroll_request.as_ref().map(|(x, requested_y)| {
@@ -1377,6 +1378,7 @@ async fn run_fetch(
                 context.save_storage();
                 return Ok(());
             }
+            #[cfg(feature = "render")]
             if screenshot.is_some() {
                 deferred_eval_output = Some(result);
             }
@@ -1526,8 +1528,7 @@ async fn run_fetch(
                         }
                     }
                 }
-                println!(
-                    "{}",
+                print_stdout_line(
                     serde_json::json!({
                         "evaluation": result,
                         "controlledScroll": controlled_scroll_report,
@@ -1539,7 +1540,7 @@ async fn run_fetch(
                         },
                         "captureState": capture_state.unwrap_or(serde_json::Value::Null),
                     })
-                );
+                )?;
             }
             if !quiet {
                 eprintln!(
@@ -1607,7 +1608,8 @@ async fn fetch_original_response(
                 Arc::new(obscura_net::CookieJar::new()),
                 proxy.as_deref(),
                 false,
-            );
+            )
+            .with_user_agent(user_agent);
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
                 Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
@@ -1620,6 +1622,9 @@ async fn fetch_original_response(
         Arc::new(obscura_net::CookieJar::new()),
         proxy.as_deref(),
     );
+    // Same local-user opt-in as `fetch`: `--dump original file://...` reads
+    // the user's own file. The client refuses file:// unless told otherwise.
+    client.set_allow_file_access(true);
     if let Some(ua) = user_agent {
         client.set_user_agent(&ua).await;
     }
@@ -1784,6 +1789,19 @@ async fn run_batch_fetch(
     Ok(())
 }
 
+fn stdout_write_result(result: std::io::Result<()>) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("Failed to write to stdout: {}", error)),
+    }
+}
+
+fn print_stdout_line(content: impl std::fmt::Display) -> anyhow::Result<()> {
+    use std::io::Write;
+    stdout_write_result(writeln!(std::io::stdout().lock(), "{}", content))
+}
+
 async fn write_or_print(
     content: String,
     output: Option<&std::path::PathBuf>,
@@ -1793,7 +1811,7 @@ async fn write_or_print(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
     } else {
-        println!("{}", content);
+        print_stdout_line(content)?;
     }
     Ok(())
 }
@@ -1810,14 +1828,8 @@ async fn write_or_print_bytes(
         // Write raw bytes to stdout — never println! (would append a newline
         // and break binary payloads like JPEG/PNG).
         let mut stdout = tokio::io::stdout();
-        stdout
-            .write_all(bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to write to stdout: {}", e))?;
-        stdout
-            .flush()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {}", e))?;
+        stdout_write_result(stdout.write_all(bytes).await)?;
+        stdout_write_result(stdout.flush().await)?;
     }
     Ok(())
 }

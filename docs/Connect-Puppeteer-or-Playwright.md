@@ -1,3 +1,5 @@
+Examples use Node.js ES modules. Save scripts with a `.mjs` extension.
+
 Obscura speaks the Chrome DevTools Protocol over WebSocket. Puppeteer and
 Playwright can connect to its CDP endpoint for the supported workflows below.
 
@@ -18,7 +20,7 @@ npm install puppeteer-core
 ```
 
 ```js
-const puppeteer = require('puppeteer-core');
+import puppeteer from 'puppeteer-core';
 
 const browser = await puppeteer.connect({
   browserWSEndpoint: 'ws://127.0.0.1:9222',
@@ -40,7 +42,7 @@ npm install playwright
 ```
 
 ```js
-const { chromium } = require('playwright');
+import { chromium } from 'playwright';
 
 const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222');
 const context = browser.contexts()[0] || await browser.newContext();
@@ -54,9 +56,30 @@ await browser.close();
 
 Use `connectOverCDP`, not `connect`. Playwright's `connect` speaks Playwright's own protocol, which obscura does not implement.
 
+## Authentication
+
+A non-loopback server bind requires `OBSCURA_CDP_TOKEN` of at least 32 bytes.
+Pass the same token in the client connection headers:
+
+```js
+// Puppeteer
+const browser = await puppeteer.connect({
+  browserWSEndpoint: 'ws://127.0.0.1:9222',
+  headers: { Authorization: `Bearer ${process.env.OBSCURA_CDP_TOKEN}` },
+});
+```
+
+```js
+// Playwright
+const browser = await chromium.connectOverCDP(
+  'ws://127.0.0.1:9222',
+  { headers: { Authorization: `Bearer ${process.env.OBSCURA_CDP_TOKEN}` } },
+);
+```
+
 ## `waitUntil`
 
-Default is `domcontentloaded`. For full subresource load:
+Puppeteer and Playwright default to `load`. Set it explicitly when needed:
 
 ```js
 await page.goto('https://example.com', { waitUntil: 'load' });
@@ -64,10 +87,15 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 
 | Value              | Returns when                            |
 | ------------------ | --------------------------------------- |
-| `domcontentloaded` | HTML parsed, scripts ran (default)      |
-| `load`             | All subresources finished               |
+| `domcontentloaded` | HTML parsed, scripts ran      |
+| `load`             | All subresources finished (default)     |
 | `networkidle2`     | ≤2 network connections active for 500ms |
 | `networkidle0`     | 0 network connections active for 500ms  |
+
+The table uses Puppeteer names. Playwright uses `networkidle` for zero active
+connections and also accepts `commit`. Raw CDP `Page.navigate` uses Obscura's
+`domcontentloaded` default when its `waitUntil` parameter is omitted; client
+libraries wait for lifecycle events according to their own options.
 
 ## Supported
 
@@ -86,15 +114,9 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 
 DOM-agent frameworks such as browser-use also connect: obscura implements `DOMSnapshot.captureSnapshot` and `Target.targetInfoChanged` for perception, and `DOM.focus` so a focused field receives `Input.dispatchKeyEvent` keystrokes.
 
-For documents and fetch/XHR responses, `Network.getResponseBody` returns decoded
-text for recognized text MIME types or declared charsets. Binary, untyped, and
-undecodable bodies use Base64 so clients can recover the original bytes. Ordinary
-and native-stealth fetches use the same policy. Page-side
-`fetch().arrayBuffer()` remains byte-preserving. Cached
-transport bytes are decoded only on lookup; `Fetch.takeResponseBodyAsStream`
-transfers the original bytes, including legacy-encoded text.
-Body retention still follows `OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and
-`OBSCURA_NETWORK_BODY_BUFFER_BYTES`; discarded bodies are not encoded for CDP.
+`Runtime.evaluate` runs scripts in the execution context's global scope, without
+calling the page's `eval`. Global lexical bindings survive subsequent evaluations
+in that context; navigation creates a fresh context.
 
 ## Capture example
 
@@ -147,9 +169,20 @@ and group geometry. Full anonymous-table fixup for mixed content is not implemen
 unsupported CSS table structures retain ordinary box layout rather than dropping
 their non-table children.
 
+## Response bodies
+
+`Network.getResponseBody` decodes recognized text MIME types using their charset
+and byte order mark. Binary, untyped, or undecodable bodies use Base64.
+`Fetch.takeResponseBodyAsStream` transfers the original response bytes, including
+legacy text encodings.
+
+For Rust callers, `Page::get_response_body` keeps raw bytes;
+`Page::get_response_body_for_cdp` returns the decoded CDP presentation.
+
 ## Current limits
 
-- Pages share one V8 isolate. CPU-bound JavaScript on one page can delay others.
+- Pages on one CDP connection serialize JavaScript work. Separate connections
+  execute on separate threads.
 - PDF output is raster-backed; text is not selectable and tagged PDF,
   headers/footers, outlines, and full CSS paged media are not implemented.
 - Service workers, native media playback, some Web APIs, and long-tail CSS or

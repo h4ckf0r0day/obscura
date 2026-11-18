@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Functional flex bases use the final main-axis size</title>
+<style>
+body { margin: 20px; }
+.row { display: flex; width: 600px; height: 20px; margin-bottom: 10px; }
+.item { min-width: 0; min-height: 0; height: 20px; }
+#calc { flex-basis: calc(100% - 200px); background: #087f5b; }
+#min { flex: 0 0 min(50%, 200px); background: #1971c2; }
+#max { flex: 0 0 max(25%, 200px); background: #e8590c; }
+#clamp { flex: 0 0 clamp(100px, 60%, 500px); background: #7048e8; }
+#sidebar { flex: 0 0 150px; }
+#remaining { flex: 1; min-width: 0; }
+#nested { display: flex; width: 100%; }
+#nested .item { flex: 0 0 calc(100% - 20px); background: #c2255c; }
+#column { position: absolute; left: 650px; top: 20px; display: flex;
+  flex-direction: column; width: 40px; height: 300px; }
+#column .item { flex: 0 0 calc(50% - 20px); background: #0b7285; }
+</style>
+<div class="row"><div id="calc" class="item"></div></div>
+<div class="row"><div id="min" class="item"></div></div>
+<div class="row"><div id="max" class="item"></div></div>
+<div class="row"><div id="clamp" class="item"></div></div>
+<div class="row"><div id="sidebar"></div><div id="remaining"><div id="nested"><div class="item"></div></div></div></div>
+<div id="column"><div class="item"></div></div>

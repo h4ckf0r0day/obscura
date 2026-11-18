@@ -14,6 +14,10 @@ pub struct BrowserContext {
     pub indexed_db: Arc<obscura_js::indexed_db::IndexedDbStorage>,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
+    /// The UA the caller set explicitly (`--user-agent`), or `None` when the
+    /// profile default was resolved. Stealth mode uses it for the wire UA and
+    /// navigator.userAgent; `None` keeps the stealth defaults.
+    pub user_agent_override: Option<String>,
     pub platform: String,
     pub ua_platform: String,
     pub ua_platform_version: String,
@@ -29,6 +33,7 @@ pub struct BrowserContext {
     /// so every CDP and MCP route is covered; the CLI's own `obscura fetch
     /// file://...` opts its local context in. A page can never drive
     /// itself from a web origin into file:// regardless of this flag.
+    /// Use `set_allow_file_access` to keep the transport permission in sync.
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
     /// When true, the http client allows fetching localhost / RFC1918 /
@@ -42,10 +47,10 @@ pub struct BrowserContext {
 /// One origin's persisted `localStorage`. The origin is inside the file, so the
 /// file name only has to be unique and stable, not reversible.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct StoredOriginStorage {
+struct StoredOriginStorage<T = Vec<(String, String)>> {
     origin: String,
     /// `[key, value]` pairs in insertion order, the order `Storage.key(i)` uses.
-    entries: Vec<(String, String)>,
+    entries: T,
 }
 
 /// Filename-safe stem for an origin: a sanitized prefix for readability plus the
@@ -181,6 +186,7 @@ impl BrowserContext {
             client.block_trackers = true;
         }
         let profile = crate::profiles::select_profile();
+        let user_agent_override = user_agent.clone();
         let resolved_ua = user_agent.unwrap_or_else(|| profile.user_agent.to_string());
         let platform = profile.platform.to_string();
         let ua_platform = profile.ua_platform.to_string();
@@ -204,6 +210,7 @@ impl BrowserContext {
             indexed_db: Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()),
             http_client,
             user_agent: resolved_ua,
+            user_agent_override,
             platform,
             ua_platform,
             ua_platform_version,
@@ -215,6 +222,14 @@ impl BrowserContext {
             storage_dir,
             allow_private_network,
         }
+    }
+
+    /// Sets the file:// opt-in on the context and on its http client, whose
+    /// loader enforces it for every fetch, not only for navigation. Assigning
+    /// the field directly leaves the client refusing file://.
+    pub fn set_allow_file_access(&mut self, allow: bool) {
+        self.allow_file_access = allow;
+        self.http_client.set_allow_file_access(allow);
     }
 
     pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
@@ -232,6 +247,15 @@ impl BrowserContext {
 
     pub fn with_proxy(id: String, proxy_url: Option<String>) -> Self {
         Self::with_options(id, proxy_url, false)
+    }
+
+    /// Private CDP state; only the server's persistence context writes the profile.
+    pub fn connection_copy(&self, id: String) -> Self {
+        let mut copy = self.isolated_copy(id, true);
+        copy.local_storage = Arc::new(self.local_storage.isolated_snapshot());
+        copy.indexed_db = Arc::new(obscura_js::indexed_db::IndexedDbStorage::default());
+        copy.storage_dir = None;
+        copy
     }
 
     /// Create a context with the same browser configuration but independent
@@ -252,6 +276,7 @@ impl BrowserContext {
         if self.stealth {
             client.block_trackers = true;
         }
+        client.set_allow_file_access(self.allow_file_access);
         if let Ok(mut guard) = client.user_agent.try_write() {
             *guard = self.user_agent.clone();
         }
@@ -271,6 +296,7 @@ impl BrowserContext {
                 else { Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()) },
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
+            user_agent_override: self.user_agent_override.clone(),
             platform: self.platform.clone(),
             ua_platform: self.ua_platform.clone(),
             ua_platform_version: self.ua_platform_version.clone(),
@@ -297,7 +323,14 @@ impl BrowserContext {
             return;
         }
         let root = dir.join("localStorage");
-        if let Err(e) = std::fs::create_dir_all(&root) {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        if let Err(e) = builder.create(&root) {
             tracing::warn!("Failed to create {}: {}", root.display(), e);
             return;
         }
@@ -309,7 +342,7 @@ impl BrowserContext {
                     result => result,
                 }
             } else {
-                let stored = StoredOriginStorage { origin: origin.to_string(), entries: entries.to_vec() };
+                let stored = StoredOriginStorage { origin: origin.to_string(), entries };
                 serde_json::to_vec(&stored).map_err(std::io::Error::other)
                     .and_then(|bytes| write_file_atomically(&path, &bytes))
             };
@@ -330,10 +363,15 @@ impl BrowserContext {
     /// Called during graceful shutdown.
     pub fn save_cookies(&self) {
         if let Some(ref dir) = self.storage_dir {
-            let _ = std::fs::create_dir_all(dir);
+            // `save_to_file` creates the directory itself, with owner-only
+            // permissions on unix, so any failure to do so is reported below.
             let cookie_path = dir.join("cookies.json");
             if let Err(e) = self.cookie_jar.save_to_file(&cookie_path) {
-                tracing::warn!("Failed to save cookies to {}: {}", cookie_path.display(), e);
+                tracing::error!(
+                    "Could not save cookies to {}: {}. They will not be persisted, so the next run starts without them.",
+                    cookie_path.display(),
+                    e
+                );
             } else {
                 tracing::info!("Saved cookies to {}", cookie_path.display());
             }
@@ -386,6 +424,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_dirty_web_storage_keeps_a_new_profile_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = temp_storage_dir("private-profile");
+        let dir = parent.join("profile");
+        let context = BrowserContext::with_storage("private-profile".into(), Some(dir.clone()));
+        assert!(context.local_storage.set("https://example.com", "token".into(), "private".into()));
+        context.save_storage();
+        for path in [&dir, &dir.join("localStorage")] {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0, "{}", path.display());
+        }
+        assert_eq!(std::fs::metadata(dir.join("cookies.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        let restored = BrowserContext::with_storage("restored".into(), Some(dir));
+        assert_eq!(restored.local_storage.get("https://example.com", "token").as_deref(), Some("private"));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_web_storage_preserves_existing_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_storage_dir("existing-private-profile");
+        let root = dir.join("localStorage");
+        std::fs::create_dir(&root).unwrap();
+        for path in [&dir, &root] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let context = BrowserContext::with_storage("existing-private-profile".into(), Some(dir.clone()));
+        assert!(context.local_storage.set("https://example.com", "key".into(), "value".into()));
+        context.save_storage();
+        for path in [&dir, &root] {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o750);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// --storage-dir has to survive a restart, which is the whole point of a
@@ -572,6 +647,27 @@ mod tests {
             persistent.local_storage.get("https://app.example", "k"),
             Some("v".to_string())
         );
+    }
+
+    #[test]
+    fn connection_copies_isolate_live_storage_and_cannot_write_the_profile() {
+        let dir = temp_storage_dir("connection-copy");
+        let profile = BrowserContext::with_storage("profile".into(), Some(dir.clone()));
+        assert!(profile.local_storage.load("https://app.test", vec![("seed".into(), "initial".into())]));
+        let a = profile.connection_copy("a".into());
+        let b = profile.connection_copy("b".into());
+        assert!(a.storage_dir.is_none());
+        assert!(a.local_storage.set("https://app.test", "secret".into(), "a".into()));
+        assert_eq!(b.local_storage.get("https://app.test", "seed").as_deref(), Some("initial"));
+        assert_eq!(b.local_storage.get("https://app.test", "secret"), None);
+        assert_eq!(profile.local_storage.get("https://app.test", "secret"), None);
+        assert!(!Arc::ptr_eq(&a.indexed_db, &b.indexed_db));
+        assert!(!Arc::ptr_eq(&a.indexed_db, &profile.indexed_db));
+        a.save_local_storage();
+        assert!(!dir.join("localStorage").exists());
+        let persistent = profile.isolated_copy("persistent".into(), true);
+        assert!(Arc::ptr_eq(&persistent.local_storage, &profile.local_storage));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// An unchanged store must not touch the disk, or every navigation on a

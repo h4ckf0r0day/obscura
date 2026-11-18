@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deno_core::Extension;
@@ -83,6 +84,8 @@ pub struct StoredNetworkResponseBody {
 #[derive(Debug, Clone)]
 pub enum CachedNetworkResponseBody {
     Raw { bytes: Vec<u8>, content_type: Option<String> },
+    // Already-decoded static resources keep their existing native store path.
+    Bytes { bytes: Vec<u8>, base64_encoded: bool },
     Encoded(StoredNetworkResponseBody),
 }
 
@@ -94,6 +97,10 @@ impl CachedNetworkResponseBody {
     pub fn decoded(&self) -> StoredNetworkResponseBody {
         match self {
             Self::Encoded(body) => body.clone(),
+            Self::Bytes { bytes, base64_encoded } => StoredNetworkResponseBody {
+                body: if *base64_encoded { BASE64.encode(bytes) } else { String::from_utf8_lossy(bytes).into_owned() },
+                base64_encoded: *base64_encoded,
+            },
             Self::Raw { bytes, content_type } => {
                 match obscura_net::encoding::decode_devtools_response_body(bytes, content_type.as_deref()) {
                     Some(body) => StoredNetworkResponseBody { body, base64_encoded: false },
@@ -103,9 +110,30 @@ impl CachedNetworkResponseBody {
         }
     }
 
+    pub fn raw_bytes(&self) -> Option<(Vec<u8>, bool)> {
+        match self {
+            Self::Raw { bytes, content_type } => {
+                let text_like = content_type.as_deref().map_or(true, |header| {
+                    let mime = header.split(';').next().unwrap_or(header).trim().to_ascii_lowercase();
+                    mime.is_empty() || mime.starts_with("text/")
+                        || matches!(mime.as_str(), "application/json" | "application/xml"
+                            | "application/xhtml+xml" | "application/javascript"
+                            | "application/ecmascript" | "image/svg+xml")
+                        || mime.ends_with("+json") || mime.ends_with("+xml")
+                });
+                Some((bytes.clone(), !text_like))
+            }
+            Self::Bytes { bytes, base64_encoded } => Some((bytes.clone(), *base64_encoded)),
+            Self::Encoded(body) => Some((if body.base64_encoded {
+                BASE64.decode(body.body.as_bytes()).ok()?
+            } else { body.body.as_bytes().to_vec() }, body.base64_encoded)),
+        }
+    }
+
     pub fn into_bytes(self) -> Option<Vec<u8>> {
         match self {
             Self::Raw { bytes, .. } => Some(bytes),
+            Self::Bytes { bytes, .. } => Some(bytes),
             Self::Encoded(body) if body.base64_encoded => BASE64.decode(body.body.as_bytes()).ok(),
             Self::Encoded(body) => Some(body.body.into_bytes()),
         }
@@ -201,16 +229,16 @@ const LOCAL_STORAGE_ORIGIN_LIMIT: usize = 5 * 1024 * 1024;
 const LOCAL_STORAGE_TOTAL_LIMIT: usize = 32 * 1024 * 1024;
 const LOCAL_STORAGE_ORIGIN_COUNT_LIMIT: usize = 256;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct OriginStorageEntries {
-    items: Vec<(String, String)>,
+    items: Vec<Arc<(String, String)>>,
     indices: HashMap<String, usize>,
     bytes: usize,
 }
 
 #[derive(Default)]
 struct OriginStorageInner {
-    origins: HashMap<String, OriginStorageEntries>,
+    origins: HashMap<String, Arc<OriginStorageEntries>>,
     bytes: usize,
     changed: HashSet<String>,
 }
@@ -225,14 +253,27 @@ impl OriginStorage {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Independent store; each origin stays shared until its first mutation.
+    pub fn isolated_snapshot(&self) -> Self {
+        let inner = self.lock();
+        Self {
+            inner: std::sync::Mutex::new(OriginStorageInner {
+                origins: inner.origins.clone(),
+                bytes: inner.bytes,
+                changed: HashSet::new(),
+            }),
+        }
+    }
+
     pub fn snapshot(&self, origin: &str) -> Vec<(String, String)> {
-        self.lock().origins.get(origin).map(|entries| entries.items.clone()).unwrap_or_default()
+        self.lock().origins.get(origin).map(|entries|
+            entries.items.iter().map(|entry| entry.as_ref().clone()).collect()).unwrap_or_default()
     }
 
     pub fn get(&self, origin: &str, key: &str) -> Option<String> {
         self.lock().origins.get(origin)
             .and_then(|entries| entries.indices.get(key).and_then(|index| entries.items.get(*index)))
-            .map(|(_, value)| value.clone())
+            .map(|entry| entry.1.clone())
     }
 
     pub fn len(&self, origin: &str) -> usize {
@@ -241,7 +282,7 @@ impl OriginStorage {
 
     pub fn key(&self, origin: &str, index: usize) -> Option<String> {
         self.lock().origins.get(origin).and_then(|entries| entries.items.get(index))
-            .map(|(key, _)| key.clone())
+            .map(|entry| entry.0.clone())
     }
 
     /// Refuse writes over budget without changing the previous value.
@@ -252,8 +293,8 @@ impl OriginStorage {
         let entries = inner.origins.get(origin);
         let index = entries.and_then(|entries| entries.indices.get(&key).copied());
         let previous = entries.and_then(|entries| index.and_then(|index| entries.items.get(index)));
-        if previous.is_some_and(|(_, previous)| previous == &value) { return true; }
-        let previous_bytes = previous.map_or(0, |(name, value)| name.len() + value.len());
+        if previous.is_some_and(|previous| previous.1 == value) { return true; }
+        let previous_bytes = previous.map_or(0, |entry| entry.0.len() + entry.1.len());
         let origin_bytes = entries.map_or(0, |entries| entries.bytes);
         let new_bytes = key.len() + value.len();
         let next_origin_bytes = origin_bytes.saturating_sub(previous_bytes) + new_bytes;
@@ -261,12 +302,12 @@ impl OriginStorage {
         if next_origin_bytes > LOCAL_STORAGE_ORIGIN_LIMIT || next_total_bytes > LOCAL_STORAGE_TOTAL_LIMIT {
             return false;
         }
-        let entries = inner.origins.entry(origin.to_string()).or_default();
+        let entries = Arc::make_mut(inner.origins.entry(origin.to_string()).or_default());
         if let Some(index) = index {
-            entries.items[index].1 = value;
+            entries.items[index] = Arc::new((key, value));
         } else {
             entries.indices.insert(key.clone(), entries.items.len());
-            entries.items.push((key, value));
+            entries.items.push(Arc::new((key, value)));
         }
         entries.bytes = next_origin_bytes;
         inner.bytes = next_total_bytes;
@@ -277,17 +318,18 @@ impl OriginStorage {
     pub fn remove(&self, origin: &str, key: &str) {
         let mut inner = self.lock();
         let removed = inner.origins.get_mut(origin).and_then(|entries| {
-            entries.indices.remove(key).map(|index| {
-                let removed = entries.items.remove(index);
-                entries.bytes -= removed.0.len() + removed.1.len();
-                for (index, (name, _)) in entries.items.iter().enumerate().skip(index) {
-                    if let Some(position) = entries.indices.get_mut(name) { *position = index; }
-                }
-                removed
-            })
+            let index = entries.indices.get(key).copied()?;
+            let entries = Arc::make_mut(entries);
+            entries.indices.remove(key);
+            let removed = entries.items.remove(index);
+            entries.bytes -= removed.0.len() + removed.1.len();
+            for (index, entry) in entries.items.iter().enumerate().skip(index) {
+                if let Some(position) = entries.indices.get_mut(&entry.0) { *position = index; }
+            }
+            Some(removed)
         });
-        if let Some((name, value)) = removed {
-            inner.bytes -= name.len() + value.len();
+        if let Some(removed) = removed {
+            inner.bytes -= removed.0.len() + removed.1.len();
             if inner.origins.get(origin).is_some_and(|entries| entries.items.is_empty()) { inner.origins.remove(origin); }
             inner.changed.insert(origin.to_string());
         }
@@ -296,7 +338,8 @@ impl OriginStorage {
     pub fn entries(&self) -> Vec<(String, Vec<(String, String)>)> {
         let inner = self.lock();
         let mut out: Vec<_> = inner.origins.iter()
-            .map(|(origin, entries)| (origin.clone(), entries.items.clone())).collect();
+            .map(|(origin, entries)| (origin.clone(),
+                entries.items.iter().map(|entry| entry.as_ref().clone()).collect())).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -317,7 +360,10 @@ impl OriginStorage {
         let next_bytes = inner.bytes.saturating_sub(previous_bytes).saturating_add(bytes);
         if next_bytes > LOCAL_STORAGE_TOTAL_LIMIT { return false; }
         if items.is_empty() { inner.origins.remove(origin); }
-        else { inner.origins.insert(origin.to_string(), OriginStorageEntries { items, indices, bytes }); }
+        else {
+            let items = items.into_iter().map(Arc::new).collect();
+            inner.origins.insert(origin.to_string(), Arc::new(OriginStorageEntries { items, indices, bytes }));
+        }
         inner.bytes = next_bytes;
         inner.changed.remove(origin);
         true
@@ -329,13 +375,48 @@ impl OriginStorage {
         origins
     }
 
+    /// Merge changed keys without replacing another connection's untouched values.
+    /// A false result means at least one changed value exceeded the destination budget.
+    pub fn merge_changes(&self, initial: &Self, current: &Self) -> bool {
+        let changed = {
+            let current = current.lock();
+            let mut changed: Vec<_> = current.changed.iter()
+                .map(|origin| (origin.clone(), current.origins.get(origin).cloned())).collect();
+            changed.sort_by(|a, b| a.0.cmp(&b.0));
+            changed
+        };
+        let mut accepted = true;
+        for (origin, current) in changed {
+            let initial = initial.lock().origins.get(&origin).cloned();
+            if let Some(initial) = &initial {
+                for entry in &initial.items {
+                    if !current.as_ref().is_some_and(|entries| entries.indices.contains_key(&entry.0)) {
+                        self.remove(&origin, &entry.0);
+                    }
+                }
+            }
+            if let Some(current) = current {
+                for entry in &current.items {
+                    let previous = initial.as_ref().and_then(|entries|
+                        entries.indices.get(&entry.0).and_then(|index| entries.items.get(*index)));
+                    if previous.is_some_and(|previous|
+                        Arc::ptr_eq(previous, entry) || previous.1 == entry.1) { continue; }
+                    if !self.set(&origin, entry.0.clone(), entry.1.clone()) { accepted = false; }
+                }
+            }
+        }
+        accepted
+    }
+
     /// One lock fences mutations and competing writers through acknowledgement.
     pub fn flush_changed(&self, mut write: impl FnMut(&str, &[(String, String)]) -> bool) {
         let mut inner = self.lock();
         let mut origins: Vec<_> = inner.changed.iter().cloned().collect();
         origins.sort();
         for origin in origins {
-            if write(&origin, inner.origins.get(&origin).map_or(&[], |entries| entries.items.as_slice())) {
+            let entries: Vec<_> = inner.origins.get(&origin).map(|entries|
+                entries.items.iter().map(|entry| entry.as_ref().clone()).collect()).unwrap_or_default();
+            if write(&origin, &entries) {
                 inner.changed.remove(&origin);
             }
         }
@@ -359,8 +440,44 @@ struct StorageOriginCache {
     origin: String,
 }
 
+struct FormCacheBuffer {
+    generation: Arc<AtomicU64>,
+    backing_store: v8::SharedRef<v8::BackingStore>,
+    publisher: Arc<StdMutex<FormCachePublisher>>,
+    observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+struct FormCachePublisher {
+    backing_store: v8::SharedRef<v8::BackingStore>,
+    generation: std::sync::Weak<AtomicU64>,
+}
+
+impl FormCachePublisher {
+    fn publish(&self, generation: u64) {
+        let words = self.backing_store.data().expect("fixed form cache backing storage").cast::<u32>().as_ptr();
+        // The pinned eight-byte V8 allocation was checked for u32 alignment.
+        unsafe {
+            AtomicU32::from_ptr(words).store(generation as u32, AtomicOrdering::Relaxed);
+            AtomicU32::from_ptr(words.add(1)).store((generation >> 32) as u32, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+fn form_cache_observer(
+    publisher: Arc<StdMutex<FormCachePublisher>>,
+    owner: std::sync::Weak<AtomicU64>,
+) -> Arc<dyn Fn(u64) + Send + Sync> {
+    Arc::new(move |generation| {
+        let publisher = publisher.lock().expect("form cache backing storage poisoned");
+        // A retired document can still be retained by native callers.
+        if !std::sync::Weak::ptr_eq(&owner, &publisher.generation) { return; }
+        publisher.publish(generation);
+    })
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
+    form_cache_buffer: Option<FormCacheBuffer>,
     pub url: String,
     /// Initial about:blank and srcdoc documents retain their creator's base and origin.
     pub(crate) about_base_url: Option<String>,
@@ -452,6 +569,8 @@ pub struct ObscuraState {
     pub frame_id_counter: u32,
     /// Which frame this state belongs to; 0 is the page's own realm.
     pub frame_id: u32,
+    /// Which frame is the parent browsing context; 0 is the page's own realm.
+    pub parent_frame_id: u32,
     // postMessage traffic between realms, waiting to be delivered. A realm
     // cannot reach another realm's context on its own, so the message is queued
     // here and the Page dispatches it, the same way frames themselves are
@@ -514,7 +633,7 @@ pub struct ObscuraState {
     /// pages nor incompatible CORS profiles share a completion.
     #[cfg(feature = "render")]
     pub render_image_in_flight:
-        HashMap<(u64, String, ImageRequestProfile),
+        HashMap<(u64, String, ImageRequestProfile, Option<u64>),
             (tokio::sync::oneshot::Sender<()>, Vec<tokio::sync::oneshot::Sender<()>>)>,
     /// Page-transport loads for resources that cache-only layout or paint
     /// missed. The owning page fetches them and sends the outcome here; the
@@ -614,6 +733,8 @@ pub struct PendingFrameMessage {
     pub target_frame_id: u32,
     /// Where it came from, so the receiver can reply through `event.source`.
     pub source_frame_id: u32,
+    /// The sender's browsing context, even if its document retires before delivery.
+    pub source_context_id: Option<u32>,
     /// The sender's origin, for `event.origin`.
     pub origin: String,
     /// The origin the sender restricted delivery to (postMessage's
@@ -630,6 +751,32 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
+    pub(crate) fn replace_dom(&mut self, dom: DomTree) {
+        if let Some(cache) = self.form_cache_buffer.as_mut() {
+            let generation = dom.form_cache_generation_handle();
+            generation.store(cache.generation.load(AtomicOrdering::Relaxed).wrapping_add(1), AtomicOrdering::Relaxed);
+            cache.publisher.lock().expect("form cache backing storage poisoned").generation = Arc::downgrade(&generation);
+            let observer = form_cache_observer(cache.publisher.clone(), Arc::downgrade(&generation));
+            observer(generation.load(AtomicOrdering::Relaxed));
+            dom.watch_form_cache_generation(Arc::downgrade(&observer));
+            cache.observer = Some(observer);
+            cache.generation = generation;
+        }
+        self.dom = Some(dom);
+    }
+
+    pub(crate) fn take_dom(&mut self) -> Option<DomTree> {
+        let dom = self.dom.take()?;
+        if let Some(cache) = self.form_cache_buffer.as_mut() {
+            let mut publisher = cache.publisher.lock().expect("form cache backing storage poisoned");
+            publisher.generation = std::sync::Weak::new();
+            let epoch = cache.generation.fetch_add(1, AtomicOrdering::Relaxed).wrapping_add(1);
+            publisher.publish(epoch);
+            cache.observer = None;
+        }
+        Some(dom)
+    }
+
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
         self.media_preferences = parent.media_preferences.clone();
         #[cfg(feature = "render")]
@@ -657,6 +804,7 @@ impl ObscuraState {
         #[cfg(feature = "render")]
         if has_page_transport(parent) {
             self.render_resources.set_sync_loading_enabled(false);
+            self.render_resources.set_document_scoped(true);
         }
     }
 
@@ -665,6 +813,7 @@ impl ObscuraState {
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
             dom: None,
+            form_cache_buffer: None,
             url: "about:blank".to_string(),
             about_base_url: None,
             inherited_origin: None,
@@ -708,6 +857,7 @@ impl ObscuraState {
             pending_frame_bytes: 0,
             frame_id_counter: 0,
             frame_id: 0,
+            parent_frame_id: 0,
             pending_frame_messages: Vec::new(),
             pending_frame_message_bytes: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -955,6 +1105,48 @@ fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
     }
 }
 
+#[cfg(test)]
+mod retained_body_tests {
+    use super::*;
+
+    fn event(id: &str, size: usize) -> JsNetworkEvent {
+        JsNetworkEvent {
+            request_id: id.into(), intercepted: false, url: "https://example.test/body".into(),
+            method: "GET".into(), resource_type: "Fetch".into(), status: 200,
+            response_headers: HashMap::new(), body_size: size, timestamp: 0.0, error_text: None,
+        }
+    }
+
+    #[test]
+    fn disabled_or_oversized_retention_does_not_construct_a_body() {
+        let mut state = ObscuraState::new();
+        for (entries, bytes, size) in [("0", "8", 1), ("8", "0", 1), ("8", "3", 4)] {
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", entries);
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", bytes);
+            record_network_completion(&mut state, event("uncached", size), |_| panic!("retention disabled"));
+            assert!(state.network_response_bodies.is_empty());
+        }
+        assert_eq!(state.js_network_events.len(), 3);
+    }
+
+    #[test]
+    fn retained_bytes_obey_the_source_byte_limit_and_completion_order() {
+        std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "2");
+        std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", "3");
+        let mut state = ObscuraState::new();
+        for id in ["one", "two", "three"] {
+            record_network_completion(&mut state, event(id, 3), |_| {
+                CachedNetworkResponseBody::raw(&[0, 255, 128], Some("application/octet-stream"))
+            });
+        }
+        assert_eq!(state.network_response_bodies.len(), 2);
+        assert!(!state.network_response_bodies.contains_key("one"));
+        let body = state.network_response_bodies.remove("two").unwrap();
+        assert_eq!(body.decoded().body, "AP+A");
+        assert_eq!(body.into_bytes().unwrap(), [0, 255, 128]);
+    }
+}
+
 /// Hard cap on a single JS fetch/XHR response body buffered fully in memory.
 /// `op_fetch_url` reads the whole body, then makes a UTF-8 copy and a base64
 /// copy of it, so an unbounded body OOMs the process. This bounds the initial
@@ -1146,11 +1338,24 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
     frame_timers: HashMap<u32, FrameTimers>,
+    frame_contexts: HashMap<u32, FrameContext>,
+    frame_context_owners: HashMap<(*const RefCell<ObscuraState>, NodeId, u64), u32>,
+    frame_context_children: HashMap<u32, Vec<u32>>,
+    last_frame_context: u32,
+    pub(crate) frame_preload_scripts: Vec<String>,
 }
 
 struct FrameTimers {
     owner: Option<(std::rc::Weak<RefCell<ObscuraState>>, NodeId, u64)>,
     cancel: Rc<CancelHandle>,
+    context_id: Option<u32>,
+}
+
+struct FrameContext {
+    owner: Option<(std::rc::Weak<RefCell<ObscuraState>>, NodeId, u64)>,
+    parent: Option<u32>,
+    frame_id: Option<u32>,
+    name: String,
 }
 
 impl RealmStates {
@@ -1168,10 +1373,10 @@ impl RealmStates {
     }
 
     pub(crate) fn forget_frame(&mut self, frame_id: u32) {
-        self.cancel_frame_timers(frame_id);
+        self.retire_frame(frame_id);
         self.entries.retain(|(_, id, _)| *id != frame_id);
         self.frame_timers.remove(&frame_id);
-        self.cancel_inactive_frame_timers();
+        self.prune_frame_contexts();
     }
     pub fn register(
         &mut self,
@@ -1179,9 +1384,17 @@ impl RealmStates {
         frame_id: u32,
         state: SharedState,
     ) {
+        let context_id = self.frame_timers.get(&frame_id).and_then(|frame| frame.context_id)
+            .or_else(|| {
+                let parent = self.context_for_frame(state.borrow().parent_frame_id);
+                self.allocate_frame_context(FrameContext {
+                    owner: None, parent, frame_id: Some(frame_id), name: String::new(),
+                })
+            });
         self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
-            owner: None, cancel: CancelHandle::new_rc(),
+            owner: None, cancel: CancelHandle::new_rc(), context_id,
         });
+        self.connect_document_frames(&state);
         self.entries.push((context, frame_id, state));
     }
 
@@ -1193,11 +1406,148 @@ impl RealmStates {
         }
     }
 
-    fn own_frame(&mut self, frame_id: u32, parent: &SharedState, node: NodeId) {
+    pub(crate) fn own_frame(&mut self, frame_id: u32, parent: &SharedState, node: NodeId) {
         let generation = parent.borrow().document_generation;
-        self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
-            owner: None, cancel: CancelHandle::new_rc(),
-        }).owner = Some((Rc::downgrade(parent), node, generation));
+        let context_id = self.connect_frame_context(parent, node);
+        if let Some(context_id) = context_id {
+            let context = self.frame_contexts.get_mut(&context_id).unwrap();
+            if let Some(previous) = context.frame_id.replace(frame_id).filter(|id| *id != frame_id) {
+                if let Some(frame) = self.frame_timers.get(&previous) { frame.cancel.cancel(); }
+            }
+        }
+        let previous = self.frame_timers.get(&frame_id).and_then(|frame| frame.context_id);
+        if previous != context_id {
+            if let Some(previous) = previous.filter(|id|
+                self.frame_contexts.get(id).is_some_and(|context| context.owner.is_none()))
+            {
+                self.frame_contexts.remove(&previous);
+            }
+        }
+        let frame = self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
+            owner: None, cancel: CancelHandle::new_rc(), context_id,
+        });
+        frame.owner = Some((Rc::downgrade(parent), node, generation));
+        frame.context_id = context_id;
+    }
+
+    fn allocate_frame_context(&mut self, context: FrameContext) -> Option<u32> {
+        let Some(id) = self.last_frame_context.checked_add(1) else {
+            tracing::error!("frame context id space exhausted");
+            return None;
+        };
+        self.last_frame_context = id;
+        if context.owner.is_some() {
+            if let Some(parent) = context.parent {
+                self.frame_context_children.entry(parent).or_default().push(id);
+            }
+        }
+        self.frame_contexts.insert(id, context);
+        Some(id)
+    }
+
+    fn context_for_frame(&self, frame_id: u32) -> Option<u32> {
+        if frame_id == 0 { return Some(0); }
+        self.frame_timers.get(&frame_id).and_then(|frame| frame.context_id)
+    }
+
+    fn connect_frame_context(&mut self, parent: &SharedState, node: NodeId) -> Option<u32> {
+        let state = parent.borrow();
+        if state.frame_id != 0 && self.frame_timers_active(state.frame_id) != Some(true) {
+            return None;
+        }
+        let dom = state.dom.as_ref()?;
+        if !dom.is_connected(node) || !dom.with_node(node, |node|
+            node.as_element().is_some_and(|tag| tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                && matches!(tag.local.as_ref(), "iframe" | "frame"))).unwrap_or(false)
+        {
+            return None;
+        }
+        let key = (Rc::as_ptr(parent), node, state.document_generation);
+        if let Some(id) = self.frame_context_owners.get(&key) { return Some(*id); }
+        let parent_context = self.context_for_frame(state.frame_id)?;
+        let name = dom.with_node(node, |node|
+            node.get_attribute("name").unwrap_or("").to_owned()).unwrap_or_default();
+        let id = self.allocate_frame_context(FrameContext {
+            owner: Some((Rc::downgrade(parent), node, state.document_generation)),
+            parent: Some(parent_context), frame_id: None, name,
+        })?;
+        self.frame_context_owners.insert(key, id);
+        Some(id)
+    }
+
+    pub(crate) fn connect_document_frames(&mut self, parent: &SharedState) {
+        let nodes = {
+            let parent = parent.borrow();
+            let Some(dom) = &parent.dom else { return };
+            match dom.query_selector_all("iframe,frame") {
+                Ok(nodes) => nodes,
+                Err(error) => {
+                    tracing::error!(%error, "cannot enumerate parsed frame owners");
+                    return;
+                }
+            }
+        };
+        for node in nodes { self.connect_frame_context(parent, node); }
+    }
+
+    fn frame_context_active(&self, mut id: u32) -> Option<bool> {
+        for _ in 0..=self.frame_contexts.len() {
+            if id == 0 { return Some(true); }
+            let Some(context) = self.frame_contexts.get(&id) else { return Some(false) };
+            if let Some((parent, node, generation)) = &context.owner {
+                let Some(parent) = parent.upgrade() else { return Some(false) };
+                let parent = parent.try_borrow().ok()?;
+                if parent.document_generation != *generation
+                    || !parent.dom.as_ref().is_some_and(|dom| dom.is_connected(*node))
+                {
+                    return Some(false);
+                }
+                return if parent.frame_id == 0 { Some(true) }
+                    else { self.frame_timers_active(parent.frame_id) };
+            }
+            match context.frame_id.and_then(|frame| self.frame_timers_active(frame)) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None if context.frame_id.is_some() => return None,
+                None => return Some(false),
+            }
+            let Some(parent) = context.parent else { return Some(false) };
+            id = parent;
+        }
+        Some(false)
+    }
+
+    fn retire_frame(&mut self, frame_id: u32) {
+        self.cancel_frame_timers(frame_id);
+        if let Some(context) = self.context_for_frame(frame_id)
+            .and_then(|id| self.frame_contexts.get_mut(&id))
+        {
+            if context.frame_id == Some(frame_id) { context.frame_id = None; }
+        }
+        self.prune_frame_contexts();
+    }
+
+    fn retire_frame_contexts(&mut self, ids: &std::collections::HashSet<u32>) {
+        for id in ids {
+            if let Some(context) = self.frame_contexts.remove(id) {
+                if let Some(frame) = context.frame_id.and_then(|id| self.frame_timers.get(&id)) {
+                    frame.cancel.cancel();
+                }
+                if let Some((owner, node, generation)) = context.owner {
+                    self.frame_context_owners.remove(&(owner.as_ptr(), node, generation));
+                }
+                self.frame_context_children.remove(id);
+            }
+        }
+        for children in self.frame_context_children.values_mut() {
+            children.retain(|id| !ids.contains(id));
+        }
+    }
+
+    pub(crate) fn prune_frame_contexts(&mut self) {
+        let retired = self.frame_contexts.keys().copied()
+            .filter(|id| self.frame_context_active(*id) == Some(false)).collect();
+        self.retire_frame_contexts(&retired);
     }
 
     pub(crate) fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
@@ -1234,9 +1584,9 @@ impl RealmStates {
     }
 
     fn frames_removed_by(&self, shared: &SharedState, cmd: &str, arg1: &str, arg2: &str)
-        -> Vec<(u32, u32)>
+        -> Vec<(u32, u32, u32)>
     {
-        if self.frame_timers.is_empty() { return Vec::new(); }
+        if self.frame_contexts.is_empty() { return Vec::new(); }
         let (root, inclusive) = match cmd {
             "append_child" => (arg2, true),
             "insert_before" | "remove_child" => (arg1, true),
@@ -1248,13 +1598,13 @@ impl RealmStates {
         let root = NodeId::new(root);
         let state = shared.borrow();
         let Some(dom) = &state.dom else { return Vec::new() };
+        if inclusive && !dom.is_connected(root) { return Vec::new(); }
         let mut removed = Vec::new();
-        // ponytail: scan the bounded live-frame registry only on structural
-        // mutations; index owners by document if frame-heavy profiling warrants it.
-        for (id, timers) in &self.frame_timers {
-            let Some((parent, node, generation)) = &timers.owner else { continue };
+        // Only structural mutations inspect the bounded live-frame registry.
+        for (id, context) in &self.frame_contexts {
+            let Some((parent, node, generation)) = &context.owner else { continue };
             if parent.as_ptr() != Rc::as_ptr(shared) || *generation != state.document_generation
-                || timers.cancel.is_canceled() || !dom.is_connected(*node)
+                || self.frame_context_active(*id) != Some(true)
             {
                 continue;
             }
@@ -1262,7 +1612,7 @@ impl RealmStates {
             for _ in 0..=dom.len() {
                 let Some(current_node) = current else { break };
                 if current_node == root && (inclusive || current_node != *node) {
-                    removed.push((*id, node.index() as u32));
+                    removed.push((*id, context.frame_id.unwrap_or(0), node.index() as u32));
                     break;
                 }
                 current = dom.with_node(current_node, |node| node.parent).flatten()
@@ -1272,11 +1622,31 @@ impl RealmStates {
         removed
     }
 
+    pub(crate) fn has_pending_navigation(&self) -> bool {
+        self.entries.iter().any(|(_, _, state)| state.borrow().pending_navigation.is_some())
+    }
+
+    pub(crate) fn take_pending_navigations(&self) -> Vec<(u32, String, String, String)> {
+        self.entries.iter().filter_map(|(_, id, state)| {
+            state.borrow_mut().pending_navigation.take().map(|(url, method, body)| (*id, url, method, body))
+        }).collect()
+    }
+
     pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
             .map(|(_, _, state)| state.clone())
+    }
+
+    pub(crate) fn child_frame_for_node(&self, parent: &SharedState, node: NodeId) -> Option<u32> {
+        let generation = parent.borrow().document_generation;
+        self.entries.iter().find_map(|(_, id, _)| {
+            let (owner, owner_node, owner_generation) = self.frame_timers.get(id)?.owner.as_ref()?;
+            (owner.as_ptr() == Rc::as_ptr(parent) && *owner_node == node
+                && *owner_generation == generation && self.frame_timers_active(*id) == Some(true))
+                .then_some(*id)
+        })
     }
 }
 
@@ -1744,6 +2114,7 @@ pub struct RenderResourceLoad {
     pub generation: u64,
     pub url: String,
     pub profile: Option<ImageRequestProfile>,
+    pub image_request_generation: Option<u64>,
     pub is_font: bool,
     /// Final URL, status, headers and body of the response; `None` when the
     /// request failed or was blocked.
@@ -1793,6 +2164,7 @@ pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::Re
     let mut cache = obscura_render::RenderResourceCache::default();
     if has_page_transport(state) {
         cache.set_sync_loading_enabled(false);
+        cache.set_document_scoped(true);
     }
     cache
 }
@@ -1879,8 +2251,9 @@ fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
 }
 
 #[op2(fast)]
-fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_mark_started(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    // Resolve the calling frame's document (a frame's node ids are not the page's).
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -1896,8 +2269,9 @@ fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
 /// Atomically claim an executable script.  A false result means the node was
 /// created inert by an HTML-string API or has already been prepared once.
 #[op2(fast)]
-fn op_script_try_start(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    // Resolve the calling frame's document (a frame's node ids are not the page's).
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -1914,13 +2288,18 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 /// tree. Layout intentionally remains unaware of the detached root until
 /// scoped style, slot assignment, and composed-tree paint are implemented.
 #[op2(fast)]
-fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+fn op_shadow_attach(
+    state: &OpState,
+    host_nid: u32,
+    #[string] mode: String,
+    frame_id: u32,
+) -> i32 {
     let mode = match mode.as_str() {
         "open" => ShadowRootMode::Open,
         "closed" => ShadowRootMode::Closed,
         _ => return -1,
     };
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return -1;
@@ -1937,8 +2316,8 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// visibility in bootstrap.js.
 #[op2]
 #[string]
-fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_shadow_root_info(state: &OpState, host_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return String::new();
@@ -2109,6 +2488,69 @@ fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) ->
     serde_json::json!({ "originClean": true, "css": css }).to_string()
 }
 
+fn window_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] {
+    let Some(tag) = node.as_element() else { return [None, None] };
+    let name = (tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+        && matches!(tag.local.as_ref(), "embed" | "form" | "iframe" | "img" | "object"))
+        .then(|| node.get_attribute_ns("", "name")).flatten();
+    [node.get_attribute_ns("", "id"), name].map(|value| value.filter(|value| !value.is_empty()))
+}
+
+#[op2(fast)]
+fn op_form_owner(state: &OpState, nid: u32, frame_id: u32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        frame_state(state, frame_id).borrow().dom.as_ref()
+            .and_then(|dom| dom.form_owner(NodeId::new(nid)))
+            .map_or(-1, |form| form.raw() as i32)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_form_owner panicked; returning null");
+        -1
+    })
+}
+
+#[op2]
+fn op_form_cache_buffer<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>, state: &OpState, frame_id: u32,
+) -> v8::Local<'s, v8::Value> {
+    let backing_store = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let mut state = shared.borrow_mut();
+        let dom = state.dom.as_ref()?;
+        let generation = dom.form_cache_generation_handle();
+        if let Some(cache) = state.form_cache_buffer.as_ref() {
+            if Arc::ptr_eq(&cache.generation, &generation) {
+                return Some(cache.backing_store.clone());
+            }
+        }
+        let backing_store = v8::SharedArrayBuffer::new_backing_store(scope, 8).make_shared();
+        let Some(data) = backing_store.data() else {
+            tracing::error!("form cache backing storage is empty");
+            return None;
+        };
+        if !data.cast::<AtomicU32>().as_ptr().is_aligned() {
+            tracing::error!("form cache backing storage is not aligned for shared uint32 words");
+            return None;
+        }
+        let publisher = Arc::new(StdMutex::new(FormCachePublisher {
+            backing_store: backing_store.clone(), generation: Arc::downgrade(&generation),
+        }));
+        let observer = form_cache_observer(publisher.clone(), Arc::downgrade(&generation));
+        observer(generation.load(AtomicOrdering::Relaxed));
+        dom.watch_form_cache_generation(Arc::downgrade(&observer));
+        state.form_cache_buffer = Some(FormCacheBuffer {
+            generation, backing_store: backing_store.clone(), publisher, observer: Some(observer),
+        });
+        Some(backing_store)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_form_cache_buffer panicked; rejecting cache");
+        None
+    });
+    match backing_store {
+        Some(store) => v8::SharedArrayBuffer::with_backing_store(scope, &store).into(),
+        None => v8::null(scope).into(),
+    }
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -2128,20 +2570,20 @@ fn op_dom(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         if cmd == "retire_frame" {
-            if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
+            if let Ok(id) = arg1.parse::<u32>() { registry.borrow_mut().retire_frame(id); }
             return "true".into();
         }
         let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
         let result = op_dom_inner(shared, cmd, arg1, arg2);
         if result == "true" && !removed.is_empty() {
-            let registry = registry.borrow();
-            for (id, _) in &removed {
-                if let Some(timers) = registry.frame_timers.get(id) { timers.cancel.cancel(); }
-            }
+            let mut registry = registry.borrow_mut();
+            registry.retire_frame_contexts(&removed.iter().map(|(id, _, _)| *id).collect());
             registry.cancel_inactive_frame_timers();
+            registry.prune_frame_contexts();
             // The bootstrap unwraps this private mutation result before any
             // DOM caller sees it, and resets only the retired iframe identities.
-            serde_json::json!({"__obscuraFrameRetirements":removed,"result":result}).to_string()
+            let retired: Vec<_> = removed.into_iter().map(|(_, frame, node)| (frame, node)).collect();
+            serde_json::json!({"__obscuraFrameRetirements":retired,"result":result}).to_string()
         } else {
             result
         }
@@ -2402,6 +2844,34 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             });
             "null".to_string()
         }
+        "window_named_names" => {
+            let root = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let mut names = Vec::new();
+            let mut seen = HashSet::new();
+            for node in std::iter::once(root).chain(dom.descendants(root)) {
+                dom.with_node(node, |node| {
+                    for name in window_named_attributes(node).into_iter().flatten() {
+                        if seen.insert(name.to_string()) { names.push(name.to_string()); }
+                    }
+                });
+            }
+            serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
+        }
+        "window_named_candidates" => {
+            if arg1.is_empty() { return "[]".into(); }
+            let mut matches = Vec::new();
+            for node_id in dom.descendants(dom.document()) {
+                dom.with_node(node_id, |node| {
+                    let names = window_named_attributes(node);
+                    if names.contains(&Some(arg1.as_str())) {
+                        let named_frame = names[1] == Some(arg1.as_str())
+                            && node.as_element().is_some_and(|tag| tag.local.as_ref() == "iframe");
+                        matches.push((node_id.index(), named_frame));
+                    }
+                });
+            }
+            serde_json::to_string(&matches).unwrap_or_else(|_| "[]".into())
+        }
         "document_node_id" => dom.document().index().to_string(),
         "document_compat_mode" => if dom.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into(),
         "document_title" => {
@@ -2633,24 +3103,96 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 None => "null".into(),
             }
         }
+        "form_owner" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.form_owner(nid).map(|form| form.index())).to_string()
+        }
+        "form_controls" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.form_controls(nid).map(|controls| {
+                controls.into_iter().map(|control| control.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "table_rows" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.table_rows(nid).map(|rows| {
+                rows.into_iter().map(|row| row.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "table_interface" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.table_interface(nid)).to_string()
+        }
+        "table_head" | "table_foot" | "table_bodies" | "table_section_rows" | "table_row_cells" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let elements = match cmd.as_str() {
+                "table_head" => dom.table_sections(nid, "thead"),
+                "table_foot" => dom.table_sections(nid, "tfoot"),
+                "table_bodies" => dom.table_sections(nid, "tbody"),
+                "table_section_rows" => dom.table_section_rows(nid),
+                _ => dom.table_row_cells(nid),
+            };
+            serde_json::json!(elements.map(|elements| {
+                elements.into_iter().map(|element| element.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "table_row_index" | "table_section_row_index" | "table_cell_index" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let index = match cmd.as_str() {
+                "table_row_index" => dom.table_row_index(nid, false),
+                "table_section_row_index" => dom.table_row_index(nid, true),
+                _ => dom.table_cell_index(nid),
+            };
+            serde_json::json!(index).to_string()
+        }
+        "select_options" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.select_options(nid).map(|options| {
+                options.into_iter().map(|option| option.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "option_index" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.option_index(nid)).to_string()
+        }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom
+            dom
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
-                        if name.ns == html5ever::ns!(html) {
-                            name.local.as_ref().to_ascii_uppercase()
+                        let html = name.ns == html5ever::ns!(html);
+                        let tag = if html {
+                            match &name.prefix {
+                                Some(prefix) => {
+                                    let mut qualified = format!("{}:{}", prefix, name.local);
+                                    qualified.make_ascii_uppercase();
+                                    qualified
+                                }
+                                None => name.local.as_ref().to_ascii_uppercase(),
+                            }
                         } else {
                             match &name.prefix {
                                 Some(prefix) => format!("{}:{}", prefix, name.local),
                                 None => name.local.to_string(),
                             }
+                        };
+                        if arg2 == "interface" && (!html || name.prefix.is_some()
+                            || name.local.as_ref().bytes().any(|byte| byte.is_ascii_uppercase())) {
+                            serde_json::json!([tag, name.ns.as_ref(), name.local.as_ref()]).to_string()
+                        } else {
+                            serde_json::Value::String(tag).to_string()
                         }
                     })
                 })
                 .flatten()
-                .unwrap_or_default();
-            serde_json::to_string(&name).unwrap_or("\"\"".into())
+                .unwrap_or_else(|| "\"\"".into())
+        }
+        "prefix" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let prefix = dom.with_node(NodeId::new(nid), |n| {
+                n.as_element().and_then(|name| name.prefix.as_ref().map(|prefix| prefix.to_string()))
+            }).flatten();
+            serde_json::to_string(&prefix).unwrap_or("null".into())
         }
         "local_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -2726,6 +3268,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let node_id = NodeId::new(nid);
             if let Some((name, value)) = arg2.split_once('\0') {
+                #[cfg(feature = "render")]
+                if matches!(name, "src" | "srcset" | "sizes" | "crossorigin") {
+                    gs.render_resources.forget_html_image_request(node_id);
+                }
                 if name == "id" {
                     let old_id = dom
                         .with_node(node_id, |n| n.get_attribute("id").map(|s| s.to_string()))
@@ -2799,6 +3345,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "remove_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let node_id = NodeId::new(nid);
+            #[cfg(feature = "render")]
+            if matches!(arg2.as_str(), "src" | "srcset" | "sizes" | "crossorigin") {
+                gs.render_resources.forget_html_image_request(node_id);
+            }
             // Removing `id` must clear the id_index too, matching set_attribute /
             // remove_attribute_ns; otherwise getElementById keeps returning the
             // still-attached element (#1013).
@@ -2839,6 +3389,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let qualified = parts.next().unwrap_or("");
             let value = parts.next().unwrap_or("");
             if !qualified.is_empty() {
+                #[cfg(feature = "render")]
+                if ns.is_empty() && matches!(qualified, "src" | "srcset" | "sizes" | "crossorigin") {
+                    gs.render_resources.forget_html_image_request(node_id);
+                }
                 let local = qualified
                     .split_once(':')
                     .map(|(_, local)| local)
@@ -2863,6 +3417,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let node_id = NodeId::new(nid);
             let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
+            #[cfg(feature = "render")]
+            if arg2.starts_with('\0') && matches!(local, "src" | "srcset" | "sizes" | "crossorigin") {
+                gs.render_resources.forget_html_image_request(node_id);
+            }
             if ns.is_empty() && local == "id" {
                 let old_id = dom
                     .with_node(node_id, |n| n.get_attribute("id").map(str::to_owned))
@@ -4882,6 +5440,57 @@ mod tests {
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the
     // behaviour the realm-local object could not provide.
     #[test]
+    fn origin_storage_snapshot_preserves_quota_and_profile_replacement_is_private() {
+        use std::sync::Arc;
+        let origin = "https://a.test";
+        let original = OriginStorage::default();
+        assert!(original.load(origin, vec![("k".into(), "x".repeat(LOCAL_STORAGE_ORIGIN_LIMIT - 1))]));
+        let copy = original.isolated_snapshot();
+        let shared = original.lock().origins[origin].clone();
+        assert!(!copy.set(origin, "extra".into(), String::new()));
+        assert!(Arc::ptr_eq(&shared, &copy.lock().origins[origin]));
+        assert!(copy.changed_origins().is_empty());
+        original.clear(origin);
+        assert_eq!(copy.len(origin), 1);
+        assert!(copy.load(origin, vec![("replacement".into(), "value".into())]));
+        assert_eq!(original.len(origin), 0);
+        assert_eq!(copy.snapshot(origin), vec![("replacement".into(), "value".into())]);
+        assert_eq!(copy.lock().bytes, "replacement".len() + "value".len());
+        copy.remove(origin, "replacement");
+        assert_eq!(copy.lock().bytes, 0);
+        assert_eq!(copy.changed_origins(), [origin]);
+    }
+
+    #[test]
+    fn origin_storage_snapshots_share_untouched_origins_but_not_mutations() {
+        use std::sync::Arc;
+        let original = OriginStorage::default();
+        assert!(original.load("https://a.test", vec![("seed".into(), "initial".into())]));
+        assert!(original.load("https://b.test", vec![("other".into(), "value".into())]));
+        let copy = original.isolated_snapshot();
+        let original_a = original.lock().origins["https://a.test"].clone();
+        let original_b = original.lock().origins["https://b.test"].clone();
+        assert!(Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(copy.changed_origins().is_empty());
+        copy.remove("https://a.test", "missing");
+        assert!(copy.set("https://a.test", "seed".into(), "initial".into()));
+        assert!(Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(copy.set("https://a.test", "new".into(), "value".into()));
+        assert!(!Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(Arc::ptr_eq(&original_a.items[0], &copy.lock().origins["https://a.test"].items[0]));
+        assert!(copy.set("https://a.test", "seed".into(), "changed".into()));
+        assert!(!Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(!Arc::ptr_eq(&original_a.items[0], &copy.lock().origins["https://a.test"].items[0]));
+        assert!(Arc::ptr_eq(&original_b, &copy.lock().origins["https://b.test"]));
+        assert_eq!(original.get("https://a.test", "seed").as_deref(), Some("initial"));
+        assert_eq!(copy.get("https://a.test", "seed").as_deref(), Some("changed"));
+        copy.clear("https://b.test");
+        assert_eq!(original.get("https://b.test", "other").as_deref(), Some("value"));
+        assert_eq!(copy.get("https://b.test", "other"), None);
+        assert_eq!(copy.changed_origins(), ["https://a.test", "https://b.test"]);
+    }
+
+    #[test]
     fn origin_storage_deletion_reinsertion_and_profile_replacement_keep_keys_and_quota_consistent() {
         let store = OriginStorage::default();
         let origin = "https://app.test";
@@ -5158,7 +5767,8 @@ mod tests {
 
     use super::read_body_capped;
     use super::url_set_inner;
-    use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_derive, push_capped};
+    use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_blocks, pbkdf2_can_inline, pbkdf2_derive,
+        pbkdf2_derive_with, validate_pbkdf2, CancelPbkdf2OnDrop, push_capped};
     use super::{intercept_fulfill_response, visible_response_headers};
     use base64::{Engine as _, engine::general_purpose::STANDARD as FULFILL_BASE64};
 
@@ -5443,6 +6053,76 @@ mod tests {
         let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
+    #[test]
+    fn pbkdf2_bounds_the_combined_work_before_deriving() {
+        let error = validate_pbkdf2("SHA-1", PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES)
+            .expect_err("iteration and output caps alone must not permit unbounded work");
+        assert!(error.to_string().contains("work"), "{error}");
+        assert!(validate_pbkdf2("SHA-256", PBKDF2_MAX_ITERATIONS, 32).is_ok());
+        assert!(validate_pbkdf2("SHA-256", 0, 32).is_err());
+    }
+
+    #[test]
+    fn pbkdf2_native_fast_path_is_bounded_by_work_and_input_size() {
+        assert!(pbkdf2_can_inline(4096, 512, 512));
+        assert!(!pbkdf2_can_inline(4097, 8, 8));
+        assert!(!pbkdf2_can_inline(1, 512, 513));
+        assert!(!pbkdf2_can_inline(1, usize::MAX, 1));
+    }
+
+    #[test]
+    fn pbkdf2_cancelled_work_stops_even_with_few_or_no_output_blocks() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        for iterations in [1, 2, 4096, 4097, PBKDF2_MAX_ITERATIONS] {
+            for length in [0, 32, 65] {
+                let error = pbkdf2_derive_with(
+                    "SHA-256", b"password", b"salt", iterations, length, &cancelled,
+                ).expect_err("cancellation must be checked before every derivation");
+                assert!(error.to_string().contains("cancelled"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn pbkdf2_block_boundary_checks_cancellation_below_the_round_interval() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let mut output = [7; 65];
+        assert!(!pbkdf2_blocks::<hmac::Hmac<sha2::Sha256>>(
+            b"password", b"salt", 1, &mut output, &cancelled,
+        ));
+        assert_eq!(output, [7; 65], "cancelled work must not start its first block");
+    }
+
+    #[test]
+    fn pbkdf2_blocks_match_existing_primitives_and_rfc6070() {
+        let derived = pbkdf2_derive("SHA-1", b"password", b"salt", 4096, 20).unwrap();
+        let hex: String = derived.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, "4b007901b765489abead49d926f721d065a429c1");
+        for (hash, length) in [("SHA-1", 45), ("SHA-256", 70), ("SHA-384", 49), ("SHA-512", 130)] {
+            for iterations in [1, 2, 5000] {
+                let derived = pbkdf2_derive(hash, b"password", b"salt", iterations, length).unwrap();
+                let mut expected = vec![0; length as usize];
+                match hash {
+                    "SHA-1" => pbkdf2::pbkdf2_hmac::<sha1::Sha1>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-256" => pbkdf2::pbkdf2_hmac::<sha2::Sha256>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-384" => pbkdf2::pbkdf2_hmac::<sha2::Sha384>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-512" => pbkdf2::pbkdf2_hmac::<sha2::Sha512>(b"password", b"salt", iterations, &mut expected),
+                    _ => unreachable!(),
+                }
+                assert_eq!(derived, expected, "{hash}, iterations={iterations}, length={length}");
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_a_pbkdf2_waiter_signals_cancellation() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = CancelPbkdf2OnDrop(cancelled.clone());
+        assert!(!cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        drop(guard);
+        assert!(cancelled.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // HKDF and the CSPRNG draw share the same DoS shape: both size an output
@@ -6445,12 +7125,17 @@ pub struct SessionHistory {
     pub current: usize,
 }
 
+fn navigation_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 { return Some(state.borrow::<SharedState>().clone()); }
+    state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow().by_frame_id(frame_id)
+}
+
 /// `"documentStart,current,length"` of the session history; length is 0 when
 /// this realm has none.
 #[op2]
 #[string]
-fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
-    let gs = realm_state(scope, state);
+fn op_session_history(state: &OpState, frame_id: u32) -> String {
+    let Some(gs) = navigation_state(state, frame_id) else { return "0,0,0".into(); };
     let gs = gs.borrow();
     let history = &gs.session_history;
     format!("{},{},{}", history.document_start, history.current, history.urls.len())
@@ -6459,8 +7144,8 @@ fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
 /// Queue a traversal to another document's session history entry. Returns
 /// false when the index is out of range.
 #[op2(fast)]
-fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) -> bool {
-    let gs = realm_state(scope, state);
+fn op_history_traverse(state: &OpState, index: u32, frame_id: u32) -> bool {
+    let Some(gs) = navigation_state(state, frame_id) else { return false; };
     let mut gs = gs.borrow_mut();
     let index = index as usize;
     let Some(url) = gs.session_history.urls.get(index).cloned() else {
@@ -6472,16 +7157,19 @@ fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) ->
 }
 
 // A frame that navigates itself must not move the top document. Recording the
-// navigation against the calling realm keeps it inside that frame.
+// navigation against the realm that owns the Location object keeps it inside
+// that frame, also when another realm calls it: the page can run
+// `iframe.contentWindow.location.replace(url)`, and the running context is
+// then the page's, not the frame's (see `frame_state`).
 #[op2(fast)]
 fn op_navigate(
-    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] method: &str,
     #[string] body: &str,
+    frame_id: u32,
 ) {
-    let gs = realm_state(scope, state);
+    let Some(gs) = navigation_state(state, frame_id) else { return; };
     let mut gs = gs.borrow_mut();
     // Only queue the navigation — do NOT change the realm URL here. The URL is
     // updated on commit via `set_url` once the navigation is actually performed.
@@ -6534,6 +7222,8 @@ fn op_post_frame_message(
             .unwrap_or_else(|_| "null".to_string())
     });
     drop(source);
+    let source_context_id = state.borrow::<Rc<RefCell<RealmStates>>>().borrow()
+        .context_for_frame(source_frame_id);
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     let over_entries = gs.pending_frame_messages.len() >= frame_message_queue_entry_limit();
@@ -6556,6 +7246,7 @@ fn op_post_frame_message(
     gs.pending_frame_messages.push(PendingFrameMessage {
         target_frame_id,
         source_frame_id,
+        source_context_id,
         origin,
         target_origin: target_origin.to_string(),
         data_json: data_json.to_string(),
@@ -6667,6 +7358,149 @@ fn op_register_document_realm(
 
 /// Resolve a borrowed document member from the receiver's creation realm, not
 /// its public prototype, which a membrane is allowed to replace.
+pub(crate) fn document_realm<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    receiver: v8::Local<'s, v8::Object>,
+) -> Option<(u32, v8::Local<'s, v8::Object>)> {
+    let context = receiver.get_creation_context(scope)?;
+    let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
+    let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
+    Some((owner, members))
+}
+
+fn select_index_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    object: v8::Local<'_, v8::Object>,
+    data: v8::Local<'_, v8::Value>,
+    field: u32,
+    args: &[v8::Local<'s, v8::Value>],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let data = v8::Local::new(scope, data);
+    let callback = v8::Local::<v8::Array>::try_from(data).ok()
+        .and_then(|values| values.get_index(scope, field))
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok());
+    let Some(callback) = callback else {
+        if let Some(message) = v8::String::new(scope, "Invalid native select") {
+            let error = v8::Exception::type_error(scope, message);
+            scope.throw_exception(error);
+        }
+        return None;
+    };
+    callback.call(scope, object.into(), args)
+}
+
+fn select_index_values<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    object: v8::Local<'_, v8::Object>,
+    data: v8::Local<'_, v8::Value>,
+) -> Option<v8::Local<'s, v8::Array>> {
+    let value = select_index_callback(scope, object, data, 0, &[])?;
+    if let Ok(values) = v8::Local::<v8::Array>::try_from(value) { return Some(values); }
+    if let Some(message) = v8::String::new(scope, "Invalid native select options") {
+        let error = v8::Exception::type_error(scope, message);
+        scope.throw_exception(error);
+    }
+    None
+}
+
+fn select_allocator(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    if args.is_construct_call() { return; }
+    if let Some(message) = v8::String::new(scope, "Illegal constructor") {
+        let error = v8::Exception::type_error(scope, message);
+        scope.throw_exception(error);
+    }
+}
+
+#[op2(reentrant)]
+fn op_create_select_allocator<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    prototype: v8::Local<'s, v8::Object>,
+    refresh: v8::Local<'s, v8::Function>,
+    setter: v8::Local<'s, v8::Function>,
+) -> Result<v8::Local<'s, v8::Function>, deno_error::JsErrorBox> {
+    let context = prototype.get_creation_context(scope)
+        .ok_or_else(|| deno_error::JsErrorBox::type_error("Invalid select creation realm"))?;
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let key = v8::String::new(scope, "_nid")
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create select node key"))?;
+    let data = v8::Array::new_with_elements(scope, &[refresh.into(), setter.into()]);
+    let constructor = v8::FunctionTemplate::builder(select_allocator).build(scope);
+    let template = constructor.instance_template(scope);
+    let empty_nid = v8::Integer::new(scope, 0);
+    template.set(key.into(), empty_nid.into());
+    template.set_indexed_property_handler(v8::IndexedPropertyHandlerConfiguration::new().data(data.into())
+        .getter(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Value>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            if index >= values.length() { return v8::Intercepted::kNo; }
+            if let Some(value) = values.get_index(scope, index) { rv.set(value); }
+            v8::Intercepted::kYes
+        })
+        .setter(|scope: &mut v8::PinScope, index: u32, value: v8::Local<v8::Value>,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<()>| {
+            let value = v8::Local::new(scope, value);
+            let index = v8::Integer::new_from_unsigned(scope, index);
+            if select_index_callback(scope, args.holder(), args.data(), 1, &[index.into(), value]).is_some() {
+                rv.set_bool(true);
+            }
+            v8::Intercepted::kYes
+        })
+        .query(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Integer>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            if index >= values.length() { return v8::Intercepted::kNo; }
+            rv.set_int32(0);
+            v8::Intercepted::kYes
+        })
+        .definer(|scope: &mut v8::PinScope, index: u32, descriptor: &v8::PropertyDescriptor,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<()>| {
+            if descriptor.has_get() || descriptor.has_set() {
+                rv.set_bool(true);
+                return v8::Intercepted::kYes;
+            }
+            let value = if descriptor.has_value() { descriptor.value() } else { v8::undefined(scope).into() };
+            let value = v8::Local::new(scope, value);
+            let index = v8::Integer::new_from_unsigned(scope, index);
+            if select_index_callback(scope, args.holder(), args.data(), 1, &[index.into(), value]).is_some() {
+                rv.set_bool(true);
+            }
+            v8::Intercepted::kYes
+        })
+        .deleter(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Boolean>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            let allowed = index >= values.length();
+            if !allowed && args.should_throw_on_error() {
+                if let Some(message) = v8::String::new(scope, "Cannot delete a supported select index") {
+                    let error = v8::Exception::type_error(scope, message);
+                    scope.throw_exception(error);
+                }
+            }
+            rv.set_bool(allowed);
+            v8::Intercepted::kYes
+        })
+        .enumerator(|scope: &mut v8::PinScope,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Array>| {
+            if let Some(values) = select_index_values(scope, args.holder(), args.data()) {
+                let keys: Vec<v8::Local<v8::Value>> = (0..values.length())
+                    .map(|index| v8::Integer::new_from_unsigned(scope, index).into()).collect();
+                rv.set(v8::Array::new_with_elements(scope, &keys));
+            }
+        }));
+    let constructor = constructor.get_function(scope)
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create native select constructor"))?;
+    let key = v8::String::new(scope, "prototype")
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create select prototype key"))?;
+    if constructor.set(scope, key.into(), prototype.into()) != Some(true) {
+        return Err(deno_error::JsErrorBox::generic("Could not initialize native select prototype"));
+    }
+    Ok(constructor)
+}
+
 #[op2]
 fn op_document_realm_member<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
@@ -6675,10 +7509,8 @@ fn op_document_realm_member<'s, 'i>(
     caller_frame_id: u32,
 ) -> v8::Local<'s, v8::Value> {
     let member = (|| {
-        let context = receiver.get_creation_context(scope)?;
-        let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
+        let (owner, members) = document_realm(scope, receiver)?;
         if owner == caller_frame_id { return None; }
-        let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
         let key = v8::String::new(scope, name)?;
         let value = members.get(scope, key.into())?;
         value.is_function().then_some(value)
@@ -6694,7 +7526,10 @@ pub fn max_live_frames() -> usize {
 }
 
 /// Initial blank and srcdoc documents share their creator's realm setup.
-#[op2]
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
@@ -6746,6 +7581,7 @@ fn op_initial_frame(
             child.sandbox_opaque_origin = opaque;
             child.url = frame_url.to_string();
             child.frame_id = frame_id;
+            child.parent_frame_id = parent_frame_id;
             child.about_base_url = document_base_url(&parent);
             child.scripting_enabled = parent.scripting_enabled && sandbox.as_deref().is_none_or(|value|
                 value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("allow-scripts")));
@@ -6763,8 +7599,8 @@ fn op_initial_frame(
             child.inherit_resources(&parent);
         }
         let handle = v8::Global::new(scope, context);
-        registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
         registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
+        registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         let receiver = v8::undefined(scope);
@@ -7186,24 +8022,24 @@ fn op_subtle_jwk_parse(#[buffer] bytes: &[u8]) -> Result<serde_json::Value, deno
     parse_jwk(bytes)
 }
 
-/// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
-/// page JS drives this op on the single-threaded runtime: an unbounded
-/// iteration count pins the V8 isolate (blocking every other CDP command on the
-/// connection) and a huge output length forces an unbounded `vec![0u8; length]`
-/// allocation. Both caps sit far above any legitimate use — OWASP recommends
-/// ~600k iterations and derived keys are tens of bytes.
+/// Bound page-controlled PBKDF2 CPU work and output allocation. Normal derived
+/// keys use tens of bytes; each hash-sized output block repeats every round.
 const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
 const PBKDF2_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+const PBKDF2_MAX_WORK: u64 = 1_000_000_000;
 
-/// PBKDF2 key derivation with DoS guards. Split out from the op so the bounds
-/// are unit-testable without the `#[op2]` wrapper.
-fn pbkdf2_derive(
+fn pbkdf2_can_inline(work: u64, password_length: usize, salt_length: usize) -> bool {
+    work <= 4096 && password_length.saturating_add(salt_length) <= 1024
+}
+
+fn validate_pbkdf2(
     hash: &str,
-    password: &[u8],
-    salt: &[u8],
     iterations: u32,
     length: u32,
-) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+) -> Result<u64, deno_error::JsErrorBox> {
+    if iterations == 0 {
+        return Err(crypto_err("PBKDF2 iteration count must be positive"));
+    }
     if iterations > PBKDF2_MAX_ITERATIONS {
         return Err(crypto_err(format!(
             "PBKDF2 iteration count {iterations} exceeds the supported maximum of {PBKDF2_MAX_ITERATIONS}"
@@ -7214,29 +8050,137 @@ fn pbkdf2_derive(
             "PBKDF2 output length {length} bytes exceeds the supported maximum of {PBKDF2_MAX_OUTPUT_BYTES}"
         )));
     }
-    use pbkdf2::pbkdf2_hmac;
-    let mut dk = vec![0u8; length as usize];
-    match hash {
-        "SHA-1" => pbkdf2_hmac::<sha1::Sha1>(password, salt, iterations, &mut dk),
-        "SHA-256" => pbkdf2_hmac::<sha2::Sha256>(password, salt, iterations, &mut dk),
-        "SHA-384" => pbkdf2_hmac::<sha2::Sha384>(password, salt, iterations, &mut dk),
-        "SHA-512" => pbkdf2_hmac::<sha2::Sha512>(password, salt, iterations, &mut dk),
+    let block_length = match hash {
+        "SHA-1" => 20,
+        "SHA-256" => 32,
+        "SHA-384" => 48,
+        "SHA-512" => 64,
         _ => return Err(crypto_err("unsupported PBKDF2 hash")),
+    };
+    let work = u64::from(iterations) * u64::from(length).div_ceil(block_length);
+    if work > PBKDF2_MAX_WORK {
+        return Err(crypto_err(format!(
+            "PBKDF2 work of {iterations} iterations over {length} bytes exceeds the supported maximum of {PBKDF2_MAX_WORK}"
+        )));
+    }
+    Ok(work)
+}
+
+#[cfg(test)]
+fn pbkdf2_derive(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    length: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    pbkdf2_derive_with(hash, password, salt, iterations, length, &cancelled)
+}
+
+fn pbkdf2_derive_with(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    length: u32,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    validate_pbkdf2(hash, iterations, length)?;
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crypto_err("PBKDF2 derivation was cancelled"));
+    }
+    let mut dk = vec![0u8; length as usize];
+    let completed = match hash {
+        "SHA-1" => pbkdf2_blocks::<hmac::Hmac<sha1::Sha1>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-256" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha256>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-384" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha384>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-512" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha512>>(password, salt, iterations, &mut dk, cancelled),
+        _ => return Err(crypto_err("unsupported PBKDF2 hash")),
+    };
+    if !completed {
+        return Err(crypto_err("PBKDF2 derivation was cancelled"));
     }
     Ok(dk)
 }
 
-/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
+fn pbkdf2_blocks<M>(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    output: &mut [u8],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> bool
+where
+    M: hmac::Mac + hmac::digest::KeyInit + Clone,
+{
+    use std::sync::atomic::Ordering;
+    let prf = <M as hmac::digest::KeyInit>::new_from_slice(password)
+        .expect("HMAC accepts a key of any length");
+    for (index, block) in output.chunks_mut(<M as hmac::digest::OutputSizeUser>::output_size()).enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut mac = prf.clone();
+        mac.update(salt);
+        mac.update(&(index as u32 + 1).to_be_bytes());
+        let mut value = mac.finalize().into_bytes();
+        block.copy_from_slice(&value[..block.len()]);
+        for round in 1..iterations {
+            if round % 4096 == 0 && cancelled.load(Ordering::Relaxed) {
+                return false;
+            }
+            let mut mac = prf.clone();
+            mac.update(&value);
+            value = mac.finalize().into_bytes();
+            for (byte, next) in block.iter_mut().zip(value.iter()) {
+                *byte ^= next;
+            }
+        }
+    }
+    true
+}
+
+struct CancelPbkdf2OnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelPbkdf2OnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn pbkdf2_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+        std::sync::Arc::new(tokio::sync::Semaphore::new((cores / 2).max(1)))
+    })
+}
+
+/// Keep large derivations off the page thread, retaining their permits until
+/// workers exit. Small bounded work avoids blocking-pool scheduling overhead.
 #[op2]
 #[buffer]
-fn op_subtle_pbkdf2(
-    #[string] hash: &str,
-    #[buffer] password: &[u8],
-    #[buffer] salt: &[u8],
+async fn op_subtle_pbkdf2(
+    #[string] hash: String,
+    #[buffer(copy)] password: Vec<u8>,
+    #[buffer(copy)] salt: Vec<u8>,
     iterations: u32,
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    pbkdf2_derive(hash, password, salt, iterations, length)
+    let work = validate_pbkdf2(&hash, iterations, length)?;
+    if pbkdf2_can_inline(work, password.len(), salt.len()) {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        return pbkdf2_derive_with(&hash, &password, &salt, iterations, length, &cancelled);
+    }
+    let slot = pbkdf2_slots().clone().acquire_owned().await
+        .map_err(|error| crypto_err(format!("PBKDF2 unavailable: {error}")))?;
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelPbkdf2OnDrop(cancelled.clone());
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        pbkdf2_derive_with(&hash, &password, &salt, iterations, length, &cancelled)
+    }).await.map_err(|error| crypto_err(format!("PBKDF2 task failed: {error}")))?
 }
 
 /// Generous DoS backstop on HKDF output length. HKDF itself rejects output
@@ -7677,6 +8621,7 @@ fn op_canvas_register_surface(
     width: u32,
     height: u32,
     #[buffer] pixels: JsBuffer,
+    frame_id: u32,
 ) -> bool {
     const MAX_CANVAS_DIMENSION: u32 = 32_767;
     const MAX_CANVAS_PIXELS: usize = 67_108_864;
@@ -7695,7 +8640,7 @@ fn op_canvas_register_surface(
         return false;
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let mut state = shared.borrow_mut();
     let node = NodeId::new(nid);
     let is_canvas = state
@@ -7740,8 +8685,9 @@ fn op_canvas_register_surface(
 /// screencast/readiness without throwing away otherwise-valid layout.
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_canvas_paint_damage(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    // Resolve the calling frame's document (a frame's node ids are not the page's).
+    let shared = frame_state(state, frame_id);
     let mut state = shared.borrow_mut();
     let node = NodeId::new(nid);
     if !state.canvas_surfaces.contains_key(&node) {
@@ -7757,9 +8703,121 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+#[op2]
+#[string]
+fn op_frame_preload_scripts(state: &OpState) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        serde_json::to_string(&registry.borrow().frame_preload_scripts).unwrap_or("[]".into())
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_preload_scripts panicked; returning no scripts");
+        "[]".into()
+    })
+}
+
+#[op2(fast)]
+fn op_connect_frame(state: &OpState, parent_frame_id: u32, node_id: u32) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let parent = if parent_frame_id == 0 { Some(state.borrow::<SharedState>().clone()) }
+            else { state.borrow::<Rc<RefCell<RealmStates>>>().borrow().by_frame_id(parent_frame_id) };
+        let id = parent.and_then(|parent|
+            state.borrow::<Rc<RefCell<RealmStates>>>().borrow_mut()
+                .connect_frame_context(&parent, NodeId::new(node_id)));
+        if id.is_none() {
+            tracing::warn!(parent_frame_id, node_id, "rejecting inactive frame owner");
+        }
+        id.map_or(-1.0, f64::from)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_connect_frame panicked");
+        -1.0
+    })
+}
+
+#[op2(fast)]
+fn op_frame_context(state: &OpState, frame_id: u32) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.borrow::<Rc<RefCell<RealmStates>>>().borrow()
+            .context_for_frame(frame_id).map_or(-1.0, f64::from)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_context panicked");
+        -1.0
+    })
+}
+
+// Relations: child count, parent, indexed/named child, liveness, realm, local owner.
+#[op2(fast)]
+fn op_frame_relation(
+    state: &OpState, context_id: u32, relation: u32, index: u32, #[string] name: &str,
+) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+        let active = registry.frame_context_active(context_id) == Some(true);
+        if relation == 4 { return if active { 1.0 } else { 0.0 }; }
+        if !active { return if relation == 0 { 0.0 } else { -1.0 }; }
+        if relation == 1 {
+            return if context_id == 0 { 0.0 } else {
+                registry.frame_contexts.get(&context_id).and_then(|context| context.parent)
+                    .map_or(-1.0, f64::from)
+            };
+        }
+        if relation == 5 {
+            return if context_id == 0 { 0.0 } else {
+                registry.frame_contexts.get(&context_id).and_then(|context| context.frame_id)
+                    .filter(|id| registry.frame_timers_active(*id) == Some(true))
+                    .map_or(-1.0, f64::from)
+            };
+        }
+        if relation == 6 {
+            let Some((owner, node, generation)) = registry.frame_contexts.get(&context_id)
+                .and_then(|context| context.owner.as_ref()) else { return -1.0 };
+            let caller = if index == 0 { Some(state.borrow::<SharedState>().clone()) }
+                else { registry.by_frame_id(index) };
+            return caller.filter(|caller| owner.as_ptr() == Rc::as_ptr(caller)
+                && caller.borrow().document_generation == *generation)
+                .map_or(-1.0, |_| node.index() as f64);
+        }
+        let mut children = registry.frame_context_children.get(&context_id).into_iter().flatten()
+            .copied().filter(|id| registry.frame_context_active(*id) == Some(true));
+        match relation {
+            0 => children.count() as f64,
+            2 => children.skip(index as usize).next().map_or(-1.0, f64::from),
+            3 if !name.is_empty() => children.find(|id| {
+                let context = &registry.frame_contexts[id];
+                if context.name != name { return false; }
+                let Some((owner, node, _)) = &context.owner else { return false };
+                owner.upgrade().is_some_and(|owner|
+                    owner.borrow().dom.as_ref().is_some_and(|dom|
+                        dom.with_node(*node, |node| node.get_attribute("name") == Some(name))
+                            .unwrap_or(false)))
+            }).map_or(-1.0, f64::from),
+            _ => -1.0,
+        }
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_relation panicked");
+        -1.0
+    })
+}
+
+#[op2]
+#[string]
+fn op_frame_name(state: &OpState, context_id: u32, #[string] value: Option<String>) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow_mut();
+        let Some(context) = registry.frame_contexts.get_mut(&context_id) else { return String::new() };
+        if let Some(value) = value { context.name = value; }
+        context.name.clone()
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_name panicked");
+        String::new()
+    })
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_form_owner(),
+        op_form_cache_buffer(),
+        op_create_select_allocator(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),
@@ -7790,6 +8848,10 @@ pub fn build_extension() -> Extension {
         op_history_traverse(),
         op_frame_document_ready(),
         op_initial_frame(),
+        op_connect_frame(),
+        op_frame_context(),
+        op_frame_relation(),
+        op_frame_name(),
         op_document_realm_member(),
         op_register_document_realm(),
         op_post_frame_message(),
@@ -7847,6 +8909,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
     }
+    ops.push(op_frame_preload_scripts());
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
@@ -8134,9 +9197,13 @@ fn ensure_prepared_render_with_base_url(
             .then(|| state.prepared_render.take())
             .flatten();
         let mutations = std::mem::take(&mut state.pending_style_mutations);
-        let prepared = {
+        // Anti-panic boundary: style and layout run inside a JS op (a geometry
+        // read), and deno_core's op callbacks are `extern "C"`, so a panic in
+        // the layout engine would abort the process. A page whose layout
+        // panics loses its layout for this read instead.
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let dom = state.dom.as_ref()?;
-            match previous {
+            Some(match previous {
                 Some(previous) => obscura_render::prepare_dom_with_retained_styles_with_animation_state(
                     dom,
                     viewport,
@@ -8184,6 +9251,13 @@ fn ensure_prepared_render_with_base_url(
                         &mut state.animation_timeline,
                     )?,
                 },
+            })
+        }));
+        let prepared = match prepared {
+            Ok(prepared) => prepared?,
+            Err(_) => {
+                tracing::error!("layout panicked; the page has no layout for this read");
+                return None;
             }
         };
         if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
@@ -8463,8 +9537,9 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_image_metadata(state: &OpState, nid: u32, cached_only: bool, frame_id: u32) -> String {
+    // Resolve the calling frame's document: a frame's node ids are not the page's.
+    let shared = frame_state(state, frame_id);
     let gs = shared.borrow();
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
@@ -8475,6 +9550,20 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
     });
     if !is_image {
         return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
+    }
+    if !cached_only {
+        // Source assignments may retry failed requests; getters and layout
+        // only observe the current outcome and must not restart it.
+        let request = gs.dom.as_ref().and_then(|dom| {
+            let (url, _, _, _) = profiled_cached_image_metadata(&gs, node_id)?;
+            Some((url, image_request_profile(dom, node_id)))
+        });
+        drop(gs);
+        let mut gs = shared.borrow_mut();
+        if let Some((url, profile)) = request {
+            gs.render_resources.retry_html_image_request(node_id, &url, profile);
+        }
+        return cached_image_metadata_for_node(&gs, node_id);
     }
     cached_image_metadata_for_node(&gs, node_id)
 }
@@ -8549,10 +9638,13 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
+async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id: u32) -> String {
+    // An async op cannot ask V8 which realm called it; the JS side passes its
+    // frame id. Without this, an <img> inside an iframe was looked up in the
+    // page's DOM, answered "stale" forever, and never fired load/error.
     let shared = {
         let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+        frame_state(&state, frame_id)
     };
     let node_id = NodeId::new(nid);
     let (
@@ -8625,7 +9717,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     }
 
     // Different CORS/credential profiles do not share an in-flight response.
-    let request_key = (document_generation, selected_url.clone(), request_profile);
+    let image_request_generation = shared.borrow().render_resources.begin_html_image_request(&selected_url, request_profile);
+    let request_key = (document_generation, selected_url.clone(), request_profile, image_request_generation);
     let (follower, cancel_rx) = {
         let mut gs = shared.borrow_mut();
         if let Some((_, waiters)) = gs.render_image_in_flight.get_mut(&request_key) {
@@ -8714,10 +9807,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             match bytes {
                 Some(bytes) => {
                     if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
-                        gs.render_resources.seed_image(
-                            selected_url.clone(),
-                            request_profile,
-                            bytes,
+                        gs.render_resources.seed_image_shared_for_request(
+                            selected_url.clone(), request_profile, Arc::from(bytes), image_request_generation,
                         );
                         // The leader owns the unknown-to-known cache
                         // transition. Followers only observe this result and
@@ -8725,12 +9816,12 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                         invalidate_render_resource_geometry(&mut gs);
                     } else {
                         gs.render_resources
-                            .seed_image_missing(selected_url.clone(), request_profile);
+                            .seed_image_missing_for_request(selected_url.clone(), request_profile, image_request_generation);
                     }
                 }
                 None => {
                     gs.render_resources
-                        .seed_image_missing(selected_url.clone(), request_profile);
+                        .seed_image_missing_for_request(selected_url.clone(), request_profile, image_request_generation);
                 }
             }
         }
@@ -9150,12 +10241,19 @@ fn op_computed_style(
         return String::new();
     };
     let custom = prepared.computed_custom_properties(nid).unwrap_or_default();
-    let mut object = serde_json::Map::with_capacity(snapshot.len() + custom.len());
+    let mut object = serde_json::Map::with_capacity(snapshot.len() + custom.len() + 4);
     for (name, value) in snapshot {
         object.insert(name.to_string(), serde_json::Value::String(value));
     }
     for (name, value) in custom {
         object.insert(name, serde_json::Value::String(value));
+    }
+    if let (Some(prepared), Some(dom)) = (gs.prepared_render.as_ref(), gs.dom.as_ref()) {
+        if let Some(insets) = prepared.resolved_insets(dom, nid) {
+            for (name, value) in ["top", "right", "bottom", "left"].into_iter().zip(insets) {
+                object.insert(name.to_string(), serde_json::Value::String(value));
+            }
+        }
     }
     serde_json::json!([true, object]).to_string()
 }

@@ -129,9 +129,9 @@ pub async fn handle(
                 .ok_or("Network.getResponseBody requires requestId")?;
 
             let body = if let Some(page) = ctx.get_session_page(session_id) {
-                page.get_response_body(request_id)
+                page.get_response_body_for_cdp(request_id)
             } else {
-                ctx.pages.iter().find_map(|page| page.get_response_body(request_id))
+                ctx.pages.iter().find_map(|page| page.get_response_body_for_cdp(request_id))
             };
 
             match body {

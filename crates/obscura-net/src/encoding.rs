@@ -30,7 +30,7 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
     let mut dec = if ignore_bom {
         enc.new_decoder_without_bom_handling()
     } else {
-        enc.new_decoder()
+        enc.new_decoder_with_bom_removal()
     };
     // Both decode calls write only into the string's spare capacity and stop
     // with OutputFull when it runs out. Legacy encodings can expand one byte into
@@ -73,6 +73,10 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
 pub fn decode_devtools_response_body(bytes: &[u8], content_type: Option<&str>) -> Option<String> {
     if bytes.is_empty() { return Some(String::new()); }
     let header = content_type?;
+    let decode = |encoding: &'static Encoding| {
+        let encoding = Encoding::for_bom(bytes).map_or(encoding, |(encoding, _)| encoding);
+        decode_with_label(encoding.name(), bytes, true, false)
+    };
     let mut quoted = false;
     let mut escaped = false;
     let mut parts = header.split(|c| {
@@ -103,7 +107,7 @@ pub fn decode_devtools_response_body(bytes: &[u8], content_type: Option<&str>) -
         if label.is_empty() { break; }
         // Blink uses its plain-text default for an unrecognized declared label.
         let encoding = Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::WINDOWS_1252);
-        return decode_with_label(encoding.name(), bytes, true, false);
+        return decode(encoding);
     }
     let encoding = if mime == "text/html" {
         sniff_meta_charset(bytes).unwrap_or(UTF_8)
@@ -123,7 +127,7 @@ pub fn decode_devtools_response_body(bytes: &[u8], content_type: Option<&str>) -
     } else {
         return None;
     };
-    decode_with_label(encoding.name(), bytes, true, false)
+    decode(encoding)
 }
 
 /// Decode an HTTP response body. `content_type_header` is the raw header
@@ -427,10 +431,38 @@ mod tests {
             (b"<html/>", Some("application/xhtml+xml"), Some("<html/>")),
             (b"<x/>", Some("text/xsl"), None),
             (&[0xff], Some("application/x-javascript"), None),
+            (b"\xef\xbb\xbfA", Some("text/plain; charset=windows-1252"), Some("A")),
+            (b"\xff\xfeA\0", Some("text/plain"), Some("A")),
+            (b"\xff\xfeA\0", Some("text/plain; charset=utf-8"), Some("A")),
+            (b"\xef\xbb\xbfA", Some("text/html; charset=windows-1252"), Some("A")),
+            (b"\xef\xbb\xbfA", Some("application/octet-stream; charset=not-real"), Some("A")),
+            (b"\xef\xbb\xbfA", Some("application/octet-stream"), None),
+            (b"\xef\xbb\xbfA", Some("text/xsl"), None),
+            (b"\xef\xbb\xbfA", None, None),
+            // A malformed code unit remains byte-exact through base64/streams.
+            (b"\xff\xfeA", Some("text/plain; charset=utf-8"), None),
         ];
         for &(bytes, content_type, expected) in cases {
             assert_eq!(decode_devtools_response_body(bytes, content_type).as_deref(), expected,
                 "{content_type:?}, bytes={bytes:?}");
+        }
+    }
+
+
+
+    #[test]
+    fn text_decoder_bom_does_not_override_the_selected_encoding() {
+        assert_eq!(decode_with_label("utf-8", &[0xff, 0xfe, 65, 0], false, false).as_deref(),
+            Some("\u{fffd}\u{fffd}A\0"));
+        assert_eq!(decode_with_label("utf-8", &[0xff, 0xfe, 65, 0], true, false), None);
+        assert_eq!(decode_with_label("windows-1252", &[0xef, 0xbb, 0xbf, 65], false, false).as_deref(),
+            Some("\u{ef}\u{bb}\u{bf}A"));
+        for fatal in [false, true] {
+            assert_eq!(decode_with_label("utf-8", &[0xef, 0xbb, 0xbf, 65], fatal, false).as_deref(), Some("A"));
+            assert_eq!(decode_with_label("utf-8", &[0xef, 0xbb, 0xbf, 65], fatal, true).as_deref(), Some("\u{feff}A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xff, 0xfe, 65, 0], fatal, false).as_deref(), Some("A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xff, 0xfe, 65, 0], fatal, true).as_deref(), Some("\u{feff}A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xfe, 0xff, 0, 65], fatal, false).as_deref(), Some("\u{fffe}\u{4100}"));
         }
     }
 

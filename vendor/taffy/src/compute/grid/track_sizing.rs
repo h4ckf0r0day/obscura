@@ -1383,6 +1383,8 @@ fn distribute_space_up_to_limits(
 
     let mut space_to_distribute = space_to_distribute;
     while space_to_distribute > THRESHOLD {
+        let space_before = space_to_distribute;
+        let mut tracks_changed = false;
         let track_distribution_proportion_sum: f32 = tracks
             .iter()
             .filter(|track| track_affected_property(track) + track.item_incurred_increase < track_limit(track))
@@ -1418,11 +1420,102 @@ fn distribute_space_up_to_limits(
             }
             let increase = iteration_item_incurred_increase * track_distribution_proportion(track);
             if increase > 0.0 && current_size + increase <= limit + THRESHOLD {
+                let previous_increase = track.item_incurred_increase;
                 track.item_incurred_increase += increase;
+                tracks_changed |= track.item_incurred_increase != previous_increase;
                 space_to_distribute -= increase;
             }
+        }
+        // Saturating a track is progress even if subtracting its small
+        // increase from the remaining space rounds away.
+        if !tracks_changed && space_to_distribute >= space_before {
+            break;
         }
     }
 
     space_to_distribute
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{distribute_space_up_to_limits, GridTrack};
+    use crate::prelude::TaffyZero;
+    use crate::style::LengthPercentage;
+    use core::cell::Cell;
+
+    #[test]
+    fn track_distribution_stops_when_rounding_prevents_all_progress() {
+        let mut tracks = [
+            GridTrack::gutter(LengthPercentage::ZERO),
+            GridTrack::gutter(LengthPercentage::ZERO),
+            GridTrack::gutter(LengthPercentage::ZERO),
+        ];
+        for (track, (base, limit, proportion, incurred)) in tracks.iter_mut().zip([
+            (0.71128696, 780789.875, 0.6958633, 780789.1875),
+            (99.2123, 429551.4375, 1.2281497, 429452.21875),
+            (8.539768, 436054.53125, 0.47339195, 260653.515625),
+        ]) {
+            track.base_size = base;
+            track.growth_limit = limit;
+            track.content_alignment_adjustment = proportion;
+            track.item_incurred_increase = incurred;
+        }
+        let before = [
+            tracks[0].item_incurred_increase,
+            tracks[1].item_incurred_increase,
+            tracks[2].item_incurred_increase,
+        ];
+        let calls = Cell::new(0);
+        let remaining = distribute_space_up_to_limits(
+            64365076.0,
+            &mut tracks,
+            |_| true,
+            |track| track.content_alignment_adjustment,
+            |track| track.base_size,
+            |track| {
+                calls.set(calls.get() + 1);
+                assert!(calls.get() < 1000, "track sizing repeated a state without progress");
+                track.growth_limit
+            },
+        );
+        assert_eq!(remaining, 64365076.0);
+        for (track, before) in tracks.iter().zip(before) {
+            assert_eq!(track.item_incurred_increase, before);
+        }
+    }
+
+    #[test]
+    fn track_distribution_continues_when_only_a_track_progresses() {
+        let mut tracks = [
+            GridTrack::gutter(LengthPercentage::ZERO),
+            GridTrack::gutter(LengthPercentage::ZERO),
+        ];
+        tracks[0].growth_limit = 1e-9;
+        tracks[1].growth_limit = 100.0;
+        let remaining = distribute_space_up_to_limits(
+            100.0, &mut tracks, |_| true, |_| 1.0, |track| track.base_size, |track| track.growth_limit,
+        );
+        assert_eq!(remaining, 0.0);
+        assert_eq!(tracks[0].item_incurred_increase, 1e-9);
+        assert_eq!(tracks[1].item_incurred_increase, 100.0);
+    }
+
+    #[test]
+    fn track_distribution_preserves_weighted_limits_and_remaining_space() {
+        let mut tracks = [
+            GridTrack::gutter(LengthPercentage::ZERO),
+            GridTrack::gutter(LengthPercentage::ZERO),
+        ];
+        tracks[0].growth_limit = 10.0;
+        tracks[1].growth_limit = 30.0;
+        tracks[0].content_alignment_adjustment = 1.0;
+        tracks[1].content_alignment_adjustment = 3.0;
+        let remaining = distribute_space_up_to_limits(
+            50.0, &mut tracks, |_| true, |track| track.content_alignment_adjustment,
+            |track| track.base_size, |track| track.growth_limit,
+        );
+        assert_eq!(remaining, 10.0);
+        assert_eq!(tracks[0].item_incurred_increase, 10.0);
+        assert_eq!(tracks[1].item_incurred_increase, 30.0);
+    }
 }
