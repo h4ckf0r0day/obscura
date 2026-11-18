@@ -1334,6 +1334,9 @@ pub struct LayoutStyle {
     /// is the default. Fixed-basis sidebars/columns (`flex: 0 0 260px`)
     /// collapse to content width without it.
     pub flex_basis: Dimension,
+    /// Owns a functional basis until the local Taffy tree is dropped. Retained
+    /// restyles build a new tree, so replacing this owner cannot stale a handle.
+    pub(crate) flex_basis_calc: Option<std::sync::Arc<crate::style::GridCalcExpression>>,
 
     // CSS Grid. Tracks are stored as taffy sizing functions; `grid_areas` is the
     // parsed `grid-template-areas` matrix (one Vec per row, `.` for a null cell),
@@ -2673,7 +2676,9 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
     if let Some(fs) = style.flex_shrink {
         s.flex_shrink = fs;
     }
-    if style.flex_basis != Dimension::Auto {
+    if let Some(calc) = &style.flex_basis_calc {
+        s.flex_basis = calc.flex_basis_dimension();
+    } else if style.flex_basis != Dimension::Auto {
         s.flex_basis = dimension(style.flex_basis);
     }
 

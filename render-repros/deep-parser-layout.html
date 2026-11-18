@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Deep parser layout</title>
+<style>
+  body { margin: 24px; font: 18px sans-serif; color: #17324d; background: white; }
+  h1 { font-size: 26px; }
+  #root { border: 1px solid #17324d; padding: 8px; }
+  #root div { padding-left: 1px; }
+  #stats { margin-top: 20px; }
+</style>
+<h1>Deep parsed DOM retains every element</h1>
+<main id="root"></main>
+<pre id="stats"></pre>
+<script>
+  const root = document.getElementById("root");
+  const count = 600;
+  root.innerHTML = "<div>".repeat(count) + "All " + count + " nodes retained";
+  const divs = root.querySelectorAll("div");
+  const marker = document.createElement("span");
+  marker.style.cssText = "display:block;width:80px;height:20px;background:#3186e8";
+  divs[divs.length - 1].appendChild(marker);
+  let depth = 0;
+  for (let node = divs[divs.length - 1]; node !== root; node = node.parentElement) depth++;
+  document.getElementById("stats").textContent = "Nodes: " + divs.length + "\nDiv depth: " + depth;
+</script>

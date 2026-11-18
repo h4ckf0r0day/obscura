@@ -43,21 +43,20 @@ async fn call_with_arguments(session_id: &str, arguments: Value, declaration: &s
     reply["result"].clone()
 }
 
-// go-rod marshals CallArgument from a Go struct, so `omitempty` never drops the
-// unset `Value` field (gson.JSON is a struct) and every object handle reaches
-// the wire as `{"value":null,"objectId":"..."}`. value must not win over
-// objectId, or rod's JS helpers get `null` instead of the `functions` object:
-// "TypeError: Cannot set properties of null (setting 'selectable')".
 #[tokio::test(flavor = "current_thread")]
-async fn object_id_argument_wins_over_a_null_value() {
-    let result = call_with_arguments(
-        "rod-null-shadow",
-        json!([{"value": null, "objectId": "__never_resolves__"}]),
-        "function(o) { return o === undefined; }",
-    )
-    .await;
-    assert_eq!(result["type"], "boolean", "{result}");
-    assert_eq!(result["value"], json!(true), "{result}");
+async fn unknown_object_id_argument_does_not_fall_back_to_a_null_value() {
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    ctx.sessions.insert("rod-null-shadow".to_string(), page_id);
+    let response = dispatch(&CdpRequest {
+        id: 1, method: "Runtime.callFunctionOn".to_string(),
+        params: json!({
+            "functionDeclaration": "function(o) { globalThis.__called = true; return o; }",
+            "arguments": [{"value":null,"objectId":"__never_resolves__"}],
+        }),
+        session_id: Some("rod-null-shadow".to_string()),
+    }, &mut ctx).await;
+    assert_eq!(response.error.unwrap().message, "Could not find object with given id");
 }
 
 #[tokio::test(flavor = "current_thread")]
