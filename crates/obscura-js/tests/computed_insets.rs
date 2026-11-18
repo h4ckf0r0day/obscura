@@ -106,6 +106,53 @@ fn computed_insets_preserve_constraints_inline_values_and_scroll_independence() 
     assert_eq!(rt.evaluate(read).unwrap(), expected);
 }
 
+#[cfg(feature = "render")]
+#[test]
+fn computed_insets_use_stable_gutters_without_changing_viewport_units() {
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_viewport(800.0, 600.0);
+    rt.set_dom(obscura_dom::parse_html(r#"<!doctype html><style>
+        body{margin:0}div{width:40px;height:20px}
+        #fixed{position:fixed;top:10%;left:10%}
+        #absolute{position:absolute;top:10%;left:10%}
+        #auto{position:fixed;top:10px;left:12px}
+        #bothauto{position:fixed} #vw{position:fixed;top:10vh;left:10vw}
+        #sticky{position:sticky;top:10%;left:10%}
+        #math{position:fixed;top:10px;left:calc(10% + 10vw)}
+        </style><div id=fixed></div><div id=absolute></div><div id=auto></div>
+        <div id=bothauto></div><div id=vw></div><div id=sticky></div><div id=math></div>"#));
+    rt.run_page_init();
+    for (gutter, left, right, auto_right, vw_right, math_left, math_right) in [
+        ("stable", "78.5px", "666.5px", "733px", "665px", "158.5px", "586.5px"),
+        ("stable both-edges", "77px", "653px", "718px", "650px", "157px", "573px"),
+    ] {
+        rt.evaluate(&format!("document.documentElement.setAttribute('style','scrollbar-gutter:{gutter}')")).unwrap();
+        let read = r#"(() => {
+            const ids = ['fixed','absolute','auto','vw','sticky','math'];
+            return ids.map(id => {
+                const c = getComputedStyle(document.getElementById(id));
+                return [c.top,c.right,c.bottom,c.left];
+            });
+        })()"#;
+        let expected = json!([
+            ["60px",right,"520px",left], ["60px",right,"520px",left],
+            ["10px",auto_right,"570px","12px"], ["60px",vw_right,"520px","80px"],
+            ["60px","auto","auto",left], ["10px",math_right,"570px",math_left]
+        ]);
+        assert_eq!(rt.evaluate(read).unwrap(), expected, "{gutter}");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const c = getComputedStyle(document.getElementById('bothauto'));
+            return [c.top,c.right,c.bottom,c.left];
+        })()"#).unwrap(), if gutter == "stable" {
+            json!(["0px","745px","580px","0px"])
+        } else {
+            json!(["0px","730px","580px","0px"])
+        });
+        rt.evaluate(&format!("document.documentElement.setAttribute('style','scrollbar-gutter:{gutter};width:500px;margin:20px')")).unwrap();
+        assert_eq!(rt.evaluate(read).unwrap(), expected, "authored root size, {gutter}");
+    }
+}
+
 #[cfg(not(feature = "render"))]
 #[test]
 fn computed_insets_without_render_preserve_inline_values_and_auto_defaults() {

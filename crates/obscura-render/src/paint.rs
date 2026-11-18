@@ -2043,42 +2043,51 @@ impl PreparedRender {
         let needs_containing = (!inline && percentage.iter().any(|value| *value))
             || (absolute && style.inset.iter()
                 .any(|value| matches!(value, None | Some(crate::Dimension::Auto))));
-        if needs_containing && style.position_sticky {
-            let owner = self.scroll_tree.movement_owner.get(id.index()).copied().flatten();
-            if let Some(owner) = owner {
-                let size = self.scroll_tree.containers[owner.index()].client_size;
-                containing.width = size.0;
-                containing.height = size.1;
-            }
-        } else if needs_containing {
-            for parent in std::iter::successors(crate::dom::rendered_parent(tree, id),
-                |node| crate::dom::rendered_parent(tree, *node)).take(tree.len() + 1)
-            {
-                let Some(parent_style) = self.layout.styles.get(&parent) else { continue; };
-                if parent_style.display_contents { continue; }
-                let is_containing = if absolute {
-                    parent_style.establishes_positioning_containing_block()
-                        || (!style.position_fixed && parent_style.position.is_some())
-                } else {
-                    !parent_style.ignores_used_box_sizes()
-                };
-                if !is_containing { continue; }
-                let Some(parent_rect) = self.layout.rects.get(&parent) else { continue; };
-                containing = crate::Rect {
-                    x: parent_rect.x + parent_style.border.left,
-                    y: parent_rect.y + parent_style.border.top,
-                    width: (parent_rect.width - parent_style.border.left
-                        - parent_style.border.right).max(0.0),
-                    height: (parent_rect.height - parent_style.border.top
-                        - parent_style.border.bottom).max(0.0),
-                };
-                if !absolute {
-                    containing.width = (containing.width - parent_style.padding.left
-                        - parent_style.padding.right).max(0.0);
-                    containing.height = (containing.height - parent_style.padding.top
-                        - parent_style.padding.bottom).max(0.0);
+        let sticky_container = style.position_sticky.then(|| {
+            self.scroll_tree.movement_owner.get(id.index()).copied().flatten()
+                .map(|owner| &self.scroll_tree.containers[owner.index()])
+        }).flatten();
+        if needs_containing {
+            if let Some(container) = sticky_container.filter(|container| {
+                container.node.is_some() || !(percentage[1] || percentage[3])
+            }) {
+                containing.width = container.client_size.0;
+                containing.height = container.client_size.1;
+            } else {
+                let mut ancestor = Some(id);
+                for _ in 0..=tree.len() {
+                    let Some(parent) = ancestor else { break; };
+                    ancestor = crate::dom::rendered_parent(tree, parent);
+                    let Some(parent_style) = self.layout.styles.get(&parent) else { continue; };
+                    if ancestor == Some(tree.document()) {
+                        containing = crate::dom::initial_containing_block(
+                            self.viewport, parent_style.scrollbar_gutters);
+                    }
+                    if parent == id || style.position_sticky || parent_style.display_contents { continue; }
+                    let is_containing = if absolute {
+                        parent_style.establishes_positioning_containing_block()
+                            || (!style.position_fixed && parent_style.position.is_some())
+                    } else {
+                        !parent_style.ignores_used_box_sizes()
+                    };
+                    if !is_containing { continue; }
+                    let Some(parent_rect) = self.layout.rects.get(&parent) else { continue; };
+                    containing = crate::Rect {
+                        x: parent_rect.x + parent_style.border.left,
+                        y: parent_rect.y + parent_style.border.top,
+                        width: (parent_rect.width - parent_style.border.left
+                            - parent_style.border.right).max(0.0),
+                        height: (parent_rect.height - parent_style.border.top
+                            - parent_style.border.bottom).max(0.0),
+                    };
+                    if !absolute {
+                        containing.width = (containing.width - parent_style.padding.left
+                            - parent_style.padding.right).max(0.0);
+                        containing.height = (containing.height - parent_style.padding.top
+                            - parent_style.padding.bottom).max(0.0);
+                    }
+                    break;
                 }
-                break;
             }
         }
         let values: [Option<f32>; 4] = std::array::from_fn(|index| {
