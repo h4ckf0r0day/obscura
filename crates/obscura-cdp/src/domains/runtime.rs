@@ -38,16 +38,16 @@ impl DeferredEvaluation {
             js.cancel_cdp_evaluation(self.pending);
             return Err(format!("Runtime.{} promise did not settle within {}ms", self.method, self.timeout_ms));
         }
-        let watchdog = remaining.map(|budget| obscura_js::runtime::spawn_watchdog(js.isolate_handle(), budget));
+        let watchdog = js.arm_execution_watchdog(remaining);
         let result = match js.finish_cdp_evaluation(self.pending, self.return_by_value) {
             Ok(info) => emit_post_eval_nav(ctx, session_id).await.map(|_| evaluation_reply(&info)),
             Err(error) => Err(error),
         };
-        if watchdog.is_some_and(|watchdog| watchdog.stop()) {
+        if watchdog.stop() {
             if let Some(js) = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut()) {
                 js.cancel_termination();
             }
-            return Err("Runtime result serialization exceeded its task budget".into());
+            return Err("Runtime result serialization was terminated".into());
         }
         result
     }

@@ -292,6 +292,7 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    watchdog_scope: Option<crate::cdp_watchdog::ExecutionScope>,
     /// Signals that V8 approached its configured heap limit. The callback
     /// terminates the current script and temporarily raises the limit just
     /// enough for V8 to unwind instead of aborting the worker process.
@@ -479,7 +480,10 @@ const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 /// So the isolate is exited once construction finishes and entered again only
 /// around work that touches V8. Entries are then properly nested no matter how
 /// many pages exist or what order they are used and dropped in.
-struct EnteredRuntime<'a>(&'a mut JsRuntime);
+struct EnteredRuntime<'a> {
+    runtime: &'a mut JsRuntime,
+    execution_scope: Option<&'a crate::cdp_watchdog::ExecutionScope>,
+}
 
 /// Enters an isolate only while an async deno_core operation is being polled.
 /// Holding an entry across `.await` would let interleaved page futures violate
@@ -487,21 +491,31 @@ struct EnteredRuntime<'a>(&'a mut JsRuntime);
 struct EnteredRuntimeFuture<F> {
     isolate: *mut deno_core::v8::Isolate,
     future: Option<Pin<Box<F>>>,
+    execution_scope: Option<crate::cdp_watchdog::ExecutionScope>,
     _not_send: PhantomData<Rc<()>>,
 }
 
-struct IsolateEntry(*mut deno_core::v8::Isolate);
+struct IsolateEntry<'a> {
+    isolate: *mut deno_core::v8::Isolate,
+    execution_scope: Option<&'a crate::cdp_watchdog::ExecutionScope>,
+}
 
-impl IsolateEntry {
-    unsafe fn new(isolate: *mut deno_core::v8::Isolate) -> Self {
+impl<'a> IsolateEntry<'a> {
+    unsafe fn new(isolate: *mut deno_core::v8::Isolate, execution_scope: Option<&'a crate::cdp_watchdog::ExecutionScope>) -> Self {
+        if let Some(scope) = execution_scope { scope.enter(); }
         unsafe { (&mut *isolate).enter() };
-        Self(isolate)
+        Self { isolate, execution_scope }
     }
 }
 
-impl Drop for IsolateEntry {
+impl Drop for IsolateEntry<'_> {
     fn drop(&mut self) {
-        unsafe { (&mut *self.0).exit() };
+        unsafe {
+            if self.execution_scope.is_some_and(|scope| scope.leave()) {
+                (&mut *self.isolate).cancel_terminate_execution();
+            }
+            (&mut *self.isolate).exit();
+        }
     }
 }
 
@@ -512,7 +526,7 @@ impl<F: Future> Future for EnteredRuntimeFuture<F> {
         // SAFETY: construction ties the pointer and future to the same
         // borrowed JsRuntime, which cannot move or drop while this exists.
         let this = unsafe { self.get_unchecked_mut() };
-        let _entry = unsafe { IsolateEntry::new(this.isolate) };
+        let _entry = unsafe { IsolateEntry::new(this.isolate, this.execution_scope.as_ref()) };
         this.future
             .as_mut()
             .expect("entered runtime future polled after drop")
@@ -525,25 +539,27 @@ impl<F> Drop for EnteredRuntimeFuture<F> {
     fn drop(&mut self) {
         // deno_core futures can own V8 handles, so drop them while their
         // isolate is current too.
-        let _entry = unsafe { IsolateEntry::new(self.isolate) };
+        let _entry = unsafe { IsolateEntry::new(self.isolate, self.execution_scope.as_ref()) };
         drop(self.future.take());
     }
 }
 
 fn entered_runtime_future<'a, F>(
     runtime: &'a mut JsRuntime,
+    execution_scope: Option<crate::cdp_watchdog::ExecutionScope>,
     make_future: impl FnOnce(&'a mut JsRuntime) -> F,
 ) -> EnteredRuntimeFuture<F>
 where
     F: Future,
 {
     let isolate: *mut deno_core::v8::Isolate = &mut **runtime.v8_isolate();
-    let entry = unsafe { IsolateEntry::new(isolate) };
+    let entry = unsafe { IsolateEntry::new(isolate, execution_scope.as_ref()) };
     let future = Box::pin(make_future(runtime));
     drop(entry);
     EnteredRuntimeFuture {
         isolate,
         future: Some(future),
+        execution_scope,
         _not_send: PhantomData,
     }
 }
@@ -552,13 +568,13 @@ impl std::ops::Deref for EnteredRuntime<'_> {
     type Target = JsRuntime;
 
     fn deref(&self) -> &JsRuntime {
-        self.0
+        self.runtime
     }
 }
 
 impl std::ops::DerefMut for EnteredRuntime<'_> {
     fn deref_mut(&mut self) -> &mut JsRuntime {
-        self.0
+        self.runtime
     }
 }
 
@@ -568,8 +584,11 @@ impl Drop for EnteredRuntime<'_> {
         // and, entries being a per-thread stack, is the current one: any
         // isolate entered since belongs to a nested operation that has already
         // exited it.
+        if self.execution_scope.is_some_and(|scope| scope.leave()) {
+            self.runtime.v8_isolate().cancel_terminate_execution();
+        }
         unsafe {
-            self.0.v8_isolate().exit();
+            self.runtime.v8_isolate().exit();
         }
     }
 }
@@ -602,12 +621,13 @@ impl ObscuraJsRuntime {
     /// guard lives. Every path that touches V8 goes through here; see
     /// [`EnteredRuntime`] for why.
     fn runtime(&mut self) -> EnteredRuntime<'_> {
+        if let Some(scope) = &self.watchdog_scope { scope.enter(); }
         // SAFETY: entering is always sound -- it pushes this isolate onto the
         // current thread's entry stack -- and the guard's `Drop` pops it.
         unsafe {
             self.js_runtime.v8_isolate().enter();
         }
-        EnteredRuntime(&mut self.js_runtime)
+        EnteredRuntime { runtime: &mut self.js_runtime, execution_scope: self.watchdog_scope.as_ref() }
     }
 
     /// Read native isolate statistics without evaluating scripts or forcing GC.
@@ -754,6 +774,7 @@ impl ObscuraJsRuntime {
             import_map,
             module_load_activity,
             isolate_handle,
+            watchdog_scope: None,
             heap_limit_state,
             module_evaluations: HashMap::new(),
             loaded_module_specifiers,
@@ -1331,7 +1352,10 @@ impl ObscuraJsRuntime {
         // A page transport makes the renderer cache-only; see
         // `ops::fresh_render_resources` for why layout must not fetch itself.
         #[cfg(feature = "render")]
-        state.render_resources.set_sync_loading_enabled(false);
+        {
+            state.render_resources.set_sync_loading_enabled(false);
+            state.render_resources.set_document_scoped(true);
+        }
     }
 
     /// Install the owning page's passive on_request/on_response callback
@@ -1347,7 +1371,10 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         state.stealth_client = Some(client);
         #[cfg(feature = "render")]
-        state.render_resources.set_sync_loading_enabled(false);
+        {
+            state.render_resources.set_sync_loading_enabled(false);
+            state.render_resources.set_document_scoped(true);
+        }
     }
 
     pub fn set_dom(&self, dom: DomTree) {
@@ -2226,6 +2253,15 @@ impl ObscuraJsRuntime {
         profile: crate::ops::ImageRequestProfile,
         bytes: Option<std::sync::Arc<[u8]>>,
     ) {
+        let generation = self.state.borrow().render_resources.html_image_request_generation(&url, profile);
+        self.seed_shared_render_image_resource_for_request(url, profile, bytes, generation);
+    }
+
+    #[cfg(feature = "render")]
+    fn seed_shared_render_image_resource_for_request(
+        &mut self, url: String, profile: crate::ops::ImageRequestProfile,
+        bytes: Option<std::sync::Arc<[u8]>>, generation: Option<u64>,
+    ) {
         let mut state = self.state.borrow_mut();
         match bytes {
             Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
@@ -2237,13 +2273,13 @@ impl ObscuraJsRuntime {
                 };
                 state
                     .render_resources
-                    .seed_image_shared(url, profile, bytes);
+                    .seed_image_shared_for_request(url, profile, bytes, generation);
                 state.activity_generation = state.activity_generation.wrapping_add(1);
                 if needs_geometry {
                     crate::ops::invalidate_render_resource_geometry(&mut state);
                 }
             }
-            _ => state.render_resources.seed_image_missing(url, profile),
+            _ => state.render_resources.seed_image_missing_for_request(url, profile, generation),
         }
     }
 
@@ -2368,7 +2404,7 @@ impl ObscuraJsRuntime {
         for (url, profile, _) in pending.into_iter().chain(backlog).chain(queued) {
             state.render_resources.stop_resource(&url, profile);
         }
-        for ((_, url, profile), (cancel, _)) in images {
+        for ((_, url, profile, _), (cancel, _)) in images {
             state.render_resources.stop_resource(&url, Some(profile));
             let _ = cancel.send(());
         }
@@ -2430,10 +2466,14 @@ impl ObscuraJsRuntime {
         let limiter = state.render_resource_limiter.clone();
         let notify = state.render_resource_notify.clone();
         let started = requests.len();
+        let requests: Vec<_> = requests.into_iter().map(|(url, profile, is_font)| {
+            let image_generation = profile.and_then(|profile| state.render_resources.begin_html_image_request(&url, profile));
+            (url, profile, is_font, image_generation)
+        }).collect();
         let task = tokio::spawn(async move {
             use deno_core::futures::StreamExt as _;
             let loads = deno_core::futures::stream::iter(requests.into_iter().map(
-                |(raw, profile, is_font)| {
+                |(raw, profile, is_font, image_request_generation)| {
                 let http_client = http_client.clone();
                 #[cfg(feature = "stealth")]
                 let stealth_client = stealth_client.clone();
@@ -2452,6 +2492,7 @@ impl ObscuraJsRuntime {
                                 generation,
                                 url: raw,
                                 profile,
+                                image_request_generation,
                                 is_font,
                                 response: None,
                                 };
@@ -2510,6 +2551,7 @@ impl ObscuraJsRuntime {
                         generation,
                         url: raw,
                         profile,
+                        image_request_generation,
                         is_font,
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
@@ -2529,6 +2571,7 @@ impl ObscuraJsRuntime {
                             generation,
                             url: fallback.0,
                             profile: fallback.1,
+                            image_request_generation,
                             is_font: fallback.2,
                             response: None,
                         })
@@ -2631,7 +2674,7 @@ impl ObscuraJsRuntime {
             };
             tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
             match load.profile {
-                Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
+                Some(profile) => self.seed_shared_render_image_resource_for_request(load.url, profile, bytes, load.image_request_generation),
                 None => self.seed_shared_render_resource(load.url, bytes),
             }
             if let Some(response) = load.response {
@@ -3259,7 +3302,7 @@ impl ObscuraJsRuntime {
         // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
-        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+        let load = entered_runtime_future(&mut self.js_runtime, self.watchdog_scope.clone(), |runtime| {
             runtime.load_side_es_module(&specifier)
         });
         let module_id = match tokio::time::timeout(budget, load).await {
@@ -3403,7 +3446,7 @@ impl ObscuraJsRuntime {
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
         let loaded_start = self.loaded_module_specifiers.borrow().len();
 
-        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+        let load = entered_runtime_future(&mut self.js_runtime, self.watchdog_scope.clone(), |runtime| {
             runtime.load_side_es_module_from_code(
                 &specifier,
                 deno_core::ModuleCodeString::from(code.to_string()),
@@ -3658,7 +3701,7 @@ impl ObscuraJsRuntime {
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
         self.runtime().v8_isolate().perform_microtask_checkpoint();
-        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+        let event_loop = entered_runtime_future(&mut self.js_runtime, self.watchdog_scope.clone(), |runtime| {
             runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
         });
         let result = event_loop
@@ -3783,7 +3826,7 @@ impl ObscuraJsRuntime {
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
-        spawn_watchdog(self.runtime().v8_isolate().thread_safe_handle(), budget)
+        self.arm_execution_watchdog(Some(budget))
     }
 
     /// Stop a watchdog armed by [`Self::arm_watchdog`]. If it had already fired
@@ -3793,9 +3836,24 @@ impl ObscuraJsRuntime {
         let fired = token.stop();
         if fired {
             self.runtime().v8_isolate().cancel_terminate_execution();
-            tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
+            tracing::warn!("V8 execution terminated; cleared the isolate for subsequent work");
         }
         fired
+    }
+
+    /// Identify the owning page before any parser or user script executes.
+    pub fn set_watchdog_scope(&mut self, page_id: &str) {
+        self.watchdog_scope = Some(crate::cdp_watchdog::ExecutionScope::new(
+            std::thread::current().id(), page_id,
+        ));
+    }
+
+    /// Arm execution using this runtime's page identity, including when only
+    /// explicit interruption (and no automatic deadline) is requested.
+    pub fn arm_execution_watchdog(&self, budget: Option<std::time::Duration>) -> WatchdogToken {
+        WatchdogToken { armed: Some(crate::cdp_watchdog::arm_scoped(
+            self.isolate_handle(), budget, self.watchdog_scope.clone(),
+        )) }
     }
 
     /// This runtime's V8 isolate handle (captured at construction, stable for
@@ -3962,14 +4020,13 @@ impl ObscuraJsRuntime {
         self.service_render_resources();
         self.begin_javascript_task();
 
-        let checkpoint_watchdog = crate::cdp_watchdog::arm(
-            self.isolate_handle(),
+        let checkpoint_watchdog = self.arm_execution_watchdog(Some(
             std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
-        );
+        ));
         self.runtime().v8_isolate().perform_microtask_checkpoint();
-        if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
+        if checkpoint_watchdog.stop() {
             self.cancel_termination();
-            return Err("autonomous microtask checkpoint exceeded its task budget".into());
+            return Err("autonomous microtask checkpoint was terminated".into());
         }
         if self.recover_heap_limit() {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
@@ -3978,22 +4035,20 @@ impl ObscuraJsRuntime {
         // Let the page adopt frame documents and deliver messages before parking.
         if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() { return Ok(false); }
 
-        let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
             let task_generation = self.state.borrow().animation_task_generation;
-            let watchdog = crate::cdp_watchdog::arm(
-                isolate_handle.clone(),
+            let watchdog = self.arm_execution_watchdog(Some(
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
-            );
+            ));
             let tick = self
                 .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
-            let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
+            let watchdog_fired = watchdog.stop();
             if watchdog_fired {
                 self.runtime().v8_isolate().cancel_terminate_execution();
                 return std::task::Poll::Ready(Err(
-                    "autonomous browser task exceeded its task budget".into(),
+                    "autonomous browser task was terminated".into(),
                 ));
             }
             if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() {
@@ -4207,7 +4262,7 @@ impl ObscuraJsRuntime {
     pub async fn resolve_promises(&mut self) {
         self.begin_javascript_task();
         // Default settle: just pump until idle or 5s.
-        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+        let event_loop = entered_runtime_future(&mut self.js_runtime, self.watchdog_scope.clone(), |runtime| {
             runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
         });
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), event_loop).await;
@@ -5669,6 +5724,97 @@ mod tests {
     }
 
     #[test]
+    fn table_cell_colspan_and_rowspan_reflect_through_the_idl_surface() {
+        let mut rt = setup_runtime(r#"<table><tbody>
+            <tr><td id="plain">a</td><td id="markup" colspan="4" rowspan="2">b</td></tr>
+            <tr><td id="invalid" colspan="abc">c</td><th id="setter">d</th></tr>
+        </tbody></table>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('setter');
+            cell.colSpan = 5; cell.rowSpan = 2;
+            const plain = document.getElementById('plain'), markup = document.getElementById('markup');
+            return [plain.colSpan, plain.rowSpan, plain.getAttribute('colspan'),
+                markup.colSpan, markup.rowSpan, document.getElementById('invalid').colSpan,
+                cell.colSpan, cell.rowSpan, cell.getAttribute('colspan'), cell.getAttribute('rowspan')];
+        })()"#).unwrap(), serde_json::json!([1,1,null,4,2,1,5,2,"5","2"]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('setter');
+            const read = ['0', '-1', '-0', '+2', '\v2', '1001', '65535', '999999999999999999999999999999999999'];
+            return read.map(value => {
+                cell.setAttribute('colspan', value); cell.setAttribute('rowspan', value);
+                return [cell.colSpan, cell.rowSpan];
+            });
+        })()"#).unwrap(), serde_json::json!([[1,0],[1,1],[1,0],[2,2],[1,1],[1000,1001],[1000,65534],[1000,65534]]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('setter'); cell.setAttribute('rowspan', '-0');
+            return Object.is(cell.rowSpan, -0);
+        })()"#).unwrap(), serde_json::json!(false));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('setter');
+            return [0, -1, 2.9, 1001, 65535, 2147483647, 2147483648, 4294967296, NaN, Infinity].map(value => {
+                cell.colSpan = value; cell.rowSpan = value;
+                return [cell.colSpan, cell.rowSpan, cell.getAttribute('colspan'), cell.getAttribute('rowspan')];
+            });
+        })()"#).unwrap(), serde_json::json!([[1,0,"0","0"],[1,1,"1","1"],[2,2,"2","2"],
+            [1000,1001,"1001","1001"],[1000,65534,"65535","65535"],
+            [1000,65534,"2147483647","2147483647"],[1,1,"1","1"],[1,0,"0","0"],[1,0,"0","0"],[1,0,"0","0"]]));
+    }
+
+    #[test]
+    fn table_cell_spans_keep_brands_and_borrowed_child_realm_accessors() {
+        let mut rt = setup_runtime("<table><tr><td>Parent</td></tr></table><div id='other'></div>");
+        let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<table><tr><th>Child</th></tr></table>").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const cell = child.querySelector('th');
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLTableCellElement.prototype, 'colSpan');
+            descriptor.set.call(cell, 3);
+            const errors = [];
+            for (const action of [() => descriptor.get.call(document.getElementById('other')),
+                () => descriptor.set.call({}, 2), () => { cell.rowSpan = 1n; }, () => { cell.colSpan = Symbol(); }]) {
+                try { action(); errors.push(false); } catch (error) { errors.push(error.name === 'TypeError'); }
+            }
+            return [descriptor.get.call(cell), cell.getAttribute('colspan'),
+                'colSpan' in document.getElementById('other'), Object.hasOwn(Element.prototype, 'rowSpan'), errors];
+        })()"#).unwrap(), serde_json::json!([3,"3",false,false,[true,true,true,true]]));
+    }
+
+    #[test]
+    fn table_cell_spans_bypass_overridden_attribute_methods() {
+        let mut rt = setup_runtime("<table><tr><td colspan='4' rowspan='2'></td></tr></table>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.querySelector('td');
+            const getAttribute = Element.prototype.getAttribute;
+            cell.getAttribute = () => '9';
+            cell.setAttribute = () => { throw new Error('overridden'); };
+            const before = [cell.colSpan, cell.rowSpan];
+            cell.colSpan = 3; cell.rowSpan = 0;
+            const own = [cell.colSpan, cell.rowSpan, getAttribute.call(cell, 'colspan'), getAttribute.call(cell, 'rowspan')];
+            delete cell.getAttribute; delete cell.setAttribute;
+            Element.prototype.getAttribute = () => '8';
+            Element.prototype.setAttribute = () => { throw new Error('prototype overridden'); };
+            cell.colSpan = 2; cell.rowSpan = 3;
+            return [before, own, cell.colSpan, cell.rowSpan,
+                getAttribute.call(cell, 'colspan'), getAttribute.call(cell, 'rowspan')];
+        })()"#).unwrap(), serde_json::json!([[4,2],[3,0,"3","0"],2,3,"2","3"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn table_cell_span_assignment_updates_layout() {
+        let mut rt = setup_runtime(r#"<table id="table" style="width:600px;table-layout:fixed;border-collapse:collapse">
+            <thead><tr><th>A</th><th>B</th><th>C</th></tr></thead>
+            <tbody><tr><td id="empty">No records found</td></tr></tbody></table>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const cell = document.getElementById('empty');
+            const before = cell.getBoundingClientRect().width;
+            cell.colSpan = 3;
+            return [before, cell.getBoundingClientRect().width, document.getElementById('table').getBoundingClientRect().width];
+        })()"#).unwrap(), serde_json::json!([200,600,600]));
+    }
+
+    #[test]
     fn native_select_factory_preserves_child_clones_and_custom_upgrade_identity() {
         let mut rt = setup_runtime("<html><body><select id='custom' is='native-select'><option value='a'>A</option></select></body></html>");
         let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
@@ -6166,6 +6312,7 @@ mod tests {
                 generation,
                 url: url.clone(),
                 profile: None,
+                image_request_generation: None,
                 is_font: false,
                 response: Some(crate::ops::RenderResourceResponse {
                     url: url.clone(),
@@ -19865,6 +20012,104 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_src_reassignment_retries_a_failed_document_resource() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="retry" src="transient.png" width="20" height="30">"#,
+            move |_url: &str| {
+                (loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0)
+                    .then(|| png.clone())
+            },
+        );
+        rt.state.borrow_mut().render_resources.set_document_scoped(true);
+        rt.set_viewport(80.0, 60.0);
+        rt.execute_script("observe-image-retry", r#"
+            globalThis.__retryEvents = [];
+            const retry = document.getElementById('retry');
+            retry.onload = () => __retryEvents.push('load');
+            retry.onerror = () => __retryEvents.push('error');
+            void retry.complete;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[retry.complete, retry.naturalWidth, __retryEvents]").unwrap(),
+            serde_json::json!([true, 0, ["error"]]),
+        );
+        rt.evaluate(r#"(() => {
+            for (let index = 0; index < 20; index++) {
+                void retry.complete;
+                void retry.naturalWidth;
+                void retry.getBoundingClientRect().width;
+            }
+        })()"#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "reading the failed image must not retry it");
+
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        rt.evaluate("[retry.complete, retry.naturalWidth, retry.getBoundingClientRect().width]").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "unchanged HTML image queries must not retry after the generic cache window");
+        rt.screenshot_prepared((80.0, 60.0), Some("http://example.com/page/index.html"))
+            .expect("paint the failed image");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "painting the unchanged failed image must not retry its loader");
+        assert!(!rt.state.borrow().render_resources.has_sync_misses(),
+            "painting an unchanged failed HTML image must not request it again");
+
+        rt.execute_script("retry-image-source", "retry.src = retry.src;").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[retry.complete, retry.naturalWidth, retry.naturalHeight, __retryEvents]").unwrap(),
+            serde_json::json!([true, 2, 3, ["error", "load"]]),
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        rt.execute_script("reuse-loaded-image", "retry.src = retry.src;").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2,
+            "a loaded image must still reuse its bytes");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_parser_image_retries_without_reviving_the_failed_element() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<div id="host"><img id="old" src="transient.png"></div>"#,
+            move |_: &str| (loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0)
+                .then(|| png.clone()),
+        );
+        rt.state.borrow_mut().render_resources.set_document_scoped(true);
+        rt.execute_script("fail-first-image", "globalThis.old = document.getElementById('old'); void old.complete;").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[old.complete, old.naturalWidth]").unwrap(), serde_json::json!([true, 0]));
+        rt.execute_script("insert-new-image", r#"
+            document.getElementById('host').innerHTML = '<img id="fresh" src="transient.png">';
+            globalThis.fresh = document.getElementById('fresh');
+            void fresh.complete;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[fresh.complete, fresh.naturalWidth, old.complete, old.naturalWidth]").unwrap(),
+            serde_json::json!([true, 2, true, 0]));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        rt.execute_script("replace-parser-image", r#"
+            document.getElementById('host').innerHTML = '<img id="replacement" src="transient.png">';
+            globalThis.replacement = document.getElementById('replacement'); void replacement.complete;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[replacement.complete, replacement.naturalWidth, old.naturalWidth]").unwrap(),
+            serde_json::json!([true, 2, 0]));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "render")]
     #[test]
     fn parser_image_first_getter_observes_prepare_seeded_cache_synchronously() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -26778,6 +27023,75 @@ mod tests {
                 "GET /child.js HTTP/1.1",
             ],
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_dynamic_imports_fetch_each_module_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let requests_tx = requests_tx.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut request = [0u8; 2048];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..length]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let _ = requests_tx.send(path.clone());
+                    let body = match path.as_str() {
+                        "/a.js" => "import { shared } from './shared.js'; export const a = shared + 'a';",
+                        "/b.js" => "import { shared } from './shared.js'; export const b = shared + 'b';",
+                        _ => {
+                            // Keep the shared dependency in flight while the
+                            // other graphs reach it.
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                            "export const shared = 's';"
+                        }
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: application/javascript\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        let base = format!("http://{address}");
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/index.html"));
+        rt.set_http_client(client);
+
+        rt.load_inline_module(
+            "const [a1, b, a2] = await Promise.all([\
+                 import('./a.js'), import('./b.js'), import('./a.js'),\
+             ]); \
+             globalThis.__concurrent_imports = [a1.a, b.b, a2.a];",
+            &format!("{base}/index.html"),
+            5_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__concurrent_imports").unwrap(),
+            serde_json::json!(["sa", "sb", "sa"]),
+        );
+        let mut paths = requests.try_iter().collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, vec!["/a.js", "/b.js", "/shared.js"]);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1935,6 +1935,7 @@ impl Page {
             &self.url_string(),
             self.context.proxy_url.clone(),
         );
+        rt.set_watchdog_scope(&self.id);
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
         rt.set_content_type(&self.content_type);

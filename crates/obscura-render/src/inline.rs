@@ -116,6 +116,20 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
     FAMILY
 }
 
+#[cfg(feature = "paint")]
+pub(crate) fn bundled_font_bytes(family: Option<&str>, bold: bool) -> &'static [u8] {
+    match (resolve_font_family(family), bold) {
+        (SYSTEM_FAMILY, true) => SYSTEM_B,
+        (SYSTEM_FAMILY, false) => SYSTEM_R,
+        (SERIF_FAMILY, true) => SERIF_B,
+        (SERIF_FAMILY, false) => SERIF_R,
+        (MONO_FAMILY, true) => MONO_B,
+        (MONO_FAMILY, false) => MONO_R,
+        (_, true) => SANS_B,
+        _ => SANS_R,
+    }
+}
+
 fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
     let token = token
         .trim()

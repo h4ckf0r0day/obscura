@@ -14,6 +14,19 @@ use taffy::prelude::*;
 
 use crate::{Rect, to_taffy_style};
 
+pub(crate) fn initial_containing_block(viewport: (f32, f32), root_gutters: u8) -> Rect {
+    // Classic stable gutters reduce percentage bases, while vw/media queries
+    // retain the full viewport. Both edges also shift the layout origin.
+    const CLASSIC_SCROLLBAR_GUTTER: f32 = 15.0;
+    let root_gutters = root_gutters.min(2);
+    Rect {
+        x: if root_gutters == 2 { CLASSIC_SCROLLBAR_GUTTER } else { 0.0 },
+        y: 0.0,
+        width: (viewport.0 - CLASSIC_SCROLLBAR_GUTTER * f32::from(root_gutters)).max(0.0),
+        height: viewport.1,
+    }
+}
+
 pub(crate) fn word_spacing_advance(text: &str, spacing: f32) -> f32 {
     if spacing == 0.0 { return 0.0; }
     text.chars().filter(|c| matches!(c, ' ' | '\u{00a0}')).count() as f32 * spacing
@@ -5362,22 +5375,10 @@ fn layout_dom_once(
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
     let mut generated_rects: Vec<Option<Rect>> = Vec::new();
     if let Some(root_id) = root {
-        // Headless Chromium's classic scrollbar gutter is 15 CSS pixels.
-        // `scrollbar-gutter:stable` reserves it even when the scrollbar track
-        // is hidden, and Gecko subtracts the platform gutter from the viewport
-        // containing block. Media queries and vw still see the full visual
-        // viewport; percentages and auto widths use this reduced ICB.
-        const CLASSIC_SCROLLBAR_GUTTER: f32 = 15.0;
-        let root_gutters = styles
-            .get(&root_id)
-            .map_or(0, |style| style.scrollbar_gutters.min(2));
-        let initial_cb_width =
-            (viewport.0 - CLASSIC_SCROLLBAR_GUTTER * f32::from(root_gutters)).max(0.0);
-        let initial_cb_x = if root_gutters == 2 {
-            CLASSIC_SCROLLBAR_GUTTER
-        } else {
-            0.0
-        };
+        let initial_cb = initial_containing_block(viewport,
+            styles.get(&root_id).map_or(0, |style| style.scrollbar_gutters));
+        let initial_cb_width = initial_cb.width;
+        let initial_cb_x = initial_cb.x;
         // Top-down inheritance of the properties CSS inherits by default.
         #[derive(Clone)]
         struct Inherited {
@@ -6725,6 +6726,7 @@ fn layout_dom_once(
                     intrinsic_height,
                     horizontal_edges,
                     vertical_edges,
+                    native_control_percentage_uses_intrinsic(&node),
                 );
                 continue;
             }
@@ -6768,6 +6770,7 @@ fn layout_dom_once(
                     intrinsic_height,
                     horizontal_edges,
                     vertical_edges,
+                    native_control_percentage_uses_intrinsic(&node),
                 );
                 continue;
             }
@@ -6834,6 +6837,7 @@ fn layout_dom_once(
                 intrinsic_height,
                 horizontal_edges,
                 vertical_edges,
+                native_control_percentage_uses_intrinsic(&node),
             );
         }
 
@@ -6885,12 +6889,14 @@ fn layout_dom_once(
                     style.flex_basis,
                     crate::Dimension::Px(value) | crate::Dimension::Percent(value)
                         if value == 0.0
-                );
+                ) || style.flex_basis_calc.as_ref()
+                    .is_some_and(|calc| calc.fixed_flex_basis() == Some(0.0));
                 if zero_basis
                     && style.height == crate::Dimension::Auto
                     && style.min_height == crate::Dimension::Auto
                 {
                     style.flex_basis = crate::Dimension::Auto;
+                    style.flex_basis_calc = None;
                 }
             }
         }
@@ -12292,6 +12298,20 @@ enum ContainerAutoBlockSize {
     StretchedGridItem,
 }
 
+fn native_control_percentage_uses_intrinsic(node: &obscura_dom::tree::Node) -> bool {
+    let Some(name) = node.as_element() else { return false; };
+    match name.local.as_ref() {
+        "select" | "textarea" => true,
+        "input" => {
+            // These controls' default auto widths do not model inner content.
+            let kind = node.get_attribute("type").unwrap_or("text").trim();
+            !["color", "button", "submit", "reset", "image"].into_iter()
+                .any(|excluded| kind.eq_ignore_ascii_case(excluded))
+        }
+        _ => false,
+    }
+}
+
 /// Assign a native control's intrinsic border-box size to its auto axes.
 /// The intrinsic figures are border boxes (Chromium's control metrics), so
 /// a content-box control receives the content part. An authored width or
@@ -12304,11 +12324,17 @@ fn assign_native_control_size(
     intrinsic_height: f32,
     horizontal_edges: f32,
     vertical_edges: f32,
+    percentage_uses_intrinsic: bool,
 ) {
     let (stretch_inline, stretch_block) = stretched_grid_item;
     let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
-    if stretch_inline || stretch_block {
+    if stretch_inline || stretch_block
+        || (percentage_uses_intrinsic
+            && (matches!(style.width, crate::Dimension::Percent(_))
+                || style.size_expressions[0].as_deref().is_some_and(|value| value.contains('%'))))
+    {
         // Stretch controls the final size, not the intrinsic track contribution.
+        // A cyclic authored width also needs the control's auto contribution.
         // Measure content axes independently; native controls have no natural ratio.
         style.intrinsic_size = Some((
             (intrinsic_width - horizontal_edges).max(0.0),
@@ -12573,13 +12599,17 @@ fn definite_row_flex_intrinsic_width(
         {
             return None;
         }
-        let basis = match child_style.flex_basis {
-            crate::Dimension::Px(value) => value,
-            crate::Dimension::Auto => match child_style.width {
+        let basis = if let Some(calc) = &child_style.flex_basis_calc {
+            calc.fixed_flex_basis()?
+        } else {
+            match child_style.flex_basis {
                 crate::Dimension::Px(value) => value,
+                crate::Dimension::Auto => match child_style.width {
+                    crate::Dimension::Px(value) => value,
+                    _ => return None,
+                },
                 _ => return None,
-            },
-            _ => return None,
+            }
         };
         let edges = child_style.padding.left
             + child_style.padding.right
@@ -12603,9 +12633,9 @@ fn definite_row_flex_intrinsic_width(
 /// min-content floor. Gecko instead measures the flex item first, then reflows
 /// its descendants under the item's final main size.
 ///
-/// Keep the non-percentage part for the intrinsic pass (percentage basis zero),
-/// and remember enough information to resolve the complete expression after
-/// flex sizing has selected the item's used width.
+/// Preferred widths behave as auto for intrinsic contributions. Replaced
+/// widths and minimums retain the percentage-zero value; final flex reflow
+/// restores the authored sizing after selecting the item's used width.
 fn defer_cyclic_flex_inline_sizes(
     tree: &DomTree,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
@@ -12711,11 +12741,20 @@ fn defer_cyclic_flex_inline_sizes(
             // A cyclic percentage preferred size uses the container's
             // max-content contribution. Preserve that contribution for a
             // definite no-wrap row; a zero width would erase all of its fixed
-            // cells. Other cyclic forms retain the percentage-zero intrinsic
-            // value and are restored after outer flex sizing.
+            // cells. Other non-replaced preferred widths behave as auto,
+            // preserving text and native control intrinsic contributions.
             let intrinsic = crate::Dimension::Px(definite_row_width.unwrap_or(intrinsic).max(0.0));
             match slot {
-                0 => style.width = intrinsic,
+                0 => style.width = if definite_row_width.is_some()
+                    || (style.is_table_box && style.table_layout_fixed)
+                    || style.replaced_intrinsic.is_some() || style.has_replaced_sizing
+                    || (style.is_replaced_box && !(style.intrinsic_size.is_some()
+                        && tree.with_node(id, native_control_percentage_uses_intrinsic).unwrap_or(false)))
+                {
+                    intrinsic
+                } else {
+                    crate::Dimension::Auto
+                },
                 2 => style.min_width = intrinsic,
                 // A cyclic percentage max-size behaves as its initial value
                 // during intrinsic contribution sizing; treating 50% as a
@@ -12793,7 +12832,9 @@ where
         // natural inline size instead, so lift such an item to its deferred
         // images' natural width before pinning. An item with a definite
         // width or flex-basis keeps its already-correct measurement.
-        if style.width == crate::Dimension::Auto && style.flex_basis == crate::Dimension::Auto {
+        if style.width == crate::Dimension::Auto && style.flex_basis == crate::Dimension::Auto
+            && style.flex_basis_calc.is_none()
+        {
             let natural_floor = deferred
                 .iter()
                 .filter(|entry| entry.flex_item == flex_item && entry.slot == 0)
@@ -13505,10 +13546,13 @@ fn build(
     // leave floats on children after a newer rule turns their parent into a
     // flex container; routing those children through the block float-zone
     // approximation corrupts flex sizing and percentage-margin placement.
+    // Hidden children generate no float boxes.
     let has_float_child = style.display == crate::Display::Block
-        && dom_children
-            .iter()
-            .any(|&cid| styles.get(&cid).map(|s| s.float.is_some()).unwrap_or(false));
+        && dom_children.iter().any(|&cid| {
+            styles.get(&cid).is_some_and(|s| {
+                s.float.is_some() && s.display != crate::Display::None
+            })
+        });
     let native_float_band =
         has_float_child && can_use_native_float_band(tree, style, &dom_children, styles);
     let has_in_flow_block_child = dom_children
@@ -14654,7 +14698,6 @@ fn clear_matches_float_sides(clear: crate::Clear, has_left: bool, has_right: boo
 
 fn has_deferred_or_auto_margin(style: &crate::LayoutStyle) -> bool {
     style.margin_auto.iter().any(|value| *value)
-        || style.margin_percent.iter().any(Option::is_some)
         || style.margin_relative.iter().any(Option::is_some)
         || style.margin_expressions.iter().any(Option::is_some)
 }
@@ -17846,6 +17889,42 @@ mod tests {
     }
 
     #[test]
+    fn retained_functional_flex_basis_refreshes_font_and_viewport_context() {
+        let tree = parse_html("<!doctype html><style>body{margin:0}#parent{display:flex;width:100%;font-size:20px}#item{flex:0 0 calc(50% - 1em + 10vw);height:20px}</style><div id=parent><div id=item></div></div>");
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let item = tree.get_element_by_id("item").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree, (400.0, 200.0), &HashMap::new(), &[], &mut cache,
+        );
+        assert_eq!(initial.rects[&item].width, 220.0);
+        let old_owner = initial.styles[&item].flex_basis_calc.clone().unwrap();
+        tree.with_node_mut(parent, |node| node.set_attribute("style", "font-size:40px".into()));
+        let mutation = AttributeStyleMutation {
+            node: parent, name: "style".into(), old_value: None,
+            new_value: Some("font-size:40px".into()),
+        }.into();
+        let mut changed = layout_dom_with_web_fonts_and_retained_styles(
+            &tree, (400.0, 200.0), &HashMap::new(), &[], &mut cache,
+            RetainedStyleMaps {
+                styles: std::mem::take(&mut initial.styles),
+                custom_properties: std::mem::take(&mut initial.custom_properties),
+            }, &[mutation],
+        );
+        assert_eq!(changed.rects[&item].width, 200.0);
+        assert!(!std::sync::Arc::ptr_eq(&old_owner, changed.styles[&item].flex_basis_calc.as_ref().unwrap()));
+        let resized = layout_dom_with_web_fonts_and_retained_styles(
+            &tree, (800.0, 200.0), &HashMap::new(), &[], &mut cache,
+            RetainedStyleMaps {
+                styles: std::mem::take(&mut changed.styles),
+                custom_properties: std::mem::take(&mut changed.custom_properties),
+            }, &[],
+        );
+        assert_eq!(resized.rects[&item].width, 440.0);
+        assert_eq!(resized.rects, layout_dom(&tree, (800.0, 200.0)).rects);
+    }
+
+    #[test]
     fn retained_attribute_styles_match_forced_full_with_dormant_container_rules() {
         let initial_html = r#"<html><head><style>
             html,body{margin:0}
@@ -20332,6 +20411,27 @@ mod tests {
             crate::Dimension::Percent(1.0),
             "a fit-content maximum must not be frozen from intrinsic geometry"
         );
+    }
+
+    #[test]
+    fn picture_default_and_author_override_participate_in_inline_flow() {
+        for block in [false, true] {
+            let display = if block { "display:block" } else { "" };
+            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}span{{display:inline-block;width:20px;height:20px}}</style><div><span id=before></span><picture id=picture style='{display}'><img id=art src=hero.svg style='width:24px;height:12px'></picture><span id=after></span></div>"));
+            let node = |id: &str| tree.get_element_by_id(id).unwrap();
+            let intrinsic = HashMap::from([(node("art"), (24.0, 12.0))]);
+            let laid = layout_dom_with_images(&tree, (400.0, 200.0), &intrinsic);
+            let before = laid.rects[&node("before")];
+            let after = laid.rects[&node("after")];
+            if block {
+                assert!(after.y > before.y + 20.0, "{before:?} {after:?}");
+            } else {
+                assert!((before.y - after.y).abs() < 0.01, "{before:?} {after:?}");
+                assert!(laid.rects[&node("art")].x >= before.x + before.width);
+            }
+            assert_eq!(laid.styles[&node("picture")].display,
+                if block { crate::Display::Block } else { crate::Display::Inline });
+        }
     }
 
     #[test]
