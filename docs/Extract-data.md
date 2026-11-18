@@ -23,7 +23,7 @@ obscura fetch https://news.ycombinator.com --dump html > hn.html
 Plain text. No markup.
 
 ```bash
-obscura fetch https://en.wikipedia.org/wiki/Rust_(programming_language) --dump text
+obscura fetch 'https://en.wikipedia.org/wiki/Rust_(programming_language)' --dump text
 ```
 
 ## `markdown`
@@ -36,7 +36,8 @@ obscura fetch https://docs.example.com/page --dump markdown > page.md
 
 ## `links`
 
-Every `<a href>` on the page, one per line.
+Links from the page, one per line. Each line contains the resolved URL and,
+when present, a tab followed by the link text.
 
 ```bash
 obscura fetch https://example.com --dump links
@@ -52,7 +53,8 @@ obscura fetch https://example.com --dump assets
 
 ## `original`
 
-The raw HTML the server sent, before JavaScript ran.
+The raw HTTP response body, including binary content. This bypasses HTML parsing
+and JavaScript execution.
 
 ```bash
 obscura fetch https://my-spa.example --dump original > before.html

@@ -4,15 +4,16 @@ The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page
 
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/h4ckf0r0day/obscura" }
+obscura = { git = "https://github.com/h4ckf0r0day/obscura", features = ["stealth"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```
 
-The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin a tag for reproducible builds:
+The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin the full commit SHA you tested for reproducible builds. Replace the
+placeholder below with that SHA:
 
 ```toml
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
+obscura = { git = "https://github.com/h4ckf0r0day/obscura", rev = "<full commit SHA>", features = ["stealth"] }
 ```
 
 ## Quickstart
@@ -21,7 +22,7 @@ obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
 use obscura::Browser;
 use std::time::Duration;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let browser = Browser::builder()
         .stealth(true)
@@ -95,7 +96,8 @@ page.settle(2000).await;   // let in-page fetch() calls resolve
 
 ### Active interception
 
-`enable_interception()` returns a channel of every JS `fetch()`/XHR request. Resolve each through its `resolver` to pass, block, mock, or rewrite it.
+`enable_interception()` returns a channel of intercepted navigation and JS
+`fetch()`/XHR requests. Resolve each through its `resolver` to pass, block, mock, or rewrite it.
 
 ```rust
 use obscura::{Browser, InterceptResolution};

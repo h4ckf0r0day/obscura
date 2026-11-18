@@ -488,6 +488,28 @@ fn css_table_mixed_children_are_not_discarded() {
 }
 
 #[test]
+fn closed_html_dialogs_use_a_ua_display_rule_below_author_styles() {
+    let tree = parse_html(r#"<!doctype html><style>
+        html,body{margin:0} dialog{width:80px;height:30px}
+        #authored{display:block} #contents{display:contents}
+        #contents > div{width:20px;height:10px}
+    </style><dialog id=closed><div id=closed_child>hidden</div></dialog>
+    <dialog id=opened open></dialog><dialog id=authored></dialog>
+    <dialog id=contents><div id=visible_child></div></dialog>
+    <svg><dialog id=svg_dialog></dialog></svg>"#);
+    let layout = layout_dom(&tree, (400.0,300.0));
+    for name in ["closed", "closed_child"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(name).unwrap()), "{name} generated a box");
+    }
+    for name in ["opened", "authored"] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!((rect.width,rect.height),(80.0,30.0), "{name}");
+    }
+    assert!(layout.rects.contains_key(&tree.get_element_by_id("visible_child").unwrap()));
+    assert_ne!(layout.styles[&tree.get_element_by_id("svg_dialog").unwrap()].display, obscura_render::Display::None);
+}
+
+#[test]
 fn table_rowspans_are_clipped_to_the_originating_row_group() {
     let tree = parse_html(
         r#"
@@ -2039,6 +2061,50 @@ fn absolute_inline_svg_keeps_percentage_width_and_view_box_ratio() {
     assert!((art.x - 640.0).abs() < 0.01, "percentage width must anchor from the right: {art:?}");
     assert!((art.width - 160.0).abs() < 0.01, "percentage width: {art:?}");
     assert!((art.height - 160.0).abs() < 0.01, "viewBox ratio: {art:?}");
+}
+
+/// `span 0` is an invalid grid line (CSS Grid 1 section 8.3), so the
+/// declaration is ignored: the earlier placement wins, or the item stays
+/// auto-placed. Shopify themes reach it through
+/// `grid-column: span var(--menu-content-columns-desktop) / -1` with the
+/// variable at 0; that once gave taffy a zero-track grid area and aborted the
+/// whole page ("slice index starts at 13 but ends at 12").
+#[test]
+fn grid_placement_with_zero_span_is_ignored() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             .grid{--n:0;display:grid;grid-template-columns:repeat(6,1fr);width:600px}
+             #literal{grid-column:span 0 / -1}
+             #variable{grid-column:span var(--n) / -1}
+             #kept{grid-column:2 / 4;grid-column:span 0 / -1}
+             #side{grid-column-start:3;grid-column-start:span 0}
+           </style></head><body>
+             <div class="grid"><div id="literal">x</div></div>
+             <div class="grid"><div id="variable">x</div></div>
+             <div class="grid"><div id="kept">x</div></div>
+             <div class="grid"><div id="side">x</div></div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["literal", "variable"] {
+        let r = rect(id);
+        assert!(
+            r.x.abs() < 0.01 && (r.width - 100.0).abs() < 0.01,
+            "{id}: an ignored declaration leaves the item auto-placed in the first track: {r:?}"
+        );
+    }
+    let kept = rect("kept");
+    assert!(
+        (kept.x - 100.0).abs() < 0.01 && (kept.width - 200.0).abs() < 0.01,
+        "the earlier valid grid-column must win: {kept:?}"
+    );
+    let side = rect("side");
+    assert!(
+        (side.x - 200.0).abs() < 0.01 && (side.width - 100.0).abs() < 0.01,
+        "the earlier valid grid-column-start must win: {side:?}"
+    );
 }
 
 /// Chromium 150 includes collapsed descendant margins in a grid item's
@@ -5010,35 +5076,159 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
 #[test]
-fn functional_flex_basis_resolves_against_the_containing_block() {
-    // readymembership.com: `.main-nav-holder{flex-basis:calc(100% - 314px)}`.
-    // Evaluating the calc() context-free at parse time turned the 100% into
-    // 0, producing a negative basis that clamped to the item's min-content
-    // width and made the nav stack vertically.
-    let tree = parse_html(
-        r#"
-        <body style="margin:0">
-          <div style="display:flex;width:1200px">
-            <div style="flex:0 0 300px">a</div>
-            <div id="longhand" style="flex-basis:calc(100% - 314px)">nav</div>
-          </div>
-          <div style="display:flex;width:1200px">
-            <div style="flex:0 0 300px">a</div>
-            <div id="shorthand" style="flex:0 0 calc(100% - 314px)">nav</div>
-          </div>
-        </body>
-        "#,
-    );
-    let layout = layout_dom(&tree, (1400.0, 900.0));
+fn a_float_keeps_its_percentage_width_when_it_has_a_percentage_margin() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/float-percentage-margin.html"
+    ));
+    let layout = layout_dom(&tree, (1400.0, 1000.0));
     let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
-    assert!(
-        (rect("longhand").width - 886.0).abs() < 0.01,
-        "longhand: {:?}",
-        rect("longhand")
-    );
-    assert!(
-        (rect("shorthand").width - 886.0).abs() < 0.01,
-        "shorthand: {:?}",
-        rect("shorthand")
-    );
+    let offset = rect("offset");
+    let plain = rect("plain");
+    let row = rect("row-offset");
+    assert!((offset.width - 1000.0).abs() < 1.0, "width: {}", offset.width);
+    assert!((offset.x - 100.0).abs() < 1.0, "offset: {}", offset.x);
+    assert!((offset.width - plain.width).abs() < 1.0);
+    assert!(row.height > 0.0, "the row must contain its float");
+}
+
+#[test]
+fn percentage_float_margins_resolve_against_containing_width_on_every_side() {
+    for (float, margin, expected_x, expected_height) in [
+        ("left", "margin-left:8.33333333%", 100.0, 40.0),
+        ("left", "margin-left:-8.33333333%", -100.0, 40.0),
+        ("left", "margin-right:8.33333333%", 0.0, 40.0),
+        ("left", "margin-top:8.33333333%", 0.0, 140.0),
+        ("left", "margin-bottom:8.33333333%", 0.0, 140.0),
+        ("right", "margin-left:8.33333333%", 200.0, 40.0),
+        ("right", "margin-right:8.33333333%", 100.0, 40.0),
+    ] {
+        let html = format!(
+            r#"<style>
+              body{{margin:0}} #row{{width:1200px}}
+              #row::after{{content:" ";display:table;clear:both}}
+              #column{{float:{float};width:83.33333333%;{margin}}}
+              #inner{{width:300px;height:40px}} #after{{height:20px}}
+            </style><div id="row"><div id="column"><div id="inner"></div></div></div><div id="after"></div>"#
+        );
+        let tree = parse_html(&html);
+        let layout = layout_dom(&tree, (1400.0, 1000.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        let column = rect("column");
+        let row = rect("row");
+        assert!((column.width - 1000.0).abs() < 1.0, "{margin}: {}", column.width);
+        assert!((column.x - expected_x).abs() < 1.0, "{margin}: {}", column.x);
+        assert!((row.height - expected_height).abs() < 1.0, "{margin}: {}", row.height);
+        assert!((rect("after").y - expected_height).abs() < 1.0, "{margin}: following flow overlaps");
+    }
+}
+
+#[test]
+fn nested_offset_float_uses_the_expanded_row_width() {
+    let tree = parse_html(r#"<!doctype html><style>
+        * { box-sizing:border-box } body { margin:0 }
+        .container { width:1170px; margin:0 auto; padding:0 15px }
+        .row { margin-left:-15px; margin-right:-15px }
+        .row::before, .row::after { content:' '; display:table }
+        .row::after { clear:both }
+        .full, #left, #right { float:left; padding:0 15px }
+        .full { width:100% }
+        #left { width:41.66666667%; height:520px }
+        #right { width:50%; margin-left:8.33333333%; margin-top:35px; height:470px }
+        </style><div class=container><div class=row><div class=full>
+            <div class=row><div id=left></div><div id=right></div></div>
+        </div></div></div>"#);
+    let layout = layout_dom(&tree, (1440.0, 1000.0));
+    let left = layout.rects[&tree.get_element_by_id("left").unwrap()];
+    let right = layout.rects[&tree.get_element_by_id("right").unwrap()];
+    assert!((left.width - 487.5).abs() < 1.0, "{left:?}");
+    assert!((right.width - 585.0).abs() < 1.0, "{right:?}");
+    assert!((right.x - 720.0).abs() < 1.0, "{right:?}");
+    assert!((right.y - left.y - 35.0).abs() < 1.0, "{left:?} {right:?}");
+}
+
+#[test]
+fn native_float_fit_allows_roundoff_but_not_real_overflow() {
+    use taffy::{compute::FloatContext, Clear, FloatDirection, Size};
+
+    // The parsed 41.66666667% column is one rounding step wider than 487.5px.
+    let first_width = 1170.0 * (41.66666667_f32 / 100.0);
+    for (width, insets) in [
+        (1170.0, [0.0, 0.0]),
+        (1140.0, [-15.0, -15.0]),
+        (1140.0, [-15.25, -15.25]),
+        (1170.0, [0.25, 0.25]),
+    ] {
+        for direction in [FloatDirection::Left, FloatDirection::Right] {
+            for extra in [0.0, 1.0 / 64.0, 1.0] {
+                let mut context = FloatContext::new();
+                context.set_width(width);
+                context.place_floated_box(
+                    Size { width: first_width, height: 20.0 },
+                    0.0, insets, direction, Clear::None,
+                );
+                let second_width = width - insets[0] - insets[1] - 487.5 + extra;
+                let second = context.place_floated_box(
+                    Size { width: second_width, height: 20.0 },
+                    0.0, insets, direction, Clear::None,
+                );
+                assert_eq!(second.y, if extra == 0.0 { 0.0 } else { 20.0 },
+                    "width={width}, insets={insets:?}, direction={direction:?}, extra={extra}: {second:?}");
+            }
+        }
+    }
+    // At large coordinates, one f32 step is real visible overflow, not a subpixel rounding allowance.
+    for direction in [FloatDirection::Left, FloatDirection::Right] {
+        let mut context = FloatContext::new();
+        context.set_width(1_048_576.0);
+        context.place_floated_box(Size { width: 524_288.125, height: 20.0 },
+            0.0, [0.0, 0.0], direction, Clear::None);
+        let next = context.place_floated_box(Size { width: 524_288.0, height: 20.0 },
+            0.0, [0.0, 0.0], direction, Clear::None);
+        assert_eq!(next.y, 20.0, "visible overflow must still wrap: {next:?}");
+    }
+}
+
+#[test]
+fn functional_flex_basis_uses_the_final_main_axis() {
+    for (parent, basis, expected) in [
+        ("display:flex;width:1200px", "flex-basis:calc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0 0 calc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0\t0\tcalc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:min(50%, 300px)", (300.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:max(25%, 120px)", (300.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:clamp(120px, 60%, 900px)", (720.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(200px + 20px)", (220.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px;height:800px", "flex-basis:calc(50% - 20px)", (500.0, 380.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:calc(50% - 20px);height:90px", (500.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:50%;height:90px", (500.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:auto;height:90px", (500.0, 90.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(50% - 20px);flex-basis:80px", (80.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(50% - 20px);flex:none;width:160px", (160.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0 0 calc(50% - 20px);flex:initial;width:70px", (70.0, 20.0)),
+        ("display:flex;width:1200px", "flex:calc(50% - 20px)", (1200.0, 20.0)),
+    ] {
+        let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}div{{min-width:0;min-height:0}}</style><div style='{parent}'><div id=item style='flex-shrink:0;{basis}'><div style='width:40px;height:20px'></div></div></div>"));
+        let layout = layout_dom(&tree, (1400.0, 900.0));
+        let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+        assert!((rect.width - expected.0).abs() < 0.01 && (rect.height - expected.1).abs() < 0.01,
+            "parent={parent}, basis={basis}: {rect:?}, expected={expected:?}");
+    }
+}
+
+#[test]
+fn functional_flex_basis_follows_a_nested_flex_items_used_width() {
+    let tree = parse_html("<!doctype html><style>body{margin:0}div{min-width:0;min-height:0}</style><div style='display:flex;width:1200px'><div style='flex:0 0 300px'></div><div style='flex:1'><div style='display:flex;width:100%'><div id=item style='flex:0 0 calc(100% - 20px);height:20px'></div></div></div></div>");
+    let layout = layout_dom(&tree, (1400.0, 900.0));
+    let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+    assert!((rect.width - 880.0).abs() < 0.01, "{rect:?}");
+}
+
+#[test]
+fn a_functional_zero_basis_preserves_intrinsic_column_content() {
+    for basis in ["0px", "calc(0px)"] {
+        let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}</style><div id=parent style='display:flex;flex-direction:column;width:500px'><div id=item style='flex:1 1 {basis};overflow:auto'><div style='height:100px'></div></div></div>"));
+        let layout = layout_dom(&tree, (1400.0, 900.0));
+        let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+        assert_eq!(rect.height, 100.0, "{basis}: {rect:?}");
+    }
 }

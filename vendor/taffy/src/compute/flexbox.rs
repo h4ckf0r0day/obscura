@@ -774,6 +774,7 @@ fn determine_flex_base_size(
             Size::ZERO
         }
         .main(dir);
+        let flex_basis_is_auto = child_style.flex_basis().is_auto();
         let flex_basis = child_style
             .flex_basis()
             .maybe_resolve(container_width, |val, basis| tree.calc(val, basis))
@@ -792,7 +793,9 @@ fn determine_flex_base_size(
             // Note: `child.size` has already been resolved against aspect_ratio in generate_anonymous_flex_items
             // So B will just work here by using main_size without special handling for aspect_ratio
             let main_size = child.size.main(dir);
-            if let Some(flex_basis) = flex_basis.or(main_size) {
+            // Only auto retrieves the authored main size. An unresolved
+            // percentage basis uses content instead, including calc().
+            if let Some(flex_basis) = flex_basis.or(if flex_basis_is_auto { main_size } else { None }) {
                 break 'flex_basis flex_basis;
             };
 

@@ -974,3 +974,45 @@ impl DetailedGridItemsInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::*;
+
+    /// `grid-column: span 0 / -1` (Shopify themes reach it through
+    /// `span var(--menu-content-columns-desktop) / -1` with the variable at 0).
+    /// A span of zero is invalid CSS; it must not give the item a grid area of
+    /// zero tracks, which used to panic in `GridItem::grid_area_size` with
+    /// "slice index starts at 13 but ends at 12".
+    #[test]
+    fn zero_span_is_treated_as_auto() {
+        let mut tree: TaffyTree<()> = TaffyTree::new();
+        tree.disable_rounding();
+        let item = tree
+            .new_leaf(Style {
+                grid_column: Line { start: span(0), end: line(-1) },
+                ..Style::default()
+            })
+            .unwrap();
+        let root = tree
+            .new_with_children(
+                Style {
+                    display: Display::Grid,
+                    size: Size { width: length(600.0), height: auto() },
+                    grid_template_columns: vec![fr(1.0); 6],
+                    ..Style::default()
+                },
+                &[item],
+            )
+            .unwrap();
+        tree.compute_layout_with_measure(root, Size::MAX_CONTENT, |known, _, _, _, _| Size {
+            width: known.width.unwrap_or(40.0),
+            height: known.height.unwrap_or(10.0),
+        })
+        .unwrap();
+        let layout = tree.layout(item).unwrap();
+        // `auto / -1`: one track ending at the last explicit line.
+        assert_eq!(layout.location.x, 500.0);
+        assert_eq!(layout.size.width, 100.0);
+    }
+}

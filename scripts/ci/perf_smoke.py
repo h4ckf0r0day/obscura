@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Interleaved latency, peak-RSS, and result-correctness comparison."""
+"""Interleaved latency, CPU, peak-RSS, and result-correctness comparison.
+
+Linux wait4 supplies precise CPU and peak RSS for the timeout-guarded process tree.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import statistics
@@ -18,7 +22,9 @@ from threading import Thread
 
 ROUNDS = 5
 PROCESS_TIMEOUT_SECONDS = 45
-LATENCY_FAILURE_RATIO = 1.20
+LATENCY_FAILURE_RATIO = 1.10
+CPU_FAILURE_RATIO = 1.10
+CPU_FAILURE_DELTA_SECONDS = 0.02
 LATENCY_FAILURE_DELTA_MS = 10.0
 RSS_FAILURE_RATIO = 1.15
 RSS_FAILURE_DELTA_KIB = 8 * 1024
@@ -32,9 +38,35 @@ SCENARIOS = {
         "(function(){for(var i=0;i<2000;i++)localStorage.setItem('k'+i,'value-'+i);var n=0;for(var j=0;j<2000;j++)n+=localStorage.getItem('k'+j).length;return n;})()",
         18890,
     ),
+    "storage-method-read-hot": (
+        "(() => {const s=localStorage;s.setItem('item','value');let n=0;"
+        "for(let i=0;i<200000;i++)n+=s.getItem('item').length;return n})()",
+        1000000,
+    ),
+    "storage-named-read-hot": (
+        "(() => {const s=localStorage;s.item='value';let n=0;"
+        "for(let i=0;i<200000;i++)n+=s.item.length;return n})()",
+        1000000,
+    ),
+    "storage-members-hot": (
+        "(() => {const s=sessionStorage;s.item='value';let n=0;"
+        "for(let i=0;i<200000;i++)n+=s.length+('item' in s)+('getItem' in s);return n})()",
+        600000,
+    ),
+    "storage-named-write-delete-hot": (
+        "(() => {const s=sessionStorage;let n=0;for(let i=0;i<50000;i++){"
+        "s.item='value';n+=delete s.item;}return n+s.length})()",
+        50000,
+    ),
+    "storage-enumeration-hot": (
+        "(() => {const s=localStorage;s.alpha='one';s.beta='two';let n=0;"
+        "for(let i=0;i<20000;i++)n+=Object.keys(s).length+"
+        "(Object.getOwnPropertyDescriptor(s,'beta').value==='two');return n})()",
+        60000,
+    ),
     "dom-lookup": (
-        "(() => {let h=document.createElement('div');h.id='probe';document.body.append(h);let n=0;for(let i=0;i<200000;i++)if(document.getElementById('probe')===h)n++;return n;})()",
-        200000,
+        "(() => {let h=document.createElement('div');h.id='probe';document.body.append(h);let n=0;for(let i=0;i<2000000;i++)if(document.getElementById('probe')===h)n++;return n;})()",
+        2000000,
     ),
     "shadow-build": (
         "(() => {let n=0;for(let i=0;i<1500;i++){let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let t=document.createElement('span');t.textContent='row';r.append(t);if(h.shadowRoot===r && r.textContent==='row')n++;}return n;})()",
@@ -44,7 +76,93 @@ SCENARIOS = {
         "(() => {let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let n=0;for(let i=0;i<200000;i++)if(h.shadowRoot===r)n++;return n;})()",
         200000,
     ),
+    "table-create": (
+        "(() => {for(let i=0;i<5000;i++)document.body.append(document.createElement('table'));return document.querySelectorAll('table').length})()",
+        5000,
+    ),
+    "table-parse-wrap": (
+        "(() => {document.body.innerHTML='<table><tr><td>row</td></tr></table>'.repeat(5000);return document.querySelectorAll('table').length})()",
+        5000,
+    ),
+    "table-rows-hot": (
+        "(() => {document.body.innerHTML='<table><thead><tr><th>head</th></tr></thead><tbody>'+'<tr><td>body</td></tr>'.repeat(100)+'</tbody></table>';const t=document.querySelector('table'),first=t.rows[0];let n=0;for(let i=0;i<1000000;i++){const rows=t.rows;if(rows[0]===first)n+=rows.length;}return n})()",
+        101000000,
+    ),
+    "table-cells-hot": (
+        "(() => {document.body.innerHTML='<table><tbody>'+'<tr><td>A</td><td>B</td><td>C</td></tr>'.repeat(100)+'</tbody></table>';const row=document.querySelector('tr');let n=0;for(let i=0;i<100000;i++){const cells=row.cells||row.children;n+=cells.length;if(cells[0].textContent==='A')n++;}return n})()",
+        400000,
+    ),
+    "select-create-wrap": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>'.repeat(5000);return document.querySelectorAll('select').length})()",
+        5000,
+    ),
+    "select-create-wrap-50k": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>'.repeat(50000);return document.querySelectorAll('select').length})()",
+        50000,
+    ),
+    "select-item-or-index-hot": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>';const s=document.querySelector('select'),first=s.item(0),indexed='0' in s;let n=0;for(let i=0;i<1000000;i++)if((indexed?s[0]:s.item(0))===first)n++;return n})()",
+        1000000,
+    ),
+    "select-existing-getters-hot": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>';const s=document.querySelector('select');let n=0;for(let i=0;i<1000000;i++)n+=s.length;return n})()",
+        2000000,
+    ),
+    "form-elements-owned": (
+        "(() => {document.body.innerHTML='<form id=f>'+'<input name=inside>'.repeat(1000)+'</form>';const f=document.getElementById('f');let n=0;for(let i=0;i<200;i++)n+=f.elements.length;return n})()",
+        200000,
+    ),
+    "form-elements-external-mutation": (
+        "(() => {document.body.innerHTML='<form id=f><input name=inside></form>'+'<input form=f name=outside>'.repeat(1000);const f=document.getElementById('f');let n=0;for(let i=0;i<200;i++){document.body.className='state'+i;if(f.elements[0].name==='inside')n++;}return n})()",
+        200,
+    ),
+    "form-owner-ancestor-scaled": (
+        "(() => {document.body.innerHTML='<form id=f><div><div><div><input id=input></div></div></div></form>';const f=document.getElementById('f'),input=document.getElementById('input');let n=0;for(let i=0;i<10000000;i++)n+=input.form===f;return n})()",
+        10000000,
+    ),
+    "form-owner-explicit-scaled": (
+        # Older baselines return null; ownership correctness has separate tests.
+        "(() => {document.body.innerHTML='<form id=f></form><input id=input form=f>';const input=document.getElementById('input');let n=0;for(let i=0;i<10000000;i++)n+=typeof input.form==='object';return n})()",
+        10000000,
+    ),
+    "form-owner-explicit-mutation": (
+        "(() => {document.body.innerHTML='<form id=f></form><input id=input form=f>'+'<div id=extra></div>'.repeat(1000);const input=document.getElementById('input');let n=0;for(let i=0;i<10000;i++){input.className='state'+i;n+=typeof input.form==='object';}return n})()",
+        10000,
+    ),
+    "frame-content-window-hot": (
+        "(() => {const e=document.createElement('iframe');document.body.appendChild(e);const w=e.contentWindow;let n=0;for(let i=0;i<50000;i++)n+=e.contentWindow===w;return n})()",
+        50000,
+    ),
+    "frame-indexed-root-hot": (
+        "(() => {document.body.innerHTML='<iframe></iframe>'.repeat(3);const w=frames[0];let n=0;for(let i=0;i<10000;i++)n+=frames[0]===w;return n})()",
+        10000,
+    ),
+    "frame-live-owner-dom-build": (
+        "(() => {document.body.innerHTML='<iframe></iframe>'.repeat(16);for(let i=0;i<5000;i++)document.body.appendChild(document.createElement('div'));return document.querySelectorAll('div').length+frames.length})()",
+        5016,
+    ),
 }
+SCENARIOS.update({
+    f"html-parse-depth-{depth}": (
+        "(function(){const html='<div>'.repeat(" + str(depth) + ")+"
+        "'text'+'</div>'.repeat(" + str(depth) + ");"
+        "for(let i=0;i<3;i++)document.body.innerHTML=html.repeat(60);"
+        "return document.querySelectorAll('div').length})()",
+        depth * 60,
+    )
+    for depth in (4, 32, 128, 300)
+})
+SCENARIOS.update({
+    f"frame-length-{count}-dom-{padding}": (
+        "(() => {document.body.innerHTML='<div></div>'.repeat(" + str(padding)
+        + ")+'<iframe></iframe>'.repeat(" + str(count)
+        + ");let n=0;for(let i=0;i<" + str(iterations)
+        + ";i++)n+=frames.length;return n})()",
+        count * iterations,
+    )
+    for count, iterations, padding in ((0, 100000, 0), (3, 10000, 0),
+                                       (32, 10000, 0), (3, 1000, 2500))
+})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -59,9 +177,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[float, int]:
-    with tempfile.NamedTemporaryFile(prefix="obscura-rss-", delete=False) as rss_file:
-        rss_path = Path(rss_file.name)
+def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[float, int, float]:
     with tempfile.NamedTemporaryFile(prefix="obscura-stdout-", delete=False) as stdout_file:
         stdout_path = Path(stdout_file.name)
     with tempfile.NamedTemporaryFile(prefix="obscura-stderr-", delete=False) as stderr_file:
@@ -75,11 +191,6 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
         "--fsize=2097152",
         "--nofile=256",
         "--",
-        "/usr/bin/time",
-        "-f",
-        "%M",
-        "-o",
-        str(rss_path),
         str(binary),
         "fetch",
         url,
@@ -102,8 +213,9 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
                 start_new_session=True,
             )
             try:
-                # A Python timeout wait polls exits in steps up to 50 ms.
-                process.wait()
+                # Linux wait4 keeps precise CPU counters for the guarded process tree.
+                _, status, usage = os.wait4(process.pid, 0)
+                process.returncode = os.waitstatus_to_exitcode(status)
             finally:
                 # Remove background descendants left by an untrusted candidate binary.
                 try:
@@ -114,7 +226,10 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
         elapsed_ms = (time.perf_counter() - started) * 1000
         if process.returncode != 0:
             raise RuntimeError(f"{binary} exited with status {process.returncode}")
-        rss_kib = int(rss_path.read_text(encoding="ascii").strip())
+        cpu_seconds = usage.ru_utime + usage.ru_stime
+        rss_kib = usage.ru_maxrss
+        if not math.isfinite(cpu_seconds) or usage.ru_utime < 0 or usage.ru_stime < 0 or rss_kib <= 0:
+            raise RuntimeError(f"{binary} produced an invalid CPU/RSS measurement")
         try:
             result = json.loads(stdout_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -123,9 +238,8 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
             raise RuntimeError(
                 f"{binary} returned {result!r}; expected {expected!r}"
             )
-        return elapsed_ms, rss_kib
+        return elapsed_ms, rss_kib, cpu_seconds
     finally:
-        rss_path.unlink(missing_ok=True)
         stdout_path.unlink(missing_ok=True)
         stderr_path.unlink(missing_ok=True)
 
@@ -161,8 +275,8 @@ def main() -> None:
     try:
         for scenario, (expression, expected) in SCENARIOS.items():
             samples[scenario] = {
-                "base": {"latency_ms": [], "rss_kib": []},
-                "candidate": {"latency_ms": [], "rss_kib": []},
+                "base": {"latency_ms": [], "rss_kib": [], "cpu_seconds": []},
+                "candidate": {"latency_ms": [], "rss_kib": [], "cpu_seconds": []},
             }
             for round_number in range(ROUNDS):
                 order = (
@@ -171,9 +285,10 @@ def main() -> None:
                     else (("candidate", args.candidate), ("base", args.base))
                 )
                 for label, binary in order:
-                    latency_ms, rss_kib = run_once(binary, url, expression, expected)
+                    latency_ms, rss_kib, cpu_seconds = run_once(binary, url, expression, expected)
                     samples[scenario][label]["latency_ms"].append(latency_ms)
                     samples[scenario][label]["rss_kib"].append(rss_kib)
+                    samples[scenario][label]["cpu_seconds"].append(cpu_seconds)
     finally:
         server.shutdown()
         server.server_close()
@@ -181,9 +296,9 @@ def main() -> None:
     report: dict[str, object] = {"rounds": ROUNDS, "scenarios": {}}
     lines = [
         "## Performance smoke comparison\n\n",
-        "Fails above 20% and 10 ms for latency, or above 15% and 8 MiB for RSS.\n\n",
-        "| Scenario | Base latency | PR latency | Change | Base RSS | PR RSS | Change |\n",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "Fails above 10% and 10 ms for latency, 10% and 20 ms for CPU, or 15% and 8 MiB for RSS.\n\n",
+        "| Scenario | Base latency | PR latency | Change | Base CPU | PR CPU | Base RSS | PR RSS | Change |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     ]
     failures = []
     for scenario in SCENARIOS:
@@ -193,7 +308,11 @@ def main() -> None:
         pr_rss = median(samples[scenario]["candidate"]["rss_kib"])
         latency_ratio = pr_latency / base_latency
         rss_ratio = pr_rss / base_rss
+        base_cpu = median(samples[scenario]["base"]["cpu_seconds"])
+        pr_cpu = median(samples[scenario]["candidate"]["cpu_seconds"])
         report["scenarios"][scenario] = {
+            "base_cpu_seconds": base_cpu,
+            "candidate_cpu_seconds": pr_cpu,
             "base_latency_ms": base_latency,
             "candidate_latency_ms": pr_latency,
             "latency_ratio": latency_ratio,
@@ -204,7 +323,7 @@ def main() -> None:
         }
         lines.append(
             f"| {scenario} | {base_latency:.1f} ms | {pr_latency:.1f} ms | "
-            f"{(latency_ratio - 1) * 100:+.1f}% | {base_rss / 1024:.1f} MiB | "
+            f"{(latency_ratio - 1) * 100:+.1f}% | {base_cpu:.4f} s | {pr_cpu:.4f} s | {base_rss / 1024:.1f} MiB | "
             f"{pr_rss / 1024:.1f} MiB | {(rss_ratio - 1) * 100:+.1f}% |\n"
         )
         latency_delta = pr_latency - base_latency
@@ -214,6 +333,8 @@ def main() -> None:
             and latency_delta > LATENCY_FAILURE_DELTA_MS
         ):
             failures.append(f"{scenario} latency is {latency_ratio:.2f}x the base")
+        if pr_cpu > base_cpu * CPU_FAILURE_RATIO and pr_cpu - base_cpu > CPU_FAILURE_DELTA_SECONDS + 1e-9:
+            failures.append(f"{scenario} CPU increased from {base_cpu:.4f} s to {pr_cpu:.4f} s")
         if rss_ratio > RSS_FAILURE_RATIO and rss_delta > RSS_FAILURE_DELTA_KIB:
             failures.append(f"{scenario} RSS is {rss_ratio:.2f}x the base")
 
