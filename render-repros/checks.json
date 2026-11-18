@@ -1,4 +1,7 @@
 {
+  "deep-parser-layout": [
+    {"name": "fragment depth matches Chromium without losing the last element", "color": "#3186e8", "x": 545, "width": 80, "height": 20}
+  ],
   "hidden-table-rows": [
     {"name": "rowspan counts visible rows only", "color": "#1971c2", "x": 20, "y": 20, "width": 30, "height": 40},
     {"name": "next visible row occupies the second column", "color": "#e8590c", "x": 50, "y": 40, "width": 30, "height": 20},
@@ -175,6 +178,12 @@
     {"name": "later block remains in float band", "color": "#1098ad", "x": 0, "y": 230, "width": 650, "height": 70},
     {"name": "clear moves below float bottom", "color": "#a61e4d", "x": 0, "y": 400, "width": 900, "height": 50}
   ],
+  "float-percentage-margin": [
+    {"name": "offset column paints its intrinsic child", "color": "#087f5b", "x": 100, "y": 0, "width": 300, "height": 40},
+    {"name": "nested first column keeps its percentage width", "color": "#c92a2a", "x": 150, "y": 100, "width": 250, "height": 100},
+    {"name": "nested offset column stays beside its sibling", "color": "#1971c2", "x": 450, "y": 110, "width": 300, "height": 80},
+    {"name": "clearance contains the nested float band", "color": "#f76707", "x": 150, "y": 200, "width": 600, "height": 10}
+  ],
   "float-bfc-continuation": [
     {"name": "float keeps its BFC band across wrappers", "color": "#1971c2", "x": 650, "y": 0, "width": 250, "height": 400},
     {"name": "direct flow uses the first available band", "color": "#087f5b", "x": 0, "y": 0, "width": 650, "height": 250},
@@ -207,7 +216,11 @@
     {"name": "authored block image still starts a block row", "color": "#1971c2", "x": 0, "y": 80, "width": 40, "height": 20},
     {"name": "content after authored block image follows below", "color": "#e8590c", "x": 0, "y": 100, "width": 70, "height": 20},
     {"name": "atomic inline run retains its line-height strut", "color": "#7048e8", "x": 0, "y": 178, "width": 300, "height": 4},
-    {"name": "mixed cell keeps block child full width and centered", "color": "#2b8a3e", "x": 100, "y": 182, "width": 100, "height": 20}
+    {"name": "mixed cell keeps block child full width and centered", "color": "#2b8a3e", "x": 100, "y": 182, "width": 100, "height": 20},
+    {"name": "picture image stays in inline flow", "color": "#1971c2", "x": 60, "y": 260, "width": 40, "height": 20},
+    {"name": "content after picture remains on the same line", "color": "#e8590c", "x": 100, "y": 260, "width": 70, "height": 20},
+    {"name": "authored block picture starts a new row", "color": "#1971c2", "x": 0, "y": 340, "width": 40, "height": 20},
+    {"name": "content after block picture follows below", "color": "#e8590c", "x": 0, "y": 360, "width": 70, "height": 20}
   ],
   "item-self-alignment": [
     {"name": "flex item centers itself on cross axis", "color": "#087f5b", "x": 0, "y": 40, "width": 40, "height": 20},
@@ -416,5 +429,19 @@
   "z-index": [
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},
     {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110}
+  ],
+  "native-control-font-scale": [
+    {"name": "Arial 400 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 20, "width": 64, "height": 24},
+    {"name": "Arial 400 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 20, "width": 64, "height": 24},
+    {"name": "Arial 400 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 60, "width": 94, "height": 24},
+    {"name": "Arial 400 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 60, "width": 94, "height": 24},
+    {"name": "Times New Roman 700 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 100, "width": 63, "height": 24},
+    {"name": "Times New Roman 700 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 100, "width": 63, "height": 24},
+    {"name": "Courier New 700 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 140, "width": 85, "height": 24},
+    {"name": "Courier New 700 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 140, "width": 85, "height": 24},
+    {"name": "system-ui 700 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 180, "width": 83, "height": 24},
+    {"name": "system-ui 700 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 180, "width": 83, "height": 24},
+    {"name": "MissingFont, Arial 400 reference keeps CSS em metrics", "color": "#087f5b", "x": 20, "y": 220, "width": 76, "height": 24},
+    {"name": "MissingFont, Arial 400 button keeps CSS em metrics", "color": "#1971c2", "x": 200, "y": 220, "width": 76, "height": 24}
   ]
 }

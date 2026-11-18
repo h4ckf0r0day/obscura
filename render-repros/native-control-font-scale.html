@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native control font metrics</title>
+<style>
+body { margin: 0; background: white }
+.row { position: absolute; left: 0; font-size: 14px }
+.row > * { position: absolute; top: 0; font: inherit; line-height: 24px;
+  height: 24px; padding: 0; border: 0; white-space: nowrap }
+span { left: 20px; background: #087f5b }
+button { left: 200px; background: #1971c2 }
+</style>
+<div class=row style="top:20px;font-family:Arial;font-weight:400"><span>abcdefghij</span><button>abcdefghij</button></div>
+<div class=row style="top:60px;font-family:Arial;font-weight:400"><span>AVATAR Toffee</span><button>AVATAR Toffee</button></div>
+<div class=row style="top:100px;font-family:Times New Roman;font-weight:700"><span>abcdefghij</span><button>abcdefghij</button></div>
+<div class=row style="top:140px;font-family:Courier New;font-weight:700"><span>abcdefghij</span><button>abcdefghij</button></div>
+<div class=row style="top:180px;font-family:system-ui;font-weight:700"><span>abcdefghij</span><button>abcdefghij</button></div>
+<div class=row style="top:220px;font-family:MissingFont, Arial;font-weight:400"><span>café Ωmega</span><button>café Ωmega</button></div>
