@@ -25271,6 +25271,175 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_script_exception_reports_as_uncaught_window_error() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate(r#"(() => {
+            globalThis.__dynOnerrorMessages = [];
+            globalThis.__dynErrorEvents = [];
+            globalThis.__pageAlive = false;
+            // The special window handler takes (message, source, lineno,
+            // colno, error); returning nothing keeps the event uncanceled.
+            window.onerror = (message) => {
+                __dynOnerrorMessages.push(String(message));
+            };
+            addEventListener('error', event => {
+                __dynErrorEvents.push([
+                    String(event.error?.message ?? ''),
+                    event instanceof ErrorEvent,
+                ]);
+            });
+            const script = document.createElement('script');
+            script.src = 'data:text/javascript,throw new Error("boom")';
+            document.head.appendChild(script);
+            setTimeout(() => { globalThis.__pageAlive = true; }, 0);
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+
+        // window.onerror and the window 'error' ErrorEvent both saw the throw,
+        // the same report a parser-inserted script's exception produces.
+        assert_eq!(
+            rt.evaluate("[__dynOnerrorMessages, __dynErrorEvents]").unwrap(),
+            serde_json::json!([["boom"], [["boom", true]]])
+        );
+        // The exception did not poison the page: later tasks still run.
+        assert_eq!(rt.evaluate("__pageAlive").unwrap(), serde_json::json!(true));
+
+        // CDP receives Runtime.exceptionThrown, like Chrome.
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Exception(error) => Some(error),
+                _ => None,
+            }).collect();
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(exceptions[0].name, "Error");
+        assert!(exceptions[0].description.contains("boom"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_onerror_property_gets_five_args_and_true_cancels_the_event() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate(r#"(() => {
+            globalThis.__onerrorArgs = null;
+            globalThis.__listenerEvents = [];
+            addEventListener('error', event => {
+                __listenerEvents.push([
+                    event.type, event.message, event.filename,
+                    event.lineno, event.colno, event.error && event.error.message,
+                ]);
+            });
+            window.onerror = (message, source, lineno, colno, error) => {
+                __onerrorArgs = [
+                    typeof message, message,
+                    typeof source, source,
+                    typeof lineno, lineno,
+                    typeof colno, colno,
+                    error instanceof Error, error && error.message,
+                ];
+                return true;
+            };
+            const script = document.createElement('script');
+            script.src = 'data:text/javascript,throw new Error("boom")';
+            document.head.appendChild(script);
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+
+        // HTML's special error event handler: five arguments, and the script
+        // URL arrives as the source.
+        assert_eq!(
+            rt.evaluate("__onerrorArgs").unwrap(),
+            serde_json::json!([
+                "string", "boom",
+                "string", "data:text/javascript,throw new Error(\"boom\")",
+                "number", 0,
+                "number", 0,
+                true, "boom",
+            ])
+        );
+        // addEventListener listeners still receive the ErrorEvent object.
+        assert_eq!(
+            rt.evaluate("__listenerEvents").unwrap(),
+            serde_json::json!([[
+                "error", "boom", "data:text/javascript,throw new Error(\"boom\")",
+                0, 0, "boom",
+            ]])
+        );
+        // The true return canceled the event: no Runtime.exceptionThrown.
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Exception(error) => Some(error),
+                _ => None,
+            }).collect();
+        assert_eq!(exceptions.len(), 0);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_onerror_property_still_gets_the_event_object() {
+        let mut rt = parser_image_runtime(
+            r#"<img id="missing" src="missing.png">"#,
+            move |_url: &str| None,
+        );
+        rt.execute_script("element-onerror-shape", r#"
+            globalThis.__imgArgs = null;
+            const missing = document.getElementById("missing");
+            missing.onerror = function (arg) {
+                __imgArgs = [arg instanceof Event, arg.type, arguments.length];
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        // The element's onerror keeps the ordinary listener shape: one event
+        // argument, not the window's five-argument error convention.
+        assert_eq!(
+            rt.evaluate("__imgArgs").unwrap(),
+            serde_json::json!([true, "error", 1])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn body_onerror_attribute_acts_as_the_window_error_handler() {
+        let mut rt = setup_runtime(
+            "<html><head></head><body onerror=\"window.__args=[typeof event, event, source, error && error.message]; return true\"><p>hi</p></body></html>",
+        );
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate(r#"(() => {
+            globalThis.__pageAlive = false;
+            const script = document.createElement('script');
+            script.src = 'data:text/javascript,throw new Error("boom")';
+            document.head.appendChild(script);
+            setTimeout(() => { globalThis.__pageAlive = true; }, 0);
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+
+        // The body's inline onerror runs as the window's special error
+        // handler: the compiled function sees the message as `event`, the
+        // script URL as `source`, and the thrown error as `error`.
+        assert_eq!(
+            rt.evaluate("__args").unwrap(),
+            serde_json::json!([
+                "string", "boom",
+                "data:text/javascript,throw new Error(\"boom\")",
+                "boom",
+            ])
+        );
+        assert_eq!(rt.evaluate("__pageAlive").unwrap(), serde_json::json!(true));
+
+        // The attribute's `return true` cancelled the event: no
+        // Runtime.exceptionThrown.
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Exception(error) => Some(error),
+                _ => None,
+            }).collect();
+        assert_eq!(exceptions.len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_dynamic_script_loads_without_exposing_fetch_body() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

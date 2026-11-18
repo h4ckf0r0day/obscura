@@ -444,7 +444,7 @@ async function __runDynScriptTask(task) {
           const execute = () => {
             globalThis.__currentScriptNid = task.nid;
             try { (0, eval)(body); }
-            catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+            catch(e) { _reportUncaughtException(e, task.url); }
             finally { globalThis.__currentScriptNid = task.prevNid || 0; }
             resolve();
           };
@@ -2037,12 +2037,21 @@ function _eventTargetDispatch(target, event) {
     const eventHandler = target === globalThis ? target['on' + event.type] : null;
     if (typeof eventHandler === 'function') {
       try {
-        const result = eventHandler.call(target, event);
+        // HTML's special window error event handler: the window onerror
+        // property receives the ErrorEvent's fields as five arguments, and a
+        // true return cancels the event (every other handler takes the event
+        // object and cancels by returning false).
+        const specialError = event.type === 'error' && event instanceof _browserErrorEvent;
+        const result = specialError
+          ? eventHandler.call(target, event.message, event.filename, event.lineno, event.colno, event.error)
+          : eventHandler.call(target, event);
         if (event.type === 'beforeunload' && _beforeUnloadValues.has(event)) {
           if (result != null) {
             event.preventDefault();
             if (event.returnValue === '') event.returnValue = result;
           }
+        } else if (specialError) {
+          if (result === true) event.preventDefault();
         } else if (result === false) event.preventDefault();
       } catch (error) {
         console.error(error);
@@ -8228,6 +8237,60 @@ Object.defineProperty(Element.prototype, 'onload', {
   enumerable: false,
 });
 
+// body/frameset onerror is the window's error handler. It gets the five
+// arguments of the special error event handler, so the compiled inline
+// function names them (event, source, lineno, colno, error) for the
+// attribute text.
+const _defaultWindowOnError = globalThis.onerror;
+let _windowOnErrorOverrideSet = false;
+let _windowOnErrorOverride = null;
+function _windowReflectingBodyErrorHandler() {
+  if (!_scriptingEnabled) return null;
+  const body = _windowReflectingBodyElement();
+  if (!body || typeof body.getAttribute !== 'function') return null;
+  const src = body.getAttribute('onerror');
+  if (!src) return null;
+  const cache = body.__windowInlineError;
+  if (cache && cache.src === src) return cache.fn;
+  let fn = null;
+  try {
+    fn = new Function('event', 'source', 'lineno', 'colno', 'error', src);
+  } catch (_e) {
+    fn = null;
+  }
+  body.__windowInlineError = { src, fn };
+  return fn;
+}
+Object.defineProperty(globalThis, 'onerror', {
+  get() {
+    if (_windowOnErrorOverrideSet) return _windowOnErrorOverride;
+    return _windowReflectingBodyErrorHandler() || _defaultWindowOnError;
+  },
+  set(value) {
+    _windowOnErrorOverrideSet = true;
+    _windowOnErrorOverride = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: true,
+});
+Object.defineProperty(Element.prototype, 'onerror', {
+  get() {
+    if (_isWindowReflectingBodyElement(this)) {
+      return globalThis.onerror;
+    }
+    return this.__onerror || null;
+  },
+  set(value) {
+    if (_isWindowReflectingBodyElement(this)) {
+      globalThis.onerror = value;
+      return;
+    }
+    this.__onerror = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: false,
+});
+
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
@@ -12146,20 +12209,25 @@ globalThis.KeyboardEvent = class extends Event {
 };
 globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
-globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
+globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null;this.filename=o.filename||"";this.lineno=o.lineno||0;this.colno=o.colno||0; } };
 const _browserErrorEvent = globalThis.ErrorEvent;
-__obscuraCore.setReportExceptionCallback(error => {
+// Shared reporter for uncaught exceptions that reach the task/event-loop
+// boundary: deno_core tasks (timers, microtasks, posted tasks) call it through
+// the report-exception callback, and dynamic classic scripts call it directly
+// so their run-time errors report like any other uncaught error.
+function _reportUncaughtException(error, filename) {
   // deno_core's default reporter terminates execution, discarding the rest of
   // the microtask checkpoint. Browser callback errors must leave queued work live.
   let message;
   try { message = String(error?.message ?? error); }
   catch (_) { message = "Uncaught exception"; }
-  const event = new _browserErrorEvent("error", { message, error, cancelable: true });
+  const event = new _browserErrorEvent("error", { message, error, filename: filename || "", cancelable: true });
   if (_eventTargetDispatch(globalThis, event)) {
     __obscuraCore.ops.op_report_browser_exception(error, globalThis.__obscura_frameId || 0);
     _consoleFn("error", [error]);
   }
-});
+}
+__obscuraCore.setReportExceptionCallback(_reportUncaughtException);
 globalThis.PointerEvent = class extends MouseEvent {
   constructor(t,o={}) {
     super(t,o);
