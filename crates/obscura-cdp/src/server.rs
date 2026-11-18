@@ -928,6 +928,9 @@ fn run_connection(
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
             let (io_stop_tx, io_stop_rx) = tokio::sync::oneshot::channel::<()>();
             let (io_done_tx, io_done_rx) = tokio::sync::oneshot::channel::<()>();
+            let interrupt_routes = crate::dispatch::InterruptRoutes::default();
+            let socket_routes = interrupt_routes.clone();
+            let connection_thread = std::thread::current().id();
             let io_thread = match std::thread::Builder::new()
                 .name("obscura-cdp-io".into())
                 .spawn(move || {
@@ -952,7 +955,7 @@ fn run_connection(
                             }
                         };
                         tokio::select! {
-                            result = handle_connection_ws(stream, msg_tx) => {
+                            result = handle_connection_ws(stream, msg_tx, socket_routes, connection_thread) => {
                                 if let Err(error) = result {
                                     error!("WebSocket connection error: {error}");
                                 }
@@ -974,7 +977,7 @@ fn run_connection(
                 // LocalSet task can run 61 times before Tokio services I/O,
                 // starving fetch under a continuously ready page scheduler.
                 let processor = cdp_processor(
-                    msg_rx, default_context, shutdown_notify,
+                    msg_rx, default_context, shutdown_notify, interrupt_routes,
                 );
                 tokio::pin!(processor);
                 tokio::select! {
@@ -1306,8 +1309,10 @@ async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
+    interrupt_routes: crate::dispatch::InterruptRoutes,
 ) {
     let mut ctx = CdpContext::new_with_shared_context(default_context);
+    ctx.interrupt_routes = interrupt_routes;
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
@@ -2141,7 +2146,7 @@ async fn process_with_interception(
                         // Safe: no V8 enter, just bookkeeping.
                         let pid = ctx.create_page();
                         let sid = format!("{}-session", pid);
-                        ctx.sessions.insert(sid.clone(), pid.clone());
+                        ctx.attach_session(sid.clone(), pid.clone());
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
@@ -2386,8 +2391,29 @@ fn decode_base64_bytes(input: &str) -> Result<Vec<u8>, String> {
     BASE64.decode(input).map_err(|error| error.to_string())
 }
 
-fn fast_path_response(text: &str) -> Option<String> {
+fn fast_path_response(
+    text: &str,
+    routes: &crate::dispatch::InterruptRoutes,
+    owner: std::thread::ThreadId,
+) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
+
+    if req.method == "Runtime.terminateExecution" {
+        let routes = routes.lock().unwrap();
+        let page = req.session_id.as_ref().and_then(|session| routes.get(session));
+        let response = match page {
+            Some(page) if page != "browser" => {
+                obscura_js::cdp_watchdog::interrupt(owner, page);
+                crate::types::CdpResponse::success(req.id, json!({}), req.session_id)
+            }
+            None if req.session_id.is_some() => crate::types::CdpResponse::error(
+                req.id, -32001, "Session with given id not found.".into(), None,
+            ),
+            _ => crate::types::CdpResponse::error(req.id, -32601,
+                "Unknown Runtime method: terminateExecution".into(), req.session_id),
+        };
+        return serde_json::to_string(&response).ok();
+    }
 
     let result = match req.method.as_str() {
         "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
@@ -2427,6 +2453,8 @@ fn fast_path_response(text: &str) -> Option<String> {
 async fn handle_connection_ws(
     stream: TcpStream,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
+    interrupt_routes: crate::dispatch::InterruptRoutes,
+    connection_thread: std::thread::ThreadId,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -2482,7 +2510,7 @@ async fn handle_connection_ws(
                     break;
                 }
 
-                if let Some(resp) = fast_path_response(&text) {
+                if let Some(resp) = fast_path_response(&text, &interrupt_routes, connection_thread) {
                     let _ = reply_tx.send(resp);
                 } else {
                     let _ = msg_tx.send(ServerMessage::Cdp(CdpMessage {
@@ -2659,7 +2687,7 @@ mod tests {
                 "params": {"enabled": enabled},
                 "sessionId": "page-session",
             });
-            assert!(super::fast_path_response(&request.to_string()).is_none(),
+            assert!(super::fast_path_response(&request.to_string(), &Default::default(), std::thread::current().id()).is_none(),
                 "lifecycle subscriptions must not be acknowledged without updating state");
         }
     }
@@ -3217,6 +3245,7 @@ mod tests {
                     server_rx,
                     default_context,
                     shutdown,
+                    Default::default(),
                 ));
 
                 server_tx
@@ -3354,6 +3383,7 @@ mod tests {
                     server_rx,
                     default_context,
                     shutdown,
+                    Default::default(),
                 ));
 
                 server_tx
@@ -3547,7 +3577,7 @@ mod tests {
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
             let context = crate::dispatch::CdpContext::new().default_context;
             let processor = tokio::task::spawn_local(super::cdp_processor(
-                server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()),
+                server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(),
             ));
             server_tx.send(super::ServerMessage::NewConnection {
                 reply_tx: reply_tx.clone(),
@@ -3644,7 +3674,7 @@ mod tests {
             let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
             let processor = tokio::task::spawn_local(cdp_processor(
                 server_rx, CdpContext::new().default_context,
-                std::sync::Arc::new(tokio::sync::Notify::new()),
+                std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(),
             ));
             server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
@@ -3736,7 +3766,7 @@ mod tests {
             let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
             let context = CdpContext::new().default_context;
             let processor = tokio::task::spawn_local(cdp_processor(
-                server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()),
+                server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(),
             ));
             server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
@@ -3828,7 +3858,7 @@ mod tests {
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
             let context = crate::dispatch::CdpContext::new().default_context;
             let processor = tokio::task::spawn_local(super::cdp_processor(
-                server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()),
+                server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(),
             ));
             server_tx.send(super::ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();

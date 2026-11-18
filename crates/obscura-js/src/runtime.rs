@@ -20,7 +20,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, OriginStorage, RuntimeEvent, StoredNetworkResponseBody,
+    ObscuraState, OriginStorage, RuntimeEvent, CachedNetworkResponseBody, StoredNetworkResponseBody,
     begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
@@ -268,7 +268,7 @@ pub struct PendingCdpEvaluation {
 /// the same id without retaining a second isolate.
 #[derive(Default)]
 pub struct CdpObjectState {
-    object_counter: u64,
+    object_namespace: u128,
     evaluation_recipes: HashMap<String, String>,
 }
 
@@ -282,8 +282,7 @@ pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, CdpObjectRecord>,
     evaluation_recipes: HashMap<String, String>,
-    object_counter: u64,
-    /// executionContextId stamped into newly minted CDP objectIds.
+    object_namespace: u128,
     cdp_context_id: i64,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
@@ -294,6 +293,7 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    watchdog_scope: Option<crate::cdp_watchdog::ExecutionScope>,
     /// Signals that V8 approached its configured heap limit. The callback
     /// terminates the current script and temporarily raises the limit just
     /// enough for V8 to unwind instead of aborting the worker process.
@@ -481,7 +481,10 @@ const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 /// So the isolate is exited once construction finishes and entered again only
 /// around work that touches V8. Entries are then properly nested no matter how
 /// many pages exist or what order they are used and dropped in.
-struct EnteredRuntime<'a>(&'a mut JsRuntime);
+struct EnteredRuntime<'a> {
+    runtime: &'a mut JsRuntime,
+    execution_scope: Option<&'a crate::cdp_watchdog::ExecutionScope>,
+}
 
 /// Enters an isolate only while an async deno_core operation is being polled.
 /// Holding an entry across `.await` would let interleaved page futures violate
@@ -489,21 +492,31 @@ struct EnteredRuntime<'a>(&'a mut JsRuntime);
 struct EnteredRuntimeFuture<F> {
     isolate: *mut deno_core::v8::Isolate,
     future: Option<Pin<Box<F>>>,
+    execution_scope: Option<crate::cdp_watchdog::ExecutionScope>,
     _not_send: PhantomData<Rc<()>>,
 }
 
-struct IsolateEntry(*mut deno_core::v8::Isolate);
+struct IsolateEntry<'a> {
+    isolate: *mut deno_core::v8::Isolate,
+    execution_scope: Option<&'a crate::cdp_watchdog::ExecutionScope>,
+}
 
-impl IsolateEntry {
-    unsafe fn new(isolate: *mut deno_core::v8::Isolate) -> Self {
+impl<'a> IsolateEntry<'a> {
+    unsafe fn new(isolate: *mut deno_core::v8::Isolate, execution_scope: Option<&'a crate::cdp_watchdog::ExecutionScope>) -> Self {
+        if let Some(scope) = execution_scope { scope.enter(); }
         unsafe { (&mut *isolate).enter() };
-        Self(isolate)
+        Self { isolate, execution_scope }
     }
 }
 
-impl Drop for IsolateEntry {
+impl Drop for IsolateEntry<'_> {
     fn drop(&mut self) {
-        unsafe { (&mut *self.0).exit() };
+        unsafe {
+            if self.execution_scope.is_some_and(|scope| scope.leave()) {
+                (&mut *self.isolate).cancel_terminate_execution();
+            }
+            (&mut *self.isolate).exit();
+        }
     }
 }
 
@@ -514,7 +527,7 @@ impl<F: Future> Future for EnteredRuntimeFuture<F> {
         // SAFETY: construction ties the pointer and future to the same
         // borrowed JsRuntime, which cannot move or drop while this exists.
         let this = unsafe { self.get_unchecked_mut() };
-        let _entry = unsafe { IsolateEntry::new(this.isolate) };
+        let _entry = unsafe { IsolateEntry::new(this.isolate, this.execution_scope.as_ref()) };
         this.future
             .as_mut()
             .expect("entered runtime future polled after drop")
@@ -527,25 +540,27 @@ impl<F> Drop for EnteredRuntimeFuture<F> {
     fn drop(&mut self) {
         // deno_core futures can own V8 handles, so drop them while their
         // isolate is current too.
-        let _entry = unsafe { IsolateEntry::new(self.isolate) };
+        let _entry = unsafe { IsolateEntry::new(self.isolate, self.execution_scope.as_ref()) };
         drop(self.future.take());
     }
 }
 
 fn entered_runtime_future<'a, F>(
     runtime: &'a mut JsRuntime,
+    execution_scope: Option<crate::cdp_watchdog::ExecutionScope>,
     make_future: impl FnOnce(&'a mut JsRuntime) -> F,
 ) -> EnteredRuntimeFuture<F>
 where
     F: Future,
 {
     let isolate: *mut deno_core::v8::Isolate = &mut **runtime.v8_isolate();
-    let entry = unsafe { IsolateEntry::new(isolate) };
+    let entry = unsafe { IsolateEntry::new(isolate, execution_scope.as_ref()) };
     let future = Box::pin(make_future(runtime));
     drop(entry);
     EnteredRuntimeFuture {
         isolate,
         future: Some(future),
+        execution_scope,
         _not_send: PhantomData,
     }
 }
@@ -554,13 +569,13 @@ impl std::ops::Deref for EnteredRuntime<'_> {
     type Target = JsRuntime;
 
     fn deref(&self) -> &JsRuntime {
-        self.0
+        self.runtime
     }
 }
 
 impl std::ops::DerefMut for EnteredRuntime<'_> {
     fn deref_mut(&mut self) -> &mut JsRuntime {
-        self.0
+        self.runtime
     }
 }
 
@@ -570,8 +585,11 @@ impl Drop for EnteredRuntime<'_> {
         // and, entries being a per-thread stack, is the current one: any
         // isolate entered since belongs to a nested operation that has already
         // exited it.
+        if self.execution_scope.is_some_and(|scope| scope.leave()) {
+            self.runtime.v8_isolate().cancel_terminate_execution();
+        }
         unsafe {
-            self.0.v8_isolate().exit();
+            self.runtime.v8_isolate().exit();
         }
     }
 }
@@ -604,12 +622,13 @@ impl ObscuraJsRuntime {
     /// guard lives. Every path that touches V8 goes through here; see
     /// [`EnteredRuntime`] for why.
     fn runtime(&mut self) -> EnteredRuntime<'_> {
+        if let Some(scope) = &self.watchdog_scope { scope.enter(); }
         // SAFETY: entering is always sound -- it pushes this isolate onto the
         // current thread's entry stack -- and the guard's `Drop` pops it.
         unsafe {
             self.js_runtime.v8_isolate().enter();
         }
-        EnteredRuntime(&mut self.js_runtime)
+        EnteredRuntime { runtime: &mut self.js_runtime, execution_scope: self.watchdog_scope.as_ref() }
     }
 
     /// Read native isolate statistics without evaluating scripts or forcing GC.
@@ -750,13 +769,15 @@ impl ObscuraJsRuntime {
 
         let mut instance = ObscuraJsRuntime {
             state,
-            cdp_context_id: 1,
             object_store: HashMap::new(),
             evaluation_recipes: HashMap::new(),
-            object_counter: 0,
+            object_namespace: (u128::from(std::process::id()) << 64)
+                | u128::from(NEXT_CDP_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            cdp_context_id: 1,
             import_map,
             module_load_activity,
             isolate_handle,
+            watchdog_scope: None,
             heap_limit_state,
             module_evaluations: HashMap::new(),
             loaded_module_specifiers,
@@ -1583,16 +1604,34 @@ impl ObscuraJsRuntime {
             .borrow()
             .network_response_bodies
             .get(request_id)
-            .cloned()
+            .map(CachedNetworkResponseBody::decoded)
+    }
+
+    pub fn get_network_response_body_raw(&self, request_id: &str) -> Option<(Vec<u8>, bool)> {
+        self.state.borrow().network_response_bodies.get(request_id)?.raw_bytes()
     }
 
     /// Move retained bodies in completion order before the runtime is suspended.
     pub fn take_network_response_bodies(&self) -> Vec<(String, StoredNetworkResponseBody)> {
+        self.take_cached_network_response_bodies().into_iter()
+            .map(|(id, body)| (id, body.decoded())).collect()
+    }
+
+    /// Transfer cached bytes without decoding when the page suspends its realm.
+    pub fn take_cached_network_response_bodies(&self) -> Vec<(String, CachedNetworkResponseBody)> {
         let mut state = self.state.borrow_mut();
         let order = std::mem::take(&mut state.network_response_body_order);
         order.into_iter().filter_map(|id| {
             state.network_response_bodies.remove(&id).map(|body| (id, body))
         }).collect()
+    }
+
+    /// Transfer one response to a CDP stream instead of cloning it in the cache.
+    pub fn take_network_response_body_raw(&self, request_id: &str) -> Option<Vec<u8>> {
+        let mut state = self.state.borrow_mut();
+        let body = state.network_response_bodies.remove(request_id)?;
+        state.network_response_body_order.retain(|id| id != request_id);
+        body.into_bytes()
     }
 
     pub fn clear_network_response_bodies(&self) {
@@ -2827,8 +2866,7 @@ impl ObscuraJsRuntime {
     ) -> Result<CdpEvaluation, String> {
         let context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
-        self.object_counter += 1;
-        let oid = self.make_oid(self.object_counter);
+        let oid = self.make_oid(Some(self.cdp_context_id));
         // Compile the script itself, not a string passed through the page's eval.
         let record = (|| {
             let mut entered = self.runtime();
@@ -2930,6 +2968,10 @@ impl ObscuraJsRuntime {
             }
             frame_id = object_frame;
         }
+        let object_context_id = match object_id {
+            Some(id) => self.cdp_object_context_id(id),
+            None => Some(self.cdp_context_id),
+        };
         let context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
         let receiver = if object_id.is_some() {
@@ -2943,10 +2985,9 @@ impl ObscuraJsRuntime {
             let value: v8::Local<v8::Value> = global.into();
             v8::Global::new(scope, value)
         };
-        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument, &context))
+        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument, &context, object_context_id))
             .collect::<Result<Vec<_>, _>>()?;
-        self.object_counter += 1;
-        let oid = self.make_oid(self.object_counter);
+        let oid = self.make_oid(object_context_id);
         let record = (|| {
             let mut entered = self.runtime();
             v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
@@ -3148,8 +3189,7 @@ impl ObscuraJsRuntime {
     }
     pub fn store_object(&mut self, js_expression: &str) -> Result<String, String> {
         self.begin_javascript_task();
-        self.object_counter += 1;
-        let oid = self.make_oid(self.object_counter);
+        let oid = self.make_oid(Some(self.cdp_context_id));
         let code = format!(
             "globalThis.__obscura_objects[{}] = ({});",
             js_string_literal(&oid), js_expression,
@@ -3171,8 +3211,7 @@ impl ObscuraJsRuntime {
         js_expression: &str,
     ) -> Result<RemoteObjectInfo, String> {
         self.begin_javascript_task();
-        self.object_counter += 1;
-        let oid = self.make_oid(self.object_counter);
+        let oid = self.make_oid(Some(self.cdp_context_id));
         let code = format!(
             "(function() {{\n\
                 var __result = (\n{expr}\n);\n\
@@ -3246,13 +3285,13 @@ impl ObscuraJsRuntime {
 
     pub fn take_cdp_object_state(&mut self) -> CdpObjectState {
         CdpObjectState {
-            object_counter: self.object_counter,
+            object_namespace: self.object_namespace,
             evaluation_recipes: std::mem::take(&mut self.evaluation_recipes),
         }
     }
 
     pub fn restore_cdp_object_state(&mut self, state: CdpObjectState) {
-        self.object_counter = self.object_counter.max(state.object_counter);
+        if state.object_namespace != 0 { self.object_namespace = state.object_namespace; }
         self.evaluation_recipes = state.evaluation_recipes;
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
@@ -3284,7 +3323,7 @@ impl ObscuraJsRuntime {
         // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
-        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+        let load = entered_runtime_future(&mut self.js_runtime, self.watchdog_scope.clone(), |runtime| {
             runtime.load_side_es_module(&specifier)
         });
         let module_id = match tokio::time::timeout(budget, load).await {
@@ -3428,7 +3467,7 @@ impl ObscuraJsRuntime {
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
         let loaded_start = self.loaded_module_specifiers.borrow().len();
 
-        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+        let load = entered_runtime_future(&mut self.js_runtime, self.watchdog_scope.clone(), |runtime| {
             runtime.load_side_es_module_from_code(
                 &specifier,
                 deno_core::ModuleCodeString::from(code.to_string()),
@@ -3683,7 +3722,7 @@ impl ObscuraJsRuntime {
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
         self.runtime().v8_isolate().perform_microtask_checkpoint();
-        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+        let event_loop = entered_runtime_future(&mut self.js_runtime, self.watchdog_scope.clone(), |runtime| {
             runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
         });
         let result = event_loop
@@ -3808,7 +3847,7 @@ impl ObscuraJsRuntime {
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
-        spawn_watchdog(self.runtime().v8_isolate().thread_safe_handle(), budget)
+        self.arm_execution_watchdog(Some(budget))
     }
 
     /// Stop a watchdog armed by [`Self::arm_watchdog`]. If it had already fired
@@ -3818,9 +3857,24 @@ impl ObscuraJsRuntime {
         let fired = token.stop();
         if fired {
             self.runtime().v8_isolate().cancel_terminate_execution();
-            tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
+            tracing::warn!("V8 execution terminated; cleared the isolate for subsequent work");
         }
         fired
+    }
+
+    /// Identify the owning page before any parser or user script executes.
+    pub fn set_watchdog_scope(&mut self, page_id: &str) {
+        self.watchdog_scope = Some(crate::cdp_watchdog::ExecutionScope::new(
+            std::thread::current().id(), page_id,
+        ));
+    }
+
+    /// Arm execution using this runtime's page identity, including when only
+    /// explicit interruption (and no automatic deadline) is requested.
+    pub fn arm_execution_watchdog(&self, budget: Option<std::time::Duration>) -> WatchdogToken {
+        WatchdogToken { armed: Some(crate::cdp_watchdog::arm_scoped(
+            self.isolate_handle(), budget, self.watchdog_scope.clone(),
+        )) }
     }
 
     /// This runtime's V8 isolate handle (captured at construction, stable for
@@ -3987,14 +4041,13 @@ impl ObscuraJsRuntime {
         self.service_render_resources();
         self.begin_javascript_task();
 
-        let checkpoint_watchdog = crate::cdp_watchdog::arm(
-            self.isolate_handle(),
+        let checkpoint_watchdog = self.arm_execution_watchdog(Some(
             std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
-        );
+        ));
         self.runtime().v8_isolate().perform_microtask_checkpoint();
-        if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
+        if checkpoint_watchdog.stop() {
             self.cancel_termination();
-            return Err("autonomous microtask checkpoint exceeded its task budget".into());
+            return Err("autonomous microtask checkpoint was terminated".into());
         }
         if self.recover_heap_limit() {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
@@ -4003,22 +4056,20 @@ impl ObscuraJsRuntime {
         // Let the page adopt frame documents and deliver messages before parking.
         if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() { return Ok(false); }
 
-        let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
             let task_generation = self.state.borrow().animation_task_generation;
-            let watchdog = crate::cdp_watchdog::arm(
-                isolate_handle.clone(),
+            let watchdog = self.arm_execution_watchdog(Some(
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
-            );
+            ));
             let tick = self
                 .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
-            let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
+            let watchdog_fired = watchdog.stop();
             if watchdog_fired {
                 self.runtime().v8_isolate().cancel_terminate_execution();
                 return std::task::Poll::Ready(Err(
-                    "autonomous browser task exceeded its task budget".into(),
+                    "autonomous browser task was terminated".into(),
                 ));
             }
             if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() {
@@ -4232,7 +4283,7 @@ impl ObscuraJsRuntime {
     pub async fn resolve_promises(&mut self) {
         self.begin_javascript_task();
         // Default settle: just pump until idle or 5s.
-        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+        let event_loop = entered_runtime_future(&mut self.js_runtime, self.watchdog_scope.clone(), |runtime| {
             runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
         });
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), event_loop).await;
@@ -4495,16 +4546,29 @@ impl ObscuraJsRuntime {
             None
         }
     }
-    /// Set the executionContextId that objectIds minted from now on carry.
-    pub fn set_cdp_context_id(&mut self, id: i64) {
-        self.cdp_context_id = id;
+    /// The CDP layer binds only a context it has validated for this page.
+    #[doc(hidden)]
+    pub fn set_cdp_context_id(&mut self, context_id: i64) {
+        self.cdp_context_id = context_id;
     }
 
-    /// Chrome shape `<isolateId>.<executionContextId>.<objectId>`. Clients such
-    /// as Patchright parse the middle segment as the owning context.
-    fn make_oid(&self, _counter: u64) -> String {
+    fn cdp_object_context_id(&self, object_id: &str) -> Option<i64> {
+        // Callers have already validated the exact handle. Parsing identifies
+        // its owner, never authorizes a handle.
+        let mut parts = object_id.split('.');
+        if parts.next().and_then(|id| id.parse::<u128>().ok()) == Some(self.object_namespace) {
+            parts.next().and_then(|id| id.parse().ok())
+        } else { None }
+    }
+
+    fn make_oid(&self, context_id: Option<i64>) -> String {
         let id = NEXT_CDP_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("1.{}.{}", self.cdp_context_id, id)
+        match context_id {
+            Some(context) => format!("{}.{context}.{id}", self.object_namespace),
+            // Legacy console/node handles have no logical-world provenance.
+            // Keep derived handles opaque rather than claim an incorrect world.
+            None => format!("{{\"injectedScriptId\":1,\"id\":{id}}}"),
+        }
     }
 
     fn wrap_expression(expression: &str) -> String {
@@ -4630,10 +4694,14 @@ impl ObscuraJsRuntime {
         &mut self,
         argument: &serde_json::Value,
         context: &v8::Global<v8::Context>,
+        context_id: Option<i64>,
     ) -> Result<v8::Global<v8::Value>, String> {
         // Remote handles take precedence over value, including rod's value:null.
         if let Some(id) = argument.get("objectId").and_then(|value| value.as_str()) {
             let expression = self.cdp_object_expression(id)?;
+            if let (Some(owner), Some(target)) = (self.cdp_object_context_id(id), context_id) {
+                if owner != target { return Err("Object belongs to a different execution context".into()); }
+            }
             let object_context = self.object_store.get(id).and_then(|record| record.frame.as_ref())
                 .map(|(_, context)| context.clone()).unwrap_or_else(|| self.runtime().main_context());
             if &object_context != context {

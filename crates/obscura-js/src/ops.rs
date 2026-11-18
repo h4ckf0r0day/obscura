@@ -80,6 +80,66 @@ pub struct StoredNetworkResponseBody {
     pub base64_encoded: bool,
 }
 
+/// Retain transport bytes once; text decoding is only a DevTools presentation.
+#[derive(Debug, Clone)]
+pub enum CachedNetworkResponseBody {
+    Raw { bytes: Vec<u8>, content_type: Option<String> },
+    // Already-decoded static resources keep their existing native store path.
+    Bytes { bytes: Vec<u8>, base64_encoded: bool },
+    Encoded(StoredNetworkResponseBody),
+}
+
+impl CachedNetworkResponseBody {
+    pub fn raw(bytes: &[u8], content_type: Option<&str>) -> Self {
+        Self::Raw { bytes: bytes.to_vec(), content_type: content_type.map(str::to_string) }
+    }
+
+    pub fn decoded(&self) -> StoredNetworkResponseBody {
+        match self {
+            Self::Encoded(body) => body.clone(),
+            Self::Bytes { bytes, base64_encoded } => StoredNetworkResponseBody {
+                body: if *base64_encoded { BASE64.encode(bytes) } else { String::from_utf8_lossy(bytes).into_owned() },
+                base64_encoded: *base64_encoded,
+            },
+            Self::Raw { bytes, content_type } => {
+                match obscura_net::encoding::decode_devtools_response_body(bytes, content_type.as_deref()) {
+                    Some(body) => StoredNetworkResponseBody { body, base64_encoded: false },
+                    None => StoredNetworkResponseBody { body: BASE64.encode(bytes), base64_encoded: true },
+                }
+            }
+        }
+    }
+
+    pub fn raw_bytes(&self) -> Option<(Vec<u8>, bool)> {
+        match self {
+            Self::Raw { bytes, content_type } => {
+                let text_like = content_type.as_deref().map_or(true, |header| {
+                    let mime = header.split(';').next().unwrap_or(header).trim().to_ascii_lowercase();
+                    mime.is_empty() || mime.starts_with("text/")
+                        || matches!(mime.as_str(), "application/json" | "application/xml"
+                            | "application/xhtml+xml" | "application/javascript"
+                            | "application/ecmascript" | "image/svg+xml")
+                        || mime.ends_with("+json") || mime.ends_with("+xml")
+                });
+                Some((bytes.clone(), !text_like))
+            }
+            Self::Bytes { bytes, base64_encoded } => Some((bytes.clone(), *base64_encoded)),
+            Self::Encoded(body) => Some((if body.base64_encoded {
+                BASE64.decode(body.body.as_bytes()).ok()?
+            } else { body.body.as_bytes().to_vec() }, body.base64_encoded)),
+        }
+    }
+
+    pub fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Raw { bytes, .. } => Some(bytes),
+            Self::Bytes { bytes, .. } => Some(bytes),
+            Self::Encoded(body) if body.base64_encoded => BASE64.decode(body.body.as_bytes()).ok(),
+            Self::Encoded(body) => Some(body.body.into_bytes()),
+        }
+    }
+}
+
 /// A network request made from page JS (fetch()/XHR/dynamic resource) recorded
 /// so the CDP layer can emit Network.requestWillBeSent / responseReceived for
 /// it. Static navigation subresources go through Page::record_network_event;
@@ -489,7 +549,7 @@ pub struct ObscuraState {
     pub pending_console_messages: VecDeque<String>,
     pub console_messages_enabled: bool,
     pub runtime_exception_counter: u64,
-    pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
+    pub network_response_bodies: HashMap<String, CachedNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
     // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
@@ -1009,26 +1069,23 @@ fn response_body_byte_limit() -> usize {
 fn record_js_network_completion(
     state: &RefCell<OpState>,
     event: JsNetworkEvent,
-    body: &str,
-    base64_encoded: bool,
+    body: impl FnOnce(&JsNetworkEvent) -> CachedNetworkResponseBody,
 ) {
     let state_borrow = state.borrow();
     let gs = state_borrow.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
-    record_network_completion(&mut gs, event, || StoredNetworkResponseBody {
-        body: body.to_string(), base64_encoded,
-    });
+    record_network_completion(&mut gs, event, body);
 }
 
 pub(crate) fn record_network_completion(
     gs: &mut ObscuraState,
     event: JsNetworkEvent,
-    body: impl FnOnce() -> StoredNetworkResponseBody,
+    body: impl FnOnce(&JsNetworkEvent) -> CachedNetworkResponseBody,
 ) {
     let max_entries = response_body_entry_limit();
     let max_bytes = response_body_byte_limit();
     if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
-        gs.network_response_bodies.insert(event.request_id.clone(), body());
+        gs.network_response_bodies.insert(event.request_id.clone(), body(&event));
         gs.network_response_body_order.push_back(event.request_id.clone());
         while gs.network_response_body_order.len() > max_entries {
             if let Some(oldest) = gs.network_response_body_order.pop_front() {
@@ -1045,6 +1102,48 @@ fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
     if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
         let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
         gs.js_network_events.drain(0..overflow);
+    }
+}
+
+#[cfg(test)]
+mod retained_body_tests {
+    use super::*;
+
+    fn event(id: &str, size: usize) -> JsNetworkEvent {
+        JsNetworkEvent {
+            request_id: id.into(), intercepted: false, url: "https://example.test/body".into(),
+            method: "GET".into(), resource_type: "Fetch".into(), status: 200,
+            response_headers: HashMap::new(), body_size: size, timestamp: 0.0, error_text: None,
+        }
+    }
+
+    #[test]
+    fn disabled_or_oversized_retention_does_not_construct_a_body() {
+        let mut state = ObscuraState::new();
+        for (entries, bytes, size) in [("0", "8", 1), ("8", "0", 1), ("8", "3", 4)] {
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", entries);
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", bytes);
+            record_network_completion(&mut state, event("uncached", size), |_| panic!("retention disabled"));
+            assert!(state.network_response_bodies.is_empty());
+        }
+        assert_eq!(state.js_network_events.len(), 3);
+    }
+
+    #[test]
+    fn retained_bytes_obey_the_source_byte_limit_and_completion_order() {
+        std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "2");
+        std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", "3");
+        let mut state = ObscuraState::new();
+        for id in ["one", "two", "three"] {
+            record_network_completion(&mut state, event(id, 3), |_| {
+                CachedNetworkResponseBody::raw(&[0, 255, 128], Some("application/octet-stream"))
+            });
+        }
+        assert_eq!(state.network_response_bodies.len(), 2);
+        assert!(!state.network_response_bodies.contains_key("one"));
+        let body = state.network_response_bodies.remove("two").unwrap();
+        assert_eq!(body.decoded().body, "AP+A");
+        assert_eq!(body.into_bytes().unwrap(), [0, 255, 128]);
     }
 }
 
@@ -2178,7 +2277,7 @@ fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
         return false;
     };
     let node_id = NodeId::new(nid);
-    if !node_is_script(dom, node_id) {
+    if !node_is_script(dom, node_id) || dom.parser_script_already_started(node_id) {
         return false;
     }
     let newly_started = state.already_started_scripts.borrow_mut().insert(node_id);
@@ -3401,6 +3500,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 let fragment = obscura_dom::parse_fragment_with_context(html, context_name);
                 let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
+                // Range EOF scripts also keep copies inert; document-parser
+                // EOF scripts instead allow fresh explicit clones in Chromium.
+                if fragment.has_parser_started_scripts() {
+                    gs.already_started_scripts.borrow_mut().extend(
+                        script_nodes_including_template_contents(dom, target).into_iter()
+                            .filter(|node| dom.parser_script_already_started(*node)));
+                }
             }
             "true".into()
         }
@@ -3415,12 +3521,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let mut slot = gs.write_stream.borrow_mut();
             let placements = if cmd == "document_write_close" {
                 let Some(mut stream) = slot.take() else { return "[]".into(); };
-                let placements = stream.close(dom);
-                // EOF in a script's text insertion mode marks it already started.
-                // Newly released scripts have no closing tag and must not execute.
-                gs.already_started_scripts.borrow_mut().extend(placements.iter()
-                    .filter(|p| node_is_script(dom, p.node)).map(|p| p.node));
-                placements
+                stream.close(dom)
             } else {
                 slot.get_or_insert_with(|| DocumentWriteStream::new(false)).write(&arg2, dom)
             };
@@ -4518,7 +4619,9 @@ async fn fetch_url_inner(
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs_f64(),
-                    }, if encoded { &bb } else { &b }, encoded);
+                    }, |_| CachedNetworkResponseBody::Encoded(StoredNetworkResponseBody {
+                        body: if encoded { bb.clone() } else { b.clone() }, base64_encoded: encoded,
+                    }));
                     let mut response = intercept_fulfill_response(
                         status,
                         h,
@@ -5031,7 +5134,9 @@ async fn fetch_url_inner(
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+            }, |event| CachedNetworkResponseBody::raw(
+                &resp_bytes, event.response_headers.get("content-type").map(String::as_str),
+            ));
         }
         network_guard.event = None;
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
@@ -5285,7 +5390,9 @@ async fn stealth_fetch_all(
             event.body_size = resp_bytes.len();
             event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs_f64();
-            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+            record_js_network_completion(&state, event, |event| CachedNetworkResponseBody::raw(
+                &resp_bytes, event.response_headers.get("content-type").map(String::as_str),
+            ));
         } else { network_guard.event = None; }
         Ok(resp_bytes)
     });

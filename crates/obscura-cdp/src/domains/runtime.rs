@@ -38,16 +38,16 @@ impl DeferredEvaluation {
             js.cancel_cdp_evaluation(self.pending);
             return Err(format!("Runtime.{} promise did not settle within {}ms", self.method, self.timeout_ms));
         }
-        let watchdog = remaining.map(|budget| obscura_js::runtime::spawn_watchdog(js.isolate_handle(), budget));
+        let watchdog = js.arm_execution_watchdog(remaining);
         let result = match js.finish_cdp_evaluation(self.pending, self.return_by_value) {
             Ok(info) => emit_post_eval_nav(ctx, session_id).await.map(|_| evaluation_reply(&info)),
             Err(error) => Err(error),
         };
-        if watchdog.is_some_and(|watchdog| watchdog.stop()) {
+        if watchdog.stop() {
             if let Some(js) = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut()) {
                 js.cancel_termination();
             }
-            return Err("Runtime result serialization exceeded its task budget".into());
+            return Err("Runtime result serialization was terminated".into());
         }
         result
     }
@@ -61,7 +61,7 @@ pub(crate) async fn start_awaited_evaluation(
     command_budget_ms: u64,
 ) -> Result<Option<DeferredEvaluation>, String> {
     let field = if method == "evaluate" { "contextId" } else { "executionContextId" };
-    let frame_id = validate_context(params, field, ctx, session_id, method)?;
+    let (frame_id, context_id) = validate_context(params, field, ctx, session_id, method)?;
     let return_by_value = params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false);
     let timeout_ms = params.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -69,6 +69,7 @@ pub(crate) async fn start_awaited_evaluation(
     let deadline = command_deadline.map_or(deadline, |command| deadline.min(command));
     let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
     let Some(js) = page.js.as_mut() else { return Ok(None); };
+    js.set_cdp_context_id(context_id);
     let evaluation = if method == "evaluate" {
         js.start_cdp_evaluation_in_frame(
             frame_id, params.get("expression").and_then(Value::as_str).ok_or("expression required")?,
@@ -292,7 +293,7 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            let frame_id = validate_context(params, "contextId", ctx, session_id, "evaluate")?;
+            let (frame_id, context_id) = validate_context(params, "contextId", ctx, session_id, "evaluate")?;
 
             let await_promise = params
                 .get("awaitPromise")
@@ -310,13 +311,12 @@ pub async fn handle(
 
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                with_live_peers(ctx, session_id, |page| page.evaluate_for_cdp_in_frame_with_timeout(
-                    frame_id,
-                    expression,
-                    return_by_value,
-                    await_promise,
-                    timeout_ms,
-                )),
+                with_live_peers(ctx, session_id, |page| {
+                    if let Some(js) = page.js.as_mut() { js.set_cdp_context_id(context_id); }
+                    page.evaluate_for_cdp_in_frame_with_timeout(
+                        frame_id, expression, return_by_value, await_promise, timeout_ms,
+                    )
+                }),
             )
             .await
             {
@@ -357,7 +357,7 @@ pub async fn handle(
             // callFunctionOn (not `contextId`); a request may omit it when
             // `objectId` is supplied — in that case context validation is a
             // no-op and the native call uses the handle's recorded evaluation realm.
-            let frame_id = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
+            let (frame_id, context_id) = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
 
             // Keep awaitPromise alive for the same command budget as evaluate.
             // Playwright implements waits with callFunctionOn on some utility
@@ -370,15 +370,13 @@ pub async fn handle(
 
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                with_live_peers(ctx, session_id, |page| page.call_function_on_for_cdp_in_frame_with_timeout(
-                    frame_id,
-                    function_declaration,
-                    object_id,
-                    &arguments,
-                    return_by_value,
-                    await_promise,
-                    timeout_ms,
-                )),
+                with_live_peers(ctx, session_id, |page| {
+                    if let Some(js) = page.js.as_mut() { js.set_cdp_context_id(context_id); }
+                    page.call_function_on_for_cdp_in_frame_with_timeout(
+                        frame_id, function_declaration, object_id, &arguments,
+                        return_by_value, await_promise, timeout_ms,
+                    )
+                }),
             )
             .await
             {
@@ -615,22 +613,35 @@ pub async fn handle(
 /// context Obscura has not advertised for the attached page. An absent identity
 /// uses the page's default context. Direct embedders retain the compatibility
 /// path for ids reserved through `next_isolated_context`.
-fn validate_context(
+pub(super) fn validate_context(
     params: &Value,
     field: &str,
-    ctx: &crate::dispatch::CdpContext,
+    ctx: &mut crate::dispatch::CdpContext,
     session_id: &Option<String>,
     method: &str,
-) -> Result<Option<u32>, String> {
+) -> Result<(Option<u32>, i64), String> {
     let id = params.get(field).and_then(|value| value.as_i64());
     let unique_id = params.get("uniqueContextId").and_then(|value| value.as_str());
+    if method == "callFunctionOn" && params.get("objectId").is_some()
+        && (id.is_some() || unique_id.is_some())
+    {
+        return Err("ObjectId, executionContextId and uniqueContextId must mutually exclude each other".into());
+    }
     if id.is_some() && unique_id.is_some() {
         return Err(format!(
             "Runtime.{method} cannot specify both {field} and uniqueContextId"
         ));
     }
     if id.is_none() && unique_id.is_none() {
-        return Ok(None);
+        let page_id = session_id.as_ref().and_then(|session| ctx.sessions.get(session));
+        let context_id = if let Some(id) = page_id.and_then(|page| ctx.default_context_id(page)) {
+            id
+        } else {
+            let page_id = page_id.cloned();
+            page_id.and_then(|page| ctx.ensure_default_context(&page))
+                .map(|context| context.id).unwrap_or(1)
+        };
+        return Ok((None, context_id));
     }
     let record = id.and_then(|id| ctx.context_by_id(id))
         .or_else(|| unique_id.and_then(|id| ctx.context_by_unique_id(id)));
@@ -638,13 +649,13 @@ fn validate_context(
         let owner = session_id.as_ref().and_then(|session| ctx.sessions.get(session));
         if owner == Some(&record.page_id) {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            if record.frame_id == page.frame_id { return Ok(None); }
+            if record.frame_id == page.frame_id { return Ok((None, record.id)); }
             if let Some(frame_id) = record.frame_id.strip_prefix(&page.frame_id)
                 .and_then(|suffix| suffix.strip_prefix("-frame-"))
                 .and_then(|id| id.parse::<u32>().ok())
             {
                 if page.frames.iter().any(|frame| frame.frame_id() == frame_id) {
-                    return Ok(Some(frame_id));
+                    return Ok((Some(frame_id), record.id));
                 }
             }
         }
@@ -653,7 +664,7 @@ fn validate_context(
     {
         // Direct embedders can still reserve an id through the existing public
         // next_isolated_context API. Attached sessions require page ownership.
-        return Ok(None);
+        return Ok((None, id.unwrap()));
     }
     let identity = id.map(|id| id.to_string())
         .or_else(|| unique_id.map(str::to_string))
@@ -664,7 +675,7 @@ fn validate_context(
             identity
         ));
     }
-    Ok(None)
+    Ok((None, id.unwrap_or(1)))
 }
 
 /// Shape one `Runtime.evaluate` or `Runtime.callFunctionOn` reply.
@@ -728,6 +739,184 @@ fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    fn object_context(reply: &Value) -> (&str, i64) {
+        let oid = reply["result"]["objectId"].as_str().expect("remote object");
+        let mut parts = oid.split('.');
+        let namespace = parts.next().unwrap();
+        assert!(namespace.parse::<u128>().is_ok(), "numeric runtime namespace: {oid}");
+        let context = parts.next().unwrap_or("").parse().expect("Patchright context id");
+        assert!(!parts.next().unwrap_or("").is_empty(), "object identity: {oid}");
+        (namespace, context)
+    }
+
+    fn object_page(ctx: &mut CdpContext) -> (String, Option<String>) {
+        let page = ctx.create_page();
+        let session = Some(format!("{page}-objects"));
+        ctx.sessions.insert(session.clone().unwrap(), page.clone());
+        (page, session)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn object_ids_identify_the_owning_context_and_runtime() {
+        let mut ctx = CdpContext::new();
+        let (first, session) = object_page(&mut ctx);
+        let main = handle("evaluate", &json!({"expression":"globalThis"}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&main).1, ctx.default_context_id(&first).unwrap());
+        let frame = ctx.get_page(&first).unwrap().frame_id.clone();
+        let isolated = crate::domains::page::handle("createIsolatedWorld",
+            &json!({"frameId":frame,"worldName":"object-world"}), &mut ctx, &session).await.unwrap()["executionContextId"].as_i64().unwrap();
+        let value = handle("evaluate", &json!({"expression":"({nested:{answer:42}})","contextId":isolated}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&value), (object_context(&main).0, isolated));
+        let oid = value["result"]["objectId"].as_str().unwrap();
+        let props = handle("getProperties", &json!({"objectId":oid,"ownProperties":true}), &mut ctx, &session).await.unwrap();
+        let child = props["result"].as_array().unwrap().iter().find(|p| p["name"] == "nested").unwrap()["value"]["objectId"].as_str().unwrap();
+        let derived = handle("callFunctionOn", &json!({"objectId":child,"functionDeclaration":"function(){return {answer:this.answer}}"}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&derived).1, isolated);
+        let argument = json!({"objectId":oid});
+        let same_world = handle("callFunctionOn", &json!({"executionContextId":isolated,
+            "functionDeclaration":"function(value){return value.nested.answer}","arguments":[argument],"returnByValue":true}), &mut ctx, &session).await.unwrap();
+        assert_eq!(same_world["result"]["value"], json!(42.0));
+        assert!(handle("callFunctionOn", &json!({"executionContextId":object_context(&main).1,
+            "functionDeclaration":"function(value){return value}","arguments":[argument]}), &mut ctx, &session).await.is_err());
+        assert!(handle("callFunctionOn", &json!({"objectId":oid,"executionContextId":isolated,
+            "functionDeclaration":"function(){return this}"}), &mut ctx, &session).await.is_err());
+        let (_, other) = object_page(&mut ctx);
+        let other_value = handle("evaluate", &json!({"expression":"globalThis"}), &mut ctx, &other).await.unwrap();
+        assert_ne!(object_context(&main).0, object_context(&other_value).0);
+        assert!(handle("callFunctionOn", &json!({"objectId":oid,"functionDeclaration":"function(){return 1}"}), &mut ctx, &other).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn object_ids_preserve_supported_frame_contexts() {
+        let mut ctx = CdpContext::new();
+        let (page, session) = object_page(&mut ctx);
+        crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<iframe srcdoc=\"<p>child</p>\"></iframe>"}), &mut ctx, &session).await.unwrap();
+        crate::dispatch::drain_frame_events(&mut ctx);
+        let main_frame = ctx.get_page(&page).unwrap().frame_id.clone();
+        let child = ctx.contexts_for_page(&page).find(|record| record.is_default && record.frame_id != main_frame).unwrap().clone();
+        let value = handle("evaluate", &json!({"expression":"({node:document.querySelector('p')})","uniqueContextId":child.unique_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&value).1, child.id);
+        let properties = handle("getProperties", &json!({"objectId":value["result"]["objectId"]}), &mut ctx, &session).await.unwrap();
+        let oid = &properties["result"][0]["value"]["objectId"];
+        let called = handle("callFunctionOn", &json!({"objectId":oid,"functionDeclaration":"function(){return {text:this.textContent}}"}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&called).1, child.id);
+        let answer = handle("callFunctionOn", &json!({"objectId":called["result"]["objectId"],"functionDeclaration":"function(){return this.text}","returnByValue":true}), &mut ctx, &session).await.unwrap();
+        assert_eq!(answer["result"]["value"], "child");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn object_ids_keep_parent_nodes_when_frame_arenas_reuse_their_ids() {
+        let mut ctx = CdpContext::new();
+        let (page, session) = object_page(&mut ctx);
+        crate::domains::page::handle("navigate", &json!({"url":
+            r#"data:text/html,<!doctype html><title>parent</title><div id=parent>PARENT ELEMENT</div><iframe srcdoc="<!doctype html><title>child</title><div id=child>CHILD ELEMENT</div>"></iframe>"#,
+        }), &mut ctx, &session).await.unwrap();
+        crate::dispatch::drain_frame_events(&mut ctx);
+        let main_frame = ctx.get_page(&page).unwrap().frame_id.clone();
+        let child = ctx.contexts_for_page(&page).find(|record| record.is_default && record.frame_id != main_frame).unwrap().id;
+        let parent_node = ctx.get_page(&page).unwrap().with_dom(|dom| dom.get_element_by_id("parent").unwrap().index()).unwrap();
+        let child_node = handle("evaluate", &json!({"expression":"document.getElementById('child')._nid","contextId":child,"returnByValue":true}), &mut ctx, &session).await.unwrap();
+        assert_eq!(child_node["result"]["value"].as_f64().unwrap(), parent_node as f64, "the two document arenas must collide for this regression");
+        let resolved = crate::domains::dom::handle("resolveNode", &json!({"backendNodeId":parent_node,"executionContextId":child}), &mut ctx, &session).await.unwrap();
+        let result = json!({"result":resolved["object"]});
+        assert_eq!(object_context(&result).1, ctx.default_context_id(&page).unwrap());
+        let value = handle("callFunctionOn", &json!({"objectId":resolved["object"]["objectId"],
+            "functionDeclaration":"function(){return [this.id,this.textContent,this.ownerDocument.URL]}","returnByValue":true}), &mut ctx, &session).await.unwrap();
+        assert_eq!(value["result"]["value"], json!(["parent","PARENT ELEMENT",ctx.get_page(&page).unwrap().url_string()]));
+        let child_object = handle("evaluate", &json!({"expression":"document.getElementById('child')","contextId":child}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&child_object).1, child);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn object_ids_keep_legacy_console_frame_arguments_usable() {
+        let mut ctx = CdpContext::new();
+        let (page, session) = object_page(&mut ctx);
+        crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<iframe srcdoc=\"<p>child</p>\"></iframe>"}), &mut ctx, &session).await.unwrap();
+        crate::dispatch::drain_frame_events(&mut ctx);
+        handle("enable", &json!({}), &mut ctx, &session).await.unwrap();
+        let main_frame = ctx.get_page(&page).unwrap().frame_id.clone();
+        let child = ctx.contexts_for_page(&page).find(|record| record.is_default && record.frame_id != main_frame).unwrap().id;
+        let value = handle("evaluate", &json!({"expression":"globalThis.consoleValue={answer:42};console.log(consoleValue);consoleValue","contextId":child}), &mut ctx, &session).await.unwrap();
+        let events = ctx.get_page_mut(&page).unwrap().take_pending_runtime_events();
+        let console_oid = events.iter().find_map(|event| match event {
+            obscura_js::ops::RuntimeEvent::Console(event) => event.args.iter().find_map(|arg| arg["objectId"].as_str()),
+            _ => None,
+        }).expect("retained console object");
+        assert!(console_oid.starts_with("console-"));
+        let called = handle("callFunctionOn", &json!({"objectId":console_oid,
+            "functionDeclaration":"function(value){return {answer:this.answer+value.answer}}",
+            "arguments":[{"objectId":value["result"]["objectId"]}]}), &mut ctx, &session).await.unwrap();
+        let result_oid = called["result"]["objectId"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(result_oid).unwrap()["injectedScriptId"], 1);
+        let answer = handle("callFunctionOn", &json!({"objectId":result_oid,
+            "functionDeclaration":"function(){return this.answer}","returnByValue":true}), &mut ctx, &session).await.unwrap();
+        assert_eq!(answer["result"]["value"], json!(84.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn object_ids_keep_the_start_context_while_promises_are_pending() {
+        let mut ctx = CdpContext::new();
+        let (page, session) = object_page(&mut ctx);
+        let frame = ctx.get_page(&page).unwrap().frame_id.clone();
+        let isolated = crate::domains::page::handle("createIsolatedWorld",
+            &json!({"frameId":frame,"worldName":"pending-world"}), &mut ctx, &session).await.unwrap()["executionContextId"].as_i64().unwrap();
+        let pending = start_awaited_evaluation("evaluate", &json!({
+            "expression":"new Promise(resolve=>{globalThis.finishObject=()=>resolve({answer:42})})",
+            "contextId":isolated,"timeout":1000,
+        }), &mut ctx, &session, 1000).await.unwrap().unwrap();
+        let main = handle("evaluate", &json!({"expression":"globalThis"}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&main).1, ctx.default_context_id(&page).unwrap());
+        handle("evaluate", &json!({"expression":"finishObject()","returnByValue":true}), &mut ctx, &session).await.unwrap();
+        let js = ctx.get_page_mut(&page).unwrap().js.as_mut().unwrap();
+        assert!(js.resolve_promises_until(|js| js.cdp_evaluation_ready(&pending.pending), 1000).await);
+        let completed = pending.finish(&mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&completed).1, isolated);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn object_ids_resolve_nodes_in_a_validated_fresh_context() {
+        let mut ctx = CdpContext::new();
+        let (_, first) = object_page(&mut ctx);
+        handle("evaluate", &json!({"expression":"globalThis"}), &mut ctx, &first).await.unwrap();
+        let (page, session) = object_page(&mut ctx);
+        let document = crate::domains::dom::handle("getDocument", &json!({}), &mut ctx, &session).await.unwrap();
+        let node = document["root"]["nodeId"].as_u64().unwrap();
+        assert!(ctx.get_page(&page).unwrap().js.is_none(), "DOM-only lookup must stay lazy");
+        let resolved = crate::domains::dom::handle("resolveNode", &json!({"nodeId":node}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&json!({"result":resolved["object"]})).1, ctx.default_context_id(&page).unwrap());
+        let frame = ctx.get_page(&page).unwrap().frame_id.clone();
+        let isolated = crate::domains::page::handle("createIsolatedWorld", &json!({"frameId":frame,"worldName":"dom-world"}), &mut ctx, &session).await.unwrap()["executionContextId"].as_i64().unwrap();
+        let resolved = crate::domains::dom::handle("resolveNode", &json!({"nodeId":node,"executionContextId":isolated}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&json!({"result":resolved["object"]})).1, isolated);
+        assert!(crate::domains::dom::handle("resolveNode", &json!({"nodeId":node,"executionContextId":999999}), &mut ctx, &session).await.is_err());
+        ctx.get_page_mut(&page).unwrap().evaluate("globalThis._wrap=()=>null");
+        let error = crate::domains::dom::handle("resolveNode", &json!({"nodeId":node}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("Could not resolve node"), "no fabricated node handle: {error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn object_ids_survive_runtime_replay_but_not_release_or_navigation() {
+        let mut ctx = CdpContext::new();
+        let (page, session) = object_page(&mut ctx);
+        let original = handle("evaluate", &json!({"expression":"({answer:42})"}), &mut ctx, &session).await.unwrap();
+        let oid = original["result"]["objectId"].as_str().unwrap();
+        ctx.get_page_mut(&page).unwrap().suspend_js();
+        let replayed = handle("callFunctionOn", &json!({"objectId":oid,"functionDeclaration":"function(){return {answer:this.answer}}"}), &mut ctx, &session).await.unwrap();
+        assert_eq!(object_context(&original), object_context(&replayed));
+        let value = handle("callFunctionOn", &json!({"objectId":oid,"functionDeclaration":"function(){return this.answer}","returnByValue":true}), &mut ctx, &session).await.unwrap();
+        assert_eq!(value["result"]["value"], json!(42.0));
+        for forged in [format!("{}.{}.999999999",object_context(&original).0,object_context(&original).1), "{\"injectedScriptId\":1,\"id\":999999999}".into()] {
+            assert!(handle("callFunctionOn", &json!({"objectId":forged,"functionDeclaration":"function(){return 1}"}), &mut ctx, &session).await.is_err());
+        }
+        handle("releaseObject", &json!({"objectId":oid}), &mut ctx, &session).await.unwrap();
+        assert!(handle("getProperties", &json!({"objectId":oid}), &mut ctx, &session).await.is_err());
+        let before = handle("evaluate", &json!({"expression":"globalThis"}), &mut ctx, &session).await.unwrap();
+        crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<body>replacement"}), &mut ctx, &session).await.unwrap();
+        let after = handle("evaluate", &json!({"expression":"globalThis"}), &mut ctx, &session).await.unwrap();
+        assert_ne!(object_context(&before).0, object_context(&after).0);
+        assert!(handle("getProperties", &json!({"objectId":before["result"]["objectId"]}), &mut ctx, &session).await.is_err());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn indexeddb_awaited_commands_deliver_peer_versionchange_and_delayed_close() {
