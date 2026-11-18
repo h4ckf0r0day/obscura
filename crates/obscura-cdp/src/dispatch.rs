@@ -52,9 +52,12 @@ pub(crate) struct ExecutionContextRecord {
     pub is_default: bool,
 }
 
+pub(crate) type InterruptRoutes = Arc<std::sync::Mutex<HashMap<String, String>>>;
+
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
+    pub(crate) interrupt_routes: InterruptRoutes,
     /// Current document loader per page. Navigation events and later
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
@@ -184,6 +187,7 @@ impl CdpContext {
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
+            interrupt_routes: Default::default(),
             current_loader_ids: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
@@ -326,6 +330,16 @@ impl CdpContext {
         Ok(page_ids)
     }
 
+    pub(crate) fn attach_session(&mut self, session_id: String, page_id: String) {
+        self.interrupt_routes.lock().unwrap().insert(session_id.clone(), page_id.clone());
+        self.sessions.insert(session_id, page_id);
+    }
+
+    pub(crate) fn detach_session(&mut self, session_id: &str) -> Option<String> {
+        self.interrupt_routes.lock().unwrap().remove(session_id);
+        self.sessions.remove(session_id)
+    }
+
     pub fn get_page(&self, id: &str) -> Option<&Page> {
         self.pages.iter().find(|p| p.id == id)
     }
@@ -391,6 +405,7 @@ impl CdpContext {
         }
         self.page_isolated_worlds.remove(id);
         self.sessions.retain(|_, v| v != id);
+        self.interrupt_routes.lock().unwrap().retain(|_, page| page != id);
     }
 
     fn allocate_context(
@@ -827,13 +842,25 @@ pub(crate) async fn dispatch_with_deferred(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60_000);
-    let cmd_watchdog = if cmd_budget_ms == 0 || is_v8_free_method(&req.method) {
+    let cmd_watchdog = if is_v8_free_method(&req.method) {
         None
     } else {
         ctx.get_session_page(&req.session_id)
-            .and_then(|p| p.isolate_handle())
-            .map(|h| {
-                obscura_js::cdp_watchdog::arm(h, std::time::Duration::from_millis(cmd_budget_ms))
+            .and_then(|p| p.js.as_ref())
+            .map(|js| js.arm_execution_watchdog((cmd_budget_ms != 0)
+                .then(|| std::time::Duration::from_millis(cmd_budget_ms))))
+            .or_else(|| {
+                // Script commands can create their isolate inside the handler.
+                // Arm that first call too, without creating a realm for navigation.
+                if matches!(req.method.as_str(), "Runtime.evaluate" | "Runtime.callFunctionOn")
+                    || (req.method == "Page.addScriptToEvaluateOnNewDocument"
+                        && req.params.get("runImmediately").and_then(serde_json::Value::as_bool) == Some(true)
+                        && req.params.get("source").and_then(serde_json::Value::as_str).is_some_and(|source| !source.is_empty()))
+                {
+                    ctx.get_session_page_mut(&req.session_id).and_then(|p| p.js.as_ref())
+                        .map(|js| js.arm_execution_watchdog((cmd_budget_ms != 0)
+                            .then(|| std::time::Duration::from_millis(cmd_budget_ms))))
+                } else { None }
             })
     };
 
@@ -908,11 +935,10 @@ pub(crate) async fn dispatch_with_deferred(
     // budget), V8 is left in a terminating state, so clear that flag before the
     // next command runs on this page.
     if let Some(wd) = cmd_watchdog {
-        if obscura_js::cdp_watchdog::disarm(wd) {
+        if wd.stop() {
             tracing::warn!(
-                "CDP command {} held V8 past {}ms; terminated the isolate to free the dispatcher",
-                req.method,
-                cmd_budget_ms
+                "CDP command {} was terminated; clearing the isolate for subsequent commands",
+                req.method
             );
             if let Some(page) = ctx.get_session_page_mut(&req.session_id) {
                 page.cancel_v8_termination();

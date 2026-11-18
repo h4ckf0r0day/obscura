@@ -1759,6 +1759,11 @@ pub async fn handle(
             }))
         }
         "getNavigationHistory" => {
+            let changed = {
+                let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                page.sync_history_updates().then(|| (page.frame_id.clone(), page.url_string()))
+            };
+            if let Some((frame, url)) = changed { emit_same_document_navigation(ctx, session_id, &frame, &url); }
             let page = ctx
                 .get_session_page(session_id)
                 .ok_or("No page for session")?;
@@ -1790,6 +1795,14 @@ pub async fn handle(
         }
         "navigateToHistoryEntry" => {
             let entry_id = params.get("entryId").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let same_document = ctx.get_session_page_mut(session_id).ok_or("No page for session")?
+                .traverse_same_document_history(entry_id);
+            if same_document {
+                let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+                let (frame, url) = (page.frame_id.clone(), page.url_string());
+                emit_same_document_navigation(ctx, session_id, &frame, &url);
+                return Ok(json!({}));
+            }
             // Snapshot history and the current cursor BEFORE moving it, so a
             // navigation that fails can roll back to where the page actually is
             // instead of leaving currentIndex on an entry it never reached (#920).
@@ -1861,6 +1874,7 @@ pub async fn handle(
         }
         "resetNavigationHistory" => {
             if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.sync_history_updates();
                 page.set_history(Vec::new(), 0);
             }
             Ok(json!({}))
@@ -2345,6 +2359,32 @@ mod tests {
         handle("removeScriptToEvaluateOnNewDocument", &a, &mut ctx, &session).await.unwrap();
         handle("navigateToHistoryEntry", &json!({"entryId":0}), &mut ctx, &session).await.unwrap();
         assert_eq!(preload_state(&mut ctx, &session).await, json!([0, 1]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_traversal_preserves_the_document_and_state() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        handle("enable", &json!({}), &mut ctx, &session).await.unwrap();
+        handle("navigate", &json!({"url":"data:text/html,<title>history</title>"}), &mut ctx, &session).await.unwrap();
+        let entries = {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.evaluate("(() => { globalThis.marker=42; globalThis.pops=[]; addEventListener('popstate', e=>pops.push(e.state)); history.pushState({n:1}, '', '#one'); })()");
+            page.sync_virtual_url();
+            page.evaluate("history.pushState({n:2}, '', '#two')");
+            page.sync_virtual_url();
+            page.history.clone()
+        };
+        ctx.pending_events.clear();
+        handle("navigateToHistoryEntry", &json!({"entryId":1}), &mut ctx, &session).await.unwrap();
+        let page = ctx.get_session_page_mut(&session).unwrap();
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("[globalThis.marker, history.state, globalThis.pops]"), json!([42, {"n":1}, [{"n":1}]]));
+        assert!(ctx.pending_events.iter().any(|e| e.method == "Page.navigatedWithinDocument"));
+        assert!(!ctx.pending_events.iter().any(|e| e.method == "Page.frameNavigated" || e.method == "Runtime.executionContextsCleared"));
     }
 
     // #920: a history navigation that fails to load must not move the recorded

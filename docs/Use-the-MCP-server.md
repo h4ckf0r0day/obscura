@@ -147,10 +147,10 @@ Autonomous task progress currently belongs to the active tab; retaining a tab
 does not promise that background work runs while another tab is active.
 
 Element references stay valid across clicks, form fills, and scrolling that
-stay on the page, so several actions can use one listing. A navigation or tab
-switch retires all of them, and a framework rerender that replaces an element
-makes its reference stale. Take a fresh snapshot or interactive-element
-listing after either.
+stay on the page, so several actions can use one listing. A document navigation
+attempt or tab switch retires all of them, and a framework rerender that
+replaces an element makes its reference stale. Take a fresh snapshot or
+interactive-element listing after either.
 
 Treat references as opaque tokens. Each new snapshot or interactive-element
 listing invalidates the previous tokens. A reference targets the original

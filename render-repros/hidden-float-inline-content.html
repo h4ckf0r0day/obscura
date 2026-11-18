@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Hidden floats beside inline blocks</title>
+<style>
+body { margin: 0; font: 14px Arial, sans-serif }
+.row { clear: both; height: 28px }
+.item { float: left; background: #ddd }
+.ib { display: inline-block; width: 20px }
+.hidden { display: none; float: left; width: 2000px }
+</style>
+<div class="row"><div class="item" id="reference"><a href="#"><i class="ib"></i>CMS<i class="ib"></i></a></div></div>
+<div class="row"><div class="item" id="hidden-left">
+  <a href="#"><i class="ib"></i>CMS<i class="ib"></i></a>
+  <div class="hidden">Hidden content</div>
+</div></div>
+<div class="row"><div class="item" id="hidden-right">
+  <a href="#"><i class="ib"></i>CMS<i class="ib"></i></a>
+  <div class="hidden" style="float:right">Hidden content</div>
+</div></div>

@@ -68,6 +68,68 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
     }
 }
 
+/// Decode CDP response text without replacing invalid bytes. `None` means the
+/// caller must return the original bytes as Base64, not a lossy UTF-8 string.
+pub fn decode_devtools_response_body(bytes: &[u8], content_type: Option<&str>) -> Option<String> {
+    if bytes.is_empty() { return Some(String::new()); }
+    let header = content_type?;
+    let decode = |encoding: &'static Encoding| {
+        let encoding = Encoding::for_bom(bytes).map_or(encoding, |(encoding, _)| encoding);
+        decode_with_label(encoding.name(), bytes, true, false)
+    };
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut parts = header.split(|c| {
+        if escaped { escaped = false; return false; }
+        if quoted && c == '\\' { escaped = true; return false; }
+        if c == '"' { quoted = !quoted; }
+        c == ';' && !quoted
+    });
+    let mime = parts.next()?.trim().to_ascii_lowercase();
+    for part in parts {
+        let Some((name, value)) = part.trim_start().split_once('=') else { continue };
+        if !name.eq_ignore_ascii_case("charset") { continue; }
+        let value = value.trim();
+        if value.is_empty() { break; }
+        let mut label = String::new();
+        if let Some(value) = value.strip_prefix('"') {
+            let mut chars = value.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => if let Some(c) = chars.next() { label.push(c); },
+                    c => label.push(c),
+                }
+            }
+        } else {
+            label.push_str(value);
+        }
+        if label.is_empty() { break; }
+        // Blink uses its plain-text default for an unrecognized declared label.
+        let encoding = Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::WINDOWS_1252);
+        return decode(encoding);
+    }
+    let encoding = if mime == "text/html" {
+        sniff_meta_charset(bytes).unwrap_or(UTF_8)
+    } else if matches!(mime.as_str(), "text/xml" | "application/xml")
+        || (mime.contains('/') && mime.ends_with("+xml"))
+        || mime == "application/json" || mime == "text/json" || mime.ends_with("+json")
+        || matches!(mime.as_str(),
+            "application/javascript" | "application/ecmascript" | "application/x-ecmascript"
+            | "application/x-javascript" | "text/ecmascript" | "text/javascript"
+            | "text/javascript1.0" | "text/javascript1.1" | "text/javascript1.2"
+            | "text/javascript1.3" | "text/javascript1.4" | "text/javascript1.5"
+            | "text/jscript" | "text/livescript" | "text/x-ecmascript" | "text/x-javascript")
+    {
+        UTF_8
+    } else if mime.starts_with("text/") && mime != "text/xsl" {
+        encoding_rs::WINDOWS_1252
+    } else {
+        return None;
+    };
+    decode(encoding)
+}
+
 /// Decode an HTTP response body. `content_type_header` is the raw header
 /// value if present (e.g. `text/html; charset=gbk`). For HTML resources,
 /// the parser also sniffs `<meta charset>` in the first 1KB.
@@ -300,15 +362,66 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
     // Lossy is fine: any meta charset attribute is ASCII, even on a non-UTF-8 page.
     let s = String::from_utf8_lossy(prefix).to_ascii_lowercase();
 
-    // Look for any `<meta ... charset=...>` pattern in the first 1KB. We
-    // intentionally accept both the modern shorthand (`<meta charset=gbk>`)
-    // and the legacy http-equiv form (`<meta http-equiv="content-type" content="text/html; charset=gbk">`).
     let mut pos = 0;
-    while let Some(meta_start) = s[pos..].find("<meta") {
-        let abs = pos + meta_start;
-        // Find the closing `>` for this meta tag.
-        let end = s[abs..].find('>').map(|e| abs + e).unwrap_or(s.len());
-        let tag = &s[abs..end];
+    let mut raw_text: Option<&str> = None;
+    while let Some(start) = s[pos..].find('<') {
+        let start = pos + start;
+        let rest = &s[start..];
+        if let Some(name) = raw_text {
+            let closes = rest.strip_prefix("</").and_then(|tail| tail.strip_prefix(name))
+                .is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_whitespace() || matches!(c, '/' | '>')));
+            if !closes {
+                pos = start + 1;
+                continue;
+            }
+            raw_text = None;
+        }
+        if rest.starts_with("<!--") {
+            pos = rest.find("-->").map_or(s.len(), |end| start + end + 3);
+            continue;
+        }
+        let closing = rest.starts_with("</");
+        let name_start = start + if closing { 2 } else { 1 };
+        let tail = &s[name_start..];
+        if !tail.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '!' | '?')) {
+            pos = start + 1;
+            continue;
+        }
+        let name_end = name_start + tail.find(|c: char| c.is_ascii_whitespace() || matches!(c, '/' | '>'))
+            .unwrap_or(tail.len());
+        let name = &s[name_start..name_end];
+        // Only quotes beginning an attribute value hide a tag's closing `>`.
+        // The encoding prescan ends declarations/processing instructions at
+        // their first `>`, even when their text resembles quoted attributes.
+        let declaration = name.starts_with('!') || name.starts_with('?');
+        let (mut quote, mut before_value, mut unquoted) = (None, false, false);
+        let end = s[name_end..].char_indices().find_map(|(index, c)| {
+            if declaration { return (c == '>').then_some(name_end + index); }
+            if let Some(q) = quote {
+                if c == q { quote = None; }
+            } else if c == '>' {
+                return Some(name_end + index);
+            } else if c.is_ascii_whitespace() {
+                unquoted = false;
+            } else if before_value {
+                before_value = false;
+                if matches!(c, '\'' | '"') { quote = Some(c); } else { unquoted = true; }
+            } else if !unquoted && c == '=' {
+                before_value = true;
+            }
+            None
+        }).unwrap_or(s.len());
+        // An incomplete response tag is ignored. At the bounded prefix of a
+        // longer response, a complete charset label can still be recognized.
+        if end == s.len() && prefix_len == bytes.len() { break; }
+        let tag = &s[start..end];
+        pos = end.saturating_add(1).min(s.len());
+        if closing { continue; }
+        if name == "plaintext" { break; }
+        if matches!(name, "script" | "style" | "title" | "textarea" | "xmp" | "iframe" | "noembed" | "noframes") {
+            raw_text = Some(name);
+        }
+        if name != "meta" { continue; }
 
         if let Some(enc) = meta_attribute(tag, "charset")
             .filter(|value| !value.is_empty())
@@ -328,10 +441,6 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
             }
         }
 
-        pos = end + 1;
-        if pos >= s.len() {
-            break;
-        }
     }
 
     None
@@ -340,6 +449,53 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devtools_response_text_matches_chromium_mime_and_charset_boundaries() {
+        let cases: &[(&[u8], Option<&str>, Option<&str>)] = &[
+            (&[], None, Some("")),
+            (&[], Some("application/octet-stream"), Some("")),
+            (&[0x81, 0x8d], None, None),
+            (b"ABC", None, None),
+            (b"ABC", Some("application/octet-stream"), None),
+            (&[0xff], Some("application/json"), None),
+            (&[0xff], Some("text/plain"), Some("ÿ")),
+            (&[0xff], Some("text/css"), Some("ÿ")),
+            (&[0xff], Some("text/plain; charset=not-real"), Some("ÿ")),
+            (&[0xff], Some("application/json; charset=not-real"), Some("ÿ")),
+            ("\"€\"".as_bytes(), Some("application/json; charset=\"\""), Some("\"€\"")),
+            ("\"€\"".as_bytes(), Some("application/json; charset=\""), Some("\"€\"")),
+            (&[0x80], Some("application/json; charset=windows-1252"), Some("€")),
+            (&[0x80], Some("application/octet-stream; charset=windows-1252"), Some("€")),
+            (&[0xff], Some("application/octet-stream; charset=not-real"), Some("ÿ")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; charset=gbk"), Some("中文")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; charset=\"GBK\""), Some("中文")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; charset='GBK'"), Some("ÖÐÎÄ")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; CHARSET = \"GBK\""), Some("ÖÐÎÄ")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; charset= GBK"), Some("中文")),
+            (b"<svg/>", Some("image/svg+xml"), Some("<svg/>")),
+            (b"<x/>", Some("foo/bar+xml"), Some("<x/>")),
+            (b"<html/>", Some("application/xhtml+xml"), Some("<html/>")),
+            (b"<x/>", Some("text/xsl"), None),
+            (&[0xff], Some("application/x-javascript"), None),
+            (b"\xef\xbb\xbfA", Some("text/plain; charset=windows-1252"), Some("A")),
+            (b"\xff\xfeA\0", Some("text/plain"), Some("A")),
+            (b"\xff\xfeA\0", Some("text/plain; charset=utf-8"), Some("A")),
+            (b"\xef\xbb\xbfA", Some("text/html; charset=windows-1252"), Some("A")),
+            (b"\xef\xbb\xbfA", Some("application/octet-stream; charset=not-real"), Some("A")),
+            (b"\xef\xbb\xbfA", Some("application/octet-stream"), None),
+            (b"\xef\xbb\xbfA", Some("text/xsl"), None),
+            (b"\xef\xbb\xbfA", None, None),
+            // A malformed code unit remains byte-exact through base64/streams.
+            (b"\xff\xfeA", Some("text/plain; charset=utf-8"), None),
+        ];
+        for &(bytes, content_type, expected) in cases {
+            assert_eq!(decode_devtools_response_body(bytes, content_type).as_deref(), expected,
+                "{content_type:?}, bytes={bytes:?}");
+        }
+    }
+
+
 
     #[test]
     fn text_decoder_bom_does_not_override_the_selected_encoding() {
@@ -425,6 +581,91 @@ mod tests {
             assert_eq!(enc.name(), "UTF-8");
             assert_eq!(source, "default-utf8");
         }
+    }
+
+    #[test]
+    fn meta_sniff_ignores_comments_and_attribute_values() {
+        for fake in [
+            "<!-- <meta charset=windows-1252> -->",
+            "<!-- <meta charset=windows-1252>",
+            "<div data-code=\"<meta charset=windows-1252>\"></div>",
+            "<div title=\"x> <meta charset=windows-1252>\"></div>",
+            "<meta name=description content=\"x> <meta charset=windows-1252>\">",
+        ] {
+            for real in ["", "<meta charset=utf-8>"] {
+                let html = format!("<!doctype html>{fake}{real}<p>café €</p>");
+                assert_eq!(detect_encoding(html.as_bytes(), None).0.name(), "UTF-8", "{html}");
+                assert_eq!(decode_response(html.as_bytes(), None), html);
+                assert_eq!(decode_devtools_response_body(html.as_bytes(), Some("text/html")), Some(html));
+            }
+        }
+    }
+
+    #[test]
+    fn meta_sniff_skips_raw_text_until_a_matching_end_tag() {
+        for tag in ["script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes"] {
+            let html = format!("<{tag}><meta charset=windows-1252></{}><p>café €</p>", tag.to_ascii_uppercase());
+            assert_eq!(detect_encoding(html.as_bytes(), None).0.name(), "UTF-8", "{tag}");
+            assert_eq!(decode_devtools_response_body(html.as_bytes(), Some("text/html")), Some(html));
+            let mut legacy = format!("<{tag}><meta charset=utf-8></{}><meta charset=windows-1252><p>",
+                tag.to_ascii_uppercase()).into_bytes();
+            legacy.extend_from_slice(b"caf\xe9 \x80</p>");
+            assert_eq!(detect_encoding(&legacy, None).0.name(), "windows-1252", "{tag}");
+            assert!(decode_devtools_response_body(&legacy, Some("text/html")).unwrap().ends_with("café €</p>"));
+        }
+        let html = b"<script></scriptx><meta charset=windows-1252></ScRiPt><meta charset=gbk>\xd6\xd0\xce\xc4";
+        assert_eq!(detect_encoding(html, None).0.name(), "GBK");
+        assert!(decode_devtools_response_body(html, Some("text/html")).unwrap().ends_with("中文"));
+    }
+
+    #[test]
+    fn meta_sniff_preserves_noscript_and_plaintext_boundaries() {
+        let noscript = b"<noscript><meta charset=windows-1252></noscript>";
+        assert_eq!(detect_encoding(noscript, None).0.name(), "windows-1252");
+        let plaintext = "<plaintext><meta charset=windows-1252></plaintext><meta charset=windows-1252>café €";
+        assert_eq!(detect_encoding(plaintext.as_bytes(), None).0.name(), "UTF-8");
+        assert_eq!(decode_devtools_response_body(plaintext.as_bytes(), Some("text/html")), Some(plaintext.into()));
+        for raw in ["<script><meta charset=windows-1252>", "<style><meta charset=windows-1252>"] {
+            assert_eq!(detect_encoding(raw.as_bytes(), None).0.name(), "UTF-8");
+        }
+    }
+
+    #[test]
+    fn meta_sniff_keeps_the_input_byte_bound_and_header_precedence() {
+        let tag = b"<meta charset=gbk>";
+        let mut within = vec![b' '; 1024 - tag.len()];
+        within.extend_from_slice(tag);
+        assert_eq!(detect_encoding(&within, None).0.name(), "GBK");
+        let mut outside = vec![b' '; 1024];
+        outside.extend_from_slice(tag);
+        assert_eq!(detect_encoding(&outside, None).0.name(), "UTF-8");
+        let quoted = b"<div title=unquoted'quote><meta charset=gbk>";
+        assert_eq!(detect_encoding(quoted, None).0.name(), "GBK");
+        let bytes = b"<!-- <meta charset=windows-1252> --><meta charset=utf-8>";
+        assert_eq!(detect_encoding(bytes, Some("text/html; charset=gbk")).0.name(), "GBK");
+    }
+
+    #[test]
+    fn meta_sniff_declarations_end_at_the_first_gt() {
+        for prefix in ["<!bogus attr=\"", "<?bogus attr=\"", "<!DOCTYPE html PUBLIC \"", "<!DOCTYPE html SYSTEM \""] {
+            let html = format!("{prefix}> <meta charset=windows-1252>\">café €");
+            assert_eq!(detect_encoding(html.as_bytes(), None).0.name(), "windows-1252");
+            assert!(decode_devtools_response_body(html.as_bytes(), Some("text/html")).unwrap().ends_with("cafÃ© â‚¬"));
+        }
+    }
+
+    #[test]
+    fn meta_sniff_distinguishes_response_eof_from_prefix_exhaustion() {
+        let incomplete = "<!doctype html><meta charset=windows-1252 café €";
+        assert_eq!(detect_encoding(incomplete.as_bytes(), None).0.name(), "UTF-8");
+        assert_eq!(decode_devtools_response_body(incomplete.as_bytes(), Some("text/html")), Some(incomplete.into()));
+        let tag = b"<meta charset=windows-1252";
+        let mut cutoff = vec![b' '; 1024 - tag.len()];
+        cutoff.extend_from_slice(tag);
+        cutoff.extend_from_slice(">café €".as_bytes());
+        assert_eq!(cutoff[1024], b'>');
+        assert_eq!(detect_encoding(&cutoff, None).0.name(), "windows-1252");
+        assert!(decode_devtools_response_body(&cutoff, Some("text/html")).unwrap().ends_with("cafÃ© â‚¬"));
     }
 
     #[test]

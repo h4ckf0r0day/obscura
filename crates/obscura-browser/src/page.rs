@@ -3,8 +3,8 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
-use obscura_js::ops::{OriginStorage, max_live_frames, NavigationTiming};
-use obscura_js::runtime::ObscuraJsRuntime;
+use obscura_js::ops::{CachedNetworkResponseBody, OriginStorage, max_live_frames, NavigationTiming, StoredNetworkResponseBody};
+use obscura_js::runtime::{HistoryUpdate, ObscuraJsRuntime};
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
     ResourceType, Response, ResponseCallback,
@@ -191,16 +191,15 @@ pub struct NetworkEvent {
 
 #[derive(Debug, Clone)]
 pub struct StoredResponseBody {
-    /// Raw response bytes. The CDP wire form (lossy text or base64, per
-    /// `base64_encoded`) is produced on read by `cdp_body`, so the common
-    /// case — a body that no CDP client ever asks for — pays no decode at
-    /// store time and holds one copy instead of two.
+    /// Raw response bytes. MIME/charset-decoded CDP presentation is available
+    /// through `Page::get_response_body_for_cdp` without changing these bytes.
     pub body: Vec<u8>,
     pub base64_encoded: bool,
 }
 
 impl StoredResponseBody {
-    /// The body as CDP `Network.getResponseBody` reports it.
+    /// The raw body's UTF-8/base64 view. Use `Page::get_response_body_for_cdp`
+    /// for the response's MIME type and charset decoding.
     pub fn cdp_body(&self) -> String {
         if self.base64_encoded {
             BASE64.encode(&self.body)
@@ -329,7 +328,7 @@ pub struct Page {
     /// to the entry instead of appending a new one.
     pending_history_traversal: std::sync::Mutex<Option<usize>>,
     pub network_events: Vec<NetworkEvent>,
-    response_bodies: std::collections::HashMap<String, StoredResponseBody>,
+    response_bodies: std::collections::HashMap<String, CachedNetworkResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
@@ -1935,6 +1934,7 @@ impl Page {
             &self.url_string(),
             self.context.proxy_url.clone(),
         );
+        rt.set_watchdog_scope(&self.id);
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
         rt.set_content_type(&self.content_type);
@@ -2454,6 +2454,9 @@ impl Page {
                     let mut scripts = Vec::new();
 
                     for sid in script_ids {
+                        if dom.parser_script_already_started(sid) {
+                            continue;
+                        }
                         if let Some(node) = dom.get_node(sid) {
                             let src = node.get_attribute("src").map(|s| s.to_string());
                             let script_type = node
@@ -3381,6 +3384,37 @@ impl Page {
         self.push_history_entry(url, false);
     }
 
+    pub(crate) fn apply_history_update(&mut self, update: HistoryUpdate) {
+        let HistoryUpdate::Entries { start, index, old_length, truncate_forward, first, urls, .. } = update else { return; };
+        let Some(end) = first.checked_add(urls.len()) else { return; };
+        let length = if truncate_forward { end } else { old_length };
+        if first > old_length || index >= length || (!truncate_forward && end > old_length) { return; }
+        let current_url = self.url_string();
+        if urls.iter().any(|url| cross_scheme_to_file(&current_url, url)) { return; }
+        if self.history.is_empty() && start == 0 {
+            self.history.push(current_url);
+        }
+        let Some(document_end) = start.checked_add(old_length).filter(|&end| end <= self.history.len()) else { return; };
+        let Some(changed_end) = start.checked_add(end) else { return; };
+        self.history.splice(start + first..changed_end.min(document_end), urls);
+        self.document_history_start = start;
+        self.history_index = start + index;
+        if truncate_forward {
+            self.history.truncate(start + length);
+        }
+    }
+
+    /// Traverse an entry belonging to the live document without replacing its runtime.
+    pub fn traverse_same_document_history(&mut self, index: usize) -> bool {
+        self.sync_history_updates();
+        let Some(url) = self.history.get(index) else { return false; };
+        let expression = format!("globalThis.__obscuraHistory.traverse({}, {})", index,
+            serde_json::to_string(url).unwrap_or_default());
+        if self.evaluate(&expression) != serde_json::json!(true) { return false; }
+        self.sync_virtual_url();
+        true
+    }
+
     fn push_history_entry(&mut self, url: String, new_document: bool) {
         if url.is_empty() {
             return;
@@ -3413,6 +3447,13 @@ impl Page {
         self.history = history;
         self.history_index = index;
         self.document_history_start = index;
+        if self.history.is_empty() {
+            let url = self.url_string();
+            if let Some(js) = self.js.as_mut() {
+                let _ = js.execute_script("<reset-history>", &format!(
+                    "globalThis.__obscuraHistory.reset({})", serde_json::to_string(&url).unwrap_or_default()));
+            }
+        }
         self.sync_js_session_history();
     }
 
@@ -3464,6 +3505,7 @@ impl Page {
         initial_referrer: &str,
         initial_initiator: Option<&Url>,
     ) -> Result<(), PageError> {
+        self.sync_history_updates();
         // file:// is a local file read. Every client route (CLI, CDP's
         // Page.navigate/reload/history and Target.createTarget, the MCP
         // tools) ends up here, so the context's opt-in is enforced once
@@ -3658,19 +3700,18 @@ impl Page {
         })?;
         self.navigation_timing.record("responseEnd");
 
-        // Store binary main resources (images, PDFs, octet-stream) base64 so
-        // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
-        // corrupts them (issue #340). Text-like types stay as text.
-        let main_is_binary = !is_text_like_content_type(response.content_type());
-        self.record_network_event_with_body(
+        // Keep transport bytes for streams; DevTools decoding happens on read.
+        let request_id = self.record_network_event_inner(
             if was_intercepted && response.redirected_from.is_empty() { url.as_str() } else { response.url.as_str() },
             method,
             "Document",
             response.status,
             &response.headers,
-            &response.body,
-            main_is_binary,
+            response.body.len(),
         );
+        self.store_response_body_with(request_id, response.body.len(), || {
+            CachedNetworkResponseBody::raw(&response.body, response.content_type())
+        });
 
         if was_intercepted {
             if let Some(event) = self.network_events.last_mut() { event.intercepted = true; }
@@ -4858,18 +4899,23 @@ impl Page {
     }
 
     fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
+        self.store_response_body_with(request_id, body.len(), || CachedNetworkResponseBody::Bytes {
+            bytes: body.to_vec(), base64_encoded,
+        });
+    }
+
+    fn store_response_body_with(
+        &mut self,
+        request_id: String,
+        source_len: usize,
+        make_stored: impl FnOnce() -> CachedNetworkResponseBody,
+    ) {
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
-        if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
+        if max_entries == 0 || max_bytes == 0 || source_len > max_bytes {
             return;
         }
-        self.response_bodies.insert(
-            request_id.clone(),
-            StoredResponseBody {
-                body: body.to_vec(),
-                base64_encoded,
-            },
-        );
+        self.response_bodies.insert(request_id.clone(), make_stored());
         self.response_body_order.push_back(request_id);
         while self.response_body_order.len() > max_entries {
             if let Some(oldest) = self.response_body_order.pop_front() {
@@ -4879,49 +4925,29 @@ impl Page {
     }
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
-        self.response_bodies.get(request_id).cloned().or_else(|| {
-            let body = self
-                .js
-                .as_ref()?
-                .get_network_response_body(request_id)?;
-            // The JS-side store holds the lossy/base64 text form; convert to
-            // raw bytes so the page-side store stays uniformly lazy.
-            let raw = if body.base64_encoded {
-                BASE64.decode(body.body.as_bytes()).ok()?
-            } else {
-                body.body.into_bytes()
-            };
-            Some(StoredResponseBody {
-                body: raw,
-                base64_encoded: body.base64_encoded,
-            })
+        let (body, base64_encoded) = if let Some(body) = self.response_bodies.get(request_id) {
+            body.raw_bytes()?
+        } else {
+            self.js.as_ref()?.get_network_response_body_raw(request_id)?
+        };
+        Some(StoredResponseBody { body, base64_encoded })
+    }
+
+    pub fn get_response_body_for_cdp(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
+        self.response_bodies.get(request_id).map(CachedNetworkResponseBody::decoded).or_else(|| {
+            self.js.as_ref()?.get_network_response_body(request_id)
         })
     }
 
-    /// Take a stored response body as raw bytes for CDP streaming
-    /// (Fetch.takeResponseBodyAsStream). Removes it from the in-memory cache and
-    /// transfers ownership to the caller, so a large body is held once and freed
-    /// when the stream is closed rather than lingering in this long-running
-    /// process (issue #360). Binary bodies are stored base64 (byte-exact); text
-    /// bodies return their UTF-8 bytes. Returns None if the body was never
-    /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
-    /// dropped) or the id is unknown.
+    /// Transfer original response bytes to a CDP stream, removing the cached
+    /// entry. The body's MIME type and charset affect only the text getter.
+    /// Returns None for unknown, evicted, or oversized bodies.
     pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
         if let Some(body) = self.response_bodies.remove(request_id) {
             self.response_body_order.retain(|id| id != request_id);
-            // Raw bytes are what this returns; the base64 flag only says how
-            // CDP would report the body, not how it is stored.
-            return Some(body.body);
+            return body.into_bytes();
         }
-        let b = self
-            .js
-            .as_ref()?
-            .get_network_response_body(request_id)?;
-        if b.base64_encoded {
-            BASE64.decode(b.body.as_bytes()).ok()
-        } else {
-            Some(b.body.into_bytes())
-        }
+        self.js.as_ref()?.take_network_response_body_raw(request_id)
     }
 
     /// Make the body stored under `from_id` also retrievable under `to_id`.
@@ -4964,18 +4990,8 @@ impl Page {
         // Completed module and JS requests must survive the realm's teardown.
         self.sync_js_network_events();
         let max_entries = response_body_entry_limit();
-        for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
-            // The JS-side store holds the lossy/base64 text form; convert to
-            // raw bytes so the page-side store stays uniformly lazy.
-            let raw = if body.base64_encoded {
-                BASE64.decode(body.body.as_bytes()).unwrap_or_default()
-            } else {
-                body.body.into_bytes()
-            };
-            self.response_bodies.insert(id.clone(), StoredResponseBody {
-                body: raw,
-                base64_encoded: body.base64_encoded,
-            });
+        for (id, body) in self.js.as_ref().unwrap().take_cached_network_response_bodies() {
+            self.response_bodies.insert(id.clone(), body);
             self.response_body_order.push_back(id);
         }
         while self.response_body_order.len() > max_entries {
@@ -5228,6 +5244,7 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
+        self.sync_history_updates();
         let initiator = self.url.clone();
         let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
@@ -5293,7 +5310,7 @@ mod tests {
         register_linked_stylesheet_script, script_response_is_executable, split_css_imports,
         stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
         LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
-        Page, BrowserContext, LifecycleState, BASE64,
+        Page, BrowserContext, LifecycleState, HistoryUpdate, BASE64,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
@@ -5335,7 +5352,7 @@ mod tests {
         assert_eq!(page.title, "Fulfilled");
         let document = page.network_events.iter().find(|event| event.resource_type == "Document").unwrap();
         assert_eq!(document.status, 201);assert!(document.intercepted);
-        assert_eq!(page.response_bodies.get(&document.request_id).unwrap().body, expected);
+        assert_eq!(page.get_response_body(&document.request_id).unwrap().body, expected);
         let mut set_cookies = document.response_headers.get("set-cookie").unwrap().lines().collect::<Vec<_>>();
         set_cookies.sort_unstable();
         assert_eq!(set_cookies, ["first=1; Path=/", "second=2; Path=/"]);
@@ -6657,6 +6674,158 @@ mod tests {
         assert_eq!(page.url_string(), two);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_keeps_entries_when_the_cursor_moves() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-cursor");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { globalThis.marker=42; history.pushState({n:1}, '', '#one'); history.pushState({n:2}, '', '#two'); })()");
+        page.sync_virtual_url();
+        let entries = vec![url.to_string(), format!("{url}#one"), format!("{url}#two")];
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("history.back()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("[marker, history.state.n, history.length]"), serde_json::json!([42, 1, 3]));
+        page.evaluate("history.replaceState({n:3}, '', '#replaced')");
+        page.sync_virtual_url();
+        assert_eq!(page.history.len(), 3);
+        assert_eq!(page.history[1], format!("{url}#replaced"));
+        page.evaluate("history.forward()");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 2);
+        assert_eq!(page.evaluate("history.state.n"), serde_json::json!(2.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_keeps_distinct_entries_with_the_same_url() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-same-url");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState({n:1}, ''); history.pushState({n:2}, ''); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(); 3]);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("history.back()");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("history.state.n"), serde_json::json!(1.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_sync_ignores_authored_json_serialization() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-json-override");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState({n:1}, '', '#one'); JSON.stringify=()=> '\"forged\"'; Array.prototype.toJSON=()=> 'forged'; })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.url_string(), format!("{url}#one"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_keeps_native_document_position_when_authors_patch_array_map() {
+        let one = "data:text/html,<title>one</title>";
+        let two = "data:text/html,<title>two</title>";
+        let mut page = page_without_chain_limit("history-native-position");
+        page.navigate(one).await.unwrap();
+        page.navigate(two).await.unwrap();
+        page.evaluate("(() => { const map=Array.prototype.map; Array.prototype.map=function(...args){if(this.length===3 && this.every(v=>typeof v==='string' && /^\\d+$/.test(v)))throw new Error('authored map');return Reflect.apply(map,this,args);}; history.pushState(1,'','#one'); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![one.to_string(), two.to_string(), format!("{two}#one")]);
+        assert_eq!(page.history_index, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_metadata_is_bounded_by_entries() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-metadata");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { for(let i=0;i<10000;i++) history.replaceState(i, '', '#'+i); })()");
+        let update = page.js.as_mut().unwrap().take_history_update().unwrap();
+        assert!(matches!(update, HistoryUpdate::Entries { urls, .. }
+            if urls.len() == 1 && urls[0].len() < 512), "one entry must not retain a mutation log");
+        page.evaluate("history.replaceState(null, '', '#last')");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![format!("{url}#last")]);
+        assert_eq!(page.history_index, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_does_not_transfer_unchanged_entries() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-incremental-sync");
+        page.navigate(url).await.unwrap();
+        for index in 0..1000 {
+            page.evaluate(&format!("history.pushState({index}, '', '#{index}')"));
+            page.sync_virtual_url();
+        }
+        page.evaluate("history.replaceState(null, '', '#last')");
+        let update = page.js.as_mut().unwrap().take_history_update().unwrap();
+        assert!(matches!(update, HistoryUpdate::Entries { urls, .. }
+            if urls.len() == 1 && urls[0].len() < 512), "one changed entry must not transfer the unchanged history");
+        page.evaluate("history.replaceState(null, '', '#verified')");
+        page.sync_virtual_url();
+        assert_eq!(page.history.len(), 1001);
+        assert_eq!(page.history[0], url);
+        assert_eq!(page.history[1000], format!("{url}#verified"));
+        page.evaluate("history.go(-500)");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 500);
+        assert_eq!(page.url_string(), format!("{url}#499"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_keeps_only_surviving_batched_changes() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-batched-changes");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState(1, '', '#one'); history.pushState(2, '', '#two'); history.pushState(3, '', '#three'); })()");
+        page.sync_virtual_url();
+        page.evaluate("(() => { history.replaceState(4, '', '#discarded'); history.go(-2); history.pushState(5, '', '#last'); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one"), format!("{url}#last")]);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("(() => { history.back(); history.replaceState(6, '', '#changed'); history.forward(); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#changed"), format!("{url}#last")]);
+        assert_eq!(page.history_index, 2);
+        assert_eq!(page.url_string(), format!("{url}#last"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_does_not_commit_a_pending_location_navigation() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-location-preview");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState(1, '', '#one'); location.href='https://example.org/next'; })()");
+        page.sync_history_updates();
+        assert_eq!(page.url_string(), format!("{url}#one"));
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_urls_keep_the_committed_origin_during_pending_navigation() {
+        let mut page = import_map_test_page("history-committed-origin", "http://example.com/current", "<title>history</title>");
+        let result = page.evaluate("(() => { location.href='https://other.example/next'; let error=null; try { history.pushState({}, '', 'https://other.example/spoof'); } catch(e) { error=e.name; } history.pushState({n:1}, '', '/kept'); location.href='https://other.example/again'; history.replaceState({n:2}, ''); return {error,href:location.href,state:history.state}; })()");
+        assert_eq!(result, serde_json::json!({"error":"SecurityError","href":"http://example.com/kept","state":{"n":2}}));
+        page.sync_history_updates();
+        assert_eq!(page.url_string(), "http://example.com/kept");
+        assert!(page.history.iter().all(|url| url.starts_with("http://example.com/")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_rejects_non_url_page_values() {
+        let mut page = page_without_chain_limit("history-url-type");
+        page.navigate("data:text/html,<title>history</title>").await.unwrap();
+        page.evaluate("globalThis.__virtualUrl = new Array(100000)");
+        assert!(matches!(page.js.as_mut().unwrap().take_history_update().unwrap(),
+            HistoryUpdate::Url(url) if url.is_empty()));
+    }
+
     /// Same-document entries sit between the documents: a push drops the
     /// forward documents, and back() past the document's own entries loads
     /// the previous document.
@@ -6680,7 +6849,8 @@ mod tests {
         page.evaluate("history.go(-2)");
         assert!(!page.process_pending_navigation().await.unwrap());
         page.evaluate("history.back()");
-        assert!(!page.process_pending_navigation().await.unwrap());
+        assert!(page.process_pending_navigation().await.unwrap());
+        assert_eq!(page.url_string(), one);
         assert_eq!(page.evaluate("location.hash"), serde_json::json!(""));
     }
 
@@ -8648,6 +8818,35 @@ mod tests {
             Some(0.0),
             "a reference to the discarded frame survived, so its context cannot be collected"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eof_scripts_are_not_fetched_or_executed() {
+        use std::sync::atomic::Ordering;
+
+        for module in [false, true] {
+            for external in [false, true] {
+                for complete in [false, true] {
+                    let (url, requests) = spawn_script_resource_cache_server(false);
+                    let mut page = frame_page("eof-script");
+                    page.url = Some(url::Url::parse(&url).unwrap());
+                    let kind = if module { "type=module" } else { "" };
+                    let source = if external { "src=/shared.js" } else { "" };
+                    let end = if complete { "</script>" } else { "" };
+                    page.dom = Some(parse_html(&format!(
+                        "<!doctype html><body><script {kind} {source}>globalThis.__runs=(globalThis.__runs||0)+1;{end}"
+                    )));
+                    page.init_js();
+                    page.execute_scripts().await;
+                    assert_eq!(
+                        page.js.as_mut().unwrap().evaluate("globalThis.__runs||0").unwrap(),
+                        serde_json::json!(if complete { 1.0 } else { 0.0 }),
+                        "module={module}, external={external}, complete={complete}"
+                    );
+                    assert_eq!(requests.load(Ordering::SeqCst), usize::from(complete && external));
+                }
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11872,29 +12071,6 @@ impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
     }
-}
-
-/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
-/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
-/// be base64-encoded so Network.getResponseBody returns intact bytes.
-fn is_text_like_content_type(content_type: Option<&str>) -> bool {
-    let ct = match content_type {
-        Some(c) => c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase(),
-        // No Content-Type: assume text (matches the HTML-parse default).
-        None => return true,
-    };
-    if ct.is_empty() {
-        return true;
-    }
-    ct.starts_with("text/")
-        || ct == "application/json"
-        || ct == "application/xml"
-        || ct == "application/xhtml+xml"
-        || ct == "application/javascript"
-        || ct == "application/ecmascript"
-        || ct == "image/svg+xml"
-        || ct.ends_with("+json")
-        || ct.ends_with("+xml")
 }
 
 /// Lowercased MIME type of a Content-Type header, without parameters.
