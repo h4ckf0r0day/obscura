@@ -152,6 +152,15 @@ impl TreeSink for DomTree {
 
     fn parse_error(&self, _msg: Cow<'static, str>) {}
 
+    fn mark_script_already_started(&self, node: &NodeId) {
+        // Fragment creation marks scripts before attachment; the caller owns
+        // that API's inertness policy (innerHTML versus Range/document.write).
+        // The later, attached-node call marks EOF in script text in both parsers.
+        if self.with_node(*node, |node| node.parent.is_some()).unwrap_or(false) {
+            self.mark_parser_script_started(*node);
+        }
+    }
+
     fn get_document(&self) -> NodeId {
         self.document()
     }
@@ -456,6 +465,49 @@ pub fn parse_fragment_with_context(html: &str, context_name: QualName) -> DomTre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eof_scripts_preserve_parser_state_without_changing_markup() {
+        for attrs in ["", "type=module", "src=/script.js", "type=module src=/script.js"] {
+            for end in ["", "</script", "</script>"] {
+                let markup = format!("<script id=script {attrs}>window.runs++;{end}");
+                for tree in [parse_html(&markup), parse_fragment(&markup)] {
+                    let script = tree.get_element_by_id("script").unwrap();
+                    assert_eq!(tree.parser_script_already_started(script), end != "</script>",
+                        "{markup}");
+                    assert_eq!(tree.get_node(script).unwrap().attrs().unwrap().len(),
+                        1 + usize::from(attrs.contains("module")) + usize::from(attrs.contains("src=")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eof_script_state_survives_transfers_but_not_explicit_clones_or_freed_slots() {
+        let source = parse_html("<body><section><script id=eof>window.runs++;");
+        let script = source.get_element_by_id("eof").unwrap();
+        let section = source.query_selector("section").unwrap().unwrap();
+        let clone = source.clone_node(section, true).unwrap();
+        let cloned_script = source.children(clone)[0];
+        assert!(!source.parser_script_already_started(cloned_script));
+        let shallow = source.clone_node(script, false).unwrap();
+        assert!(!source.parser_script_already_started(shallow));
+
+        let dest = DomTree::new();
+        let imported = dest.import_node_from(dest.document(), &source, section).unwrap();
+        assert!(dest.parser_script_already_started(dest.children(imported)[0]));
+        source.detach(script);
+        assert!(source.parser_script_already_started(script));
+
+        let data = source.get_node(script).unwrap().data;
+        let text = source.children(script)[0];
+        source.remove(script);
+        for _ in 0..2 {
+            let reused = source.new_node(data.clone());
+            assert!(reused == script || reused == text);
+            assert!(!source.parser_script_already_started(reused));
+        }
+    }
 
     fn max_div_nesting(tree: &DomTree) -> usize {
         let mut stack = vec![(tree.document(), 0)];

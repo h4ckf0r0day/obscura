@@ -2178,7 +2178,7 @@ fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
         return false;
     };
     let node_id = NodeId::new(nid);
-    if !node_is_script(dom, node_id) {
+    if !node_is_script(dom, node_id) || dom.parser_script_already_started(node_id) {
         return false;
     }
     let newly_started = state.already_started_scripts.borrow_mut().insert(node_id);
@@ -3401,6 +3401,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 let fragment = obscura_dom::parse_fragment_with_context(html, context_name);
                 let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
+                // Range EOF scripts also keep copies inert; document-parser
+                // EOF scripts instead allow fresh explicit clones in Chromium.
+                if fragment.has_parser_started_scripts() {
+                    gs.already_started_scripts.borrow_mut().extend(
+                        script_nodes_including_template_contents(dom, target).into_iter()
+                            .filter(|node| dom.parser_script_already_started(*node)));
+                }
             }
             "true".into()
         }
@@ -3415,12 +3422,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let mut slot = gs.write_stream.borrow_mut();
             let placements = if cmd == "document_write_close" {
                 let Some(mut stream) = slot.take() else { return "[]".into(); };
-                let placements = stream.close(dom);
-                // EOF in a script's text insertion mode marks it already started.
-                // Newly released scripts have no closing tag and must not execute.
-                gs.already_started_scripts.borrow_mut().extend(placements.iter()
-                    .filter(|p| node_is_script(dom, p.node)).map(|p| p.node));
-                placements
+                stream.close(dom)
             } else {
                 slot.get_or_insert_with(|| DocumentWriteStream::new(false)).write(&arg2, dom)
             };
