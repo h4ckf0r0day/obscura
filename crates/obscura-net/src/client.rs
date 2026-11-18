@@ -299,10 +299,8 @@ impl ResourceRequest {
         match self.resource_type {
             ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             ResourceType::Stylesheet => "text/css,*/*;q=0.1",
-            // AVIF is intentionally omitted until obscura's decoder can paint
-            // it. Advertising a format and then discarding the selected body
-            // is less faithful than negotiating the best format we can use.
-            ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            // Wildcards also permit AVIF/JXL, which the renderer cannot decode.
+            ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/png,image/jpeg,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon",
             ResourceType::Script
             | ResourceType::Font
             | ResourceType::Xhr
@@ -2445,6 +2443,63 @@ mod ssrf_tests {
     fn redirect_to_self() -> String {
         "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .to_string()
+    }
+
+    async fn assert_image_negotiates_supported_format(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Url::parse(&format!("http://{}/image", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            let accept = request.lines().find_map(|line| line.strip_prefix("accept:")).unwrap();
+            let ranges: Vec<_> = accept.split(',').map(|part| part.split(';').next().unwrap().trim()).collect();
+            // This server prefers AVIF when allowed, with PNG as its supported fallback.
+            let mime = if ranges.iter().any(|range| ["image/avif", "image/*", "*/*"].contains(range)) {
+                "image/avif"
+            } else if ranges.contains(&"image/png") {
+                "image/png"
+            } else {
+                "application/octet-stream"
+            };
+            stream.write_all(ok_response(&format!("Content-Type: {mime}\r\n"), "image").as_bytes()).await.unwrap();
+        });
+        let request = ResourceRequest::subresource(ResourceType::Image, &target);
+        let jar = Arc::new(CookieJar::new());
+        #[cfg(feature = "stealth")]
+        let response = if stealth {
+            crate::StealthHttpClient::with_proxy(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        } else {
+            ObscuraHttpClient::with_full_options(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        };
+        #[cfg(not(feature = "stealth"))]
+        let response = {
+            assert!(!stealth);
+            ObscuraHttpClient::with_full_options(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        };
+        server.await.unwrap();
+        assert_eq!(response.content_type(), Some("image/png"));
+    }
+
+    #[tokio::test]
+    async fn image_request_negotiates_supported_format() {
+        assert_image_negotiates_supported_format(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn stealth_image_request_negotiates_supported_format() {
+        assert_image_negotiates_supported_format(true).await;
     }
 
     async fn form_navigation_probe(
