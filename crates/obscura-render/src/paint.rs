@@ -5450,7 +5450,8 @@ fn paint_laid_dom_scrolled(
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
-                let mw = measure_text(&marker, fsize, false, style.font_family.as_deref());
+                let is_bold = crate::style::used_font_weight(style) >= 600;
+                let mw = measure_text(&marker, fsize, is_bold, style.font_family.as_deref());
                 let mx = rect.x + style.padding.left - mw - 6.0;
                 let my = rect.y + style.border.top + style.padding.top;
                 draw_text(
@@ -5460,7 +5461,7 @@ fn paint_laid_dom_scrolled(
                     my,
                     color,
                     fsize,
-                    false,
+                    is_bold,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     style.word_spacing.unwrap_or(0.0),
@@ -5677,6 +5678,30 @@ fn paint_laid_dom_scrolled(
                 .or_else(|| node.get_attribute("value"));
             let has_value = value.is_some_and(|v| !v.is_empty())
                 || (name.local.as_ref() == "textarea" && !tree.text_content(nid).is_empty());
+            let single_line = name.local.as_ref() == "input";
+            let text_x = rect.x + style.padding.left + style.border.left;
+            // Single-line editors clip horizontally to the content box, but
+            // glyph ink may use the vertical padding. Textareas use the
+            // padding box on both axes. Preserve the ancestor overflow clip.
+            let text_clip = crate::Rect {
+                x: rect.x + style.border.left + if single_line { style.padding.left } else { 0.0 },
+                y: rect.y + style.border.top,
+                width: (rect.width - style.border.left - style.border.right
+                    - if single_line { style.padding.left + style.padding.right } else { 0.0 }).max(0.0),
+                height: (rect.height - style.border.top - style.border.bottom).max(0.0),
+            }.intersect(&visible_rect).unwrap_or_default();
+            let text_y = |size| {
+                let font = FontRef::try_from_slice(crate::inline::bundled_font_bytes(
+                    style.font_family.as_deref(), crate::style::used_font_weight(style) >= 600)).unwrap();
+                let font_height = font.as_scaled(native_font_scale(&font, size)).height();
+                let line_height = if single_line {
+                    (rect.height - style.border.top - style.border.bottom
+                        - style.padding.top - style.padding.bottom).max(0.0)
+                } else {
+                    crate::inline::used_line_height(style)
+                };
+                rect.y + style.border.top + style.padding.top + (line_height - font_height) / 2.0
+            };
             // A text `<input>`'s value is not a DOM text node either, so it
             // needs painting from its live state, falling back to the attribute.
             // Without this the
@@ -5688,8 +5713,6 @@ fn paint_laid_dom_scrolled(
                 if let Some(value) = value {
                     if !value.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
-                        let text_x = rect.x + style.padding.left + style.border.left;
-                        let text_y = rect.y + style.padding.top + style.border.top;
                         let color = style.color.unwrap_or([0, 0, 0, 255]);
                         let masked;
                         let shown = if input_type
@@ -5705,14 +5728,14 @@ fn paint_laid_dom_scrolled(
                                 &mut pixmap,
                                 shown,
                                 text_x,
-                                text_y,
+                                text_y(fsize),
                                 color,
                                 fsize,
-                                false,
+                                crate::style::used_font_weight(style) >= 600,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
                                 style.word_spacing.unwrap_or(0.0),
-                                clip,
+                                Some(text_clip),
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -5724,8 +5747,6 @@ fn paint_laid_dom_scrolled(
                 if let Some(placeholder) = node.get_attribute("placeholder") {
                     if !placeholder.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
-                        let text_x = rect.x + style.padding.left + style.border.left;
-                        let text_y = rect.y + style.padding.top + style.border.top;
                         let placeholder_style = style.placeholder_pseudo.as_deref();
                         let mut color = placeholder_style
                             .and_then(|pseudo| pseudo.color)
@@ -5740,14 +5761,14 @@ fn paint_laid_dom_scrolled(
                                 &mut pixmap,
                                 placeholder,
                                 text_x,
-                                text_y,
+                                text_y(fsize),
                                 color,
                                 fsize,
-                                false,
+                                crate::style::used_font_weight(style) >= 600,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
                                 style.word_spacing.unwrap_or(0.0),
-                                clip,
+                                Some(text_clip),
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -7707,69 +7728,29 @@ fn paint_text_node(
     Some(())
 }
 
-fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
-    let Some(family) = family else {
-        return FONT_BYTES;
-    };
-    for token in family.split(',') {
-        let token = token
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_ascii_lowercase();
-        if token == "system-ui" || token == "ui-sans-serif" {
-            return SYSTEM_FONT_BYTES;
-        }
-        if token == "monospace"
-            || token.contains("mono")
-            || token.contains("courier")
-            || token.contains("consol")
-            || token == "menlo"
-            || token == "monaco"
-            || token == "code"
-        {
-            return MONO_FONT_BYTES;
-        }
-        if token == "serif"
-            || token == "georgia"
-            || token.contains("times")
-            || token == "cambria"
-            || token.contains("garamond")
-            || token.contains("liberation serif")
-            || token == "roman"
-        {
-            return SERIF_FONT_BYTES;
-        }
-        if token == "sans-serif"
-            || token.contains("sans")
-            || token == "arial"
-            || token == "helvetica"
-            || token == "helvetica neue"
-            || token == "-apple-system"
-            || token == "roboto"
-            || token == "segoe ui"
-            || token == "inter"
-            || token == "verdana"
-            || token == "tahoma"
-        {
-            return FONT_BYTES;
-        }
-    }
-    FONT_BYTES
+// CSS font-size is pixels per em; ab_glyph scales ascent minus descent.
+fn native_font_scale(font: &FontRef<'_>, size: f32) -> PxScale {
+    let size = font.units_per_em()
+        .map(|em| size * font.height_unscaled() / em)
+        .unwrap_or(size);
+    PxScale::from(size)
 }
 
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
-    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size);
-    let scaled_font = font.as_scaled(scale);
+    let font = FontRef::try_from_slice(crate::inline::bundled_font_bytes(family, is_bold)).unwrap();
+    let scaled_font = font.as_scaled(native_font_scale(&font, size));
     let mut width = 0.0;
+    let mut previous = None;
     for c in text.chars() {
         if c.is_control() {
             continue;
         }
-        width += scaled_font.h_advance(font.glyph_id(c));
-    }
-    if is_bold {
-        width += text.chars().filter(|c| !c.is_control()).count() as f32;
+        let glyph = font.glyph_id(c);
+        if let Some(previous) = previous {
+            width += scaled_font.kern(previous, glyph);
+        }
+        width += scaled_font.h_advance(glyph);
+        previous = Some(glyph);
     }
     width
 }
@@ -7796,8 +7777,8 @@ fn draw_text(
             return;
         }
     }
-    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size * raster_scale);
+    let font = FontRef::try_from_slice(crate::inline::bundled_font_bytes(family, is_bold)).unwrap();
+    let scale = native_font_scale(&font, size * raster_scale);
     let scaled_font = font.as_scaled(scale);
     let mut caret = ab_glyph::point(x * raster_scale, y * raster_scale + scaled_font.ascent());
 
@@ -7814,12 +7795,15 @@ fn draw_text(
     let pixels = pixmap.pixels_mut();
     let (r, g, b, a_full) = (color[0], color[1], color[2], color[3]);
 
+    let mut previous = None;
     for c in text.chars() {
         if c.is_control() {
             continue;
         }
         let glyph_id = font.glyph_id(c);
-        let id = glyph_id;
+        if let Some(previous) = previous {
+            caret.x += scaled_font.kern(previous, glyph_id);
+        }
         let glyph = glyph_id.with_scale_and_position(scale, caret);
         if let Some(outlined) = font.outline_glyph(glyph) {
             let bounds = outlined.px_bounds();
@@ -7838,67 +7822,48 @@ fn draw_text(
                 if px >= 0 && px < width && py >= 0 && py < height {
                     let alpha = (a_full as f32 * c) as u8;
                     if alpha > 0 {
-                        let mut px_indices = vec![(py * width + px) as usize];
-                        if is_bold {
-                            for dx in 1..raster_scale.ceil().max(1.0) as i32 {
-                                if px + dx < width {
-                                    px_indices.push((py * width + px + dx) as usize);
-                                }
-                            }
+                        let idx = (py * width + px) as usize;
+                        let mask_alpha = clip_mask
+                            .and_then(|mask| mask.data().get(idx))
+                            .copied()
+                            .unwrap_or(255) as u32;
+                        let alpha = alpha as u32 * mask_alpha / 255;
+                        if alpha == 0 {
+                            return;
                         }
-                        for idx in px_indices {
-                            let mask_alpha = clip_mask
-                                .and_then(|mask| mask.data().get(idx))
-                                .copied()
-                                .unwrap_or(255) as u32;
-                            let alpha = alpha as u32 * mask_alpha / 255;
-                            if alpha == 0 {
-                                continue;
-                            }
-                            let dst = pixels[idx];
+                        let dst = pixels[idx];
 
-                            let src_a = alpha;
-                            let src_r = (r as u32 * src_a) / 255;
-                            let src_g = (g as u32 * src_a) / 255;
-                            let src_b = (b as u32 * src_a) / 255;
+                        let src_a = alpha;
+                        let src_r = (r as u32 * src_a) / 255;
+                        let src_g = (g as u32 * src_a) / 255;
+                        let src_b = (b as u32 * src_a) / 255;
 
-                            let dst_a = dst.alpha() as u32;
-                            let out_a = src_a + (dst_a * (255 - src_a) / 255);
+                        let dst_a = dst.alpha() as u32;
+                        let out_a = src_a + (dst_a * (255 - src_a) / 255);
 
-                            if out_a > 0 {
-                                let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
-                                let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
-                                let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
+                        if out_a > 0 {
+                            let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
+                            let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
+                            let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
 
-                                pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
-                                    out_r as u8,
-                                    out_g as u8,
-                                    out_b as u8,
-                                    out_a as u8,
-                                )
-                                .unwrap_or_else(|| {
-                                    tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
-                                });
-                            }
+                            pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
+                                out_r as u8,
+                                out_g as u8,
+                                out_b as u8,
+                                out_a as u8,
+                            )
+                            .unwrap_or_else(|| {
+                                tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
+                            });
                         }
                     }
                 }
             });
-            // Matches measure_text's +1px-per-character bold compensation:
-            // without it, a word's reserved layout width (from measure_text)
-            // is wider than what draw_text actually advances through, and
-            // the difference shows up as a visible gap after every word once
-            // each word is its own independently-positioned box.
-            caret.x += scaled_font.h_advance(id)
-                + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale
-                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
-        } else {
-            caret.x += scaled_font.h_advance(id)
-                + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale
-                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         }
+        caret.x += scaled_font.h_advance(glyph_id)
+            + letter_spacing * raster_scale
+            + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
+        previous = Some(glyph_id);
     }
 }
 
@@ -17576,6 +17541,158 @@ mod tests {
             }
         }
         assert!(found_green, "expected green text to be painted");
+    }
+
+    #[test]
+    fn native_text_metrics_match_css_em_sizes_and_font_weights() {
+        // Chrome at 14 CSS px with the same Liberation/DejaVu faces.
+        for (family, bold, text, expected) in [
+            ("Arial", false, "abcdefghij", 63.828125),
+            ("Arial", false, "Create new form", 103.484375),
+            ("Arial", false, "AVATAR Toffee", 93.390625),
+            ("Arial", false, "caf\u{e9} \u{3a9}mega", 75.84375),
+            ("Arial", true, "abcdefghij", 70.015625),
+            ("Times New Roman", false, "abcdefghij", 59.09375),
+            ("Times New Roman", true, "abcdefghij", 63.0),
+            ("Courier New", false, "abcdefghij", 84.015625),
+            ("Courier New", true, "abcdefghij", 84.015625),
+            ("system-ui", false, "abcdefghij", 73.140625),
+            ("system-ui", true, "abcdefghij", 82.96875),
+            ("MissingFont, Arial", false, "abcdefghij", 63.828125),
+        ] {
+            let width = measure_text(text, 14.0, bold, Some(family));
+            assert!((width - expected).abs() < 0.5,
+                "{family}, bold={bold}, {text:?}: {width}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn native_button_and_select_labels_keep_inline_text_width() {
+        for (family, weight, text) in [
+            ("Arial", 400, "abcdefghij"), ("Arial", 700, "Create new form"),
+            ("Arial", 400, "AVATAR Toffee"), ("Times New Roman", 700, "abcdefghij"),
+            ("Courier New", 700, "abcdefghij"), ("MissingFont, Arial", 400, "caf\u{e9} \u{3a9}mega"),
+        ] {
+            let tree = parse_html(&format!(r#"<style>
+                body{{margin:0}} .q{{display:inline-block;padding:0;border:0;
+                font:14px {family};font-weight:{weight};white-space:nowrap;appearance:none}}
+                </style><span class=q id=reference>{text}</span><button class=q id=button>{text}</button>
+                <select class=q id=select><option>{text}</option></select>"#));
+            let mut resources = RenderResourceCache::default();
+            let prepared = prepare_dom(&tree, (800.0, 120.0), None, &mut resources).unwrap();
+            let width = |id| prepared.document_rect(tree.get_element_by_id(id).unwrap()).unwrap().width;
+            for id in ["button", "select"] {
+                assert!((width(id) - width("reference")).abs() <= 1.0,
+                    "{family}, weight={weight}, {text:?}: {id}={}, span={}", width(id), width("reference"));
+            }
+        }
+    }
+
+    #[test]
+    fn native_control_glyph_size_matches_shaped_inline_text() {
+        for (family, weight) in [("Arial", 400), ("Times New Roman", 700), ("Courier New", 700), ("system-ui", 700)] {
+            for control in ["input", "select", "button"] {
+                let control = match control {
+                    "input" => "<input value=abcdefghij>",
+                    "select" => "<select><option>abcdefghij</option></select>",
+                    _ => "<button>abcdefghij</button>",
+                };
+                let tree = parse_html(&format!(r#"<style>
+                    body{{margin:0;background:white}} span,input,select,button{{display:block;
+                    width:380px;height:50px;padding:0;border:0;font:32px {family};
+                    font-weight:{weight};line-height:40px;background:transparent;white-space:nowrap}}
+                    span{{color:red}}input,select,button{{color:blue}}
+                    </style><span>abcdefghij</span>{control}"#));
+                let pixmap = paint_dom(&tree, (420.0, 120.0), None).unwrap();
+                let bounds = |blue| {
+                    let mut bounds = (u32::MAX, u32::MAX, 0, 0);
+                    for y in 0..pixmap.height() {
+                        // The select disclosure arrow is outside this text region.
+                        for x in 0..320 {
+                            let p = pixmap.pixel(x, y).unwrap();
+                            let hit = if blue { p.blue() > 200 && p.red() < 50 && p.green() < 50 }
+                                else { p.red() > 200 && p.blue() < 50 && p.green() < 50 };
+                            if hit { bounds = (bounds.0.min(x), bounds.1.min(y), bounds.2.max(x), bounds.3.max(y)); }
+                        }
+                    }
+                    assert!(bounds.0 != u32::MAX, "missing glyphs: {family}, {control}");
+                    ((bounds.2 - bounds.0 + 1) as i32, (bounds.3 - bounds.1 + 1) as i32)
+                };
+                let reference = bounds(false);
+                let native = bounds(true);
+                assert!((reference.0 - native.0).abs() <= 2 && (reference.1 - native.1).abs() <= 2,
+                    "{family}, weight={weight}, {control}: inline={reference:?}, native={native:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_input_text_respects_its_box_and_ancestor_clip() {
+        for control in [
+            "<input id=control value=abcdefghijabcdefghij>",
+            "<input id=control placeholder=abcdefghijabcdefghij>",
+            "<textarea id=control placeholder=abcdefghijabcdefghij wrap=off></textarea>",
+        ] {
+            for height in [8.0, 40.0] {
+                for clipped in [false, true] {
+                    let overflow = if clipped { "hidden" } else { "visible" };
+                    let tree = parse_html(&format!(r#"<style>
+                        body{{margin:0;background:white}}
+                        #parent{{position:absolute;left:20px;top:20px;width:60px;height:40px;overflow:{overflow}}}
+                        #control{{position:absolute;left:10px;top:6px;box-sizing:content-box;
+                        width:80px;height:{height}px;padding:8px;border:3px solid red;
+                        font:32px Arial;line-height:{height}px;color:blue;background:white;
+                        white-space:pre;overflow:visible;resize:none}}
+                        #control::placeholder{{color:blue;opacity:1}}
+                        </style><div id=parent>{control}</div>"#));
+                    let mut resources = RenderResourceCache::with_loader(|_: &str| None);
+                    let mut prepared = prepare_dom(&tree, (220.0, 140.0), None, &mut resources).unwrap();
+                    let rect = prepared.document_rect(tree.get_element_by_id("control").unwrap()).unwrap();
+                    // Chrome clips single-line text to the content width but
+                    // allows ink into vertical padding. A textarea clips to its
+                    // padding box on both axes.
+                    let textarea = control.starts_with("<textarea");
+                    let mut allowed = crate::Rect {
+                        x: rect.x + if textarea { 3.0 } else { 11.0 },
+                        y: rect.y + 3.0,
+                        width: rect.width - if textarea { 6.0 } else { 22.0 },
+                        height: rect.height - 6.0,
+                    };
+                    if clipped {
+                        let parent = prepared.document_rect(tree.get_element_by_id("parent").unwrap()).unwrap();
+                        allowed = allowed.intersect(&parent).unwrap();
+                    }
+                    let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+                    for scale in [1.0, 2.0] {
+                        let pixmap = paint_prepared_region_with_scroll(&tree, &mut prepared,
+                            &mut resources, &scroll, CaptureRegion::new(0.0, 0.0, 220.0, 140.0, scale)).unwrap();
+                        let mut count = 0;
+                        let mut min_y = u32::MAX;
+                        let mut max_y = 0;
+                        for y in 0..pixmap.height() {
+                            for x in 0..pixmap.width() {
+                                let p = pixmap.pixel(x, y).unwrap();
+                                if p.blue() > 200 && p.red() < 50 && p.green() < 50 {
+                                    let cx = (x as f32 + 0.5) / scale;
+                                    let cy = (y as f32 + 0.5) / scale;
+                                    assert!(cx >= allowed.x && cx < allowed.x + allowed.width
+                                        && cy >= allowed.y && cy < allowed.y + allowed.height,
+                                        "text outside clip: {control}, height={height}, clipped={clipped}, scale={scale}, ({cx},{cy}), {allowed:?}");
+                                    count += 1;
+                                    min_y = min_y.min(y);
+                                    max_y = max_y.max(y);
+                                }
+                            }
+                        }
+                        assert!(count > 30, "clipping must leave visible text: {control}, height={height}, clipped={clipped}, scale={scale}");
+                        if !clipped && height == 8.0 {
+                            assert!((max_y - min_y + 1) as f32 / scale >= 20.0,
+                                "short controls must retain the centered glyph ink visible in Chrome: {control}, scale={scale}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
