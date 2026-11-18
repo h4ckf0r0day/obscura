@@ -372,3 +372,29 @@ async fn terminate_execution_during_script_fetch_does_not_poison_the_script() {
         resources.abort();
     }).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn manual_termination_preserves_the_original_parser_phase_deadline() {
+    std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "500");
+    tokio::task::LocalSet::new().run_until(async {
+        let site = serve_html("<!doctype html><title>phase</title><script>globalThis.firstStarted=true;while(true){};globalThis.firstFinished=true;</script><script>globalThis.secondStarted=true;var secondStart=Date.now();while(Date.now()-secondStart<4000){};globalThis.secondFinished=true;</script>").await;
+        let port = start_server().await;
+        let (mut ws, session) = open_page(port).await;
+        let began = Instant::now();
+        send(&mut ws, json!({"id": 10, "sessionId": session, "method": "Page.navigate",
+            "params": {"url": format!("http://127.0.0.1:{site}/"), "waitUntil": "load"}})).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        send(&mut ws, json!({"id": 11, "sessionId": session, "method": "Runtime.terminateExecution"})).await;
+        assert_eq!(response(&mut ws, 11, Duration::from_secs(2)).await["result"], json!({}));
+        let navigated = response(&mut ws, 10, Duration::from_secs(6)).await;
+        assert!(navigated.get("error").is_none(), "{navigated}");
+        let elapsed = began.elapsed();
+        let after = evaluate(&mut ws, &session, 12,
+            "[!!globalThis.firstStarted,!!globalThis.firstFinished,!!globalThis.secondStarted,!!globalThis.secondFinished]").await;
+        assert_eq!(after["result"]["result"]["value"], json!([true, false, true, false]),
+            "manual interruption must preserve the phase watchdog for the second short script (elapsed {elapsed:?}): {after}");
+        // The original phase deadline is 500ms plus its 1000ms hard-stop grace.
+        // The finite second loop keeps a broken implementation bounded at 4s.
+        assert!(elapsed < Duration::from_secs(3), "phase deadline was lost: {elapsed:?}");
+    }).await;
+}

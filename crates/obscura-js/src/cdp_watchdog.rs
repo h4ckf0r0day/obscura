@@ -189,22 +189,16 @@ pub fn disarm(armed: Armed) -> bool {
 /// remain armed during I/O, but an idle runtime must not inherit termination.
 pub fn interrupt(owner: std::thread::ThreadId, page: &str) {
     let s = shared();
-    let mut guard = s.state.lock().unwrap();
+    let guard = s.state.lock().unwrap();
     let active = guard.0.values().find_map(|slot| {
         let target = slot.scope.as_ref().filter(|target| target.owner == owner && target.page.as_ref() == page)?;
         Some((target.reserve_interrupt()?, slot.handle.clone()))
     });
     if let Some((reservation, handle)) = active {
+        // Entry guards own manual recovery. Keep automatic deadlines armed:
+        // a parser phase can continue into another script after this one.
         handle.terminate_execution();
-        guard.0.retain(|_, slot| {
-            if !slot.scope.as_ref().is_some_and(|scope| Arc::ptr_eq(&scope.activity, &reservation.0)) {
-                return true;
-            }
-            slot.fired.store(true, Ordering::SeqCst);
-            false
-        });
         drop(reservation);
-        s.cv.notify_one();
     }
 }
 
