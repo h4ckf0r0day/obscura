@@ -12575,16 +12575,17 @@ fn definite_row_flex_intrinsic_width(
         {
             return None;
         }
-        if child_style.flex_basis_calc.is_some() {
-            return None;
-        }
-        let basis = match child_style.flex_basis {
-            crate::Dimension::Px(value) => value,
-            crate::Dimension::Auto => match child_style.width {
+        let basis = if let Some(calc) = &child_style.flex_basis_calc {
+            calc.fixed_flex_basis()?
+        } else {
+            match child_style.flex_basis {
                 crate::Dimension::Px(value) => value,
+                crate::Dimension::Auto => match child_style.width {
+                    crate::Dimension::Px(value) => value,
+                    _ => return None,
+                },
                 _ => return None,
-            },
-            _ => return None,
+            }
         };
         let edges = child_style.padding.left
             + child_style.padding.right

@@ -5228,6 +5228,19 @@ fn functional_flex_basis_follows_a_nested_flex_items_used_width() {
 }
 
 #[test]
+fn functional_flex_basis_preserves_fixed_intrinsic_rows() {
+    for basis in ["300px", "calc(300px)", "calc(200px + 100px)", "min(300px, 400px)"] {
+        let tree = parse_html(&format!("<!doctype html><style>html,body{{margin:0}}#outer{{display:flex;width:768px}}#parent{{flex:0 0 auto;width:auto}}#item{{display:flex;width:100%}}#cell{{flex:0 0 {basis};height:20px}}</style><div id=outer><div id=parent><div><div id=item><div id=cell></div></div></div></div></div>"));
+        let layout = layout_dom(&tree, (800.0, 600.0));
+        for id in ["parent", "item", "cell"] {
+            let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+            assert_eq!(rect.width, 300.0, "{basis};{id}: {rect:?}");
+            assert_eq!(rect.height, 20.0, "{basis};{id}: {rect:?}");
+        }
+    }
+}
+
+#[test]
 fn functional_flex_basis_preserves_content_aspect_ratio_transfer() {
     for basis in ["50%", "calc(50% - 10px)", "auto"] {
         for (width, height, expected_cross) in [
