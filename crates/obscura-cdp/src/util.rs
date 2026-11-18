@@ -136,10 +136,10 @@ mod tests {
     fn object_id_literal_survives_the_shape_the_runtime_actually_mints() {
         // Ids are JSON documents themselves, so the literal has to carry a
         // second round of quoting without losing the id.
-        let oid = r#"{"injectedScriptId":1,"id":7}"#;
+        let oid = "1.2.7";
         assert_eq!(
             object_id_literal(oid),
-            r#""{\"injectedScriptId\":1,\"id\":7}""#
+            r#""1.2.7""#
         );
 
         // And a getProperties child id is that, plus `::`, plus a page-chosen
@@ -147,7 +147,7 @@ mod tests {
         let child = format!("{oid}::lf\nx");
         assert_eq!(
             object_id_literal(&child),
-            r#""{\"injectedScriptId\":1,\"id\":7}::lf\nx""#
+            r#""1.2.7::lf\nx""#
         );
     }
 

@@ -283,6 +283,8 @@ pub struct ObscuraJsRuntime {
     object_store: HashMap<String, CdpObjectRecord>,
     evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
+    /// executionContextId stamped into newly minted CDP objectIds.
+    cdp_context_id: i64,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
     /// intentionally separate from page fetch/XHR activity so analytics does
@@ -748,6 +750,7 @@ impl ObscuraJsRuntime {
 
         let mut instance = ObscuraJsRuntime {
             state,
+            cdp_context_id: 1,
             object_store: HashMap::new(),
             evaluation_recipes: HashMap::new(),
             object_counter: 0,
@@ -4492,9 +4495,16 @@ impl ObscuraJsRuntime {
             None
         }
     }
+    /// Set the executionContextId that objectIds minted from now on carry.
+    pub fn set_cdp_context_id(&mut self, id: i64) {
+        self.cdp_context_id = id;
+    }
+
+    /// Chrome shape `<isolateId>.<executionContextId>.<objectId>`. Clients such
+    /// as Patchright parse the middle segment as the owning context.
     fn make_oid(&self, _counter: u64) -> String {
         let id = NEXT_CDP_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{{\"injectedScriptId\":1,\"id\":{}}}", id)
+        format!("1.{}.{}", self.cdp_context_id, id)
     }
 
     fn wrap_expression(expression: &str) -> String {

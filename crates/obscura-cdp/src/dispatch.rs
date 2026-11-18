@@ -860,6 +860,10 @@ pub(crate) async fn dispatch_with_deferred(
         }
     };
 
+    if matches!(domain, "Runtime" | "DOM") {
+        stamp_object_context(ctx, &req.params, &req.session_id);
+    }
+
     let result = match domain {
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
         "Browser" => domains::browser::handle(method, &req.params).await,
@@ -1322,6 +1326,27 @@ async fn dispatch_send_message_to_target(req: &CdpRequest, ctx: &mut CdpContext)
     CdpResponse::success(req.id, json!({}), req.session_id.clone())
 }
 
+/// Pick the executionContextId that objectIds minted by this command carry:
+/// the requested context, else the context of the objectId operated on, else
+/// the page's default context.
+fn stamp_object_context(ctx: &mut CdpContext, params: &serde_json::Value, session_id: &Option<String>) {
+    let requested = params.get("contextId").or_else(|| params.get("executionContextId"))
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| params.get("uniqueContextId").and_then(serde_json::Value::as_str)
+            .and_then(|unique| ctx.context_by_unique_id(unique).map(|c| c.id)))
+        .or_else(|| params.get("objectId").and_then(serde_json::Value::as_str).and_then(object_id_context));
+    let Some(page_id) = session_id.as_ref().and_then(|s| ctx.sessions.get(s)).cloned() else { return };
+    let id = requested.or_else(|| ctx.default_context_id(&page_id)).unwrap_or(1);
+    if let Some(js) = ctx.get_page_mut(&page_id).and_then(|page| page.js.as_mut()) {
+        js.set_cdp_context_id(id);
+    }
+}
+
+/// Context segment of a `<isolate>.<context>.<id>` objectId.
+fn object_id_context(object_id: &str) -> Option<i64> {
+    object_id.split('.').nth(1)?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1564,4 +1589,16 @@ mod tests {
         assert_eq!(err.code, -32700);
     }
 
+}
+
+#[cfg(test)]
+mod object_id_context_tests {
+    use super::object_id_context;
+
+    #[test]
+    fn reads_the_context_segment_of_a_chrome_shaped_object_id() {
+        assert_eq!(object_id_context("1.42.7"), Some(42));
+        assert_eq!(object_id_context("1.42.7::name"), Some(42));
+        assert_eq!(object_id_context("garbage"), None);
+    }
 }
