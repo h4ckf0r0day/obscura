@@ -133,7 +133,7 @@ impl FamilyOwned {
         }
     }
 
-    pub fn as_family(&self) -> Family {
+    pub fn as_family(&self) -> Family<'_> {
         match self {
             FamilyOwned::Name(name) => Family::Name(name),
             FamilyOwned::Serif => Family::Serif,
@@ -626,7 +626,7 @@ impl AttrsOwned {
         }
     }
 
-    pub fn as_attrs(&self) -> Attrs {
+    pub fn as_attrs(&self) -> Attrs<'_> {
         Attrs {
             color_opt: self.color_opt,
             family: self.family_owned.as_family(),
@@ -667,7 +667,7 @@ impl AttrsList {
     }
 
     /// Get the default [Attrs]
-    pub fn defaults(&self) -> Attrs {
+    pub fn defaults(&self) -> Attrs<'_> {
         self.defaults.as_attrs()
     }
 
@@ -699,7 +699,7 @@ impl AttrsList {
     /// Get the attribute span for an index
     ///
     /// This returns a span that contains the index
-    pub fn get_span(&self, index: usize) -> Attrs {
+    pub fn get_span(&self, index: usize) -> Attrs<'_> {
         self.spans
             .get(&index)
             .map(|v| v.as_attrs())

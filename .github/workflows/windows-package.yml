@@ -1,0 +1,58 @@
+name: Windows packaging regression
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/windows-package.yml'
+      - 'scripts/ci/*windows*.ps1'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/windows-package.yml'
+      - 'scripts/ci/*windows*.ps1'
+permissions:
+  contents: read
+concurrency:
+  group: windows-package-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test dependency validation
+        shell: pwsh
+        run: ./scripts/ci/test_package_windows.ps1
+      - name: Regress the four Windows archives from issue 1491
+        shell: pwsh
+        run: |
+          . ./scripts/ci/package_windows.ps1
+          $tools = Get-WindowsDistributionTools
+          # These immutable fixtures reproduce missing runtimes without Rust/V8 builds.
+          $fixtures = @{
+            '' = '0a110d0693753a252ed7ffd61e682363e8622caf79697f564c529099a31a6242'
+            '-stealth' = 'a32a26fc73fcc21850a67d9cd0d0cd7caf7b400a0e20aa91703126f0fc47c33f'
+            '-no-render' = 'a9b88f38eb1f1efdbbb0adf1f526140dbbd4866d01f35d3452f899f5eb7c4442'
+            '-no-render-stealth' = '11bb447a7b4b38e596cba8ec10754f46eb4dae55046b68cb09d82d4b2d4d32bf'
+          }
+          foreach ($suffix in $fixtures.Keys) {
+            $name = "obscura-x86_64-windows$suffix"
+            $archive = "$env:RUNNER_TEMP\$name.zip"
+            Invoke-WebRequest "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.6/$name.zip" -OutFile $archive
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $fixtures[$suffix]) { throw "Fixture checksum mismatch: $name" }
+            $stage = "$env:RUNNER_TEMP\$name"
+            Expand-Archive $archive $stage
+            try {
+              Resolve-WindowsDependencies $stage $tools.Dumpbin
+              throw 'Baseline unexpectedly has complete runtime distribution'
+            } catch {
+              if ($_.Exception.Message -notlike '*Unbundled non-system dependency*') { throw }
+              Write-Host "EXPECTED BASELINE FAILURE: $_"
+            }
+            New-WindowsPackage $stage "$env:RUNNER_TEMP\fixed-$name.zip"
+          }

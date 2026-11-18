@@ -12,6 +12,8 @@ stealth = ["wreq", "wreq-util", "futures-util"]
 [dependencies]
 obscura-ssrf = { workspace = true }
 reqwest = { workspace = true }
+# Keep embedded consumers above the vulnerable transitive zstd requirements.
+compression-codecs = { version = "0.4.46", default-features = false }
 tokio = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
@@ -28,7 +30,7 @@ futures-util = { version = "0.3", optional = true }
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
 # newer, incompatible rc and broke `cargo build --features stealth` (issue #234).
 # Pin exact versions so the build always resolves to the API wreq_client.rs targets.
-wreq-util = { version = "=3.0.0-rc.12", optional = true, features = ["emulation-compression"] }
+wreq-util = { path = "../../vendor/wreq-util", version = "=3.0.0-rc.12", optional = true, features = ["emulation-compression"] }
 
 [dev-dependencies]
 socket2 = "0.6"
