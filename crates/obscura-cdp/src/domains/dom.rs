@@ -412,6 +412,16 @@ pub async fn handle(
             Ok(json!({ "node": node }))
         }
         "resolveNode" => {
+            let (frame_id, context_id) = super::runtime::validate_context(
+                params, "executionContextId", ctx, session_id, "resolveNode",
+            )?;
+            // DOM backend ids currently name the main document. A frame has
+            // its own arena, where the same numeric id can name another node.
+            // Keep the existing main-document wrapper and report its real owner.
+            let context_id = if frame_id.is_some() {
+                ctx.get_session_page(session_id).and_then(|page| ctx.default_context_id(&page.id))
+                    .ok_or("Cannot find main execution context")?
+            } else { context_id };
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
@@ -436,31 +446,18 @@ pub async fn handle(
 
             let js_code = format!("globalThis._wrap({node_id})");
 
-            let info = if let Some(js) = &mut page.js {
-                match js.store_object_with_meta(&js_code) {
-                    Ok(info) => info,
-                    Err(_) => {
-                        return Ok(json!({
-                            "object": {
-                                "type": "object",
-                                "subtype": "node",
-                                "className": "HTMLElement",
-                                "objectId": format!("node-{}", node_id),
-                            }
-                        }));
-                    }
-                }
-            } else {
-                return Err("No JS runtime".to_string());
-            };
+            let js = page.js.as_mut().ok_or("No JS runtime")?;
+            js.set_cdp_context_id(context_id);
+            let info = js.store_object_with_meta(&js_code)?;
 
+            let object_id = info.object_id.ok_or("Could not resolve node to a remote object")?;
             Ok(json!({
                 "object": {
                     "type": "object",
                     "subtype": "node",
                     "className": if info.class_name.is_empty() { "HTMLElement".to_string() } else { info.class_name },
                     "description": info.description,
-                    "objectId": info.object_id.unwrap_or_else(|| format!("node-{}", node_id)),
+                    "objectId": object_id,
                 }
             }))
         }

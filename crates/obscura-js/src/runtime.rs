@@ -268,7 +268,7 @@ pub struct PendingCdpEvaluation {
 /// the same id without retaining a second isolate.
 #[derive(Default)]
 pub struct CdpObjectState {
-    object_counter: u64,
+    object_namespace: u128,
     evaluation_recipes: HashMap<String, String>,
 }
 
@@ -282,7 +282,8 @@ pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, CdpObjectRecord>,
     evaluation_recipes: HashMap<String, String>,
-    object_counter: u64,
+    object_namespace: u128,
+    cdp_context_id: i64,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
     /// intentionally separate from page fetch/XHR activity so analytics does
@@ -770,7 +771,9 @@ impl ObscuraJsRuntime {
             state,
             object_store: HashMap::new(),
             evaluation_recipes: HashMap::new(),
-            object_counter: 0,
+            object_namespace: (u128::from(std::process::id()) << 64)
+                | u128::from(NEXT_CDP_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            cdp_context_id: 1,
             import_map,
             module_load_activity,
             isolate_handle,
@@ -2863,8 +2866,7 @@ impl ObscuraJsRuntime {
     ) -> Result<CdpEvaluation, String> {
         let context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
-        self.object_counter += 1;
-        let oid = self.make_oid(self.object_counter);
+        let oid = self.make_oid(Some(self.cdp_context_id));
         // Compile the script itself, not a string passed through the page's eval.
         let record = (|| {
             let mut entered = self.runtime();
@@ -2966,6 +2968,10 @@ impl ObscuraJsRuntime {
             }
             frame_id = object_frame;
         }
+        let object_context_id = match object_id {
+            Some(id) => self.cdp_object_context_id(id),
+            None => Some(self.cdp_context_id),
+        };
         let context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
         let receiver = if object_id.is_some() {
@@ -2979,10 +2985,9 @@ impl ObscuraJsRuntime {
             let value: v8::Local<v8::Value> = global.into();
             v8::Global::new(scope, value)
         };
-        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument, &context))
+        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument, &context, object_context_id))
             .collect::<Result<Vec<_>, _>>()?;
-        self.object_counter += 1;
-        let oid = self.make_oid(self.object_counter);
+        let oid = self.make_oid(object_context_id);
         let record = (|| {
             let mut entered = self.runtime();
             v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
@@ -3184,8 +3189,7 @@ impl ObscuraJsRuntime {
     }
     pub fn store_object(&mut self, js_expression: &str) -> Result<String, String> {
         self.begin_javascript_task();
-        self.object_counter += 1;
-        let oid = self.make_oid(self.object_counter);
+        let oid = self.make_oid(Some(self.cdp_context_id));
         let code = format!(
             "globalThis.__obscura_objects[{}] = ({});",
             js_string_literal(&oid), js_expression,
@@ -3207,8 +3211,7 @@ impl ObscuraJsRuntime {
         js_expression: &str,
     ) -> Result<RemoteObjectInfo, String> {
         self.begin_javascript_task();
-        self.object_counter += 1;
-        let oid = self.make_oid(self.object_counter);
+        let oid = self.make_oid(Some(self.cdp_context_id));
         let code = format!(
             "(function() {{\n\
                 var __result = (\n{expr}\n);\n\
@@ -3282,13 +3285,13 @@ impl ObscuraJsRuntime {
 
     pub fn take_cdp_object_state(&mut self) -> CdpObjectState {
         CdpObjectState {
-            object_counter: self.object_counter,
+            object_namespace: self.object_namespace,
             evaluation_recipes: std::mem::take(&mut self.evaluation_recipes),
         }
     }
 
     pub fn restore_cdp_object_state(&mut self, state: CdpObjectState) {
-        self.object_counter = self.object_counter.max(state.object_counter);
+        if state.object_namespace != 0 { self.object_namespace = state.object_namespace; }
         self.evaluation_recipes = state.evaluation_recipes;
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
@@ -4543,9 +4546,29 @@ impl ObscuraJsRuntime {
             None
         }
     }
-    fn make_oid(&self, _counter: u64) -> String {
+    /// The CDP layer binds only a context it has validated for this page.
+    #[doc(hidden)]
+    pub fn set_cdp_context_id(&mut self, context_id: i64) {
+        self.cdp_context_id = context_id;
+    }
+
+    fn cdp_object_context_id(&self, object_id: &str) -> Option<i64> {
+        // Callers have already validated the exact handle. Parsing identifies
+        // its owner, never authorizes a handle.
+        let mut parts = object_id.split('.');
+        if parts.next().and_then(|id| id.parse::<u128>().ok()) == Some(self.object_namespace) {
+            parts.next().and_then(|id| id.parse().ok())
+        } else { None }
+    }
+
+    fn make_oid(&self, context_id: Option<i64>) -> String {
         let id = NEXT_CDP_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{{\"injectedScriptId\":1,\"id\":{}}}", id)
+        match context_id {
+            Some(context) => format!("{}.{context}.{id}", self.object_namespace),
+            // Legacy console/node handles have no logical-world provenance.
+            // Keep derived handles opaque rather than claim an incorrect world.
+            None => format!("{{\"injectedScriptId\":1,\"id\":{id}}}"),
+        }
     }
 
     fn wrap_expression(expression: &str) -> String {
@@ -4671,10 +4694,14 @@ impl ObscuraJsRuntime {
         &mut self,
         argument: &serde_json::Value,
         context: &v8::Global<v8::Context>,
+        context_id: Option<i64>,
     ) -> Result<v8::Global<v8::Value>, String> {
         // Remote handles take precedence over value, including rod's value:null.
         if let Some(id) = argument.get("objectId").and_then(|value| value.as_str()) {
             let expression = self.cdp_object_expression(id)?;
+            if let (Some(owner), Some(target)) = (self.cdp_object_context_id(id), context_id) {
+                if owner != target { return Err("Object belongs to a different execution context".into()); }
+            }
             let object_context = self.object_store.get(id).and_then(|record| record.frame.as_ref())
                 .map(|(_, context)| context.clone()).unwrap_or_else(|| self.runtime().main_context());
             if &object_context != context {
