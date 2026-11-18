@@ -1,4 +1,5 @@
 pub mod client;
+pub mod conditions;
 pub mod cookies;
 pub mod encoding;
 pub mod interceptor;
@@ -12,6 +13,7 @@ pub use client::{
     ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
     ResourceRequest, ResourceType, Response, ResponseCallback, SsrfGuardResolver,
 };
+pub use conditions::{NetworkConditions, NetworkConditionsCell};
 pub use cookies::{
     canonical_domain, default_cookie_path, same_site, CookieInfo, CookieJar, SameSiteContext,
 };

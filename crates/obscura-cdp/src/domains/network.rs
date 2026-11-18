@@ -1,8 +1,9 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use obscura_net::CookieJar;
+use obscura_net::{CookieJar, NetworkConditions};
 
 use crate::cookie_params::{parse_cdp_cookie, parse_delete_cookies_params};
 use crate::dispatch::CdpContext;
@@ -141,6 +142,40 @@ pub async fn handle(
                 })),
                 None => Err(format!("No response body found for requestId {}", request_id)),
             }
+        }
+        "emulateNetworkConditions" => {
+            const REQUIRED: &str =
+                "Network.emulateNetworkConditions requires boolean offline and numeric latency >= 0";
+            let offline = params
+                .get("offline")
+                .and_then(|value| value.as_bool())
+                .ok_or(REQUIRED)?;
+            let latency_ms = params
+                .get("latency")
+                .and_then(|value| value.as_f64())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .ok_or(REQUIRED)?;
+            // A missing or non-positive throughput means no limit.
+            let throughput = |name: &str| {
+                params
+                    .get(name)
+                    .and_then(|value| value.as_f64())
+                    .filter(|value| *value > 0.0)
+                    .map(|value| value as u64)
+                    .filter(|value| *value > 0)
+            };
+            let latency =
+                Duration::try_from_secs_f64(latency_ms / 1000.0).map_err(|_| REQUIRED)?;
+            let conditions = NetworkConditions {
+                offline,
+                latency,
+                download_bytes_per_sec: throughput("downloadThroughput"),
+                upload_bytes_per_sec: throughput("uploadThroughput"),
+            };
+            ctx.get_session_page(session_id)
+                .ok_or("No page for session")?
+                .set_network_conditions(conditions);
+            Ok(json!({}))
         }
         _ => Err(format!("Unknown Network method: {}", method)),
     }

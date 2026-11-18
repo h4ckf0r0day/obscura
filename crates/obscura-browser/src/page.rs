@@ -4831,6 +4831,13 @@ impl Page {
         }
     }
 
+    /// Apply `Network.emulateNetworkConditions` to this page only: every
+    /// request it drives (navigation, subresources, script fetch/XHR) reads
+    /// the conditions from its own callback registry.
+    pub fn set_network_conditions(&self, conditions: obscura_net::NetworkConditions) {
+        self.callbacks.network_conditions().set(conditions);
+    }
+
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
         self.blocked_url_patterns = patterns.clone();
         if let Some(js) = &self.js {

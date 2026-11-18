@@ -5,7 +5,7 @@ use std::error::Error;
 #[cfg(feature = "stealth")]
 use std::sync::Arc;
 #[cfg(feature = "stealth")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "stealth")]
 use futures_util::StreamExt;
@@ -23,6 +23,7 @@ use crate::client::{
     ResourceRequest, Response, SsrfGuardResolver,
 };
 #[cfg(feature = "stealth")]
+use crate::conditions::NetworkConditionsCell;
 use crate::cookies::{CookieJar, SameSiteContext};
 
 /// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
@@ -134,6 +135,7 @@ async fn read_wreq_body_limited(
     response: wreq::Response,
     url: &Url,
     limit: usize,
+    conditions: Option<&NetworkConditionsCell>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     if response
         .headers()
@@ -153,6 +155,7 @@ async fn read_wreq_body_limited(
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
     let mut body = Vec::with_capacity(capacity);
+    let started = Instant::now();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
@@ -161,6 +164,9 @@ async fn read_wreq_body_limited(
             return Err(response_too_large(url, limit));
         }
         body.extend_from_slice(&chunk);
+        if let Some(conditions) = conditions {
+            conditions.pace_download(started, body.len()).await;
+        }
     }
     Ok(body)
 }
@@ -457,6 +463,11 @@ impl StealthHttpClient {
                 request_callback_fired = true;
             }
 
+            if let Some(callbacks) = callbacks {
+                let upload_bytes = body.as_ref().map_or(0, Vec::len);
+                callbacks.network_conditions().before_request(&current_url, upload_bytes).await?;
+            }
+
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = if method == wreq::Method::GET {
                 send_get_with_connection_reset_retry(req, &current_url).await
@@ -524,8 +535,13 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
-                .await?;
+            let body = read_wreq_body_limited(
+                resp,
+                &current_url,
+                request.max_response_bytes,
+                callbacks.map(CallbackRegistry::network_conditions),
+            )
+            .await?;
             drop(in_flight);
 
             let response = Response {
@@ -579,7 +595,7 @@ impl StealthHttpClient {
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
         let response = self.send_single_headers_with_context(
-            method, url, headers, body, cookie_context, store_cookies, 64 * 1024 * 1024,
+            method, url, headers, body, cookie_context, store_cookies, 64 * 1024 * 1024, None,
         ).await?;
         Ok(Response {
             url: url.clone(), status: response.status, headers: response.headers,
@@ -597,6 +613,7 @@ impl StealthHttpClient {
         cookie_context: Option<SameSiteContext>,
         store_cookies: bool,
         max_body_bytes: usize,
+        callbacks: Option<Arc<CallbackRegistry>>,
     ) -> Result<StealthResponseHeaders, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
@@ -635,6 +652,10 @@ impl StealthHttpClient {
             req = req.body(body.to_vec());
         }
 
+        if let Some(callbacks) = &callbacks {
+            callbacks.network_conditions().before_request(url, body.len()).await?;
+        }
+
         let in_flight = InFlightGuard::new(&self.in_flight);
         let resp = req.send().await.map_err(|e| {
             ObscuraNetError::Network(format!("{}: {}", url, error_chain(&e)))
@@ -659,7 +680,13 @@ impl StealthHttpClient {
             headers: response_headers,
             body: Box::pin(async move {
                 let _in_flight = in_flight;
-                read_wreq_body_limited(resp, &body_url, max_body_bytes).await
+                read_wreq_body_limited(
+                    resp,
+                    &body_url,
+                    max_body_bytes,
+                    callbacks.as_deref().map(CallbackRegistry::network_conditions),
+                )
+                .await
             }),
         })
     }

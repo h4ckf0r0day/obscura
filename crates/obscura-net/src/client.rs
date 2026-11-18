@@ -12,6 +12,7 @@ use reqwest::{Client, Method};
 use tokio::sync::{RwLock, watch};
 use url::Url;
 
+use crate::conditions::{NetworkConditions, NetworkConditionsCell};
 use crate::cookies::{same_site, CookieJar, SameSiteContext};
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
@@ -518,6 +519,10 @@ pub struct CallbackRegistry {
     on_request: RwLock<Vec<(u64, RequestCallback)>>,
     on_response: RwLock<Vec<(u64, ResponseCallback)>>,
     id_counter: std::sync::atomic::AtomicU64,
+    /// This page's `Network.emulateNetworkConditions` state. It lives here
+    /// because the registry is page-scoped while the client is shared by every
+    /// page of a context.
+    network_conditions: NetworkConditionsCell,
 }
 
 impl CallbackRegistry {
@@ -526,7 +531,12 @@ impl CallbackRegistry {
             on_request: RwLock::new(Vec::new()),
             on_response: RwLock::new(Vec::new()),
             id_counter: std::sync::atomic::AtomicU64::new(1),
+            network_conditions: NetworkConditionsCell::default(),
         }
+    }
+
+    pub fn network_conditions(&self) -> &NetworkConditionsCell {
+        &self.network_conditions
     }
 
     fn next_id(&self) -> u64 {
@@ -842,6 +852,7 @@ pub async fn read_reqwest_body_limited(
     mut response: reqwest::Response,
     url: &Url,
     limit: usize,
+    conditions: Option<&NetworkConditionsCell>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     reject_oversized_content_length(response.headers(), url, limit)?;
     let capacity = response
@@ -850,6 +861,7 @@ pub async fn read_reqwest_body_limited(
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
+    let started = Instant::now();
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
     })? {
@@ -857,6 +869,9 @@ pub async fn read_reqwest_body_limited(
             return Err(response_too_large(url, limit));
         }
         body.extend_from_slice(&chunk);
+        if let Some(conditions) = conditions {
+            conditions.pace_download(started, body.len()).await;
+        }
     }
     Ok(body)
 }
@@ -1338,6 +1353,15 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
+        // A page with emulated network conditions must neither lead nor follow
+        // a coalesced fetch: the shared response would carry another page's
+        // conditions (or skip this page's own offline/latency/throughput).
+        if callbacks.is_some_and(|cbs| cbs.network_conditions().get() != NetworkConditions::default())
+        {
+            return self
+                .fetch_with_profile_uncached(initial_method, url, initial_body, callbacks, request)
+                .await;
+        }
         let Some(cache_key) = self
             .resource_cache_key(&initial_method, url, &initial_body, &request)
             .await
@@ -1580,6 +1604,11 @@ impl ObscuraHttpClient {
                 request_callback_fired = true;
             }
 
+            if let Some(cbs) = callbacks {
+                let upload_bytes = body.as_ref().map_or(0, Vec::len);
+                cbs.network_conditions().before_request(&current_url, upload_bytes).await?;
+            }
+
             let ua = self.user_agent.read().await.clone();
             let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
             let mut headers = HeaderMap::new();
@@ -1782,6 +1811,7 @@ impl ObscuraHttpClient {
                 resp,
                 &current_url,
                 request.max_response_bytes,
+                callbacks.map(CallbackRegistry::network_conditions),
             )
             .await?;
             drop(in_flight);
@@ -3073,6 +3103,51 @@ mod ssrf_tests {
         assert_eq!(network_requests.load(Ordering::SeqCst), 1);
         assert_eq!(callback_requests.load(Ordering::SeqCst), 32);
         assert_eq!(callback_responses.load(Ordering::SeqCst), 32);
+    }
+
+    #[tokio::test]
+    async fn emulated_conditions_page_does_not_follow_coalesced_fetch() {
+        let (url, network_requests) =
+            cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600
+").await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = Arc::new(ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        ));
+        let normal = Arc::new(CallbackRegistry::new());
+        let offline = Arc::new(CallbackRegistry::new());
+        offline.network_conditions().set(crate::NetworkConditions {
+            offline: true,
+            ..Default::default()
+        });
+
+        let leader = {
+            let (client, normal, url) = (client.clone(), normal.clone(), url.clone());
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            tokio::spawn(async move {
+                client
+                    .fetch_resource_with_callbacks(&url, request, Some(&normal))
+                    .await
+            })
+        };
+        // Let the normal page become the in-flight leader first.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        let offline_result = client
+            .fetch_resource_with_callbacks(&url, request, Some(&offline))
+            .await;
+        assert!(offline_result.is_err(), "offline page must not share a response");
+        assert_eq!(leader.await.unwrap().unwrap().status, 200);
+
+        // The cache is populated now; an offline page still must not read it.
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        assert!(client
+            .fetch_resource_with_callbacks(&url, request, Some(&offline))
+            .await
+            .is_err());
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
