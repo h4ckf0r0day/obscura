@@ -25260,6 +25260,60 @@ mod tests {
     }
 
     #[test]
+    fn iframe_sandbox_assignment_forwards_to_its_live_token_list() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe'), tokens = frame.sandbox;
+            const rows = [];
+            for (const value of ['allow-scripts allow-forms', '', null, undefined,
+                {toString(){return 'allow-scripts';}}]) {
+                frame.sandbox = value;
+                rows.push([frame.getAttribute('sandbox'), tokens.value, frame.sandbox === tokens]);
+            }
+            let symbolRejected = false;
+            try { frame.sandbox = Symbol('allow-forms'); }
+            catch (error) { symbolRejected = error instanceof TypeError; }
+            const symbolValue = tokens.value;
+            const setter = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'sandbox').set;
+            const forwarded = {};
+            Object.defineProperty(frame, 'sandbox', {value: forwarded});
+            setter.call(frame, 'allow-forms');
+            let forgedRejected = false;
+            try { setter.call({sandbox: {}}, 'allow-scripts'); }
+            catch (error) { forgedRejected = error instanceof TypeError; }
+            const frozen = document.createElement('iframe'), frozenValue = Object.freeze({value:'kept'});
+            Object.defineProperty(frozen, 'sandbox', {value: frozenValue});
+            let frozenIgnored = false;
+            try { setter.call(frozen, 'ignored'); frozenIgnored = frozenValue.value === 'kept'; }
+            catch (_) {}
+            const proxy = document.createElement('iframe');
+            Object.defineProperty(proxy, 'sandbox', {value: new Proxy({}, {set(){return false;}})});
+            let proxyIgnored = false;
+            try { setter.call(proxy, 'ignored'); proxyIgnored = true; } catch (_) {}
+            const nativeReflectSet = Reflect.set, raw = Symbol('forwarded');
+            let rawForwarded = false;
+            try {
+                Reflect.set = () => { throw new Error('author Reflect.set'); };
+                setter.call(frame, raw); rawForwarded = forwarded.value === raw;
+            } finally { Reflect.set = nativeReflectSet; }
+            const div = document.createElement('div'); div.className = 'original';
+            let classSymbolRejected = false;
+            try { div.classList.value = Symbol('class'); }
+            catch (error) { classSymbolRejected = error instanceof TypeError; }
+            return {rows, symbolRejected, symbolValue, forgedRejected, frozenIgnored, proxyIgnored,
+                rawForwarded, classSymbolRejected, classValue: div.className};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "rows": [["allow-scripts allow-forms","allow-scripts allow-forms",true],
+                ["","",true],["null","null",true],["undefined","undefined",true],
+                ["allow-scripts","allow-scripts",true]],
+            "symbolRejected":true,"symbolValue":"allow-scripts","forgedRejected":true,
+            "frozenIgnored":true,"proxyIgnored":true,"rawForwarded":true,
+            "classSymbolRejected":true,"classValue":"original",
+        }));
+    }
+
+    #[test]
     fn native_dom_dispatch_uses_receiver_frame_listeners() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.evaluate(r#"(() => {
