@@ -422,8 +422,11 @@ function __startDynClassicFetch(task) {
     error => ({ error }),
   );
 }
-function _executeClassicScript(source) {
-  __obscuraCore.ops.op_execute_classic_script(_executeClassicScript, source);
+function _executeClassicScript(source, nid) {
+  const previous = globalThis.__currentScriptNid;
+  globalThis.__currentScriptNid = nid;
+  try { __obscuraCore.ops.op_execute_classic_script(_executeClassicScript, source); }
+  finally { globalThis.__currentScriptNid = previous || 0; }
 }
 async function __runDynScriptTask(task) {
   try {
@@ -445,10 +448,8 @@ async function __runDynScriptTask(task) {
         // parser script happened to trigger the microtask checkpoint.
         await new Promise(resolve => {
           const execute = () => {
-            globalThis.__currentScriptNid = task.nid;
-            try { _executeClassicScript(body); }
+            try { _executeClassicScript(body, task.nid); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
-            finally { globalThis.__currentScriptNid = task.prevNid || 0; }
             resolve();
           };
           if (_scheduleAfter(0, execute) === undefined) execute();
@@ -2262,7 +2263,6 @@ function __prepareInsertedScript(script) {
   const src = script.getAttribute('src');
   const code = src ? "" : script.textContent;
   if (!src && !code) return;
-  const prevNid = globalThis.__currentScriptNid;
   const parserInserted = __documentWriteScripts.has(script);
   const parserBlocking = parserInserted
     && !isModule
@@ -2291,7 +2291,6 @@ function __prepareInsertedScript(script) {
       url: fullUrl,
       isModule,
       nid: script._nid,
-      prevNid,
       pageOrigin,
       fireEvent: (type) => _fireResourceEvent(script, type),
     };
@@ -2302,7 +2301,6 @@ function __prepareInsertedScript(script) {
     task.delaysLoad = globalThis.document?.readyState !== 'complete';
     if (task.delaysLoad) __dynLoadDelayingPending++;
     if (parserInserted && !isModule) {
-      task.prevNid = 0;
       if (parserBlocking) __parserBlockingScriptPending++;
       __parserBlockingScriptQueue.push({ task, blocking: parserBlocking });
       __processParserBlockingScriptQueue();
@@ -2336,7 +2334,6 @@ function __prepareInsertedScript(script) {
       url: dataUrl,
       isModule: true,
       nid: script._nid,
-      prevNid,
       pageOrigin: "",
       fireEvent: (type) => _fireResourceEvent(script, type),
       delaysLoad: globalThis.document?.readyState !== 'complete',
@@ -2352,17 +2349,14 @@ function __prepareInsertedScript(script) {
         inlineCode: code,
         isModule: false,
         nid: script._nid,
-        prevNid: 0,
         fireEvent: () => {},
         delaysLoad: false,
       },
     });
     __processParserBlockingScriptQueue();
   } else {
-    globalThis.__currentScriptNid = script._nid;
-    try { _executeClassicScript(code); }
+    try { _executeClassicScript(code, script._nid); }
     catch(e) { console.error('Dynamic inline script error:', e.message); }
-    finally { globalThis.__currentScriptNid = prevNid || 0; }
   }
 }
 
