@@ -4741,6 +4741,11 @@ async fn fetch_url_inner(
         }
     };
 
+    let user_agent = match &http_client {
+        Some(client) => client.user_agent.read().await.clone(),
+        None => "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
+    };
+
     let initial_request_origin = request_origin(&url).unwrap_or_default();
     let page_origin = if origin.is_empty() {
         initial_request_origin.clone()
@@ -4782,10 +4787,23 @@ async fn fetch_url_inner(
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
+        #[cfg(feature = "stealth")]
+        let user_agent = {
+            let stealth = {
+                let st = state.borrow();
+                let gs = st.borrow::<SharedState>().borrow();
+                gs.stealth_client.clone()
+            };
+            match stealth {
+                Some(stealth) => stealth.user_agent().await,
+                None => user_agent.clone(),
+            }
+        };
         let mut preflight_request = client
             .request(reqwest::Method::OPTIONS, &url)
             .timeout(fetch_timeout())
             .header("Origin", &page_origin)
+            .header("User-Agent", &user_agent)
             .header("Access-Control-Request-Method", method.as_str());
         if !unsafe_header_names.is_empty() {
             preflight_request = preflight_request.header(
@@ -4937,17 +4955,12 @@ async fn fetch_url_inner(
             }
         }
 
-        // Send a default User-Agent on fetch()/XHR requests (the navigation path
-        // sets one, but this op did not, so scripted requests went out with no UA
-        // and UA-gated servers rejected them). Honor an explicit override.
+        // Keep the context identity unless a request explicitly overrides it.
         if !current_headers
             .keys()
             .any(|k| k.eq_ignore_ascii_case("user-agent"))
         {
-            req = req.header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            );
+            req = req.header("User-Agent", &user_agent);
         }
 
         for (k, v) in &current_headers {

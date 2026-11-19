@@ -316,6 +316,15 @@ impl StealthHttpClient {
         self
     }
 
+    /// Browser-generated requests use the same identity as navigation.
+    pub async fn user_agent(&self) -> String {
+        self.extra_headers.read().await.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, value)| value.as_str())
+            .or(self.user_agent.as_deref())
+            .unwrap_or(STEALTH_USER_AGENT).to_string()
+    }
+
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_callbacks(url, None).await
     }
