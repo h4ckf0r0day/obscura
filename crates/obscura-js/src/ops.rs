@@ -348,6 +348,20 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             });
             "true".into()
         }
+        "template_contents" => {
+            let nid = match arg1.parse::<u32>() { Ok(n) => n, Err(_) => return "-1".into() };
+            match dom.template_contents(NodeId::new(nid)) {
+                Some(id) => id.index().to_string(),
+                None => "-1".into(),
+            }
+        }
+        "clone_node" => {
+            let nid = match arg1.parse::<u32>() { Ok(n) => n, Err(_) => return "-1".into() };
+            match dom.clone_node(NodeId::new(nid), arg2 == "true") {
+                Some(id) => id.index().to_string(),
+                None => "-1".into(),
+            }
+        }
         "create_document_fragment" => {
             dom.new_node(NodeData::Document).index().to_string()
         }

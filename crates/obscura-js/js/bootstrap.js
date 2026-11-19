@@ -581,6 +581,8 @@ class Node {
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
+    const t = this.nodeType;
+    if (t === 3 || t === 4 || t === 7 || t === 8) { this.data = v == null ? "" : String(v); return; }
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) _dom("remove_child", c);
     let added = [];
@@ -710,6 +712,14 @@ class Node {
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
     const t = this.nodeType;
+    if (t === 1 || t === 11) {
+      const nid = +_dom("clone_node", this._nid, deep ? "true" : "false");
+      if (nid >= 0) {
+        const clone = t === 11 ? new DocumentFragment(nid) : _wrap(nid);
+        if (t === 11) _cache.set(nid, clone);
+        return clone;
+      }
+    }
     if (t === 1) {
       if (deep) {
         const wrapper = document.createElement('div');
@@ -750,7 +760,13 @@ class Node {
     // -1 => this precedes other => other FOLLOWS this(4); +1 => this PRECEDING(2)).
     return (+_dom("compare_order", this._nid, other._nid) < 0) ? 4 : 2;
   }
-  getRootNode() { return globalThis.document; }
+  getRootNode(opts) {
+    let n = this, guard = 0;
+    while (guard++ < 100000) { const p = n.parentNode; if (!p) break; n = p; }
+    if (n instanceof ShadowRoot && opts && opts.composed) return n._host.getRootNode(opts);
+    if (n.nodeType === 9 && globalThis.document && n._nid === globalThis.document._nid) return globalThis.document;
+    return n;
+  }
   normalize() {
     // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
     // removed nodes keep their own data (read from the backing node by nid).
@@ -1103,6 +1119,23 @@ function _htmlAttrName(el, n) {
 
 class Element extends Node {
   constructor(nid) {
+    if (nid === undefined && new.target !== Element) {
+      const target = globalThis.__ceUpgradeTarget;
+      if (target) {
+        globalThis.__ceUpgradeTarget = null;
+        Object.setPrototypeOf(target, new.target.prototype);
+        return target;
+      }
+      const name = globalThis.customElements?._byCtor?.get(new.target);
+      if (name) {
+        nid = +_dom("create_element", name);
+        super(nid);
+        this._style = _styleProxy(new CSSStyleDeclaration());
+        this.__customUpgraded = true;
+        _cache.set(nid, this);
+        return;
+      }
+    }
     super(nid);
     this._style = _styleProxy(new CSSStyleDeclaration());
   }
@@ -1140,7 +1173,10 @@ class Element extends Node {
     if (this.localName === "svg") return "http://www.w3.org/2000/svg";
     return "http://www.w3.org/1999/xhtml";
   }
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  get innerHTML() {
+    if (this.localName === 'template') return this.content.innerHTML;
+    return _domParse("inner_html", this._nid) ?? "";
+  }
   set innerHTML(v) {
     if (this.localName === 'template') {
       this.content.innerHTML = v;
@@ -1178,7 +1214,13 @@ class Element extends Node {
     // infinite retry loop (issue #210).
     const tag = this.localName;
     if (tag === 'template') {
-      if (!this._templateContent) this._templateContent = document.createDocumentFragment();
+      if (!this._templateContent) {
+        const tc = +_dom("template_contents", this._nid);
+        if (tc < 0) return null;
+        const frag = _cache.get(tc) || new DocumentFragment(tc);
+        _cache.set(tc, frag);
+        this._templateContent = frag;
+      }
       return this._templateContent;
     }
     if (tag === 'meta') return this.getAttribute('content') || '';
@@ -1259,6 +1301,24 @@ class Element extends Node {
   hasAttributes() { return true; } // Simplified
   getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
   get attributes() {
+    const el = this;
+    return new Proxy({}, {
+      get(_t, k) {
+        const cur = el._attrSnapshot();
+        const v = cur[k];
+        return typeof v === 'function' ? v.bind(cur) : v;
+      },
+      has(_t, k) { return k in el._attrSnapshot(); },
+      ownKeys() { return Reflect.ownKeys(el._attrSnapshot()); },
+      getOwnPropertyDescriptor(_t, k) {
+        const cur = el._attrSnapshot();
+        const d = Object.getOwnPropertyDescriptor(cur, k);
+        if (d) d.configurable = true;
+        return d;
+      },
+    });
+  }
+  _attrSnapshot() {
     const el = this;
     const names = _domParse("attribute_names", el._nid) || [];
     const list = names.map((name) => {
@@ -2070,14 +2130,7 @@ class Element extends Node {
     };
   }
   getAnimations() { return []; }
-  get isConnected() {
-    var node = this;
-    while (node) {
-      if (node.nodeType === 9) return true;
-      node = node.parentNode;
-    }
-    return false;
-  }
+  get isConnected() { return _ceIsConnected(this); }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of _convertNodes(nodes)) this.appendChild(n); }
   prepend(...nodes) {
@@ -2371,11 +2424,7 @@ class Document extends Node {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
   }
   createElement(t) {
-    const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
-    if (el && t.toLowerCase() === 'template') {
-      el._templateContent = this.createDocumentFragment();
-    }
-    return el;
+    return _wrapEl(+_dom("create_element", t.toLowerCase()));
   }
   createElementNS(ns, t) {
     const el = this.createElement(t);
@@ -2692,12 +2741,9 @@ class DocumentFragment extends Node {
     }
     return null;
   }
-  cloneNode(deep) {
-    const frag = document.createDocumentFragment();
-    if (deep) frag.innerHTML = this.innerHTML;
-    return frag;
-  }
+  cloneNode(deep) { return Node.prototype.cloneNode.call(this, deep); }
 }
+
 
 class DocumentType extends Node {
   constructor(nid, name, publicId, systemId) {
@@ -4091,14 +4137,15 @@ globalThis.getSelection = _markNative(function getSelection() {
 
 globalThis.CSSStyleSheet = class CSSStyleSheet {
   constructor(options) {
-    this.cssRules = [];
+    this._rules = [];
+    this.cssRules = this._rules;
     this.ownerRule = null;
     this.disabled = false;
-    this._rules = [];
   }
   insertRule(rule, index) {
     const idx = index ?? this._rules.length;
-    this._rules.splice(idx, 0, { cssText: rule, type: 1 });
+    const m = /^\s*([^{]*)\{/.exec(String(rule));
+    this._rules.splice(idx, 0, { cssText: rule, type: 1, selectorText: m ? m[1].trim() : '', style: new CSSStyleDeclaration(), parentStyleSheet: this });
     this.cssRules = this._rules;
     return idx;
   }
@@ -4111,13 +4158,11 @@ globalThis.CSSStyleSheet = class CSSStyleSheet {
   }
   removeRule(index) { this.deleteRule(index); }
   replace(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
+    this._rules.splice(0, this._rules.length, { cssText: text, type: 1 });
     return Promise.resolve(this);
   }
   replaceSync(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
+    this._rules.splice(0, this._rules.length, { cssText: text, type: 1 });
   }
 };
 
@@ -4213,7 +4258,138 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
   }
 };
 
-globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {};
+globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
+  get mode() { return this._mode; }
+  get host() { return this._host; }
+  get delegatesFocus() { return !!this._delegatesFocus; }
+  get slotAssignment() { return 'named'; }
+  get clonable() { return false; }
+  get serializable() { return false; }
+  get activeElement() { return null; }
+  get styleSheets() { return []; }
+  get adoptedStyleSheets() { return this._adoptedStyleSheets || []; }
+  set adoptedStyleSheets(v) { this._adoptedStyleSheets = Array.from(v || []); }
+  getRootNode() { return this; }
+  setHTMLUnsafe(v) { this.innerHTML = String(v == null ? '' : v); }
+  getHTML() { return this.innerHTML; }
+  cloneNode() { throw new DOMException('Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.', 'NotSupportedError'); }
+};
+
+const _ceShadowRoots = new Set();
+function _ceIsConnected(node) {
+  let n = node, guard = 0;
+  while (n && guard++ < 100000) {
+    if (n.nodeType === 9) return true;
+    if (n instanceof ShadowRoot) { n = n._host; continue; }
+    n = n.parentNode;
+  }
+  return false;
+}
+function _ceConnect(el) {
+  if (el.__ceConnected) return;
+  el.__ceConnected = true;
+  if (typeof el.connectedCallback === 'function') {
+    try { el.connectedCallback(); }
+    catch (e) { console.warn('connectedCallback failed: <' + el.localName + '> ' + (e && e.message)); }
+  }
+}
+function _ceVisit(el, reg) {
+  const ln = el.localName;
+  if (ln && ln.indexOf('-') !== -1) {
+    if (!el.__customUpgraded) {
+      const cls = reg.get(ln);
+      if (cls) customElements._upgradeElement(el, cls);
+    } else {
+      _ceConnect(el);
+    }
+  }
+  if (el._shadowRoot) _ceProcessTree(el._shadowRoot);
+}
+function _ceProcessTree(root) {
+  const reg = globalThis.customElements && globalThis.customElements._registry;
+  if (!reg || !root) return;
+  const t = root.nodeType;
+  if (t === 1) _ceVisit(root, reg);
+  if (t === 1 || t === 11 || t === 9) {
+    const all = root.querySelectorAll('*');
+    for (let i = 0; i < all.length; i++) _ceVisit(all[i], reg);
+  }
+}
+function _ceAfterInsert(parent, nodes) {
+  if (!globalThis.customElements || !_ceIsConnected(parent)) return;
+  for (const n of nodes) if (n && n.nodeType === 1) _ceProcessTree(n);
+}
+function _ceAfterRemove(node) {
+  if (!node || node.nodeType !== 1) return;
+  const list = [node, ...node.querySelectorAll('*')];
+  for (const el of list) {
+    if (!el.__ceConnected) continue;
+    el.__ceConnected = false;
+    if (typeof el.disconnectedCallback === 'function') { try { el.disconnectedCallback(); } catch (e) {} }
+  }
+}
+(function () {
+  const wrap = (proto, name, after) => {
+    const orig = proto[name];
+    if (typeof orig !== 'function') return;
+    proto[name] = _markNative({ [name](...args) {
+      const n = args[0];
+      const nodes = (n && n.nodeType === 11) ? Array.from(n.childNodes) : [n];
+      const r = orig.apply(this, args);
+      after(this, nodes, args);
+      return r;
+    } }[name]);
+  };
+  const isFrag = (n) => n && n.nodeType === 11 && !(n instanceof ShadowRoot);
+  const origAppend = Node.prototype.appendChild;
+  const origInsert = Node.prototype.insertBefore;
+  Node.prototype.appendChild = function appendChild(n) {
+    if (isFrag(n)) { for (const k of Array.from(n.childNodes)) origAppend.call(this, k); return n; }
+    return origAppend.call(this, n);
+  };
+  Node.prototype.insertBefore = function insertBefore(n, ref) {
+    if (isFrag(n)) {
+      for (const k of Array.from(n.childNodes)) { if (ref) origInsert.call(this, k, ref); else origAppend.call(this, k); }
+      return n;
+    }
+    return origInsert.call(this, n, ref);
+  };
+  const origReplace = Node.prototype.replaceChild;
+  Node.prototype.replaceChild = function replaceChild(n, old) {
+    if (isFrag(n)) { this.insertBefore(n, old); this.removeChild(old); return old; }
+    return origReplace.call(this, n, old);
+  };
+  wrap(Node.prototype, 'appendChild', (p, nodes) => _ceAfterInsert(p, nodes));
+  wrap(Node.prototype, 'insertBefore', (p, nodes) => _ceAfterInsert(p, nodes));
+  wrap(Node.prototype, 'replaceChild', (p, nodes, args) => { _ceAfterRemove(args[1]); _ceAfterInsert(p, nodes); });
+  const origRemove = Node.prototype.removeChild;
+  Node.prototype.removeChild = _markNative(function removeChild(c) { const r = origRemove.call(this, c); _ceAfterRemove(c); return r; });
+  for (const proto of [Element.prototype, DocumentFragment.prototype]) {
+    const d = Object.getOwnPropertyDescriptor(proto, 'innerHTML');
+    if (d && d.set) {
+      Object.defineProperty(proto, 'innerHTML', { configurable: true, enumerable: d.enumerable, get: d.get,
+        set(v) { d.set.call(this, v); if (_ceIsConnected(this)) for (const c of Array.from(this.childNodes)) if (c.nodeType === 1) _ceProcessTree(c); } });
+    }
+  }
+  for (const name of ['insertAdjacentHTML', 'insertAdjacentElement']) {
+    const orig = Element.prototype[name];
+    if (typeof orig !== 'function') continue;
+    Element.prototype[name] = _markNative({ [name](pos, x) {
+      const r = orig.call(this, pos, x);
+      const p = String(pos).toLowerCase();
+      const scope = (p === 'beforebegin' || p === 'afterend') ? this.parentNode : this;
+      if (scope && _ceIsConnected(scope)) _ceProcessTree(scope);
+      return r;
+    } }[name]);
+  }
+  const origCreate = Document.prototype.createElement;
+  Document.prototype.createElement = _markNative(function createElement(t, opts) {
+    const el = origCreate.call(this, t, opts);
+    const cls = el && globalThis.customElements && globalThis.customElements._registry.get(el.localName);
+    if (cls && !el.__customUpgraded) globalThis.customElements._upgradeElement(el, cls);
+    return el;
+  });
+})();
 // Constructible-stylesheet adoption, mirroring Document.adoptedStyleSheets.
 Object.defineProperty(globalThis.ShadowRoot.prototype, 'adoptedStyleSheets', {
   get() { return this._adoptedStyleSheets || []; },
@@ -4252,6 +4428,10 @@ class CustomElementRegistry {
     try {
       const matches = globalThis.document?.querySelectorAll(name) || [];
       for (const el of matches) this._upgradeElement(el, cls);
+      for (const sr of _ceShadowRoots) {
+        if (!_ceIsConnected(sr)) continue;
+        for (const el of sr.querySelectorAll(name)) this._upgradeElement(el, cls);
+      }
     } catch (e) {}
     const resolvers = this._whenDefinedResolvers.get(name);
     if (resolvers) {
@@ -4262,26 +4442,19 @@ class CustomElementRegistry {
   _upgradeElement(el, cls) {
     if (el.__customUpgraded) return;
     el.__customUpgraded = true;
-    try {
-      // Web Components spec: copy own props from the prototype onto the
-      // element. JS-side classes define behavior via methods on the
-      // prototype; we don't truly swap prototypes (Element is shared),
-      // so attach the prototype methods directly to the instance.
-      const proto = cls.prototype;
-      for (const key of Object.getOwnPropertyNames(proto)) {
-        if (key === 'constructor') continue;
-        const desc = Object.getOwnPropertyDescriptor(proto, key);
-        if (desc) Object.defineProperty(el, key, desc);
+    globalThis.__ceUpgradeTarget = el;
+    try { Reflect.construct(cls, [], cls); }
+    catch (e) { console.warn('custom element upgrade failed: <' + el.localName + '> ' + (e && e.message)); }
+    finally { globalThis.__ceUpgradeTarget = null; }
+    const observed = cls.observedAttributes;
+    if (observed && typeof el.attributeChangedCallback === 'function') {
+      for (const a of observed) {
+        if (el.hasAttribute(a)) {
+          try { el.attributeChangedCallback(a, null, el.getAttribute(a)); } catch (e) {}
+        }
       }
-      // Run constructor-side init on the element. Real custom elements
-      // run the class constructor, but Element instances aren't a `cls`
-      // subclass here; calling `.call(el)` runs whatever init logic the
-      // class defines without needing a new allocation.
-      try { cls.call(el); } catch (e) {}
-      if (typeof el.connectedCallback === 'function' && globalThis.document?.contains?.(el)) {
-        try { el.connectedCallback(); } catch (e) {}
-      }
-    } catch (e) {}
+    }
+    if (_ceIsConnected(el)) _ceConnect(el);
   }
   get(name) { return this._registry.get(name); }
   getName(cls) {
@@ -4896,7 +5069,7 @@ globalThis.DOMParser = class DOMParser {
     // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
     // fragment parser strips the outer `<html>` and emits its head+body
     // children, which is what callers want.
-    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+    try { _dom("set_inner_html", root._nid, html); } catch (e) { /* leave empty on parse error */ }
 
     // Helper: depth-first walk to find an element by predicate.
     const walk = (node, pred) => {
@@ -4911,6 +5084,14 @@ globalThis.DOMParser = class DOMParser {
     };
 
     const findByTagName = (name) => walk(root, n => n.tagName === name);
+
+    if (!isXml && !findByTagName("BODY")) {
+      let head = findByTagName("HEAD");
+      const body = document.createElement("body");
+      for (const c of Array.from(root.childNodes)) { if (c !== head) body.appendChild(c); }
+      if (!head) { head = document.createElement("head"); root.insertBefore(head, root.firstChild); }
+      root.appendChild(body);
+    }
 
     const docNode = {
       _root: root,
@@ -6271,95 +6452,12 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   if (this._shadowRoot) {
     throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
   }
-  const host = this;
-  const children = [];
-  const shadow = {
-    mode: opts.mode,
-    host: host,
-    get innerHTML() { return children.map(c => c.outerHTML || c.textContent || '').join(''); },
-    set innerHTML(v) {
-      children.length = 0;
-      if (v) {
-        const tmp = document.createElement('div');
-        tmp.innerHTML = v;
-        for (let i = 0; i < tmp.childNodes.length; i++) children.push(tmp.childNodes[i]);
-      }
-    },
-    get childNodes() { return children; },
-    get firstChild() { return children[0] || null; },
-    get lastChild() { return children[children.length - 1] || null; },
-    get firstElementChild() { return children.find(c => c.nodeType === 1) || null; },
-    get children() { return children.filter(c => c.nodeType === 1); },
-    appendChild(c) {
-      if (c) {
-        children.push(c);
-        try { c.parentNode = shadow; } catch (_) { /* parentNode is getter-only on Node, ignore */ }
-      }
-      return c;
-    },
-    insertBefore(n, ref) {
-      if (!n) return n;
-      if (!ref) { shadow.appendChild(n); return n; }
-      const idx = children.indexOf(ref);
-      if (idx >= 0) {
-        children.splice(idx, 0, n);
-        try { n.parentNode = shadow; } catch (_) {}
-      }
-      else shadow.appendChild(n);
-      return n;
-    },
-    removeChild(c) { const idx = children.indexOf(c); if (idx >= 0) children.splice(idx, 1); return c; },
-    replaceChild(n, o) {
-      const idx = children.indexOf(o);
-      if (idx >= 0) {
-        children[idx] = n;
-        try { n.parentNode = shadow; } catch (_) {}
-      }
-      return o;
-    },
-    querySelector(s) {
-      for (const c of children) {
-        if (c.matches && c.matches(s)) return c;
-        if (c.querySelector) { const r = c.querySelector(s); if (r) return r; }
-      }
-      return null;
-    },
-    querySelectorAll(s) {
-      const results = [];
-      for (const c of children) {
-        if (c.matches && c.matches(s)) results.push(c);
-        if (c.querySelectorAll) results.push(...c.querySelectorAll(s));
-      }
-      return results;
-    },
-    getElementById(id) { return shadow.querySelector('#' + id); },
-    contains(n) { return children.includes(n); },
-    getRootNode() { return shadow; },
-    get ownerDocument() { return document; },
-    get nodeType() { return 11; }, // DOCUMENT_FRAGMENT_NODE
-    get nodeName() { return '#document-fragment'; },
-    addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-    setHTMLUnsafe(v) { this.innerHTML = String(v == null ? "" : v); },
-    getHTML() { return this.innerHTML; },
-    // Own textContent: ShadowRoot now extends DocumentFragment, so without
-    // these the inherited Node accessors run against this._nid. The setter in
-    // particular would target the host document and wipe it. Operate on the
-    // shadow's own `children` store instead.
-    get textContent() { return children.map(c => c.textContent || "").join(""); },
-    set textContent(v) {
-      children.length = 0;
-      if (v != null && v !== "") children.push(document.createTextNode(String(v)));
-    },
-    hasChildNodes() { return children.length > 0; },
-    // A detached fragment id backs any inherited nid-based method we do not
-    // override, so they stay non-destructive (operate on an empty fragment)
-    // rather than falling through to node 0 / the document.
-    _nid: +_dom("create_document_fragment"),
-    activeElement: null,
-    get styleSheets() { return []; },
-    cloneNode() { throw new DOMException('Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.', 'NotSupportedError'); },
-  };
-  Object.setPrototypeOf(shadow, ShadowRoot.prototype);
+  const shadow = new ShadowRoot();
+  shadow._mode = _mode;
+  shadow._host = this;
+  shadow._delegatesFocus = !!(opts && opts.delegatesFocus);
+  _cache.set(shadow._nid, shadow);
+  _ceShadowRoots.add(shadow);
   this._shadowRoot = shadow;
   return shadow;
 };
@@ -8145,3 +8243,31 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     if (typeof val === 'function') { walk(val); }
   }
 })();
+
+if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
+  Document.prototype.adoptNode = _markNative(function adoptNode(node) {
+    if (node && node.nodeType === 9) throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.", 'NotSupportedError');
+    if (node && node.nodeType !== 11 && node.parentNode) node.parentNode.removeChild(node);
+    return node;
+  });
+}
+Element.prototype.assignedNodes = _markNative(function assignedNodes(opts) {
+  if (this.localName !== 'slot') return [];
+  let root = this; let guard = 0;
+  while (root && !(root instanceof ShadowRoot) && guard++ < 100000) root = root.parentNode;
+  const host = root && root._host;
+  const name = this.getAttribute('name') || '';
+  const out = [];
+  if (host) {
+    for (const c of Array.from(host.childNodes)) {
+      const slotName = c.nodeType === 1 ? (c.getAttribute('slot') || '') : '';
+      if (slotName === name && (c.nodeType === 1 || (c.nodeType === 3 && name === ''))) out.push(c);
+    }
+  }
+  if (!out.length && opts && opts.flatten) return Array.from(this.childNodes);
+  return out;
+});
+Element.prototype.assignedElements = _markNative(function assignedElements(opts) {
+  return this.assignedNodes(opts).filter(n => n.nodeType === 1);
+});
+Element.prototype.assign = _markNative(function assign() {});

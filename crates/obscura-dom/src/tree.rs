@@ -651,6 +651,59 @@ impl DomTree {
         doc
     }
 
+    pub fn clone_node(&self, src: NodeId, deep: bool) -> Option<NodeId> {
+        let mut data = self.with_node(src, |n| n.data.clone())?;
+        let src_contents = take_template_contents(&mut data);
+        let root = self.new_node(data);
+        if !deep {
+            return Some(root);
+        }
+        let mut stack: Vec<(NodeId, NodeId)> = Vec::new();
+        if let Some(tc) = src_contents {
+            let doc = self.new_template_contents(root);
+            for c in self.children(tc).into_iter().rev() {
+                stack.push((doc, c));
+            }
+        }
+        for c in self.children(src).into_iter().rev() {
+            stack.push((root, c));
+        }
+        while let Some((dest_parent, src_id)) = stack.pop() {
+            let Some(mut data) = self.with_node(src_id, |n| n.data.clone()) else { continue };
+            let contents = take_template_contents(&mut data);
+            let new_id = self.new_node(data);
+            self.append_child(dest_parent, new_id);
+            for child in self.children(src_id).into_iter().rev() {
+                stack.push((new_id, child));
+            }
+            if let Some(tc) = contents {
+                let doc = self.new_template_contents(new_id);
+                for child in self.children(tc).into_iter().rev() {
+                    stack.push((doc, child));
+                }
+            }
+        }
+        Some(root)
+    }
+
+    pub fn template_contents(&self, id: NodeId) -> Option<NodeId> {
+        let current = self.with_node(id, |n| match &n.data {
+            NodeData::Element { template_contents, .. } => Some(*template_contents),
+            _ => None,
+        })??;
+        Some(current.unwrap_or_else(|| self.new_template_contents(id)))
+    }
+
+    fn new_template_contents(&self, element: NodeId) -> NodeId {
+        let doc = self.new_node(NodeData::Document);
+        self.with_node_mut(element, |n| {
+            if let NodeData::Element { template_contents, .. } = &mut n.data {
+                *template_contents = Some(doc);
+            }
+        });
+        doc
+    }
+
     pub fn import_children_from(&self, parent_id: NodeId, source: &DomTree, source_node: NodeId) {
         let source_children = source.children(source_node);
         for source_child_id in source_children {
@@ -666,19 +719,26 @@ impl DomTree {
         // keeps the source ordering).
         let mut stack = vec![(parent_id, source_node_id)];
         while let Some((dest_parent, src_id)) = stack.pop() {
-            let node_data = {
+            let mut node_data = {
                 let source_inner = source.inner.borrow();
                 match source_inner.nodes.get(src_id.index()) {
                     Some(Some(node)) => node.data.clone(),
                     _ => continue,
                 }
             };
+            let contents = take_template_contents(&mut node_data);
 
             let new_id = self.new_node(node_data);
             self.append_child(dest_parent, new_id);
 
             for child_id in source.children(src_id).into_iter().rev() {
                 stack.push((new_id, child_id));
+            }
+            if let Some(tc) = contents {
+                let doc = self.new_template_contents(new_id);
+                for child_id in source.children(tc).into_iter().rev() {
+                    stack.push((doc, child_id));
+                }
             }
         }
     }
@@ -707,6 +767,13 @@ impl DomTree {
         if let Some(new) = new_id {
             inner.id_index.insert(new.to_string(), node_id);
         }
+    }
+}
+
+fn take_template_contents(data: &mut NodeData) -> Option<NodeId> {
+    match data {
+        NodeData::Element { template_contents, .. } => template_contents.take(),
+        _ => None,
     }
 }
 
