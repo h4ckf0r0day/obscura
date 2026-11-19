@@ -4929,17 +4929,20 @@ fn grid_placement_declaration_is_valid(value: &str, shorthand: bool) -> bool {
 /// `taffy::Line` now; a value that names a grid line (`content-start /
 /// content-end`, or the `grid-column: content` area shorthand) is kept raw and
 /// resolved against the parent's line-name map in `dom::resolve_grid_areas`.
-/// Whichever representation is set, the other is cleared so a later cascade
-/// rule of the opposite kind fully overrides it.
+/// Numeric values clear the raw placement. Named forms retain numeric/span
+/// edges as a fallback while the parent cannot resolve their line names.
 fn set_grid_placement(style: &mut LayoutStyle, value: &str, is_col: bool) {
     if grid_line_has_name(value) {
         let raw = Some(value.trim().to_string());
+        let line = parse_grid_line(value).filter(|line| {
+            line.start != taffy::GridPlacement::Auto || line.end != taffy::GridPlacement::Auto
+        });
         if is_col {
             style.grid_column_raw = raw;
-            style.grid_column = None;
+            style.grid_column = line;
         } else {
             style.grid_row_raw = raw;
-            style.grid_row = None;
+            style.grid_row = line;
         }
     } else {
         let line = parse_grid_line(value);

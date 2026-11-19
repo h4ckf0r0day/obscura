@@ -3341,6 +3341,29 @@ fn mixed_grid_longhands_with_adjacent_line_names_keep_text_in_its_area() {
 }
 
 #[test]
+fn numeric_grid_edges_survive_unresolved_named_lines() {
+    for column in [true, false] {
+        for named_tracks in [true, false] {
+            let tracks = if named_tracks { "[first] 40px 40px 40px 40px [last]" }
+                else { "40px 40px 40px 40px" };
+            let (axis, container) = if column {
+                ("column", format!("width:160px;height:40px;grid-template-columns:{tracks};grid-template-rows:40px;grid-auto-columns:40px"))
+            } else {
+                ("row", format!("width:40px;height:160px;grid-template-columns:40px;grid-template-rows:{tracks};grid-auto-rows:40px"))
+            };
+            let tree = parse_html(&format!("<style>html,body{{margin:0}}#grid{{display:grid;{container}}}</style><div id='grid'><div id='item' style='grid-{axis}-end:missing;grid-{axis}-start:5'></div></div>"));
+            let layout = layout_dom(&tree, (900.0, 1000.0));
+            let parent = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+            let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            let (start, size) = if column { (item.x - parent.x, item.width) }
+                else { (item.y - parent.y, item.height) };
+            assert!((start - 160.0).abs() < 0.01 && (size - 40.0).abs() < 0.01,
+                "{axis}, named tracks={named_tracks}: start={start}, size={size}");
+        }
+    }
+}
+
+#[test]
 fn grid_numeric_longhands_after_named_placement_need_no_parent_names() {
     for column in [true, false] {
         let (axis, template, expected) = if column {
