@@ -20743,9 +20743,13 @@ mod tests {
                 replaced.enumerable, descriptor.get.call(window), location.origin, errors];
         })()"#).unwrap(), serde_json::json!([
             "http://example.com", true, true, "get origin", "set origin", 0, 1,
-            true, true, true, true, "http://example.com", "https://destination.example",
+            true, true, true, true, "http://example.com", "http://example.com",
             ["TypeError", "TypeError"]
         ]));
+        // The navigation was requested even though location (like Chrome's)
+        // still describes the current document.
+        assert_eq!(rt.take_pending_navigation().map(|(url, ..)| url).as_deref(),
+            Some("https://destination.example/next"));
     }
 
     #[test]
@@ -21257,7 +21261,9 @@ mod tests {
         let href = rt
             .evaluate("const next = '/next'; location.href = next; return location.href;")
             .unwrap();
-        assert_eq!(href, serde_json::json!("http://example.com/next"));
+        // Like Chrome, location describes the current document until the
+        // requested navigation commits.
+        assert_eq!(href, serde_json::json!("http://example.com/test"));
         assert_eq!(
             rt.take_pending_navigation(),
             Some((
@@ -21271,34 +21277,21 @@ mod tests {
     #[test]
     fn test_location_navigation_coerces_url_objects() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let hrefs = rt
-            .evaluate(
-                r#"(() => {
-                    location.href = new URL('/from-href', location.href);
-                    const href = location.href;
-                    location.assign(new URL('/from-assign', location.href));
-                    const assigned = location.href;
-                    location.replace(new URL('/from-replace', location.href));
-                    return [href, assigned, location.href];
-                })()"#,
-            )
-            .unwrap();
-        assert_eq!(
-            hrefs,
-            serde_json::json!([
-                "http://example.com/from-href",
-                "http://example.com/from-assign",
-                "http://example.com/from-replace"
-            ])
-        );
-        assert_eq!(
-            rt.take_pending_navigation(),
-            Some((
-                "http://example.com/from-replace".to_string(),
-                "GET".to_string(),
-                "".to_string()
-            ))
-        );
+        // Each call requests a navigation to the coerced URL; location itself
+        // stays on the current document until one commits, as in Chrome.
+        for (call, path) in [
+            ("location.href = new URL('/from-href', location.href)", "/from-href"),
+            ("location.assign(new URL('/from-assign', location.href))", "/from-assign"),
+            ("location.replace(new URL('/from-replace', location.href))", "/from-replace"),
+        ] {
+            rt.evaluate(&format!("(() => {{ {call}; }})()")).unwrap();
+            assert_eq!(
+                rt.take_pending_navigation(),
+                Some((format!("http://example.com{path}"), "GET".to_string(), "".to_string())),
+                "{call}"
+            );
+            assert_eq!(rt.evaluate("location.href").unwrap(), serde_json::json!("http://example.com/test"));
+        }
     }
 
     #[test]
@@ -21318,7 +21311,9 @@ mod tests {
         "#,
             )
             .unwrap();
-        assert_eq!(href, serde_json::json!("http://example.com/submitted"));
+        // The navigation is requested; location keeps the current document
+        // until it commits.
+        assert_eq!(href, serde_json::json!("http://example.com/test"));
         assert_eq!(
             rt.take_pending_navigation(),
             Some((
@@ -23154,8 +23149,8 @@ mod tests {
         let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
         rt.evaluate("location.href = 'users/42'").unwrap();
 
-        let landed = rt.evaluate("location.href").unwrap();
-        assert_eq!(landed.as_str().unwrap(), "http://example.com/app/users/42");
+        let (landed, _, _) = rt.take_pending_navigation().unwrap();
+        assert_eq!(landed, "http://example.com/app/users/42");
     }
 
     #[test]
