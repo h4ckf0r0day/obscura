@@ -4987,6 +4987,57 @@ impl Default for ObscuraJsRuntime {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn custom_elements_can_store_form_references_without_changing_native_control_ownership() {
+        let mut rt = setup_runtime(r#"<html><body>
+            <form id="first"><input id="inside"></form><form id="second"></form>
+            <input id="outside" form="first">
+            <qa-form-owner><form id="widget-form"></form></qa-form-owner>
+        </body></html>"#);
+        let result = rt.evaluate(r#"(function() {
+            let exposed = 0, failed = 0, stored = 0;
+            for (const tag of ['div','span','section','form','img','a','iframe',
+                    'optgroup','datalist','meter','progress','qa-ordinary']) {
+                const element = document.createElement(tag);
+                if ('form' in element) exposed++;
+                try { (function() { 'use strict'; this.form = 42; }).call(element); }
+                catch (error) { failed++; }
+                if (Object.hasOwn(element, 'form') && element.form === 42) stored++;
+            }
+            class FormOwner extends HTMLElement {
+                connectedCallback() {
+                    this.form = this.querySelector('form');
+                    this.setAttribute('data-initialized', 'yes');
+                }
+            }
+            customElements.define('qa-form-owner', FormOwner);
+            const widget = document.querySelector('qa-form-owner');
+            const custom = [widget.getAttribute('data-initialized') === 'yes',
+                Object.hasOwn(widget, 'form'), widget.form === document.getElementById('widget-form')];
+            const inside = document.getElementById('inside');
+            const outside = document.getElementById('outside');
+            const owners = [inside.form.id, outside.form.id];
+            document.getElementById('second').appendChild(inside);
+            outside.setAttribute('form', 'second');
+            owners.push(inside.form.id, outside.form.id);
+            let readonly = false;
+            try { (function() { 'use strict'; inside.form = null; })(); }
+            catch (error) { readonly = error.name === 'TypeError'; }
+            const interfaces = [HTMLButtonElement, HTMLFieldSetElement, HTMLInputElement,
+                HTMLLabelElement, HTMLLegendElement, HTMLObjectElement, HTMLOutputElement,
+                HTMLSelectElement, HTMLTextAreaElement, HTMLOptionElement];
+            const descriptors = interfaces.filter(Interface => {
+                const d = Object.getOwnPropertyDescriptor(Interface.prototype, 'form');
+                return d && typeof d.get === 'function' && d.set === undefined && d.enumerable;
+            }).length;
+            return [[exposed, failed, stored], custom, owners, readonly, descriptors];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [0, 0, 12], [true, true, true],
+            ["first", "first", "second", "second"], true, 10
+        ]));
+    }
+
+    #[test]
     fn form_ownership_tracks_explicit_ids_and_tree_order() {
         let mut rt = setup_runtime("<form id='f'><input id='a'><input id='b' form='g'><input id='empty' form=''></form><form id='g'></form><input id='c' form='f'><div id='block'></div>");
         assert_eq!(rt.evaluate(r#"(() => {
