@@ -11628,6 +11628,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hyperlink_url_members_do_not_make_detached_elements_look_like_shadow_hosts() {
+        let mut rt = setup_runtime(r#"<html><body>
+            <a id="a" href="https://u:p@example.test:8443/path?x=1#h"></a>
+            <area id="area" href="https://u:p@example.test:8443/path?x=1#h">
+        </body></html>"#);
+        let result = rt.evaluate(r#"(function() {
+            const members = ['protocol','username','password','host','hostname',
+                'port','pathname','search','hash','origin'];
+            const exposed = ['div','button','input'].map(tag => {
+                const element = document.createElement(tag);
+                return members.filter(name => name in element);
+            });
+            const connected = element => {
+                try {
+                    const host = element.getRootNode().host;
+                    return !!((host?.ownerDocument.contains(host))
+                        || element.ownerDocument.contains(element));
+                } catch (error) { return error.name; }
+            };
+            const button = document.createElement('button');
+            const wrapper = document.createElement('div');
+            const input = document.createElement('input');
+            wrapper.appendChild(input);
+            const roots = [connected(button), connected(input)];
+            document.body.appendChild(button);
+            roots.push(connected(button));
+            const host = document.createElement('div');
+            document.body.appendChild(host);
+            const shadow = host.attachShadow({mode:'open'});
+            const child = document.createElement('button');
+            shadow.appendChild(child);
+            roots.push(connected(child));
+            const urls = ['a','area'].map(id => {
+                const link = document.getElementById(id);
+                const before = members.map(name => link[name]);
+                link.host = 'other.example:8080';
+                return [before, link.href];
+            });
+            return [exposed, roots, urls];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[], [], []], [false, false, true, true],
+            [
+                [["https:", "u", "p", "example.test:8443", "example.test", "8443",
+                    "/path", "?x=1", "#h", "https://example.test:8443"],
+                    "https://u:p@other.example:8080/path?x=1#h"],
+                [["https:", "u", "p", "example.test:8443", "example.test", "8443",
+                    "/path", "?x=1", "#h", "https://example.test:8443"],
+                    "https://u:p@other.example:8080/path?x=1#h"]
+            ]
+        ]));
+    }
+
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn ordinary_inline_keeps_computed_sizes_but_uses_content_geometry() {
