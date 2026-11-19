@@ -3283,6 +3283,82 @@ fn nested_full_span_column_subgrid_shares_ancestor_tracks() {
     }
 }
 
+#[test]
+fn mixed_grid_placement_longhands_retain_the_opposite_edge() {
+    let cases = [
+        ("grid-column-start:4;grid-column-end:main", (240.0, 200.0), (100.0, 80.0)),
+        ("grid-column-end:main;grid-column-start:4", (240.0, 200.0), (100.0, 80.0)),
+        ("grid-column-start:full;grid-column-end:4", (0.0, 240.0), (0.0, 100.0)),
+        ("grid-column-end:4;grid-column-start:full", (0.0, 240.0), (0.0, 100.0)),
+        ("grid-column-end:span 2;grid-column-start:main-start", (40.0, 200.0), (20.0, 80.0)),
+        ("grid-column-start:main-start;grid-column-end:span 2", (40.0, 200.0), (20.0, 80.0)),
+        ("grid-column-start:-4;grid-column-end:main-end", (240.0, 200.0), (100.0, 80.0)),
+        ("grid-column-start:main-start;grid-column-end:-2", (40.0, 400.0), (20.0, 160.0)),
+        ("grid-column:main;grid-column-start:4", (240.0, 200.0), (100.0, 80.0)),
+        ("grid-column:main;grid-column-start:auto", (340.0, 100.0), (140.0, 40.0)),
+        ("grid-column:main;grid-column-start:2;grid-column-end:4", (40.0, 200.0), (20.0, 80.0)),
+        ("grid-column-start:main-start;grid-column-end:auto", (40.0, 100.0), (20.0, 40.0)),
+        ("--from:4;--to:main;grid-column-start:var(--from);grid-column-end:var(--to)", (240.0, 200.0), (100.0, 80.0)),
+    ];
+    for column in [true, false] {
+        let template = if column {
+            "width:480px;height:40px;grid-template-columns:[full-start] 40px [main-start] repeat(4,100px) [main-end] 40px [full-end];grid-template-rows:40px"
+        } else {
+            "width:100px;height:200px;grid-template-columns:100px;grid-template-rows:[full-start] 20px [main-start] repeat(4,40px) [main-end] 20px [full-end]"
+        };
+        for (declarations, expected_column, expected_row) in cases {
+            let declarations = if column { declarations.to_string() }
+                else { declarations.replace("grid-column", "grid-row") };
+            let tree = parse_html(&format!("<style>html,body{{margin:0}}#grid{{display:grid;{template}}}</style><div id='grid'><div id='item' style='{declarations}'></div></div>"));
+            let layout = layout_dom(&tree, (800.0, 600.0));
+            let parent = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+            let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            let (start, size) = if column { (item.x - parent.x, item.width) }
+                else { (item.y - parent.y, item.height) };
+            let expected = if column { expected_column } else { expected_row };
+            assert!((start - expected.0).abs() < 0.01 && (size - expected.1).abs() < 0.01,
+                "{declarations}: start={start}, size={size}, expected={expected:?}");
+        }
+    }
+}
+
+#[test]
+fn mixed_grid_longhands_with_adjacent_line_names_keep_text_in_its_area() {
+    for template in [
+        "[full-start] 40px [main-start] repeat(4,100px) [main-end] 40px [full-end]",
+        "[full-start]40px[main-start]repeat(4,100px)[main-end]40px[full-end]",
+        "[full-start]40px[main-start]repeat(4,[track]100px)[main-end]40px[full-end]",
+    ] {
+        for placement in ["grid-column-end:main;grid-column-start:4", "grid-column:main;grid-column-start:4"] {
+            let tree = parse_html(&format!("<style>html,body{{margin:0}}#grid{{display:grid;width:480px;height:40px;grid-template-columns:{template};grid-template-rows:40px}}#item{{padding:8px;box-sizing:border-box}}</style><div id='grid'><div id='item' style='{placement}'>Placed item</div></div>"));
+            let layout = layout_dom(&tree, (900.0, 1000.0));
+            let parent = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+            let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            assert!((item.x - parent.x - 240.0).abs() < 0.01 && (item.width - 200.0).abs() < 0.01,
+                "{template}; {placement}: parent={parent:?}, item={item:?}");
+        }
+    }
+}
+
+#[test]
+fn grid_numeric_longhands_after_named_placement_need_no_parent_names() {
+    for column in [true, false] {
+        let (axis, template, expected) = if column {
+            ("column", "width:480px;height:40px;grid-template-columns:40px repeat(4,100px) 40px;grid-template-rows:40px", (40.0, 200.0))
+        } else {
+            ("row", "width:100px;height:200px;grid-template-columns:100px;grid-template-rows:20px repeat(4,40px) 20px", (20.0, 80.0))
+        };
+        let tree = parse_html(&format!("<style>html,body{{margin:0}}#grid{{display:grid;{template}}}</style><div id='grid'><div id='item' style='grid-{axis}-start:missing;grid-{axis}-end:4;grid-{axis}-start:2'></div></div>"));
+        let layout = layout_dom(&tree, (800.0, 600.0));
+        let parent = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+        let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+        let (start, size) = if column { (item.x - parent.x, item.width) }
+            else { (item.y - parent.y, item.height) };
+        assert!((start - expected.0).abs() < 0.01 && (size - expected.1).abs() < 0.01,
+            "{axis}: start={start}, size={size}, expected={expected:?}");
+    }
+}
+
 /// Cases outside the bounded reduction must retain the existing fallback,
 /// rather than freezing an invented set of ancestor tracks. The narrow parent
 /// cannot fit every max-content growth limit, and the second row only spans a
