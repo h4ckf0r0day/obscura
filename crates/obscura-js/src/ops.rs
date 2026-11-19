@@ -2939,18 +2939,33 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "document_content_type" => {
             serde_json::to_string(&gs.content_type).unwrap_or("\"text/html\"".into())
         }
-        "document_element" => {
-            for cid in dom.children(dom.document()) {
-                if let Some(n) = dom.get_node(cid) {
-                    if n.as_element()
-                        .map(|name| name.local.as_ref() == "html")
-                        .unwrap_or(false)
-                    {
-                        return cid.index().to_string();
-                    }
+        "document_element" | "document_head" | "document_body" => {
+            let root = if arg1.is_empty() { Some(dom.document()) }
+                else { arg1.parse::<u32>().ok().map(NodeId::new) };
+            let element = root.and_then(|root| {
+                // A shim's element root differs from a container holding its current root.
+                if arg2 == "element" {
+                    return dom.borrow_node(root).and_then(|node| node.as_element().map(|_| root));
                 }
-            }
-            "-1".into()
+                dom.children(root).into_iter().find(|&child|
+                    dom.borrow_node(child).is_some_and(|node| node.as_element().is_some()))
+            });
+            let found = element.and_then(|element| {
+                if cmd == "document_element" { return Some(element); }
+                let node = dom.borrow_node(element)?;
+                let name = node.as_element()?;
+                if name.ns.as_ref() != "http://www.w3.org/1999/xhtml" || name.local.as_ref() != "html" {
+                    return None;
+                }
+                dom.children(element).into_iter().find(|&child| {
+                    dom.borrow_node(child).is_some_and(|node| node.as_element().is_some_and(|name| {
+                        name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                            && if cmd == "document_head" { name.local.as_ref() == "head" }
+                               else { matches!(name.local.as_ref(), "body" | "frameset") }
+                    }))
+                })
+            });
+            found.map_or_else(|| "-1".into(), |node| node.index().to_string())
         }
         "document_doctype" => {
             for cid in dom.children(dom.document()) {

@@ -68,6 +68,27 @@ SCENARIOS = {
         "(() => {let h=document.createElement('div');h.id='probe';document.body.append(h);let n=0;for(let i=0;i<2000000;i++)if(document.getElementById('probe')===h)n++;return n;})()",
         2000000,
     ),
+    "document-element-hot": (
+        "(() => {const root=document.documentElement;let n=0;"
+        "for(let i=0;i<1000000;i++)if(document.documentElement===root)n++;return n})()",
+        1000000,
+    ),
+    "document-head-hot": (
+        "(() => {const head=document.head;let n=0;"
+        "for(let i=0;i<1000000;i++)if(document.head===head)n++;return n})()",
+        1000000,
+    ),
+    "document-body-hot": (
+        "(() => {const body=document.body;let n=0;"
+        "for(let i=0;i<1000000;i++)if(document.body===body)n++;return n})()",
+        1000000,
+    ),
+    "document-detached-parts-hot": (
+        "(() => {const doc=document.implementation.createHTMLDocument('read'),"
+        "root=doc.documentElement,head=doc.head,body=doc.body;let n=0;"
+        "for(let i=0;i<100000;i++)n+=(doc.documentElement===root&&doc.head===head&&doc.body===body);return n})()",
+        100000,
+    ),
     "shadow-build": (
         "(() => {let n=0;for(let i=0;i<1500;i++){let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let t=document.createElement('span');t.textContent='row';r.append(t);if(h.shadowRoot===r && r.textContent==='row')n++;}return n;})()",
         1500,
