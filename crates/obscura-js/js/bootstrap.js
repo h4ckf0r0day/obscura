@@ -3334,7 +3334,7 @@ class DOMTokenList {
   }
   get length() { return this._tokens().length; }
   get value() { return this._el.getAttribute(this._attr) || ""; }
-  set value(v) { this._el.setAttribute(this._attr, String(v)); }
+  set value(v) { this._el.setAttribute(this._attr, `${v}`); }
   item(i) { const t = this._tokens(); return (i >= 0 && i < t.length) ? t[i] : null; }
   contains(token) { return this._tokens().includes(String(token)); }
   add(...tokens) {
@@ -14752,7 +14752,6 @@ for (const [name, tags] of Object.entries({
   }
 }
 
-
 HTMLScriptElement.supports = {
   supports(type) {
     if (arguments.length < 1) throw new TypeError("HTMLScriptElement.supports requires a script type");
@@ -14762,6 +14761,21 @@ HTMLScriptElement.supports = {
   },
 }.supports;
 _markNative(HTMLScriptElement.supports);
+
+{
+  const reflectSet = Reflect.set;
+  Object.defineProperty(HTMLIFrameElement.prototype, 'sandbox', {
+    get: Object.getOwnPropertyDescriptor(Element.prototype, 'sandbox').get,
+    set: _markNative(Object.getOwnPropertyDescriptor({
+      set sandbox(value) {
+        if (_tableElementTag(this) !== 'iframe') throw new TypeError('Illegal invocation');
+        reflectSet(this.sandbox, 'value', value);
+      },
+    }, 'sandbox').set),
+    enumerable: true,
+    configurable: true,
+  });
+}
 
 let _formOwnerSnapshots = new WeakMap();
 let _formControlSnapshots = new WeakMap();

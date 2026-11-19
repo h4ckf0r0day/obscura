@@ -8264,9 +8264,11 @@ mod tests {
         let mut page = import_map_test_page("srcdoc-sandbox", "https://parent.test", "<body></body>");
         page.evaluate_script(r#"(() => {
             globalThis.escaped = false;
-            for (const [id, policy] of [['opaque', 'ALLOW-SCRIPTS'], ['inert', 'ALLOW-SAME-ORIGIN']]) {
+            for (const [id, policy] of [['opaque', 'ALLOW-SCRIPTS'], ['inert', 'ALLOW-SAME-ORIGIN'],
+                ['opaque-property', 'ALLOW-SCRIPTS'], ['inert-property', 'ALLOW-SAME-ORIGIN']]) {
                 const f = document.createElement('iframe'); f.id = id;
-                f.setAttribute('sandbox', policy);
+                if (id.endsWith('-property')) f.sandbox = policy;
+                else f.setAttribute('sandbox', policy);
                 f.srcdoc = '<button onclick="parent.escaped=true">hello</button><script>globalThis.ran=true;try{parent.escaped=true}catch(e){}</script><noscript><i>fallback</i></noscript>';
                 document.body.appendChild(f);
             }
@@ -8274,16 +8276,23 @@ mod tests {
         })()"#).unwrap();
         pump_srcdoc_frames(&mut page).await;
         assert_eq!(page.evaluate_script(r#"(() => {
-            const opaque = document.getElementById('opaque');
-            const inert = document.getElementById('inert');
-            inert.contentDocument.querySelector('button').click();
-            return [opaque.contentDocument === null, inert.contentDocument.URL,
-                inert.contentDocument.querySelector('button').textContent,
-                typeof inert.contentWindow.ran, escaped,
-                inert.contentDocument.querySelector('noscript i')?.textContent];
-        })()"#).unwrap(), serde_json::json!([true, "about:srcdoc", "hello", "undefined", false, "fallback"]));
-        assert_eq!(page.evaluate_in_frame(0, "[document.URL, globalThis.ran, location.origin]").unwrap(),
-            serde_json::json!(["about:srcdoc", true, "null"]));
+            return ['', '-property'].map(suffix => {
+                const opaque = document.getElementById('opaque' + suffix);
+                const inert = document.getElementById('inert' + suffix);
+                inert.contentDocument.querySelector('button').click();
+                return [opaque.contentDocument === null, inert.contentDocument.URL,
+                    inert.contentDocument.querySelector('button').textContent,
+                    typeof inert.contentWindow.ran, escaped,
+                    inert.contentDocument.querySelector('noscript i')?.textContent];
+            });
+        })()"#).unwrap(), serde_json::json!([
+            [true, "about:srcdoc", "hello", "undefined", false, "fallback"],
+            [true, "about:srcdoc", "hello", "undefined", false, "fallback"],
+        ]));
+        for index in [0, 2] {
+            assert_eq!(page.evaluate_in_frame(index, "[document.URL, globalThis.ran, location.origin]").unwrap(),
+                serde_json::json!(["about:srcdoc", true, "null"]));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
