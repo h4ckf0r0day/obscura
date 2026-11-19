@@ -2266,6 +2266,26 @@ fn op_script_mark_started(state: &OpState, nid: u32, frame_id: u32) -> bool {
     true
 }
 
+#[op2(nofast, reentrant)]
+fn op_execute_classic_script<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    realm: v8::Local<'s, v8::Object>,
+    source: v8::Local<'s, v8::String>,
+) -> Result<(), deno_error::JsErrorBox> {
+    // Bound ops live in main; use the private caller's creation realm for frames.
+    let context = realm.get_creation_context(scope)
+        .ok_or_else(|| deno_error::JsErrorBox::type_error("Invalid script realm"))?;
+    let scope = &mut v8::ContextScope::new(scope, context);
+    // shortcut: preserve document-based imports until per-script bases are tracked.
+    let name = v8::String::empty(scope);
+    let origin = v8::ScriptOrigin::new(scope, name.into(), 0, 0, false, 0, None,
+        false, false, false, None);
+    if let Some(script) = v8::Script::compile(scope, source, Some(&origin)) {
+        let _ = script.run(scope);
+    }
+    Ok(())
+}
+
 /// Atomically claim an executable script.  A false result means the node was
 /// created inert by an HTML-string API or has already been prepared once.
 #[op2(fast)]
@@ -8824,6 +8844,7 @@ pub fn build_extension() -> Extension {
         op_form_cache_buffer(),
         op_create_select_allocator(),
         op_script_mark_started(),
+        op_execute_classic_script(),
         op_script_try_start(),
         op_shadow_attach(),
         op_shadow_root_info(),

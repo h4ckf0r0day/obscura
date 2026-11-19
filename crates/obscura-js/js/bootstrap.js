@@ -422,6 +422,9 @@ function __startDynClassicFetch(task) {
     error => ({ error }),
   );
 }
+function _executeClassicScript(source) {
+  __obscuraCore.ops.op_execute_classic_script(_executeClassicScript, source);
+}
 async function __runDynScriptTask(task) {
   try {
     if (task.isModule) {
@@ -443,7 +446,7 @@ async function __runDynScriptTask(task) {
         await new Promise(resolve => {
           const execute = () => {
             globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(body); }
+            try { _executeClassicScript(body); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
             finally { globalThis.__currentScriptNid = task.prevNid || 0; }
             resolve();
@@ -2357,7 +2360,7 @@ function __prepareInsertedScript(script) {
     __processParserBlockingScriptQueue();
   } else {
     globalThis.__currentScriptNid = script._nid;
-    try { (0, eval)(code); }
+    try { _executeClassicScript(code); }
     catch(e) { console.error('Dynamic inline script error:', e.message); }
     finally { globalThis.__currentScriptNid = prevNid || 0; }
   }

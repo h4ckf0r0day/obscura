@@ -25669,6 +25669,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn inserted_classic_scripts_preserve_document_import_resolution() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request.lines().next().unwrap().split_ascii_whitespace().nth(1).unwrap();
+                let (status, headers, body) = match path {
+                    "/redirect.js" => ("302 Found", "Location: /assets/main.js\r\n", ""),
+                    "/assets/main.js" => ("200 OK", "", "globalThis.externalImport = import('./lazy.js').then(m => m.value, () => 'rejected');"),
+                    "/assets/lazy.js" => ("200 OK", "", "export const value = 42;"),
+                    _ => ("200 OK", "", "export const value = 0;"),
+                };
+                let response = format!("HTTP/1.1 {status}\r\n{headers}Content-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let url = format!("http://{address}/assets/page");
+        let mut rt = ObscuraJsRuntime::with_base_url(&url);
+        rt.set_dom(parse_html("<html><head></head><body></body></html>"));
+        rt.set_url(&url);
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        rt.run_page_init();
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const inline = document.createElement('script');
+            inline.textContent = "globalThis.inlineImport = import('./lazy.js').then(m => m.value, () => 'rejected');";
+            document.head.appendChild(inline);
+            const inlineValue = await globalThis.inlineImport;
+            const external = document.createElement('script'); external.src = '/redirect.js';
+            await new Promise(resolve => { external.onload = resolve; external.onerror = resolve; document.head.appendChild(external); });
+            return [inlineValue, await globalThis.externalImport];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([42,42]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_dynamic_script_loads_without_exposing_fetch_body() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -25677,7 +25719,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0u8; 1024];
             let _ = stream.read(&mut buffer);
-            let body = "globalThis.__crossOriginScriptLoaded = true";
+            let body = "let __crossOriginScriptValue = 42; globalThis.__crossOriginScriptLoaded = true";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len(),
@@ -25700,7 +25742,8 @@ mod tests {
                             script.onerror = () => resolve("error");
                             document.head.appendChild(script);
                         }});
-                        return {{ outcome, loaded: globalThis.__crossOriginScriptLoaded === true }};
+                        return {{ outcome, loaded: globalThis.__crossOriginScriptLoaded === true,
+                            lexical: typeof __crossOriginScriptValue === 'number' ? __crossOriginScriptValue : null }};
                     }}"#
                 ),
                 None,
@@ -25713,7 +25756,7 @@ mod tests {
 
         assert_eq!(
             result.value.unwrap(),
-            serde_json::json!({ "outcome": "load", "loaded": true })
+            serde_json::json!({ "outcome": "load", "loaded": true, "lexical":42 })
         );
     }
 
@@ -28390,6 +28433,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([0, 0]));
+    }
+
+    #[test]
+    fn inserted_classic_scripts_share_document_global_lexical_bindings() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.execute_script("http://example.com/parser.js", "let parserValue = 40;").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const insert = (id, code) => {
+                const script = document.createElement('script');
+                script.id = id; script.textContent = code;
+                document.head.appendChild(script);
+            };
+            insert('declarations', 'parserValue++; let insertedValue = 2; const insertedConst = 43; class InsertedClass {}');
+            insert('consumer', 'globalThis.observed = [parserValue, insertedValue, insertedConst, typeof InsertedClass, document.currentScript.id];');
+            insert('duplicate', 'let insertedValue = 99; globalThis.duplicateRan = true;');
+            const originalEval = globalThis.eval;
+            try {
+                globalThis.eval = () => { throw new Error('author eval'); };
+                insert('native', 'globalThis.nativeExecution = insertedValue + insertedConst;');
+            } finally { globalThis.eval = originalEval; }
+            insert('outer', `const nestedScript = document.createElement('script');
+                nestedScript.id = 'inner';
+                nestedScript.textContent = 'let nestedValue = 7; globalThis.innerScript = document.currentScript.id; throw new Error("nested");';
+                document.head.appendChild(nestedScript);
+                globalThis.outerScript = [nestedValue, document.currentScript.id];`);
+            return {observed: globalThis.observed || null, duplicateRan: !!globalThis.duplicateRan,
+                nativeExecution: globalThis.nativeExecution || null,
+                nested: [globalThis.innerScript, globalThis.outerScript],
+                lexicalOnWindow: Object.hasOwn(globalThis, 'insertedValue'), currentScript: document.currentScript};
+        })()"#).unwrap(), serde_json::json!({
+            "observed":[41,2,43,"function","consumer"], "duplicateRan":false,
+            "nativeExecution":45, "lexicalOnWindow":false, "currentScript":null,
+            "nested":["inner",[7,"outer"]],
+        }));
+    }
+
+    #[test]
+    fn inserted_classic_script_watchdog_leaves_the_runtime_usable() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let deadline = rt.arm_watchdog(std::time::Duration::from_millis(100));
+        let _ = rt.execute_script("inserted-script-timeout", r#"(() => {
+            const script = document.createElement('script');
+            script.textContent = 'while (true) {}'; document.head.appendChild(script);
+            globalThis.afterInfiniteScript = true;
+        })()"#);
+        assert!(rt.disarm_watchdog(deadline));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const script = document.createElement('script');
+            script.textContent = 'globalThis.recoveredScript = 42'; document.head.appendChild(script);
+            return [typeof afterInfiniteScript, globalThis.recoveredScript];
+        })()"#).unwrap(), serde_json::json!(["undefined",42]));
+    }
+
+    #[test]
+    fn inserted_classic_script_lexical_bindings_stay_in_their_frame() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.execute_script("http://example.com/parser.js", "let frameValue = 'parent';").unwrap();
+        for (id, url, value) in [(1, "http://example.com/child", "same"),
+            (2, "http://foreign.test/child", "foreign")] {
+            let frame = crate::frame::FrameRealm::new(&mut rt, id, 0, url,
+                "<html><head></head><body></body></html>").unwrap();
+            frame.execute_script(&mut rt, &format!(r#"(() => {{
+                const first = document.createElement('script');
+                first.textContent = "let frameValue = '{value}'; class FrameClass {{}}";
+                document.head.appendChild(first);
+                const second = document.createElement('script');
+                second.textContent = "globalThis.frameResult = [frameValue, typeof FrameClass, document.URL];";
+                document.head.appendChild(second);
+            }})()"#)).unwrap();
+            assert_eq!(frame.evaluate(&mut rt, "globalThis.frameResult || null").unwrap(),
+                serde_json::json!([value, "function", url]));
+        }
+        assert_eq!(rt.evaluate("[frameValue, typeof FrameClass, typeof frameResult]").unwrap(),
+            serde_json::json!(["parent", "undefined", "undefined"]));
     }
 
     #[test]
