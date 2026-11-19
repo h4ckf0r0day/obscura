@@ -14819,6 +14819,17 @@ for (const [name, tags] of Object.entries({
   }
 }
 
+// Ordinary elements must be able to store their own form references.
+{
+  const descriptor = { ...Object.getOwnPropertyDescriptor(Element.prototype, 'form'), enumerable: true };
+  for (const Interface of [HTMLButtonElement, HTMLFieldSetElement, HTMLInputElement,
+      HTMLLabelElement, HTMLLegendElement, HTMLObjectElement, HTMLOutputElement,
+      HTMLSelectElement, HTMLTextAreaElement, HTMLOptionElement]) {
+    Object.defineProperty(Interface.prototype, 'form', descriptor);
+  }
+  delete Element.prototype.form;
+}
+
 // URL members on ordinary elements make detached roots look like shadow hosts.
 for (const name of ['protocol','username','password','host','hostname',
     'port','pathname','search','hash','origin']) {
