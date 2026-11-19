@@ -1867,7 +1867,12 @@ impl Page {
                     cookie_jar: self.context.cookie_jar.clone(),
                 };
                 self.fetch_navigation_with_redirect_hook(&target, method, body, headers, initiator, Some(&redirect_pause)).await
-                    .map_err(|error| PageError::NetworkError(error.to_string()))?
+                    .map_err(|error| PageError::NetworkError(match error {
+                        // A refused redirect target reports the same text as a
+                        // refused first request, not a doubled "Network error:".
+                        ObscuraNetError::Network(message) => message,
+                        other => other.to_string(),
+                    }))?
             }
             Ok(InterceptResolution::Fail {reason}) => {
                 return Err(PageError::NetworkError(net_error_from_cdp_reason(&reason)));
@@ -5631,7 +5636,8 @@ mod tests {
             assert_eq!(second.url, format!("{origin}/target"));
             second.resolver.send(InterceptResolution::Fail {reason: "BlockedByClient".into()}).ok().unwrap();
         });
-        assert!(result.unwrap_err().to_string().contains("net::ERR_BLOCKED_BY_CLIENT"));
+        assert_eq!(result.unwrap_err().to_string(), "Network error: net::ERR_BLOCKED_BY_CLIENT",
+            "the same error text as refusing the first request");
         assert_eq!(page.lifecycle, LifecycleState::Failed);
         assert_eq!(paths.recv().await.unwrap(), "/redirect");
         assert!(tokio::time::timeout(std::time::Duration::from_millis(300), paths.recv()).await.is_err(),
