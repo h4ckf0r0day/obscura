@@ -1560,6 +1560,217 @@ fn float_exclusion_continues_through_non_bfc_block_wrappers() {
     );
 }
 
+#[cfg(feature = "paint")]
+#[test]
+fn nested_text_wraps_around_floats_and_recovers_full_line_width() {
+    let text = vec!["AAAAA"; 300].join(" ");
+    for side in ["right", "left"] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            body {{ margin:0; background:white; color:black; font:10px/20px monospace }}
+            #panel {{ display:flow-root; width:760px; margin:20px }}
+            #float {{ float:{side}; width:300px; height:200px; background:#ccc;
+                margin-{}:16px }}
+            #lead {{ height:40px }} .inner {{ padding-right:24px }}
+            </style><div id="panel"><div id="float"></div><div class="content">
+            <div id="lead"></div><div class="inner"><div id="copy">{text}</div>
+            </div></div></div>"#, if side == "right" { "left" } else { "right" }));
+        let layout = layout_dom(&tree, (800.0, 500.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        let floating = rect("float");
+        let copy = rect("copy");
+        assert_eq!((copy.x, copy.y, copy.width), (20.0, 60.0, 736.0),
+            "{side}: ordinary block geometry must span below the float");
+        assert!((copy.height - 380.0).abs() <= 1.0,
+            "{side}: lines must wrap beside the float and widen below it: {copy:?}");
+        assert!((rect("panel").height - 420.0).abs() <= 1.0);
+
+        let png = obscura_render::screenshot_png(&tree, (800.0, 500.0), None).unwrap();
+        let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+        let ink = |x: u32, y: u32| {
+            let pixel = pixmap.pixel(x, y).unwrap();
+            pixel.red() < 100 && pixel.green() < 100 && pixel.blue() < 100
+        };
+        let overlaps = (floating.y as u32 + 1..(floating.y + floating.height) as u32 - 1)
+            .any(|y| (floating.x as u32 + 1..(floating.x + floating.width) as u32 - 1)
+                .any(|x| ink(x, y)));
+        assert!(!overlaps, "{side}: text painted through the floated figure");
+        let recovered = ((floating.y + floating.height) as u32 + 2..(copy.y + copy.height) as u32)
+            .any(|y| (floating.x as u32 + 1..(floating.x + floating.width).min(copy.x + copy.width) as u32 - 1)
+                .any(|x| ink(x, y)));
+        assert!(recovered, "{side}: text never reclaimed the width below the float");
+    }
+}
+
+#[test]
+fn leaf_measurement_observes_changed_float_context_after_cached_layout() {
+    use taffy::{AvailableSpace, Display, Size, Style, TaffyTree};
+    struct Measure<'a>(&'a mut Vec<f32>);
+    impl taffy::tree::LeafMeasure<()> for Measure<'_> {
+        const USES_FLOAT_CONTEXT: bool = true;
+        fn measure(&mut self, known: Size<Option<f32>>, _: Size<AvailableSpace>,
+            _: taffy::NodeId, _: Option<&mut ()>, _: &Style) -> Size<f32>
+        {
+            let width = known.width.unwrap_or(760.0);
+            Size { width, height: (1200.0 / width).ceil() * 20.0 }
+        }
+        fn measure_with_block_context(&mut self, known: Size<Option<f32>>,
+            available: Size<AvailableSpace>, node: taffy::NodeId, context: Option<&mut ()>,
+            style: &Style, _: Size<Option<f32>>, block: Option<&mut taffy::BlockContext<'_>>)
+            -> Size<f32>
+        {
+            if let Some(block) = block.filter(|block| block.has_active_floats(0.0)) {
+                let slot = block.find_content_slot(0.0, taffy::style::Clear::None, None);
+                self.0.push(slot.width);
+                return Size { width: known.width.unwrap_or(760.0), height: (1200.0 / slot.width).ceil() * 20.0 };
+            }
+            self.measure(known, available, node, context, style)
+        }
+    }
+    let mut tree = TaffyTree::new();
+    let mut float_style = Style { display:Display::Block, float:taffy::style::Float::Right,
+        size:Size { width:taffy::Dimension::length(300.0), height:taffy::Dimension::length(200.0) },
+        ..Default::default() };
+    let floating = tree.new_leaf(float_style.clone()).unwrap();
+    let text = tree.new_leaf_with_context(Style { display:Display::Block, ..Default::default() }, ()).unwrap();
+    let root = tree.new_with_children(Style { display:Display::Block,
+        size:Size { width:taffy::Dimension::length(760.0), height:taffy::Dimension::auto() },
+        ..Default::default() }, &[floating, text]).unwrap();
+    for (width, expected_slot, expected_height) in [(300.0, 460.0, 60.0), (400.0, 360.0, 80.0)] {
+        float_style.size.width = taffy::Dimension::length(width);
+        tree.set_style(floating, float_style.clone()).unwrap();
+        let mut slots = Vec::new();
+        tree.compute_layout_with_measure_context(root,
+            Size { width:AvailableSpace::Definite(900.0), height:AvailableSpace::MaxContent },
+            Measure(&mut slots)).unwrap();
+        assert!(slots.iter().any(|slot| (*slot - expected_slot).abs() < 0.01), "{slots:?}");
+        assert_eq!(tree.layout(text).unwrap().size, Size { width:760.0, height:expected_height });
+    }
+}
+
+#[test]
+fn removing_float_refreshes_cached_text_measurement_context() {
+    use taffy::{AvailableSpace, Display, Size, Style, TaffyTree};
+    struct Measure<'a>(&'a mut Vec<bool>);
+    impl taffy::tree::LeafMeasure<()> for &mut Measure<'_> {
+        const USES_FLOAT_CONTEXT: bool = true;
+        fn measure(&mut self, _: Size<Option<f32>>, _: Size<AvailableSpace>,
+            _: taffy::NodeId, context: Option<&mut ()>, _: &Style) -> Size<f32>
+        {
+            if context.is_some() { self.0.push(false); }
+            Size { width:760.0, height:40.0 }
+        }
+        fn measure_with_block_context(&mut self, known: Size<Option<f32>>,
+            available: Size<AvailableSpace>, node: taffy::NodeId, context: Option<&mut ()>,
+            style: &Style, _: Size<Option<f32>>, block: Option<&mut taffy::BlockContext<'_>>)
+            -> Size<f32>
+        {
+            if context.is_some() && block.is_some_and(|block| block.has_active_floats(0.0)) {
+                self.0.push(true);
+                return Size { width:760.0, height:60.0 };
+            }
+            self.measure(known, available, node, context, style)
+        }
+    }
+    let mut tree = TaffyTree::new();
+    let text = tree.new_leaf_with_context(Style { display:Display::Block, ..Default::default() }, ()).unwrap();
+    let root = tree.new_with_children(Style { display:Display::Block,
+        size:Size { width:taffy::Dimension::length(760.0), height:taffy::Dimension::auto() },
+        ..Default::default() }, &[text]).unwrap();
+    let available = Size { width:AvailableSpace::Definite(900.0), height:AvailableSpace::MaxContent };
+    let mut calls = Vec::new();
+    tree.compute_layout_with_measure_context(root, available, &mut Measure(&mut calls)).unwrap();
+    let floating = tree.new_leaf(Style { display:Display::Block, float:taffy::style::Float::Right,
+        size:Size { width:taffy::Dimension::length(300.0), height:taffy::Dimension::length(200.0) },
+        ..Default::default() }).unwrap();
+    tree.insert_child_at_index(root, 0, floating).unwrap();
+    tree.compute_layout_with_measure_context(root, available, &mut Measure(&mut calls)).unwrap();
+    assert_eq!(calls.last(), Some(&true));
+    calls.clear();
+    tree.remove_child(root, floating).unwrap();
+    tree.compute_layout_with_measure_context(root, available, &mut Measure(&mut calls)).unwrap();
+    assert_eq!(calls.last(), Some(&false), "cached text must discard the removed exclusion");
+    assert_eq!(tree.layout(text).unwrap().size.height, 40.0);
+}
+
+#[test]
+fn a_later_taller_float_keeps_its_exclusion_below_an_earlier_float() {
+    use taffy::{Clear, FloatContext, FloatDirection, Size};
+    for (first, second, expected_x) in [
+        (FloatDirection::Left, FloatDirection::Right, 0.0),
+        (FloatDirection::Right, FloatDirection::Left, 200.0),
+    ] {
+        let mut context = FloatContext::new();
+        context.set_width(760.0);
+        context.place_floated_box(Size { width:250.0, height:120.0 }, 0.0,
+            [0.0, 0.0], first, Clear::None);
+        context.place_floated_box(Size { width:200.0, height:200.0 }, 0.0,
+            [0.0, 0.0], second, Clear::None);
+        assert!(context.has_active_floats(160.0), "the taller float still occupies this band");
+        let slot = context.find_content_slot(160.0, [0.0, 0.0], Clear::None, None);
+        assert_eq!((slot.x, slot.width), (expected_x, 560.0));
+        assert!(!context.has_active_floats(200.0));
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn opposing_floats_restore_text_width_at_each_float_bottom() {
+    let text = vec!["AAAAA"; 300].join(" ");
+    for (left, right, margin, height) in [(250, 200, 16, 380.0), (396, 364, 0, 420.0)] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            body {{margin:0;background:white;color:black;font:10px/20px monospace}}
+            #panel {{display:flow-root;width:760px;margin:20px}}
+            #left {{float:left;width:{left}px;height:120px;background:#ccc}}
+            #right {{float:right;width:{right}px;height:200px;background:#ccc;margin-left:{margin}px}}
+            #lead {{height:40px}} #inner {{padding-right:24px}}
+            </style><div id="panel"><div id="left"></div><div id="right"></div>
+            <div><div id="lead"></div><div id="inner"><div id="copy">{text}</div></div></div></div>"#));
+        let layout = layout_dom(&tree, (900.0, 800.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        let copy = rect("copy");
+        assert_eq!((copy.x, copy.y, copy.width, copy.height), (20.0, 60.0, 736.0, height));
+        let png = obscura_render::screenshot_png(&tree, (900.0, 800.0), None).unwrap();
+        let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+        for floating in [rect("left"), rect("right")] {
+            assert!(!(floating.y as u32 + 1..(floating.y + floating.height) as u32 - 1)
+                .any(|y| (floating.x as u32 + 1..(floating.x + floating.width) as u32 - 1)
+                    .any(|x| {
+                        let p = pixmap.pixel(x, y).unwrap();
+                        p.red() < 100 && p.green() < 100 && p.blue() < 100
+                    })), "text crossed a float: {floating:?}");
+        }
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn inline_borders_stop_at_their_owner_when_text_wraps_around_a_float() {
+    let text = vec!["AAAAA"; 300].join(" ");
+    let tree = parse_html(&format!(r#"<!doctype html><style>
+        body {{margin:0;background:white;color:black;font:10px/20px monospace}}
+        #panel {{display:flow-root;width:760px;margin:20px}}
+        #float {{float:right;width:300px;height:200px;background:#ccc;margin-left:16px}}
+        #lead {{height:40px}} #inner {{padding-right:24px}}
+        #owner {{padding:0 10px;border:2px solid red}}
+        </style><div id="panel"><div id="float"></div><div><div id="lead"></div>
+        <div id="inner"><div id="copy"><span id="owner">{}</span> {}</div></div></div></div>"#,
+        &text[..200], &text[200..]));
+    let layout = layout_dom(&tree, (900.0, 800.0));
+    let owner = tree.get_element_by_id("owner").unwrap();
+    let copy = layout.rects[&tree.get_element_by_id("copy").unwrap()];
+    let pieces = &layout.inline_fragments[&owner];
+    assert_eq!(pieces.len(), 3, "the short inline must not own later visual lines: {pieces:?}");
+    assert!(pieces.iter().all(|piece| piece.y + piece.height < copy.y + 65.0));
+    let png = obscura_render::screenshot_png(&tree, (900.0, 800.0), None).unwrap();
+    let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+    let red = |y| (0..900).any(|x| {
+        let p = pixmap.pixel(x, y).unwrap();
+        p.red() > 200 && p.green() < 50 && p.blue() < 50
+    });
+    assert!((60..125).any(red));
+    assert!(!(150..500).any(red), "border leaked onto following plain text");
+}
+
 #[test]
 fn full_width_percentage_float_uses_definite_containing_block() {
     let tree = parse_html(
