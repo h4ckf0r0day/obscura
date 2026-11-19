@@ -24523,6 +24523,60 @@ mod tests {
         }
     }
 
+    async fn check_preflight_user_agent(stealth: bool) {
+        for configured in 0..if stealth { 3 } else { 2 } {
+            let (mut rt, target, requests) = cors_preflight_runtime();
+            let client = rt.state.borrow().http_client.as_ref().unwrap().clone();
+            if configured > 0 {
+                client.set_user_agent("ConfiguredBrowser/1.0").await;
+            }
+            #[cfg(feature = "stealth")]
+            if stealth {
+                let client = obscura_net::StealthHttpClient::with_proxy(
+                    client.cookie_jar.clone(), None, true,
+                ).with_user_agent((configured > 0).then(|| "ConfiguredBrowser/1.0".to_string()));
+                if configured == 2 {
+                    client.extra_headers.write().await.insert("User-Agent".into(), "HeaderBrowser/2.0".into());
+                }
+                rt.set_stealth_client(std::sync::Arc::new(client));
+            }
+            let result = rt.call_function_on_for_cdp(&format!(r#"async () => {{
+                const response = await fetch({target:?}, {{
+                    headers: {{'Content-Type': 'application/json'}}
+                }});
+                return response.text();
+            }}"#), None, &[], true, true).await.unwrap();
+            assert_eq!(result.value, Some(serde_json::json!("ok")));
+            let preflight = requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            let request = requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            let agents = |wire: &str| wire.lines().filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| value.trim().to_string()).collect::<Vec<_>>();
+            let actual_agent = agents(&request);
+            assert_eq!(actual_agent.len(), 1, "stealth={stealth}: {request}");
+            if configured > 0 {
+                assert_eq!(actual_agent, [if configured == 2 { "HeaderBrowser/2.0" } else { "ConfiguredBrowser/1.0" }]);
+            } else {
+                assert!(actual_agent[0].contains("Chrome/"), "{request}");
+            }
+            assert_eq!(agents(&preflight), actual_agent, "stealth={stealth}: {preflight}");
+            let preflight = preflight.to_ascii_lowercase();
+            assert!(preflight.contains("access-control-request-headers: content-type\r\n"));
+            assert!(!preflight.contains("\r\ncookie:") && !preflight.contains("\r\nauthorization:"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cors_preflight_uses_the_browser_user_agent() {
+        check_preflight_user_agent(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cors_preflight_uses_the_browser_user_agent() {
+        check_preflight_user_agent(true).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn denied_preflight_never_sends_the_unsafe_request() {
         let (mut rt, target, requests) = cors_preflight_runtime();
