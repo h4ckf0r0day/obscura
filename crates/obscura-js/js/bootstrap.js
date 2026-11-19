@@ -422,11 +422,8 @@ function __startDynClassicFetch(task) {
     error => ({ error }),
   );
 }
-function _executeClassicScript(source, nid) {
-  const previous = globalThis.__currentScriptNid;
-  globalThis.__currentScriptNid = nid;
-  try { __obscuraCore.ops.op_execute_classic_script(_executeClassicScript, source); }
-  finally { globalThis.__currentScriptNid = previous || 0; }
+function _executeClassicScript(source) {
+  __obscuraCore.ops.op_execute_classic_script(_executeClassicScript, source);
 }
 async function __runDynScriptTask(task) {
   try {
@@ -448,8 +445,11 @@ async function __runDynScriptTask(task) {
         // parser script happened to trigger the microtask checkpoint.
         await new Promise(resolve => {
           const execute = () => {
-            try { _executeClassicScript(body, task.nid); }
+            const previousNid = globalThis.__currentScriptNid;
+            globalThis.__currentScriptNid = task.nid;
+            try { _executeClassicScript(body); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+            finally { globalThis.__currentScriptNid = previousNid || 0; }
             resolve();
           };
           if (_scheduleAfter(0, execute) === undefined) execute();
@@ -2263,6 +2263,7 @@ function __prepareInsertedScript(script) {
   const src = script.getAttribute('src');
   const code = src ? "" : script.textContent;
   if (!src && !code) return;
+  const prevNid = globalThis.__currentScriptNid;
   const parserInserted = __documentWriteScripts.has(script);
   const parserBlocking = parserInserted
     && !isModule
@@ -2355,8 +2356,10 @@ function __prepareInsertedScript(script) {
     });
     __processParserBlockingScriptQueue();
   } else {
-    try { _executeClassicScript(code, script._nid); }
+    globalThis.__currentScriptNid = script._nid;
+    try { _executeClassicScript(code); }
     catch(e) { console.error('Dynamic inline script error:', e.message); }
+    finally { globalThis.__currentScriptNid = prevNid || 0; }
   }
 }
 
