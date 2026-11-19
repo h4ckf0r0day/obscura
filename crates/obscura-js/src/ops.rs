@@ -3183,7 +3183,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             dom
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
-                        let html = name.ns == html5ever::ns!(html);
+                        let html = dom.is_html_element_in_html_document(NodeId::new(nid));
                         let tag = if html {
                             match &name.prefix {
                                 Some(prefix) => {
@@ -3599,6 +3599,15 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .unwrap_or("-1".into())
         }
         "create_document_fragment" => dom.new_node(NodeData::Document).index().to_string(),
+        "create_xml_document" => dom.new_xml_document().index().to_string(),
+        "mark_xml_document" => {
+            let nid = match arg1.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => return "false".into(),
+            };
+            dom.mark_xml_document(NodeId::new(nid));
+            "true".into()
+        }
         "clone_node" => {
             let nid = match arg1.parse::<u32>() {
                 Ok(n) => n,

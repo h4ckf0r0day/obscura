@@ -3588,7 +3588,7 @@ function _htmlAttrName(el, n) {
   for (let i = 0; i < n.length; i++) {
     const c = n.charCodeAt(i);
     if (c >= 65 && c <= 90) {
-      return el.namespaceURI === "http://www.w3.org/1999/xhtml" ? n.toLowerCase() : n;
+      return el.namespaceURI === "http://www.w3.org/1999/xhtml" && !el._xmlOwnerDocument ? n.toLowerCase() : n;
     }
   }
   return n;
@@ -6568,10 +6568,10 @@ class DOMImplementation {
     const contentType = ns === "http://www.w3.org/1999/xhtml"
       ? "application/xhtml+xml"
       : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
-    const doc = _createDetachedDocument(contentType, true);
+    const doc = _xmlDocument(+_dom("create_xml_document"), contentType);
     const name = qualifiedName == null ? "" : String(qualifiedName);
     const element = name === "" ? null : doc.createElementNS(ns, name);
-    if (doctype != null) doc.appendChild(doctype);
+    if (doctype != null) doc.appendChild(_xmlOwnNode(doctype, doc));
     if (element) doc.appendChild(element);
     return doc;
   }
@@ -12900,6 +12900,105 @@ function _xmlWellFormed(src) {
 const _escapeXmlErrorText = (text) =>
   String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+// Real XML documents (document.implementation.createDocument) share the
+// ordinary node cache and arena with HTML, but tag/attribute case and
+// getElementsByTagName must stay case-sensitive and the nodes must report
+// as detached rather than falling back to the live document.
+function _xmlElementsByTagName(name) {
+  name = String(name);
+  return HTMLCollection._from(Array.from(this.querySelectorAll("*"))
+    .filter(el => name === "*" || el.tagName === name));
+}
+
+function _xmlOwnNode(node, doc) {
+  node._xmlOwnerDocument = doc;
+  if (node.nodeType === 1) node.getElementsByTagName = _xmlElementsByTagName;
+  Object.defineProperties(node, {
+    ownerDocument: { configurable: true, get() { return this._xmlOwnerDocument; } },
+    baseURI: { configurable: true, get() { return "about:blank"; } },
+    isConnected: { configurable: true, get() {
+      let root = this;
+      while (root.parentNode) root = root.parentNode;
+      return root.nodeType === 9;
+    } },
+  });
+  return node;
+}
+
+// A node the native `clone_node` op produced was never routed through
+// createElementNS/createTextNode/etc, so it was never cached-and-owned the
+// way a freshly-created XML node is. Own the whole cloned subtree once, up
+// front, so the first `_wrap`/`_wrapEl` anyone does on these ids (including
+// our own `children` getter) hits an already-XML-owned cached instance.
+function _xmlOwnSubtree(nodeId, doc) {
+  _xmlOwnNode(_wrap(nodeId), doc);
+  for (const childId of _domParse("child_nodes", nodeId) || []) _xmlOwnSubtree(childId, doc);
+}
+
+function _xmlDocument(nodeId, mimeType) {
+  const doc = new XMLDocument(nodeId);
+  doc._contentType = mimeType;
+  doc._xmlDocument = true;
+  _cache.set(nodeId, doc);
+  Object.defineProperties(doc, {
+    isConnected: { get() { return true; } },
+    documentElement: { get() { return this.children[0] || null; } },
+    children: { get() { return HTMLCollection._from(
+        (_domParse("element_children", this._nid) || []).map(_wrapEl).filter(Boolean)); } },
+    head: { get() { return null; } },
+    body: { get() { return null; } },
+    title: { get() { return ""; }, set(value) { String(value); } },
+    doctype: { get() { return Array.from(this.childNodes).find(n => n.nodeType === 10) || null; } },
+    URL: { get() { return "about:blank"; } },
+    documentURI: { get() { return "about:blank"; } },
+    baseURI: { get() { return "about:blank"; } },
+    referrer: { get() { return ""; } },
+    location: { get() { return null; } },
+    defaultView: { get() { return null; } },
+    readyState: { get() { return "complete"; } },
+    characterSet: { get() { return "UTF-8"; } },
+    compatMode: { get() { return "CSS1Compat"; } },
+    textContent: { get() { return null; }, set(value) {} },
+    styleSheets: { get() { return { length: 0, item() { return null; }, [Symbol.iterator]: function* () {} }; } },
+  });
+  doc.querySelector = DocumentFragment.prototype.querySelector;
+  doc.querySelectorAll = DocumentFragment.prototype.querySelectorAll;
+  doc.getElementById = DocumentFragment.prototype.getElementById;
+  doc.getElementsByTagName = _xmlElementsByTagName;
+  doc.getElementsByClassName = function(names) { return _getElementsByClassName(this, names); };
+  doc.createElementNS = function(namespace, qualifiedName) {
+    const ns = namespace == null ? "" : String(namespace);
+    const name = String(qualifiedName);
+    _ns_validateQualifiedName(ns, name);
+    const nid = +_dom("create_element_ns", ns + "\0" + name);
+    const el = _wrapEl(nid);
+    el._tagName = name;
+    el._lname = name.includes(":") ? name.slice(name.indexOf(":") + 1) : name;
+    el._ns = ns;
+    Object.defineProperty(el, "prefix", { configurable: true, value: name.includes(":") ? name.split(":")[0] : null });
+    _seedDetachedTreeState(el);
+    return _xmlOwnNode(el, this);
+  };
+  doc.createElement = function(name) { return this.createElementNS(null, name); };
+  for (const method of ["createTextNode", "createComment", "createCDATASection",
+      "createProcessingInstruction", "createDocumentFragment"]) {
+    doc[method] = function(...args) {
+      return _xmlOwnNode(Reflect.apply(Document.prototype[method], this, args), this);
+    };
+  }
+  // Clone via the native tree op rather than a serialize/reparse round trip --
+  // this document has no string parser backing it.
+  doc.cloneNode = function(deep) {
+    if (!deep) return _xmlDocument(+_dom("create_xml_document"), this.contentType);
+    const nid = +_dom("clone_node", this._nid, "true");
+    _dom("mark_xml_document", nid);
+    const clone = _xmlDocument(nid, this.contentType);
+    for (const childId of _domParse("child_nodes", nid) || []) _xmlOwnSubtree(childId, clone);
+    return clone;
+  };
+  return doc;
+}
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
@@ -13071,6 +13170,28 @@ globalThis.DOMParser = class DOMParser {
     return docNode;
   }
 };
+// Case-sensitive, attribute-order-preserving serialization for real XML
+// documents/nodes, independent of the HTML outerHTML path (which lower-cases
+// tag/attribute names and skips CDATA).
+function _serializeXmlNode(node) {
+  const escape = value => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  if (node.nodeType === 9 || node.nodeType === 11) return Array.from(node.childNodes, _serializeXmlNode).join("");
+  if (node.nodeType === 3) return escape(node.data);
+  if (node.nodeType === 4) return "<![CDATA[" + node.data + "]]>";
+  if (node.nodeType === 8) return "<!--" + node.data + "-->";
+  if (node.nodeType === 7) return "<?" + node.target + (node.data ? " " + node.data : "") + "?>";
+  if (node.nodeType === 10) return XMLSerializer.prototype.serializeToString.call(null, node);
+  if (node.nodeType !== 1) return "";
+  let opening = "<" + node.nodeName;
+  for (const name of _domParse("attribute_names", node._nid) || []) {
+    opening += " " + name + '="' + escape(node.getAttribute(name)).replace(/"/g, "&quot;")
+      .replace(/\t/g, "&#9;").replace(/\n/g, "&#10;").replace(/\r/g, "&#13;") + '"';
+  }
+  const children = Array.from(node.childNodes);
+  return children.length ? opening + ">" + children.map(_serializeXmlNode).join("") + "</" + node.nodeName + ">"
+    : opening + "/>";
+}
+
 globalThis.XMLSerializer = class XMLSerializer {
   serializeToString(node) {
     if (!node) return "";
@@ -13084,6 +13205,7 @@ globalThis.XMLSerializer = class XMLSerializer {
       s += ">";
       return s;
     }
+    if (node._xmlDocument || node._xmlOwnerDocument) return _serializeXmlNode(node);
     if (node.outerHTML !== undefined) return node.outerHTML;
     if (node.nodeType === 9) {
       let s = "";
