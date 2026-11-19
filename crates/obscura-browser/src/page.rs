@@ -7984,6 +7984,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fetched_frame_window_event_handler_assignments_use_the_real_window() {
+        let (base, mut requests) = spawn_form_target_server().await;
+        let mut page = import_map_test_page("frame-window-handlers", &base,
+            "<html><body><iframe src='/child'></iframe></body></html>");
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(requests.try_recv().unwrap().0, "GET /child HTTP/1.1");
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const child = document.querySelector('iframe').contentWindow;
+            let calls = 0; const fn = function(event) { if (this === child.window && event.type === 'message') calls++; };
+            child.onmessage = fn;
+            const same = child.onmessage === fn;
+            child.eval("dispatchEvent(new MessageEvent('message', {data:'hello'}))");
+            child.onmessage = null;
+            child.eval("dispatchEvent(new MessageEvent('message', {data:'ignored'}))");
+            return [same, calls, child.onmessage === null, typeof window.onmessage];
+        })()"#).unwrap(), serde_json::json!([true,1,true,"object"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn form_submission_to_named_iframe_keeps_the_top_document() {
         let (base, mut requests) = spawn_form_target_server().await;
         for method in ["GET", "POST"] {

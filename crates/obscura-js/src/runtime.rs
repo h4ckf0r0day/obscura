@@ -22428,6 +22428,283 @@ mod tests {
     }
 
     #[test]
+    fn global_event_handler_accessors_support_wrapped_assignments() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const results = [];
+            for (const name of ['onclick', 'oninput', 'onchange']) {
+                const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, name);
+                if (typeof descriptor.set !== 'function') return ['missing setter', name];
+                Object.defineProperty(HTMLElement.prototype, name, {set(value) {
+                    descriptor.set.call(this, typeof value === 'function' ? function(event) {
+                        return value.call(this, event);
+                    } : value);
+                }});
+                const element = document.createElement('button');
+                let calls = 0;
+                element[name] = function(event) { if (this === element && event.currentTarget === element) calls++; return false; };
+                const dispatched = element.dispatchEvent(new Event(name.slice(2), {cancelable:true}));
+                results.push([typeof descriptor.get, descriptor.enumerable, descriptor.configurable,
+                    calls, dispatched, Object.hasOwn(element, name)]);
+            }
+            for (const [target, prototype] of [[document, Document.prototype], [window, window]]) {
+                const descriptor = Object.getOwnPropertyDescriptor(prototype, 'onclick');
+                let calls = 0;
+                target.onclick = function(event) { if (this === target && event.currentTarget === target) calls++; };
+                target.dispatchEvent(new Event('click'));
+                results.push([typeof descriptor.get, typeof descriptor.set, calls]);
+            }
+            return results;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            ["function",true,true,1,false,false], ["function",true,true,1,false,false],
+            ["function",true,true,1,false,false], ["function","function",1], ["function","function",1],
+        ]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_convert_values_and_preserve_attribute_precedence() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const conversions = [];
+            for (const target of [document.createElement('button'), document, window]) {
+                for (const value of [undefined, true, 7, 'source', Symbol('source'), {}, {handleEvent() {}}, function() {}]) {
+                    target.onclick = value;
+                    conversions.push(target.onclick === ((typeof value === 'object' || typeof value === 'function') ? value : null));
+                }
+                target.onclick = null;
+            }
+            const empty = document.createElement('button'); empty.setAttribute('onclick', '');
+            const emptyRead = typeof empty.onclick;
+            const element = document.createElement('button'); globalThis.handlerOrder = [];
+            element.setAttribute('onclick', "handlerOrder.push('attribute')");
+            const attributeRead = typeof element.onclick;
+            element.click(); element.onclick = () => handlerOrder.push('idl'); element.click();
+            element.onclick = null; element.click();
+            element.setAttribute('onclick', "handlerOrder.push('updated')"); element.click();
+            element.removeAttribute('onclick'); element.click();
+            element.onclick = () => handlerOrder.push('retained');
+            element.removeAttribute('onclick'); element.click();
+            element.setAttributeNS(null, 'onclick', "handlerOrder.push('ns')"); element.click();
+            element.removeAttributeNS(null, 'onclick'); element.click();
+            return [conversions.every(Boolean), attributeRead, handlerOrder, element.onclick === null, emptyRead];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            true,"function",["attribute","idl","updated","retained","ns"],true,"function",
+        ]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_use_the_receiver_realm_and_check_brands() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'onclick');
+            if (typeof descriptor.get !== 'function') return ['missing getter'];
+            const invalid = [document, {}, Object.create(HTMLElement.prototype), document.createTextNode('x')];
+            const brands = invalid.map(target => { try { descriptor.get.call(target); return false; }
+                catch (error) { return error instanceof TypeError; } });
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const child = frame.contentWindow; const element = child.document.createElement('button');
+            child.document.body.appendChild(element);
+            let calls = 0; const fn = function() { if (this === element) calls++; };
+            descriptor.set.call(element, fn); element.click();
+            const before = descriptor.get.call(element) === fn;
+            child.eval('globalThis.childClickDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "onclick")');
+            const parent = document.createElement('button');
+            child.childClickDescriptor.set.call(parent, fn);
+            const borrowed = parent.onclick === fn;
+            Object.setPrototypeOf(parent, null);
+            return [brands, calls, before, borrowed, descriptor.get.call(parent) === fn];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([[true,true,true,true],1,true,true,true]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_preserve_image_error_content_handlers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            globalThis.imageHandlerCalls = [];
+            const image = document.createElement('img');
+            image.setAttribute('onerror', "imageHandlerCalls.push('attribute')");
+            image.dispatchEvent(new Event('error'));
+            image.onerror = () => imageHandlerCalls.push('idl');
+            image.dispatchEvent(new Event('error'));
+            image.onerror = null;
+            image.dispatchEvent(new Event('error'));
+            return imageHandlerCalls;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["attribute","idl"]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_preserve_dialog_content_handlers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            globalThis.dialogHandlerCalls = [];
+            const dialog = document.createElement('dialog'); document.body.appendChild(dialog);
+            dialog.setAttribute('oncancel', "dialogHandlerCalls.push('cancel'); event.preventDefault()");
+            dialog.setAttribute('onclose', "dialogHandlerCalls.push('close')");
+            dialog.show(); dialog.requestClose();
+            const retained = dialog.open;
+            dialog.dispatchEvent(new Event('close'));
+            return [retained, dialogHandlerCalls];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,["cancel","close"]]));
+    }
+
+    #[test]
+    fn specialized_event_handlers_share_attribute_and_idl_precedence() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const result = [];
+            for (const [tag, type] of [['div','load'],['img','load'],['dialog','cancel'],['dialog','close'],['body','load']]) {
+                const target = tag === 'body' ? document.body : document.createElement(tag);
+                globalThis.specializedHandlerCalls = [];
+                const name = 'on'+type;
+                target.setAttribute(name, "specializedHandlerCalls.push('attribute')");
+                target.dispatchEvent(new Event(type));
+                target[name] = () => specializedHandlerCalls.push('idl');
+                target.dispatchEvent(new Event(type));
+                target[name] = null;
+                target.dispatchEvent(new Event(type));
+                target.setAttribute(name, "specializedHandlerCalls.push('updated')");
+                target.dispatchEvent(new Event(type));
+                result.push([tag,type,specializedHandlerCalls.slice()]);
+            }
+            return result;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            ["div","load",["attribute","idl","updated"]],
+            ["img","load",["attribute","idl","updated"]],
+            ["dialog","cancel",["attribute","idl","updated"]],
+            ["dialog","close",["attribute","idl","updated"]],
+            ["body","load",[]],
+        ]));
+    }
+
+    #[test]
+    fn standard_event_handler_accessors_deliver_and_cancel() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const rows=[];
+            for(const type of ['beforeinput','beforetoggle','auxclick','animationstart','animationend','animationiteration','transitionrun','transitionstart','transitionend','transitioncancel']) {
+                for(const target of [document.createElement('input'), document, window]) {
+                    let calls=0;
+                    target['on'+type]=e=>{calls++; e.preventDefault()};
+                    const dispatched=target.dispatchEvent(new Event(type,{cancelable:true}));
+                    target['on'+type]=null;
+                    rows.push([calls,dispatched]);
+                }
+            }
+            return rows;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::Value::Array(vec![serde_json::json!([1,false]); 30]));
+    }
+
+    #[test]
+    fn inherited_event_handler_accessors_preserve_delivery() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const result=[];
+            for(const [tag,type] of [['div','fullscreenchange'],['div','fullscreenerror'],['div','beforecopy'],['audio','encrypted'],['audio','waitingforkey'],['video','enterpictureinpicture'],['video','leavepictureinpicture']]) {
+                const target=document.createElement(tag);
+                let calls=0;
+                const handler=e=>{calls++;e.preventDefault()};
+                target['on'+type]=handler;
+                const dispatched=target.dispatchEvent(new Event(type,{cancelable:true}));
+                result.push([calls,dispatched,target['on'+type]===handler]);
+            }
+            return result;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::Value::Array(vec![serde_json::json!([1,false,true]); 7]));
+    }
+
+    #[test]
+    fn window_event_handler_state_survives_snapshot_restore() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const defaults = [typeof window.onerror, typeof window.onunhandledrejection];
+            let calls = 0;
+            const handler = event => { calls++; event.preventDefault(); };
+            window.onbeforeinput = handler;
+            const dispatched = window.dispatchEvent(new Event('beforeinput', {cancelable:true}));
+            return [defaults, calls, dispatched, window.onbeforeinput === handler];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([["function","function"],1,false,true]));
+    }
+
+    #[test]
+    fn event_handler_accessors_preserve_target_specific_surfaces() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const restricted = ['onfullscreenchange','onfullscreenerror','onwebkitfullscreenchange',
+                'onwebkitfullscreenerror','onbeforecopy','onbeforecut','onbeforepaste'];
+            return [restricted.every(name => name in document.createElement('div') && name in document && !(name in window)),
+                'onencrypted' in document.createElement('audio'), 'onencrypted' in document.createElement('div'),
+                'onenterpictureinpicture' in document.createElement('video'), 'onenterpictureinpicture' in document.createElement('audio')];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,true,false,true,false]));
+    }
+
+    #[test]
+    fn cached_load_handlers_follow_a_replacement_body() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const replacement = document.createElement('body');
+            replacement.onload = () => {};
+            const handler = () => {};
+            window.onload = handler;
+            document.documentElement.replaceChild(replacement, document.body);
+            return [replacement.onload === handler, window.onload === handler, document.body === replacement];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,true,true]));
+    }
+
+    #[test]
+    fn native_event_delivery_ignores_public_handler_getters() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            globalThis.nativeHandlerCalls = [];
+            let reads = 0;
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'onclick');
+            Object.defineProperty(HTMLElement.prototype, 'onclick', {
+                configurable: true,
+                get() { reads++; return () => nativeHandlerCalls.push('getter'); },
+                set: descriptor.set,
+            });
+            const button = document.createElement('button');
+            document.body.appendChild(button);
+            button.setAttribute('onclick', "nativeHandlerCalls.push('attribute')");
+            button.click();
+            button.onclick = () => nativeHandlerCalls.push('idl'); button.click();
+            button.onclick = null; button.click();
+            return [reads, nativeHandlerCalls];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([0,["attribute","idl"]]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_ignore_unsupported_document_and_window_properties() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            let custom = 0, clicks = 0, reads = 0;
+            document.onownedunsupported = () => custom++;
+            window.onownedunsupported = () => custom++;
+            for (const target of [document, window]) {
+                Object.defineProperty(target, 'onownedgetter', {get() { reads++; return () => custom++; }});
+            }
+            document.onclick = () => clicks++;
+            window.onclick = () => clicks++;
+            const button = document.createElement('button'); document.body.appendChild(button);
+            button.dispatchEvent(new Event('ownedunsupported', {bubbles:true}));
+            button.dispatchEvent(new Event('ownedgetter', {bubbles:true}));
+            button.click();
+            return {custom, clicks, reads};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({"custom":0,"clicks":2,"reads":0}));
+    }
+
+    #[test]
     fn test_matches_and_closest() {
         let mut rt = setup_runtime(
             r#"<div class="outer"><div class="inner"><span id="target">Hi</span></div></div>"#,

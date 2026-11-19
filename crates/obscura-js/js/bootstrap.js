@@ -2042,7 +2042,7 @@ function _eventTargetDispatch(target, event, authorDispatch = false) {
   event.eventPhase = 2;
   try {
     // Other EventTargets register their IDL handlers in the listener list.
-    const eventHandler = target === globalThis ? target['on' + event.type] : null;
+    const eventHandler = target === globalThis ? _nativeEventHandler(target, 'on' + event.type) : null;
     if (typeof eventHandler === 'function') {
       try {
         const result = eventHandler.call(target, event);
@@ -2114,9 +2114,9 @@ function _domEventInvokeHandlers(target, event, capture, phase) {
   // listener group. Keep their existing position ahead of listeners installed
   // through addEventListener; changing that ordering here would be an unrelated
   // compatibility change.
-  if (!capture && typeof target._resolveInlineHandler === "function") {
+  if (!capture) {
     const handlerName = "on" + event.type;
-    const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
+    const inlineFn = _nativeEventHandler(target, handlerName);
     if (typeof inlineFn === "function") {
       try {
         if (inlineFn.call(target, event) === false) event.preventDefault();
@@ -4485,11 +4485,7 @@ class Element extends Node {
       }
     }
     if (n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
-    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
-      _windowOnloadOverrideSet = false;
-      _windowOnloadOverride = null;
-      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
-    }
+    _eventHandlerAttributeChanged(this, n);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, n, null, observedOldValue);
     if (customOldValue !== undefined) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, value, null]);
@@ -4516,6 +4512,7 @@ class Element extends Node {
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttributeNS(ns, localName) : null;
     const customOldValue = _customElementObserves(this, localName) ? this.getAttributeNS(ns, localName) : undefined;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    if (ns === '') _eventHandlerAttributeChanged(this, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
     // Namespace-aware writes can replace an attribute by namespace/local name
@@ -4538,6 +4535,7 @@ class Element extends Node {
       : null;
     const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
     const customOldValue = _customElementObserves(this, n) ? this.getAttribute(n) : null;
+    const handlerWasPresent = n.startsWith('on') && this.hasAttribute(n);
     _dom("remove_attribute", this._nid, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
@@ -4550,11 +4548,7 @@ class Element extends Node {
       _reconcileWindowNamedProperty(previousWindowName);
     }
     if (n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
-    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
-      _windowOnloadOverrideSet = false;
-      _windowOnloadOverride = null;
-      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
-    }
+    if (handlerWasPresent) _eventHandlerAttributeChanged(this, n);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -4577,7 +4571,9 @@ class Element extends Node {
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe' && this.getAttributeNS(ns, n) === null) return;
     const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
     const customOldValue = _customElementObserves(this, n) ? this.getAttributeNS(ns, n) : null;
+    const handlerWasPresent = ns === '' && n.startsWith('on') && this.getAttributeNS(ns, n) !== null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    if (handlerWasPresent) _eventHandlerAttributeChanged(this, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
@@ -4721,7 +4717,7 @@ class Element extends Node {
     const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
     if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
     const src = this.getAttribute && this.getAttribute(name);
-    if (!src) { cache[name] = null; return null; }
+    if (src == null) { cache[name] = null; return null; }
     try {
       cache[name] = new Function('event', src);
     } catch (e) {
@@ -4953,10 +4949,10 @@ class Element extends Node {
   set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
   get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
   set returnValue(v) { this._returnValue = String(v); }
-  get oncancel() { return this._oncancel || null; }
-  set oncancel(f) { this._oncancel = typeof f === 'function' ? f : null; }
-  get onclose() { return this._onclose || null; }
-  set onclose(f) { this._onclose = typeof f === 'function' ? f : null; }
+  get oncancel() { return _eventHandlerGet.call(this, 'oncancel', 'element'); }
+  set oncancel(value) { _eventHandlerSet.call(this, 'oncancel', 'element', value); }
+  get onclose() { return _eventHandlerGet.call(this, 'onclose', 'element'); }
+  set onclose(value) { _eventHandlerSet.call(this, 'onclose', 'element', value); }
   get closedBy() { const v = (this.getAttribute('closedby') || '').toLowerCase(); return (v === 'any' || v === 'closerequest' || v === 'none') ? v : 'auto'; }
   set closedBy(v) { this.setAttribute('closedby', String(v)); }
   show() {
@@ -7310,7 +7306,7 @@ function _insertWrittenNodes(doc, placements) {
 // Preserve the receiver realm's implementations even if a membrane remaps the
 // document's public prototype. The ordinary own-document path makes no op call.
 function _documentRealmMember(receiver, name) {
-  return receiver === globalThis.document ? undefined
+  return receiver === _document ? undefined
     : __obscuraCore.ops.op_document_realm_member(receiver, name, _realmFrameId);
 }
 
@@ -7557,18 +7553,16 @@ class HTMLImageElement extends Element {
     this._queueImageRequest();
     return this._imageNaturalHeight;
   }
-  get onload() { return this._imageOnload || null; }
+  get onload() { return _eventHandlerGet.call(this, 'onload', 'element'); }
   set onload(value) {
-    this._imageOnload = typeof value === "function" ? value : null;
-    if (this._imageOnload) {
+    if (_eventHandlerSet.call(this, 'onload', 'element', value)) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
   }
-  get onerror() { return this._imageOnerror || null; }
+  get onerror() { return _eventHandlerGet.call(this, 'onerror', 'element'); }
   set onerror(value) {
-    this._imageOnerror = typeof value === "function" ? value : null;
-    if (this._imageOnerror) {
+    if (_eventHandlerSet.call(this, 'onerror', 'element', value)) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
@@ -8171,79 +8165,149 @@ globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
 
+const _eventHandlerValues = new WeakMap();
+// Window lives for the realm; keep its record through snapshot restoration.
+const _windowEventHandlerState = {kind: 'window', values: Object.create(null)};
+const _nativeResolveInlineHandler = Element.prototype._resolveInlineHandler;
+const _nativeElementLocalName = Object.getOwnPropertyDescriptor(Element.prototype, 'localName').get;
+function _eventHandlerState(receiver, kind) {
+  const existing = receiver === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(receiver);
+  if (existing) {
+    if (existing.kind !== kind) throw new TypeError('Illegal invocation');
+    return existing.values;
+  }
+  const valid = kind === 'window' ? receiver === globalThis
+    : kind === 'document' ? _documentInstances.has(receiver)
+    : receiver && _nodeCacheGet(receiver._nid) === receiver && +_dom('node_type', receiver._nid) === 1;
+  if (!valid) return null;
+  const values = Object.create(null);
+  _eventHandlerValues.set(receiver, {kind, values});
+  return values;
+}
+function _eventHandlerValue(receiver, name, kind, values) {
+  if (values && name in values) return values[name];
+  if (kind === 'window' && name === 'onload') {
+    const body = _windowReflectingBodyElement();
+    return body ? _nativeResolveInlineHandler.call(body, name) : null;
+  }
+  return kind === 'element' ? _nativeResolveInlineHandler.call(receiver, name) : null;
+}
+function _nativeEventHandler(receiver, name) {
+  const state = receiver === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(receiver);
+  const kind = state ? state.kind
+    : typeof receiver._resolveInlineHandler === 'function' ? 'element'
+    : receiver === globalThis ? 'window' : 'document';
+  // Body load handlers belong to Window, not to a load dispatched on Body.
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(receiver)) return null;
+  return _eventHandlerValue(receiver, name, kind, state?.values);
+}
+function _eventHandlerGet(name, kind) {
+  const values = _eventHandlerState(this, kind);
+  if (!values) {
+    const get = this && _documentRealmMember(this, 'getEventHandler');
+    if (get) return get.call(this, name, kind);
+    throw new TypeError('Illegal invocation');
+  }
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(this)) {
+    return _eventHandlerGet.call(globalThis, name, 'window');
+  }
+  return _eventHandlerValue(this, name, kind, values);
+}
+function _eventHandlerSet(name, kind, value) {
+  const values = _eventHandlerState(this, kind);
+  if (!values) {
+    const set = this && _documentRealmMember(this, 'setEventHandler');
+    if (set) return set.call(this, name, kind, value);
+    throw new TypeError('Illegal invocation');
+  }
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(this)) {
+    return _eventHandlerSet.call(globalThis, name, 'window', value);
+  }
+  return values[name] = value !== null && (typeof value === 'object' || typeof value === 'function') ? value : null;
+}
+function _eventHandlerAttributeChanged(element, name) {
+  if (!name.startsWith('on')) return;
+  const state = _eventHandlerValues.get(element);
+  if (state) delete state.values[name];
+  if (element.__inlineHandlerCache) delete element.__inlineHandlerCache[name];
+  if (name === 'onload' && _isWindowReflectingBodyElement(element)) {
+    delete _windowEventHandlerState.values.onload;
+  }
+}
+
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
 // event path through these: jQuery checks `("on" + ev) in window`, and React
 // decides whether the `input` event is supported via `("oninput" in document)`.
 // When that check fails React falls back to a legacy change-detection path that
 // never fires onChange for controlled inputs (issue #324). Initialising these to
-// null on all three targets makes the checks match real browsers. On Document and
-// Element they are non-enumerable so they don't surface in `for..in` over nodes.
-for (const _ev of [
-  "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
-  "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
-  "dragenter","dragleave","dragover","dragstart","drop","durationchange","emptied",
-  "ended","error","focus","focusin","focusout","formdata","gotpointercapture",
-  "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
-  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message",
-  "mousedown","mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup",
-  "offline","online","pagehide","pageshow","paste","pause","play","playing",
-  "pointercancel","pointerdown","pointerenter","pointerleave","pointermove",
-  "pointerout","pointerover","pointerup","popstate","progress","ratechange",
-  "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
-  "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
-  "unload","volumechange","waiting","wheel",
+// null on all three targets makes the checks match real browsers. Accessors
+// also let instrumentation wrap assignments through the original IDL setter.
+const _globalEventHandlerNames = [
+  "abort","animationcancel","animationend","animationiteration","animationstart","auxclick",
+  "beforeinput","beforematch","beforeprint","beforetoggle","beforeunload","beforexrselect","blur",
+  "cancel","canplay","canplaythrough","change","click","close","command",
+  "contentvisibilityautostatechange","contextlost","contextmenu","contextrestored","cuechange",
+  "dblclick","drag","dragend","dragenter","dragleave","dragover","dragstart","drop",
+  "durationchange","emptied","ended","error","focus","focusin","focusout","formdata",
+  "gotpointercapture","hashchange","input","invalid","keydown","keypress","keyup","languagechange",
+  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message","mousedown",
+  "mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup","mousewheel","offline",
+  "online","pagehide","pageshow","paste","pause","play","playing","pointercancel","pointerdown",
+  "pointerenter","pointerleave","pointermove","pointerout","pointerover","pointerrawupdate",
+  "pointerup","popstate","progress","ratechange","rejectionhandled","reset","resize","scroll",
+  "scrollend","scrollsnapchange","scrollsnapchanging","search","securitypolicyviolation","seeked",
+  "seeking","select","selectionchange","selectstart","slotchange","stalled","storage","submit",
+  "suspend","timeupdate","toggle","transitioncancel","transitionend","transitionrun",
+  "transitionstart","unhandledrejection","unload","volumechange","waiting","webkitanimationend",
+  "webkitanimationiteration","webkitanimationstart","webkittransitionend","wheel",
+];
+for (const [_proto, _kind, _names] of [
+  [Element.prototype, 'element', [..._globalEventHandlerNames,
+    "beforecopy","beforecut","beforepaste","copy","cut","fullscreenchange","fullscreenerror",
+    "webkitfullscreenchange","webkitfullscreenerror",
+  ]],
+  [Document.prototype, 'document', [..._globalEventHandlerNames,
+    "beforecopy","beforecut","beforepaste","copy","cut","freeze","fullscreenchange",
+    "fullscreenerror","pointerlockchange","pointerlockerror","prerenderingchange",
+    "readystatechange","resume","visibilitychange","webkitfullscreenchange","webkitfullscreenerror",
+  ]],
+  [globalThis, 'window', [..._globalEventHandlerNames,
+    "afterprint","appinstalled","beforeinstallprompt","devicemotion","deviceorientation",
+    "deviceorientationabsolute","gamepadconnected","gamepaddisconnected","messageerror",
+    "pagereveal","pageswap",
+  ]],
+  [HTMLMediaElement.prototype, 'element', ['encrypted', 'waitingforkey']],
+  [HTMLVideoElement.prototype, 'element', ['enterpictureinpicture', 'leavepictureinpicture']],
 ]) {
-  const _on = "on" + _ev;
-  if (!(_on in globalThis)) globalThis[_on] = null;
-  for (const _proto of [Document.prototype, Element.prototype]) {
-    if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
+  for (const _ev of _names) {
+    const _on = "on" + _ev;
+    if (_kind === 'window' || !(_on in _proto)) {
+      const initial = _kind === 'window' ? _proto[_on] : null;
+      const descriptor = Object.getOwnPropertyDescriptor({
+        get [_on]() {
+          const state = this === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(this);
+          if (_on !== 'onload' && state?.kind === _kind && _on in state.values) return state.values[_on];
+          return _eventHandlerGet.call(this, _on, _kind);
+        },
+        set [_on](value) { _eventHandlerSet.call(this, _on, _kind, value); },
+      }, _on);
+      _markNative(descriptor.get);
+      _markNative(descriptor.set);
+      Object.defineProperty(_proto, _on, descriptor);
+      if (initial != null) _eventHandlerSet.call(_proto, _on, _kind, initial);
     }
   }
 }
 
-let _windowOnloadOverrideSet = false;
-let _windowOnloadOverride = null;
 function _windowReflectingBodyElement() {
   const document = globalThis.document;
   return document && (document.body || document.querySelector('frameset'));
 }
 function _isWindowReflectingBodyElement(element) {
-  return element === _windowReflectingBodyElement();
+  const name = _nativeElementLocalName.call(element);
+  return (name === 'body' || name === 'frameset') && element === _windowReflectingBodyElement();
 }
-Object.defineProperty(globalThis, 'onload', {
-  get() {
-    if (_windowOnloadOverrideSet) return _windowOnloadOverride;
-    const body = _windowReflectingBodyElement();
-    return body && body._resolveInlineHandler
-      ? body._resolveInlineHandler('onload')
-      : null;
-  },
-  set(value) {
-    _windowOnloadOverrideSet = true;
-    _windowOnloadOverride = typeof value === 'function' ? value : null;
-  },
-  configurable: true,
-  enumerable: true,
-});
-Object.defineProperty(Element.prototype, 'onload', {
-  get() {
-    if (_isWindowReflectingBodyElement(this)) {
-      return globalThis.onload;
-    }
-    return this.__onload || null;
-  },
-  set(value) {
-    if (_isWindowReflectingBodyElement(this)) {
-      globalThis.onload = value;
-      return;
-    }
-    this.__onload = typeof value === 'function' ? value : null;
-  },
-  configurable: true,
-  enumerable: false,
-});
 
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
@@ -16690,6 +16754,9 @@ function _frameWindowFor(frameId) {
       // itself as `this`, not with this proxy.
       return Reflect.get(target, prop);
     },
+    set(target, prop, value) {
+      return Reflect.set(target, prop, value);
+    },
     has(target, prop) {
       return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
     },
@@ -19730,6 +19797,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['windowOrigin', _windowOriginDescriptor.get],
   ['setWindowOrigin', _windowOriginDescriptor.set],
+  ['getEventHandler', _eventHandlerGet],
+  ['setEventHandler', _eventHandlerSet],
 ]));
 
 globalThis.__obscura_init_frames = function() {
