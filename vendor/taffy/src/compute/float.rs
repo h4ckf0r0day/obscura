@@ -393,8 +393,9 @@ impl FloatContext {
         let end_idx = match end {
             None => {
                 let last_y_end = self.segments.last().map(|seg| seg.y.end).unwrap_or(0.0);
-                if min_y > last_y_end {
-                    self.segments.push(Segment { y: last_y_end..min_y, insets: [0.0, 0.0] });
+                let end_y = start_y + floated_box.height;
+                if end_y > last_y_end {
+                    self.segments.push(Segment { y: last_y_end..end_y, insets: [0.0, 0.0] });
                 }
                 self.segments.len() - 1
             }
@@ -469,7 +470,7 @@ impl FloatContext {
                     x: inset_left,
                     y: segment.y.start.max(min_y),
                     width: self.available_width - inset_left - inset_right,
-                    height: f32::INFINITY,
+                    height: segment.y.end - segment.y.start.max(min_y),
                 }
             }
             None => ContentSlot {
