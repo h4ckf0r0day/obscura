@@ -24472,6 +24472,67 @@ mod tests {
     }
 
 
+    async fn assert_network_cors_response_type(stealth: bool) {
+        let (mut rt, target, _requests) = cors_preflight_runtime();
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(
+                obscura_net::StealthHttpClient::with_proxy(
+                    std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+                ),
+            ));
+        }
+        let result = rt.call_function_on_for_cdp(&format!(r#"async () => {{
+            const response = await fetch({target:?}, {{headers: {{'Content-Type':'application/json'}}}});
+            const copy = response.clone();
+            return [response.type, copy.type, response.status, await response.text(), await copy.text()];
+        }}"#), None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(["cors", "cors", 200, "ok", "ok"])),
+            "stealth={stealth}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_cors_response_type_is_preserved_by_clone() {
+        assert_network_cors_response_type(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cors_response_type_is_preserved_by_clone() {
+        assert_network_cors_response_type(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fulfilled_cors_response_type_distinguishes_same_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        let fetch = rt.call_function_on_for_cdp(r#"async () => {
+            const results = [];
+            for (const url of ['http://example.com/resource', 'https://cross.example/resource']) {
+                const response = await fetch(url);
+                results.push([response.type, response.clone().type, await response.text()]);
+            }
+            return results;
+        }"#, None, &[], true, true);
+        let fulfill = async {
+            for _ in 0..2 {
+                let request = rx.recv().await.expect("intercepted fetch");
+                request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                    status: 200,
+                    headers: [("access-control-allow-origin".to_string(), "*".to_string())].into(),
+                    body: "fulfilled".into(), body_base64: String::new(),
+                }).unwrap();
+            }
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3),
+            async { tokio::join!(fetch, fulfill) }).await.expect("fulfilled responses");
+        assert_eq!(result.unwrap().value, Some(serde_json::json!([
+            ["basic", "basic", "fulfilled"], ["cors", "cors", "fulfilled"]
+        ])));
+    }
+
     #[test]
     fn request_headers_ignore_forbidden_names_and_remain_guarded() {
         let mut rt = setup_runtime("<body></body>");

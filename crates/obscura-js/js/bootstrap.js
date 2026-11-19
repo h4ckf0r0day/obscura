@@ -9002,7 +9002,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
     cleanup();
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
+  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : (parsed.cors ? "cors" : "basic");
   const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
   const responseBody = respType === "opaque"
     ? null
