@@ -15,6 +15,19 @@ use url::Url;
 use crate::cookies::{same_site, CookieJar, SameSiteContext};
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
+const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
+
+pub(crate) fn default_http_timeout() -> Duration {
+    http_timeout_from_env_value(std::env::var("OBSCURA_HTTP_TIMEOUT_MS").ok().as_deref())
+}
+
+fn http_timeout_from_env_value(value: Option<&str>) -> Duration {
+    let milliseconds = value
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS);
+    Duration::from_millis(milliseconds)
+}
+
 fn configured_root_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|path| !path.is_empty()) {
@@ -869,6 +882,8 @@ pub struct ObscuraHttpClient {
     pub accept_language: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
+    /// HTTP request timeout, read from `OBSCURA_HTTP_TIMEOUT_MS` at construction.
+    /// Defaults to 30 seconds; zero disables this timeout. Set before first use.
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
@@ -1152,7 +1167,7 @@ impl ObscuraHttpClient {
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            timeout: Duration::from_secs(30),
+            timeout: default_http_timeout(),
             block_trackers: false,
             resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
@@ -1172,7 +1187,6 @@ impl ObscuraHttpClient {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
-                .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
@@ -1180,6 +1194,10 @@ impl ObscuraHttpClient {
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
+
+            if !self.timeout.is_zero() {
+                builder = builder.timeout(self.timeout);
+            }
 
             if std::env::var_os("SSL_CERT_FILE").is_some()
                 || std::env::var_os("SSL_CERT_DIR").is_some()
@@ -1866,6 +1884,31 @@ pub enum ObscuraNetError {
 
     #[error("Response body exceeded {limit} byte limit: {url}")]
     ResponseTooLarge { url: String, limit: usize },
+}
+
+#[cfg(test)]
+mod http_timeout_tests {
+    use super::http_timeout_from_env_value;
+    use std::time::Duration;
+
+    #[test]
+    fn missing_or_invalid_http_timeout_uses_thirty_seconds() {
+        for value in [None, Some(""), Some("invalid"), Some("-1"), Some("1.5"),
+            Some("60000 "), Some("18446744073709551616")] {
+            assert_eq!(http_timeout_from_env_value(value), Duration::from_secs(30), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn http_timeout_environment_value_is_in_milliseconds() {
+        assert_eq!(http_timeout_from_env_value(Some("45000")), Duration::from_secs(45));
+        assert_eq!(http_timeout_from_env_value(Some("1")), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn zero_http_timeout_disables_the_client_deadline() {
+        assert_eq!(http_timeout_from_env_value(Some("0")), Duration::ZERO);
+    }
 }
 
 #[cfg(test)]

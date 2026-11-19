@@ -38,6 +38,24 @@ Hard ceiling on a single navigation. Default 30000 (30 seconds). Applies to `Pag
 OBSCURA_NAV_TIMEOUT_MS=60000 obscura serve
 ```
 
+### `OBSCURA_HTTP_TIMEOUT_MS`
+
+HTTP client request timeout in milliseconds. Default 30000 (30 seconds).
+Applies to both the regular and stealth clients, including navigation and
+resource requests that use them. Read when a client is created. Set `0` to
+disable this client timeout. Unset, non-numeric, negative and out-of-range
+values use the default; whitespace is not trimmed.
+
+```bash
+OBSCURA_HTTP_TIMEOUT_MS=60000 OBSCURA_NAV_TIMEOUT_MS=90000 obscura serve
+```
+
+This does not change the navigation, script, CDP command or scripted fetch/XHR
+deadlines. In particular, `OBSCURA_FETCH_TIMEOUT_MS` still bounds scripted
+fetch/XHR and module network requests. Raise the relevant outer deadlines as
+well if requests need more time. Protocol, operating system and proxy timeouts
+can still end a request when this client timeout is disabled.
+
 ### `OBSCURA_NAV_CHAIN_LIMIT`
 
 How many documents a navigation chain may load, the first navigation included. Default 10, which allows the requested document and nine navigations the page itself triggers via `location` assignments or form submissions. Raise the value for an endpoint that chains longer for good reasons, such as an SSO handover across several providers. The low default is what stops a page that resets `location` on every load.
