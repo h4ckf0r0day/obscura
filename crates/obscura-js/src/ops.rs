@@ -4442,6 +4442,7 @@ fn intercept_fulfill_response(
         "url": url,
         "headers": visible_headers,
         "opaque": opaque,
+        "cors": mode == "cors" && cross_origin,
     })
 }
 
@@ -5140,6 +5141,7 @@ async fn fetch_url_inner(
         "url": current_url,
         "redirected": redirected,
         "opaque": opaque,
+        "cors": mode == "cors" && crossed_origin,
         "headers": script_headers,
     });
     // A resource must not form an ownership cycle with its OpState table.
@@ -5396,6 +5398,7 @@ async fn stealth_fetch_all(
         "url": current_url,
         "redirected": redirects_followed > 0,
         "opaque": opaque,
+        "cors": mode == "cors" && crossed_origin,
         "headers": script_headers,
     });
     let body_state = Rc::downgrade(&state);
