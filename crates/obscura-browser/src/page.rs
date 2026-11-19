@@ -9710,16 +9710,16 @@ mod tests {
     async fn document_write_external_script_blocks_later_parser_scripts() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(75),
-            "globalThis.__writtenOrder.push('external'); globalThis.__writtenValue = 1;",
+            "globalThis.__writtenOrder.push('external'); let __writtenValue = 1;",
         );
         let html = format!(
             r#"<html><body>
                 <script>globalThis.__writtenOrder = [];</script>
                 <script>
                     document.write('<script src="{base}/written.js"><\/script>');
-                    document.write('<script>globalThis.__writtenOrder.push("written:" + String(globalThis.__writtenValue));<\/script>');
+                    document.write('<script>const __writtenInlineValue = 2; globalThis.__writtenOrder.push("written:" + String(__writtenValue));<\/script>');
                 </script>
-                <script>globalThis.__writtenOrder.push('after:' + String(globalThis.__writtenValue));</script>
+                <script>globalThis.__writtenOrder.push('after:' + String(__writtenValue) + ':' + __writtenInlineValue);</script>
             </body></html>"#,
         );
         let mut page = import_map_test_page(
@@ -9742,7 +9742,7 @@ mod tests {
                 .unwrap()
                 .evaluate("globalThis.__writtenOrder")
                 .unwrap(),
-            serde_json::json!(["external", "written:1", "after:1"]),
+            serde_json::json!(["external", "written:1", "after:1:2"]),
         );
     }
 
