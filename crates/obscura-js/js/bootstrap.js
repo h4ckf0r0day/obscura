@@ -14819,6 +14819,15 @@ for (const [name, tags] of Object.entries({
   }
 }
 
+// URL members on ordinary elements make detached roots look like shadow hosts.
+for (const name of ['protocol','username','password','host','hostname',
+    'port','pathname','search','hash','origin']) {
+  const descriptor = { ...Object.getOwnPropertyDescriptor(Element.prototype, name), enumerable: true };
+  Object.defineProperty(HTMLAnchorElement.prototype, name, descriptor);
+  Object.defineProperty(HTMLAreaElement.prototype, name, descriptor);
+  delete Element.prototype[name];
+}
+
 HTMLScriptElement.supports = {
   supports(type) {
     if (arguments.length < 1) throw new TypeError("HTMLScriptElement.supports requires a script type");
