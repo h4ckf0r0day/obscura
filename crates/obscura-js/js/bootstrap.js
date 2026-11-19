@@ -21,7 +21,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth', '__obscura_markTrusted', '__obscura_fireBeforeUnload', '__obscura_core_handoff',
+    '__obscura_stealth', '__obscura_markTrusted', '__obscura_dispatchDomEvent', '__obscura_fireBeforeUnload', '__obscura_core_handoff',
     // Created by later evaluation, input and emulation paths. Register them
     // before the snapshot hide list is captured, just like the other internals.
     '__obscura_await_rejected', '__obscura_click_target',
@@ -143,7 +143,7 @@ globalThis.removeEventListener = function(type, fn, options) {
   _eventTargetRemove(globalThis, type, fn, options);
 };
 globalThis.dispatchEvent = function(event) {
-  return _eventTargetDispatch(globalThis, event);
+  return _eventTargetDispatch(globalThis, event, true);
 };
 
 let _domMutationEpoch = 0;
@@ -452,13 +452,11 @@ async function __runDynScriptTask(task) {
         });
       }
     }
-    // Fire load via dispatchEvent only: it invokes the element's onload
-    // property handler and any addEventListener('load') listeners, read live
-    // off the element. Calling onload separately would double-fire it.
-    try { task.dispatchEvent(new Event('load')); } catch(e) {}
+    // The internal dispatcher invokes both IDL handlers and registered listeners.
+    try { task.fireEvent('load'); } catch(e) {}
   } catch(e) {
     console.error('Dynamic script fetch error:', e.message);
-    try { task.dispatchEvent(new Event('error')); } catch(ex) {}
+    try { task.fireEvent('error'); } catch(ex) {}
   } finally {
     if (task.delaysLoad) {
       task.delaysLoad = false;
@@ -703,9 +701,9 @@ async function _loadLinkedStylesheet(c) {
       globalThis.__obscura_frameId || 0
     );
     _registerLinkedStylesheet(c, loaded.responseUrl);
-    try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
+    try { _fireResourceEvent(c, 'load'); } catch(e) {}
   } catch(e) {
-    try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
+    try { _fireResourceEvent(c, 'error'); } catch(e) {}
   }
 }
 
@@ -1652,7 +1650,7 @@ class MessagePort {
   }
   dispatchEvent(event) {
     _messagePortStateFor(this);
-    return _eventTargetDispatch(this, event);
+    return _eventTargetDispatch(this, event, true);
   }
   get onmessage() { return _messagePortStateFor(this).onmessage; }
   set onmessage(callback) {
@@ -1959,6 +1957,12 @@ function _shallowCloneNode(node) {
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
 const _eventTargetListenerChanged = new WeakMap();
+function _demoteAuthorEvent(event) {
+  if (event && (event._dispatching || _eventSetHas(__obscuraCore.ops.__obscura_activeEvents, event))) {
+    throw new DOMException("The event is already being dispatched.", "InvalidStateError");
+  }
+  _eventSetDelete(__obscuraCore.ops.__obscura_eventTrust, event);
+}
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -2016,16 +2020,17 @@ function _eventTargetRemove(target, type, callback, options) {
   if (byType.size === 0) _eventTargetListeners.delete(target);
   _eventTargetListenerChanged.get(target)?.();
 }
-function _eventTargetDispatch(target, event) {
+function _eventTargetDispatch(target, event, authorDispatch = false) {
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
   if (String(event.type) === "") {
     throw new DOMException("The event's type was not specified.", "InvalidStateError");
   }
-  if (event._dispatching) {
+  if (event._dispatching || (authorDispatch && _eventSetHas(__obscuraCore.ops.__obscura_activeEvents, event))) {
     throw new DOMException("The event is already being dispatched.", "InvalidStateError");
   }
+  if (authorDispatch) _eventSetDelete(__obscuraCore.ops.__obscura_eventTrust, event);
   event._dispatching = true;
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
@@ -2139,17 +2144,18 @@ function _domEventInvokeHandlers(target, event, capture, phase) {
 // and left eventPhase at NONE. Delegated framework handlers depend on capture
 // running before target/bubble listeners, so build the path once and dispatch
 // each phase explicitly.
-function _domEventDispatch(target, event) {
+function _domEventDispatch(target, event, authorDispatch = false) {
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
   if (String(event.type) === "") {
     throw new DOMException("The event's type was not specified.", "InvalidStateError");
   }
-  if (event._dispatching) {
+  if (event._dispatching || (authorDispatch && _eventSetHas(__obscuraCore.ops.__obscura_activeEvents, event))) {
     throw new DOMException("The event is already being dispatched.", "InvalidStateError");
   }
 
+  if (authorDispatch) _eventSetDelete(__obscuraCore.ops.__obscura_eventTrust, event);
   event._dispatching = true;
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
@@ -2198,6 +2204,14 @@ function _domEventDispatch(target, event) {
   }
 }
 
+function _dispatchDomEvent(target, event, authorDispatch = false) {
+  if (_cache.get(target._nid) !== target) {
+    const dispatch = _documentRealmMember(target, 'dispatchDomEvent');
+    if (dispatch) return dispatch.call(target, event, authorDispatch);
+  }
+  return _domEventDispatch(target, event, authorDispatch);
+}
+
 // During custom-element upgrade, HTMLElement's constructor must return the
 // already-existing element being upgraded. A class constructor cannot be
 // invoked with `.call(existingElement)`, so the registry and Element
@@ -2231,7 +2245,7 @@ function __prepareInsertedScript(script) {
     if (error) {
       console.error('Import map error:', error);
       queueMicrotask(() => {
-        try { script.dispatchEvent(new Event('error')); } catch (_) {}
+        try { _fireResourceEvent(script, 'error'); } catch (_) {}
       });
     }
     return;
@@ -2276,7 +2290,7 @@ function __prepareInsertedScript(script) {
       nid: script._nid,
       prevNid,
       pageOrigin,
-      dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
+      fireEvent: (type) => _fireResourceEvent(script, type),
     };
     // Non-parser-inserted external scripts are async by default, but scripts
     // prepared while the document is still loading still delay window.load.
@@ -2321,7 +2335,7 @@ function __prepareInsertedScript(script) {
       nid: script._nid,
       prevNid,
       pageOrigin: "",
-      dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
+      fireEvent: (type) => _fireResourceEvent(script, type),
       delaysLoad: globalThis.document?.readyState !== 'complete',
     };
     if (task.delaysLoad) __dynLoadDelayingPending++;
@@ -2336,7 +2350,7 @@ function __prepareInsertedScript(script) {
         isModule: false,
         nid: script._nid,
         prevNid: 0,
-        dispatchEvent: () => {},
+        fireEvent: () => {},
         delaysLoad: false,
       },
     });
@@ -3202,7 +3216,7 @@ class Node {
     _eventTargetRemove(this, type, callback, options);
   }
   dispatchEvent(event) {
-    return _eventTargetDispatch(this, event);
+    return _eventTargetDispatch(this, event, true);
   }
 }
 class CharacterData extends Node {
@@ -4121,7 +4135,7 @@ class Animation {
   reverse() { throw new DOMException('reverse() is not implemented for this animation', 'NotSupportedError'); }
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
-  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event, true); }
 }
 
 class DocumentTimeline {
@@ -4695,7 +4709,7 @@ class Element extends Node {
     _eventTargetRemove(this, type, handler, opts);
   }
   dispatchEvent(event) {
-    return _domEventDispatch(this, event);
+    return _domEventDispatch(this, event, true);
   }
   _resolveInlineHandler(name) {
     if (!_scriptingEnabled) return null;
@@ -4766,7 +4780,7 @@ class Element extends Node {
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
     if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
-    const cancelled = !this.dispatchEvent(_clickEvent);
+    const cancelled = !_domEventDispatch(this, _clickEvent);
     if (cancelled) {
       if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _setInputChecked(_radioStates[i][0], _radioStates[i][1]); }
       else if (_checkable) { _setInputChecked(this, _oldChecked); _setInputIndeterminate(this, _oldIndeterminate); }
@@ -4776,7 +4790,7 @@ class Element extends Node {
       for (const _type of ['input', 'change']) {
         const _e = new Event(_type, {bubbles: true});
         if (_trusted) globalThis.__obscura_markTrusted(_e);
-        try { this.dispatchEvent(_e); } catch (e) {}
+        try { _domEventDispatch(this, _e); } catch (e) {}
       }
       return;
     }
@@ -4823,19 +4837,19 @@ class Element extends Node {
     const previous = globalThis.__obscura_focused || null;
     if (previous === this) return;
     if (previous) {
-      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: this })));
-      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
+      _dispatchDomEvent(previous, globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: this })));
+      _dispatchDomEvent(previous, globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
     }
     globalThis.__obscura_focused = this;
     globalThis.__obscura_click_target = this;
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
+    _dispatchDomEvent(this, globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
+    _dispatchDomEvent(this, globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
   }
   blur() {
     if (globalThis.__obscura_focused !== this) return;
     globalThis.__obscura_focused = null;
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: null })));
+    _dispatchDomEvent(this, globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
+    _dispatchDomEvent(this, globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: null })));
   }
 
   // --- Popover API (HTML "popover") ---------------------------------------
@@ -6934,7 +6948,7 @@ class Document extends Node {
     _eventTargetRemove(this, type, fn, opts);
   }
   dispatchEvent(event) {
-    return _domEventDispatch(this, event);
+    return _domEventDispatch(this, event, true);
   }
   createTreeWalker(root, whatToShow, filter) {
     // whatToShow is unsigned long; default SHOW_ALL only when the arg is omitted.
@@ -8369,6 +8383,7 @@ class NetworkInformation {
     if (listeners) this._listeners[type] = listeners.filter((item) => item !== listener);
   }
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     if (!event || !event.type) return true;
     for (const listener of this._listeners[event.type] || []) {
       try { listener.call(this, event); } catch (error) { console.error(error); }
@@ -8442,7 +8457,7 @@ globalThis.navigator = {
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(event){_demoteAuthorEvent(event);return true;} },
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -8611,7 +8626,7 @@ class Screen {
     this._availW = availW === undefined ? w : availW;
     this._availH = availH === undefined ? h - 40 : availH;
     this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(event){_demoteAuthorEvent(event);return true;}};
   }
   get width() { return this._w; }
   get height() { return this._h; }
@@ -8983,6 +8998,7 @@ class XMLHttpRequestEventTarget {
     }
   }
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     if (!event || !event.type) return false;
     const ev = (typeof event === 'object') ? event : { type: event };
     ev.target = ev.target || this;
@@ -9188,6 +9204,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   // Per WHATWG DOM spec, required by zone.js which patches XHR via
   // Object.getOwnPropertyDescriptor on XMLHttpRequestEventTarget.prototype.
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     if (!event || !event.type) return false;
     const ev = (typeof event === 'object') ? event : { type: event };
     ev.target = ev.target || this;
@@ -11939,19 +11956,19 @@ globalThis.DOMException = (function () {
   }
   return DOMException;
 })();
-// Per the UI Events spec, only events the user agent dispatches (real or
-// automation-synthesized input) are trusted; events page script builds with
-// `new Event(...)` must report isTrusted === false (issue #303). Returning true
-// for everything is a trivial bot-detection tell. Trusted events are tracked in
-// a closure-private WeakSet so page JS can neither read nor forge the flag.
-// obscura's CDP input pipeline marks its synthetic events via the
-// non-enumerable __obscura_markTrusted helper.
-const _trustedEvents = new WeakSet();
+// Browser-generated events are trusted (issue #303); authored dispatch clears trust.
+// The private ops handoff shares weak event registries with child realms.
+__obscuraCore.ops.__obscura_eventTrust = new WeakSet();
+__obscuraCore.ops.__obscura_activeEvents = new WeakSet();
+const _eventSetAdd = Function.prototype.call.bind(WeakSet.prototype.add);
+const _eventSetHas = Function.prototype.call.bind(WeakSet.prototype.has);
+const _eventSetDelete = Function.prototype.call.bind(WeakSet.prototype.delete);
+globalThis.__obscura_dispatchDomEvent = _dispatchDomEvent;
 let _hasStickyActivation = false;
 globalThis.__obscura_markTrusted = function(ev) {
   try {
     if (ev) {
-      _trustedEvents.add(ev);
+      _eventSetAdd(__obscuraCore.ops.__obscura_eventTrust, ev);
       if ((ev.type === 'keydown' && ev.key !== 'Escape') || ev.type === 'mousedown'
           || (ev.type === 'pointerdown' && ev.pointerType === 'mouse')
           || (ev.type === 'pointerup' && ev.pointerType !== 'mouse') || ev.type === 'touchend') {
@@ -12022,15 +12039,21 @@ globalThis.__obscura_setInputFiles = function(el, specs, validateOnly = false) {
   // trusted events; upload flows that gate their change handler on
   // event.isTrusted (common in frameworks and anti-bot code) ignore untrusted
   // ones, which would silently break the exact case this feature targets.
-  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true })));
-  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true })));
+  _dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event("input", { bubbles: true })));
+  _dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event("change", { bubbles: true })));
   return true;
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now();this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
-  get isTrusted() { return _trustedEvents.has(this); }
+  get isTrusted() { return _eventSetHas(__obscuraCore.ops.__obscura_eventTrust, this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  initEvent(type,bubbles,cancelable) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present.");
+    type = String(type);
+    if (this._dispatching || _eventSetHas(__obscuraCore.ops.__obscura_activeEvents, this)) return;
+    _eventSetDelete(__obscuraCore.ops.__obscura_eventTrust, this);
+    this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false;
+  }
   composedPath() {
     if (!this.target) return [];
     const path = [];
@@ -12040,6 +12063,14 @@ globalThis.Event = class Event {
     return path;
   }
 };
+
+// Browser resource completion must not call author-replaced constructors or dispatchEvent.
+const _BrowserEvent = Event;
+function _fireResourceEvent(target, type) {
+  const event = new _BrowserEvent(type);
+  _eventSetAdd(__obscuraCore.ops.__obscura_eventTrust, event);
+  return _dispatchDomEvent(target, event);
+}
 
 const _beforeUnloadValues = new WeakMap();
 globalThis.BeforeUnloadEvent = class BeforeUnloadEvent extends Event {
@@ -12058,7 +12089,7 @@ globalThis.__obscura_fireBeforeUnload = function() {
   _beforeUnloadValues.set(event, '');
   Object.setPrototypeOf(event, BeforeUnloadEvent.prototype);
   globalThis.__obscura_markTrusted(event);
-  const allowed = globalThis.dispatchEvent(event);
+  const allowed = _eventTargetDispatch(globalThis, event);
   return _hasStickyActivation && (!allowed || event.returnValue !== '');
 };
 _markNative(BeforeUnloadEvent);
@@ -12388,10 +12419,13 @@ let _createDependentAbortSignal;
     state.sources.clear();
     dependentsFinalizer.unregister(state.ref);
     state.dependents.clear();
-    const evt = typeof Event === "function" ? new Event("abort") : { type: "abort" };
-    _trustedEvents.add(evt);
+    const evt = new _BrowserEvent("abort");
+    _eventSetAdd(__obscuraCore.ops.__obscura_eventTrust, evt);
     try { evt.target = signal; evt.currentTarget = signal; } catch (_) {}
-    emit(signal, evt);
+    // Abort listeners can freeze the event; delivery state must remain private.
+    _eventSetAdd(__obscuraCore.ops.__obscura_activeEvents, evt);
+    try { emit(signal, evt); }
+    finally { _eventSetDelete(__obscuraCore.ops.__obscura_activeEvents, evt); }
   }
   function fire(signal, reason) {
     const state = _abortSignalState(signal);
@@ -12443,6 +12477,7 @@ let _createDependentAbortSignal;
       _retainObservedSignal(this);
     }
     dispatchEvent(evt) {
+      _demoteAuthorEvent(evt);
       if (evt && evt.type === "abort") emit(this, evt);
       return true;
     }
@@ -12960,7 +12995,7 @@ globalThis.DOMParser = class DOMParser {
         return Node.prototype.cloneNode.call(this, deep);
       },
       contains(n) { return root.contains ? root.contains(n) : false; },
-      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+      addEventListener() {}, removeEventListener() {}, dispatchEvent(event) { _demoteAuthorEvent(event); return true; },
     };
     // The parsed tree belongs to this document, not the main one.
     _registerForeignDocument();
@@ -13345,7 +13380,7 @@ Object.defineProperty(Document.prototype, 'fonts', {
     _set.status = 'loaded';
     _set.addEventListener = () => {};
     _set.removeEventListener = () => {};
-    _set.dispatchEvent = () => true;
+    _set.dispatchEvent = (event) => { _demoteAuthorEvent(event); return true; };
     return _set;
   },
   configurable: true,
@@ -13851,6 +13886,7 @@ globalThis.atob = globalThis.atob || ((s) => {
       if (index >= 0) list.splice(index, 1);
     },
     dispatchEvent(event) {
+      _demoteAuthorEvent(event);
       if (!event || !event.type) return true;
       const list = (listeners[String(event.type)] || []).slice();
       for (const callback of list) {
@@ -16281,6 +16317,7 @@ class _IframeDocument {
     if (index !== -1) list.splice(index, 1);
   }
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     const type = event && event.type;
     if (!type) return true;
     const list = this._listeners && this._listeners[type];
@@ -16504,7 +16541,7 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   const clone = JSON.parse(json).v;
   setTimeout(() => {
     try {
-      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+      _eventTargetDispatch(globalThis, globalThis.__obscura_markTrusted(
         new MessageEvent('message', { data: clone, origin, source: globalThis })));
     } catch (error) {
       console.error('message listener failed:', error && error.message || error);
@@ -16663,7 +16700,7 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
     // postMessage, it did not dispatch this. Real embedders check the flag and
     // drop anything untrusted, so an untrusted event is not merely suspicious,
     // it is silently discarded and the widget waits forever.
-    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+    _eventTargetDispatch(globalThis, globalThis.__obscura_markTrusted(
       new MessageEvent('message', { data, origin, source })));
   } catch (error) {
     console.error('message listener failed:', error && error.message || error);
@@ -16898,6 +16935,7 @@ class _IframeWindow {
     }
   }
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     const handlers = this._listeners?.[event?.type] || [];
     for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
     return true;
@@ -18722,7 +18760,7 @@ if (typeof FileReader === 'undefined') {
     }
     addEventListener(t, fn) { if (typeof fn === "function") (this._listeners[t] = this._listeners[t] || []).push(fn); }
     removeEventListener(t, fn) { const ls = this._listeners[t]; if (ls) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); } }
-    dispatchEvent() { return true; }
+    dispatchEvent(event) { _demoteAuthorEvent(event); return true; }
   };
   globalThis.FileReader.EMPTY = 0; globalThis.FileReader.LOADING = 1; globalThis.FileReader.DONE = 2;
   Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
@@ -18753,6 +18791,7 @@ function _makeListenerBox(self) {
     if (i >= 0) bucket.splice(i, 1);
   };
   self.dispatchEvent = function (event) {
+    _demoteAuthorEvent(event);
     const bucket = map.get(event.type);
     if (!bucket) return true;
     for (const fn of bucket.slice()) {
@@ -18899,7 +18938,7 @@ if (typeof BroadcastChannel === 'undefined') {
     }
     dispatchEvent(event) {
       stateFor(this);
-      return _eventTargetDispatch(this, event);
+      return _eventTargetDispatch(this, event, true);
     }
     postMessage(message) {
       const state = stateFor(this);
@@ -18985,7 +19024,7 @@ globalThis.MediaQueryList = class MediaQueryList {
   removeListener(callback) { this.removeEventListener('change', callback); }
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
-  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event, true); }
   get [Symbol.toStringTag]() { return 'MediaQueryList'; }
 };
 Object.setPrototypeOf(MediaQueryList.prototype, EventTarget.prototype);
@@ -19655,6 +19694,7 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['activateElement', function(trusted) {
     return _nativeElementClick.call(this, trusted ? _TRUSTED_ACTIVATION : undefined);
   }],
+  ['dispatchDomEvent', function(event, authorDispatch) { return _domEventDispatch(this, event, authorDispatch); }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
   ['selectOptions', _selectOptionsMember],

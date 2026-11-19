@@ -25259,6 +25259,232 @@ mod tests {
         assert_eq!(result.value.unwrap(), serde_json::json!("rejected"));
     }
 
+    #[test]
+    fn native_dom_dispatch_uses_receiver_frame_listeners() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const doc = frame.contentDocument;
+            const input = doc.createElement('input'), button = doc.createElement('button');
+            doc.body.appendChild(input); doc.body.appendChild(button);
+            let focuses = 0, clicks = 0, childBubbles = 0, parentBubbles = 0, trusted = true;
+            input.addEventListener('focus', event => { focuses++; trusted = trusted && event.isTrusted; });
+            button.addEventListener('click', event => { clicks++; trusted = trusted && event.isTrusted; event.preventDefault(); });
+            doc.addEventListener('click', () => childBubbles++);
+            document.addEventListener('click', () => parentBubbles++);
+            HTMLElement.prototype.focus.call(input);
+            const event = globalThis.__obscura_markTrusted(new Event('click', {bubbles:true,cancelable:true}));
+            const canceled = !globalThis.__obscura_dispatchDomEvent(button, event);
+            return {focuses, clicks, childBubbles, parentBubbles, trusted, canceled};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "focuses":1,"clicks":1,"childBubbles":1,"parentBubbles":0,"trusted":true,"canceled":true,
+        }));
+    }
+
+    #[test]
+    fn authored_dispatch_clears_trust_across_frame_realms() {
+        let mut rt = setup_runtime("<html><body><input id='field'></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const child = frame.contentWindow;
+            const field = document.getElementById('field');
+            let event; field.addEventListener('focus', e => event = e); field.focus();
+            const rootTrusted = event.isTrusted;
+            child.document.dispatchEvent(event);
+            const rootRedispatched = event.isTrusted;
+            const input = child.document.createElement('input'); child.document.body.appendChild(input);
+            input.addEventListener('focus', e => event = e); input.focus();
+            const childTrusted = event.isTrusted;
+            document.dispatchEvent(event);
+            const childRedispatched = event.isTrusted;
+            return {rootTrusted, rootRedispatched, childTrusted, childRedispatched};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "rootTrusted": true, "rootRedispatched": false,
+            "childTrusted": true, "childRedispatched": false,
+        }));
+    }
+
+    #[test]
+    fn abort_delivery_preserves_trust_until_author_redispatch() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const controller = new AbortController(), rows = [];
+            let saved;
+            controller.signal.addEventListener('abort', event => {
+                saved = event;
+                event.initEvent('changed', true, true);
+                let nestedRejected = false;
+                try { controller.signal.dispatchEvent(event); }
+                catch (error) { nestedRejected = error.name === 'InvalidStateError'; }
+                rows.push([event.type, event.isTrusted, nestedRejected]);
+            });
+            controller.signal.addEventListener('abort', event => rows.push([event.type, event.isTrusted]));
+            controller.abort();
+            let conversionRejected = false;
+            try { saved.initEvent({toString(){throw new Error('conversion');}}, true, true); }
+            catch (error) { conversionRejected = error.message === 'conversion'; }
+            rows.push([conversionRejected, saved.isTrusted]);
+            new EventTarget().dispatchEvent(saved);
+            rows.push([saved.isTrusted]);
+            globalThis.Event = function() { return Object.freeze({type:'abort'}); };
+            const frozen = new AbortController();
+            frozen.signal.addEventListener('abort', event => { rows.push([event.isTrusted]); Object.freeze(event); });
+            frozen.abort();
+            return rows;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            ["abort",true,true],["abort",true],[true,true],[false],[true],
+        ]));
+    }
+
+    #[test]
+    fn custom_event_targets_demote_redispatched_browser_events() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const targets = [new XMLHttpRequest(), new AbortController().signal,
+                navigation, navigator.connection, document.implementation.createHTMLDocument('detached'),
+                new WebSocket('ws://example.test/'), new FileReader(), document.fonts,
+                screen.orientation, navigator.serviceWorker];
+            return targets.map(target => {
+                const input = document.createElement('input'); document.body.appendChild(input);
+                let event; input.addEventListener('focus', e => event = e); input.focus();
+                const before = event.isTrusted;
+                target.dispatchEvent(event);
+                const after = event.isTrusted;
+                input.remove();
+                return [before, after];
+            });
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([[true,false],[true,false],[true,false],[true,false],[true,false],
+            [true,false],[true,false],[true,false],[true,false],[true,false]]));
+    }
+
+    #[test]
+    fn frame_event_trust_does_not_call_parent_weak_set_overrides() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("(() => { globalThis.trustLeaks = 0; WeakSet.prototype.add = function() { trustLeaks++; throw new Error('parent override'); }; })()").unwrap();
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "https://other.example/frame", "<html><body><input id='field'></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, r#"(() => {
+            const field = document.getElementById('field');
+            let event; field.addEventListener('focus', e => event = e); field.focus();
+            return event.isTrusted;
+        })()"#).unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("trustLeaks").unwrap(), serde_json::json!(0.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_completion_bypasses_author_dispatch_and_uses_trusted_events() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming().take(12) {
+                let mut stream = stream.unwrap();
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request.split_whitespace().nth(1).unwrap();
+                let (status, mime, body) = if path.starts_with("/missing") {
+                    ("404 Not Found", "text/plain", "missing")
+                } else if path.starts_with("/ok.css") {
+                    ("200 OK", "text/css", "body { color: rgb(1, 2, 3) }")
+                } else {
+                    ("200 OK", "text/javascript", "globalThis.resourceExecutions = (globalThis.resourceExecutions || 0) + 1;")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("http://{address}/"));
+        rt.set_dom(parse_html("<html><head></head><body></body></html>"));
+        rt.set_url(&format!("http://{address}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+            ),
+        ));
+        rt.run_page_init();
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const rows = [];
+                const NativeEvent = Event;
+                for (const kind of ['link', 'classic', 'module']) {
+                    for (const fail of [false, true]) for (const override of [false, true]) {
+                        const node = document.createElement(kind === 'link' ? 'link' : 'script');
+                        const type = fail ? 'error' : 'load';
+                        const url = '/' + (fail ? 'missing' : 'ok')
+                            + (kind === 'link' ? '.css' : '.js') + '?case=' + rows.length;
+                        if (kind === 'link') { node.rel = 'stylesheet'; node.href = url; }
+                        else { node.src = url; if (kind === 'module') node.type = 'module'; }
+                        let dispatchCalls = 0, captured = 0, bubbled = 0, handled = 0;
+                        const capture = event => { if (event.target === node) captured++; };
+                        const bubble = event => { if (event.target === node) bubbled++; };
+                        document.addEventListener(type, capture, true);
+                        document.addEventListener(type, bubble);
+                        node['on' + type] = () => { handled++; };
+                        if (override) {
+                            node.dispatchEvent = () => { dispatchCalls++; throw new Error('author dispatch'); };
+                            globalThis.Event = function() { throw new Error('author Event constructor'); };
+                        }
+                        let event, delivered;
+                        try {
+                            event = await new Promise(resolve => {
+                                const timer = setTimeout(() => resolve({timeout: true}), 1000);
+                                node.addEventListener(type, ev => {
+                                    clearTimeout(timer);
+                                    delivered = ev;
+                                    let nestedRejected = false;
+                                    try { document.dispatchEvent(ev); }
+                                    catch (error) { nestedRejected = error.name === 'InvalidStateError'; }
+                                    ev.initEvent('changed', true, true);
+                                    resolve({type: ev.type, trusted: ev.isTrusted, bubbles: ev.bubbles,
+                                        cancelable: ev.cancelable, target: ev.target === node,
+                                        currentTarget: ev.currentTarget === node, nestedRejected});
+                                });
+                                document.head.appendChild(node);
+                            });
+                        } finally { globalThis.Event = NativeEvent; }
+                        document.removeEventListener(type, capture, true);
+                        document.removeEventListener(type, bubble);
+                        node.remove();
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                        const destination = rows.length % 5;
+                        if (delivered) {
+                            if (destination === 4) delivered.initEvent('changed', true, true);
+                            else [document.body, document, window, new EventTarget()][destination].dispatchEvent(delivered);
+                        }
+                        rows.push({kind, fail, override, event, dispatchCalls, captured, bubbled, handled,
+                            afterAuthor: delivered ? delivered.isTrusted : null});
+                    }
+                }
+                return {rows, authorTrusted: new Event('load').isTrusted, executions: resourceExecutions};
+            }"#,
+            None, &[], true, true,
+        ).await.unwrap().value.unwrap();
+        assert_eq!(result["authorTrusted"], false);
+        assert_eq!(result["executions"], 4);
+        let rows = result["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 12);
+        for row in rows {
+            let event_type = if row["fail"] == true { "error" } else { "load" };
+            assert_eq!(row["event"], serde_json::json!({
+                "type": event_type, "trusted": true, "bubbles": false,
+                "cancelable": false, "target": true, "currentTarget": true, "nestedRejected": true,
+            }), "{row}");
+            assert_eq!(row["afterAuthor"], false, "{row}");
+            assert_eq!(row["dispatchCalls"], 0, "{row}");
+            assert_eq!(row["captured"], 1, "{row}");
+            assert_eq!(row["bubbled"], 0, "{row}");
+            assert_eq!(row["handled"], 1, "{row}");
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
         let mut rt =

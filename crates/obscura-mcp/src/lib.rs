@@ -1115,8 +1115,8 @@ async fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, Str
             var el = document.querySelector({sel});
             if (!el) return "error:element not found";
             globalThis.__obscura_setFieldValue(el, "value", {val});
-            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
-            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", {{bubbles:true}})));
+            globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
+            globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event("change", {{bubbles:true}})));
             return "ok";
         }})()"#,
         sel = serde_json::to_string(&selector).unwrap(),
@@ -1142,7 +1142,7 @@ async fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, Str
             var el = document.querySelector({sel});
             if (!el) return "error:element not found";
             globalThis.__obscura_setFieldValue(el, "value", (el.value || "") + {txt});
-            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
+            globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
             return "ok";
         }})()"#,
         sel = serde_json::to_string(&selector).unwrap(),
@@ -1746,16 +1746,16 @@ async fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
                 globalThis.__obscura_setFieldValue(el, 'checked', true);
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
+                globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap()),
             "uncheck" => format!(r#"(function(){{
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
                 globalThis.__obscura_setFieldValue(el, 'checked', false);
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
+                globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap()),
             "select" => format!(r#"(function(){{
@@ -1772,16 +1772,16 @@ async fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String
                     }}
                 }}
                 if (!matched) return "error:no matching option";
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
+                globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
             _ => format!(r#"(function(){{
                 var el = document.querySelector({sel});
                 if (!el) return "error:not found";
                 globalThis.__obscura_setFieldValue(el, 'value', {val});
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
+                globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
+                globalThis.__obscura_dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
         };
