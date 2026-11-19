@@ -14716,6 +14716,17 @@ for (const [name, tags] of Object.entries({
   }
 }
 
+
+HTMLScriptElement.supports = {
+  supports(type) {
+    if (arguments.length < 1) throw new TypeError("HTMLScriptElement.supports requires a script type");
+    type = `${type}`;
+    // Speculative navigation is not implemented; do not advertise its script type.
+    return type === 'classic' || type === 'module' || type === 'importmap';
+  },
+}.supports;
+_markNative(HTMLScriptElement.supports);
+
 let _formOwnerSnapshots = new WeakMap();
 let _formControlSnapshots = new WeakMap();
 let _formCacheEpoch = null;

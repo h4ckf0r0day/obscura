@@ -19132,6 +19132,33 @@ mod tests {
     }
 
     #[test]
+    fn script_type_support_checks_implemented_types_without_leaking_to_other_elements() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const supports = HTMLScriptElement.supports;
+            const values = ['classic', 'module', 'importmap', 'speculationrules',
+                'MODULE', ' module', 'module ', '', null, undefined, 1,
+                {toString(){return 'module';}}];
+            let missing = false, symbol = false, construction = false;
+            try { supports(); } catch (error) { missing = error instanceof TypeError; }
+            try { supports(Symbol('module')); } catch (error) { symbol = error instanceof TypeError; }
+            try { new supports('module'); } catch (error) { construction = error instanceof TypeError; }
+            return {
+                values: values.map(value => supports(value)), missing, symbol, construction,
+                length: supports.length, name: supports.name,
+                script: document.createElement('script').constructor.supports('module'),
+                other: typeof Element.supports === 'undefined'
+                    && typeof document.createElement('div').constructor.supports === 'undefined',
+            };
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "values": [true,true,true,false,false,false,false,false,false,false,false,true],
+            "missing": true, "symbol": true, "construction": true,
+            "length": 1, "name": "supports", "script": true, "other": true,
+        }));
+    }
+
+    #[test]
     fn dynamic_script_status_bridge_is_hidden_and_idle() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert!(!rt.has_pending_dynamic_scripts());
