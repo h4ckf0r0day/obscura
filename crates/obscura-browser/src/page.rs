@@ -1829,7 +1829,8 @@ impl Page {
         let Some(tx) = &self.intercept_tx else { return Ok(None); };
         let request_headers = self.http_client.extra_headers.read().await.clone();
         let (resolver, resolution) = tokio::sync::oneshot::channel();
-        let request = InterceptedRequest {request_id: format!("{}.{}", self.id, self.network_event_counter + 1),
+        let request_id = format!("{}.{}", self.id, self.network_event_counter + 1);
+        let request = InterceptedRequest {request_id: request_id.clone(),
             page_id: self.id.clone(), url: url.to_string(), method: method.into(), headers: request_headers.clone(),
             resource_type: "Document".into(), resolver};
         if tx.send(request).is_err() { return Ok(None); }
@@ -1837,25 +1838,8 @@ impl Page {
             Ok(InterceptResolution::Fulfill {status, headers: supplied, body, body_base64}) => {
                 DocumentProgress::mark_intercepted(None);
                 let document_request = DocumentRequest::claim(ResourceType::Document);
-                let bytes = if body_base64.is_empty() { body.into_bytes() } else {
-                    BASE64.decode(body_base64).map_err(|error| PageError::NetworkError(error.to_string()))?
-                };
-                if bytes.len() > ResourceRequest::navigation().max_response_bytes {
-                    return Err(PageError::NetworkError("Fulfilled document exceeds the response body limit".into()));
-                }
-                let mut headers = std::collections::HashMap::new();
-                for (name, value) in supplied {
-                    let name = name.to_ascii_lowercase();
-                    if name == "set-cookie" {
-                        headers.entry(name).and_modify(|cookies: &mut String| {
-                            cookies.push('\n'); cookies.push_str(&value);
-                        }).or_insert(value);
-                    } else { headers.insert(name, value); }
-                }
-                if let Some(cookies) = headers.get("set-cookie") {
-                    for cookie in cookies.lines() { self.context.cookie_jar.set_cookie(cookie, url); }
-                }
-                let response = Response {url: url.clone(), status, headers, body: bytes, redirected_from: Vec::new()};
+                let response = fulfilled_document_response(url, status, supplied, body, body_base64, &self.context.cookie_jar)
+                    .map_err(PageError::NetworkError)?;
                 let referrer = initiator.map(|source| navigation_referrer(source, url)).unwrap_or_default();
                 let mut captured = document_request.response(response, method, &referrer);
                 captured.complete();
@@ -1873,16 +1857,20 @@ impl Page {
                 DocumentProgress::mark_intercepted((target != *url).then_some(url));
                 let method = changed_method.as_deref().unwrap_or(method);
                 let body = changed_body.or_else(|| (method == "POST" || !body.is_empty()).then(|| body.as_bytes().to_vec()));
-                self.fetch_navigation_from_document(&target, method, body, headers, initiator).await
+                // Chrome pauses again before requesting each redirect target, so
+                // a client that refuses URLs from Fetch.requestPaused also sees
+                // where the redirect leads (issue #1540).
+                let redirect_pause = NavigationRedirectPause {
+                    tx: tx.clone(), page_id: self.id.clone(), request_id,
+                    patterns: self.intercept_block_patterns.clone(),
+                    headers: headers.clone().unwrap_or(request_headers),
+                    cookie_jar: self.context.cookie_jar.clone(),
+                };
+                self.fetch_navigation_with_redirect_hook(&target, method, body, headers, initiator, Some(&redirect_pause)).await
                     .map_err(|error| PageError::NetworkError(error.to_string()))?
             }
             Ok(InterceptResolution::Fail {reason}) => {
-                let mut error = String::from("net::ERR_");
-                for (index, ch) in reason.chars().enumerate() {
-                    if index > 0 && ch.is_ascii_uppercase() { error.push('_'); }
-                    error.push(ch.to_ascii_uppercase());
-                }
-                return Err(PageError::NetworkError(error));
+                return Err(PageError::NetworkError(net_error_from_cdp_reason(&reason)));
             }
             Err(_) => return Err(PageError::NetworkError("net::ERR_ABORTED".into())),
         };
@@ -1893,11 +1881,19 @@ impl Page {
         &self, url: &Url, method: &str, body: Option<Vec<u8>>,
         headers: Option<std::collections::HashMap<String, String>>, initiator: Option<&Url>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_navigation_with_redirect_hook(url, method, body, headers, initiator, None).await
+    }
+
+    async fn fetch_navigation_with_redirect_hook(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<std::collections::HashMap<String, String>>, initiator: Option<&Url>,
+        redirect_hook: Option<&dyn obscura_net::interceptor::RedirectHook>,
+    ) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(client) = &self.stealth_client {
-            return client.fetch_navigation_request_from_document(url, method, body, headers, initiator, Some(&self.callbacks)).await;
+            return client.fetch_navigation_request_with_redirect_hook(url, method, body, headers, initiator, Some(&self.callbacks), redirect_hook).await;
         }
-        self.http_client.fetch_navigation_request_from_document(url, method, body, headers, initiator, Some(&self.callbacks)).await
+        self.http_client.fetch_navigation_request_with_redirect_hook(url, method, body, headers, initiator, Some(&self.callbacks), redirect_hook).await
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -5352,6 +5348,91 @@ fn script_response_is_executable(status: u16) -> bool {
 
 pub use obscura_js::ops::url_matches_cdp_pattern;
 
+/// CDP `Network.ErrorReason` (`BlockedByClient`) as Chrome's error text
+/// (`net::ERR_BLOCKED_BY_CLIENT`).
+fn net_error_from_cdp_reason(reason: &str) -> String {
+    let mut error = String::from("net::ERR_");
+    for (index, ch) in reason.chars().enumerate() {
+        if index > 0 && ch.is_ascii_uppercase() { error.push('_'); }
+        error.push(ch.to_ascii_uppercase());
+    }
+    error
+}
+
+/// The document a `Fetch.fulfillRequest` supplies for `url`, with its
+/// cookies stored.
+fn fulfilled_document_response(
+    url: &Url, status: u16, supplied: std::collections::HashMap<String, String>,
+    body: String, body_base64: String, cookie_jar: &obscura_net::CookieJar,
+) -> Result<Response, String> {
+    let bytes = if body_base64.is_empty() { body.into_bytes() } else {
+        BASE64.decode(body_base64).map_err(|error| error.to_string())?
+    };
+    if bytes.len() > ResourceRequest::navigation().max_response_bytes {
+        return Err("Fulfilled document exceeds the response body limit".into());
+    }
+    let mut headers = std::collections::HashMap::new();
+    for (name, value) in supplied {
+        let name = name.to_ascii_lowercase();
+        if name == "set-cookie" {
+            headers.entry(name).and_modify(|cookies: &mut String| {
+                cookies.push('\n'); cookies.push_str(&value);
+            }).or_insert(value);
+        } else { headers.insert(name, value); }
+    }
+    if let Some(cookies) = headers.get("set-cookie") {
+        for cookie in cookies.lines() { cookie_jar.set_cookie(cookie, url); }
+    }
+    Ok(Response {url: url.clone(), status, headers, body: bytes, redirected_from: Vec::new()})
+}
+
+/// Pauses each redirect target of an intercepted navigation on
+/// `Fetch.requestPaused`, as Chrome does. The pause keeps the navigation's
+/// request id, which is also its CDP `networkId`.
+struct NavigationRedirectPause {
+    tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    page_id: String,
+    request_id: String,
+    patterns: Vec<String>,
+    headers: std::collections::HashMap<String, String>,
+    cookie_jar: Arc<obscura_net::CookieJar>,
+}
+
+impl obscura_net::interceptor::RedirectHook for NavigationRedirectPause {
+    fn before_redirect<'a>(
+        &'a self, url: &'a Url, method: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = obscura_net::interceptor::RedirectDecision> + Send + 'a>> {
+        use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+        use obscura_net::interceptor::RedirectDecision;
+        Box::pin(async move {
+            if !self.patterns.is_empty() && !self.patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str())) {
+                return RedirectDecision::Follow { url: None, headers: None };
+            }
+            let (resolver, resolution) = tokio::sync::oneshot::channel();
+            let request = InterceptedRequest {request_id: self.request_id.clone(), page_id: self.page_id.clone(),
+                url: url.to_string(), method: method.into(), headers: self.headers.clone(),
+                resource_type: "Document".into(), resolver};
+            // The client went away: nobody can answer, so follow as before.
+            if self.tx.send(request).is_err() { return RedirectDecision::Follow { url: None, headers: None }; }
+            match resolution.await {
+                // The redirect status already fixed the method and body; a
+                // rewritten URL is re-validated by the network client.
+                Ok(InterceptResolution::Continue {url: rewrite, headers, ..}) => match rewrite.map(|value| Url::parse(&value)).transpose() {
+                    Ok(url) => RedirectDecision::Follow { url, headers },
+                    Err(error) => RedirectDecision::Fail(error.to_string()),
+                },
+                Ok(InterceptResolution::Fulfill {status, headers, body, body_base64}) =>
+                    match fulfilled_document_response(url, status, headers, body, body_base64, &self.cookie_jar) {
+                        Ok(response) => RedirectDecision::Fulfill(response),
+                        Err(error) => RedirectDecision::Fail(error),
+                    },
+                Ok(InterceptResolution::Fail {reason}) => RedirectDecision::Fail(net_error_from_cdp_reason(&reason)),
+                Err(_) => RedirectDecision::Fail("net::ERR_ABORTED".into()),
+            }
+        })
+    }
+}
+
 impl Drop for Page {
     fn drop(&mut self) {
         // A closed target must not keep fetching for a document nobody can
@@ -5466,6 +5547,113 @@ mod tests {
         assert_eq!(page.title,"continued");
         assert_eq!(page.url_string(),"http://127.0.0.1:9/original","a network rewrite does not rewrite the document URL");
         assert!(page.http_client.extra_headers.read().await.is_empty(),"per-request headers cannot leak to another page");
+    }
+
+    /// Serves `/redirect` as a 302 to `/target` and `/target` as a document,
+    /// one connection per request, recording each request path.
+    async fn redirect_fixture() -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (paths_tx, paths) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new(); let mut chunk = [0; 4096];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).await.unwrap(); if n == 0 { break; }
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let path = String::from_utf8_lossy(&request).split(' ').nth(1).unwrap_or("").to_string();
+                let response: &[u8] = if path == "/redirect" {
+                    b"HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 21\r\nConnection: close\r\n\r\n<title>target</title>"
+                };
+                let _ = paths_tx.send(path);
+                let _ = socket.write_all(response).await;
+            }
+        });
+        (origin, paths)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_pauses_each_redirect_target() {
+        assert_navigation_interception_pauses_each_redirect_target(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_pauses_each_redirect_target_in_stealth() {
+        assert_navigation_interception_pauses_each_redirect_target(true).await;
+    }
+
+    // Issue #1540: Chrome emits Fetch.requestPaused for the request after a
+    // redirect; a navigation used to pause only for the first URL.
+    async fn assert_navigation_interception_pauses_each_redirect_target(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        let (origin, mut paths) = redirect_fixture().await;
+        let context = Arc::new(BrowserContext::with_storage_and_network("redirect-pause".into(), None, stealth, None, None, true));
+        let mut page = Page::new("redirect-pause".into(), context);
+        let mut requests = page.enable_interception();
+        let start = format!("{origin}/redirect");
+        let (result, paused) = tokio::join!(page.navigate(&start), async {
+            let mut paused = Vec::new();
+            for _ in 0..2 {
+                let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
+                paused.push((request.url.clone(), request.request_id.clone(), request.resource_type.clone()));
+                request.resolver.send(InterceptResolution::Continue {url: None, method: None, headers: None, body: None}).ok().unwrap();
+            }
+            paused
+        });
+        result.unwrap();
+        assert_eq!(paused.iter().map(|(url, ..)| url.as_str()).collect::<Vec<_>>(),
+            [format!("{origin}/redirect"), format!("{origin}/target")]);
+        assert_eq!(paused[0].1, paused[1].1, "both pauses belong to one network request");
+        assert!(paused.iter().all(|(.., kind)| kind == "Document"));
+        assert_eq!(page.title, "target");
+        assert_eq!(page.url_string(), format!("{origin}/target"));
+        assert_eq!(paths.recv().await.unwrap(), "/redirect");
+        assert_eq!(paths.recv().await.unwrap(), "/target");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_can_refuse_a_redirect_target() {
+        use obscura_js::ops::InterceptResolution;
+        let (origin, mut paths) = redirect_fixture().await;
+        let context = Arc::new(BrowserContext::with_storage_and_network("redirect-refused".into(), None, false, None, None, true));
+        let mut page = Page::new("redirect-refused".into(), context);
+        let mut requests = page.enable_interception();
+        let start = format!("{origin}/redirect");
+        let (result, ()) = tokio::join!(page.navigate(&start), async {
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
+            first.resolver.send(InterceptResolution::Continue {url: None, method: None, headers: None, body: None}).ok().unwrap();
+            let second = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
+            assert_eq!(second.url, format!("{origin}/target"));
+            second.resolver.send(InterceptResolution::Fail {reason: "BlockedByClient".into()}).ok().unwrap();
+        });
+        assert!(result.unwrap_err().to_string().contains("net::ERR_BLOCKED_BY_CLIENT"));
+        assert_eq!(page.lifecycle, LifecycleState::Failed);
+        assert_eq!(paths.recv().await.unwrap(), "/redirect");
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), paths.recv()).await.is_err(),
+            "a refused redirect target is never requested");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_skips_redirect_targets_outside_its_patterns() {
+        use obscura_js::ops::InterceptResolution;
+        let (origin, _paths) = redirect_fixture().await;
+        let context = Arc::new(BrowserContext::with_storage_and_network("redirect-pattern".into(), None, false, None, None, true));
+        let mut page = Page::new("redirect-pattern".into(), context);
+        let mut requests = page.enable_interception();
+        page.intercept_block_patterns = vec!["*/redirect".into()];
+        let start = format!("{origin}/redirect");
+        let (result, ()) = tokio::join!(page.navigate(&start), async {
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
+            first.resolver.send(InterceptResolution::Continue {url: None, method: None, headers: None, body: None}).ok().unwrap();
+        });
+        result.unwrap();
+        assert_eq!(page.title, "target");
+        assert!(requests.try_recv().is_err(), "/target does not match the pattern, so it is not paused");
     }
 
     #[tokio::test(flavor = "current_thread")]
