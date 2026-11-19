@@ -4584,7 +4584,7 @@ impl ObscuraJsRuntime {
         }
     }
 
-    fn wrap_expression(expression: &str) -> String {
+    pub fn wrap_expression(expression: &str) -> String {
         let trimmed = expression.trim();
 
         let is_multi_statement = trimmed.starts_with("var ")
