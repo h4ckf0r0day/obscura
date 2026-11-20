@@ -24,6 +24,8 @@ use crate::client::{
 };
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
+#[cfg(feature = "stealth")]
+use crate::interceptor::{RedirectDecision, RedirectHook};
 
 /// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
 /// host *string*, so on its own it lets a public name that resolves inward
@@ -353,7 +355,7 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request(url, request, callbacks, "GET", None, None).await
+        self.fetch_request(url, request, callbacks, "GET", None, None, None).await
     }
 
     /// Continue a navigation without changing another page's headers or pool.
@@ -370,14 +372,27 @@ impl StealthHttpClient {
         headers: Option<HashMap<String, String>>, initiator: Option<&Url>,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        let request = initiator.map(ResourceRequest::navigation_from_document)
-            .unwrap_or_else(ResourceRequest::navigation);
-        self.fetch_request(url, request, callbacks, method, body, headers).await
+        self.fetch_navigation_request_with_redirect_hook(url, method, body, headers, initiator, callbacks, None).await
     }
 
+    /// Like `fetch_navigation_request_from_document`, but consults `redirect_hook`
+    /// before requesting each redirect target.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_navigation_request_with_redirect_hook(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, initiator: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>, redirect_hook: Option<&dyn RedirectHook>,
+    ) -> Result<Response, ObscuraNetError> {
+        let request = initiator.map(ResourceRequest::navigation_from_document)
+            .unwrap_or_else(ResourceRequest::navigation);
+        self.fetch_request(url, request, callbacks, method, body, headers, redirect_hook).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_request(
         &self, url: &Url, request: ResourceRequest, callbacks: Option<&CallbackRegistry>,
         method: &str, mut body: Option<Vec<u8>>, mut request_headers: Option<HashMap<String, String>>,
+        redirect_hook: Option<&dyn RedirectHook>,
     ) -> Result<Response, ObscuraNetError> {
         let mut method = wreq::Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
@@ -543,6 +558,32 @@ impl StealthHttpClient {
                         if let Some(headers) = request_headers.as_mut() {
                             headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(),
                                 "content-type" | "content-encoding" | "content-language" | "content-location" | "content-length"));
+                        }
+                    }
+                    if let Some(hook) = redirect_hook {
+                        match hook.before_redirect(&current_url, method.as_str()).await {
+                            RedirectDecision::Follow { url, headers } => {
+                                if let Some(url) = url {
+                                    if url.scheme() != current_url.scheme() {
+                                        return Err(ObscuraNetError::Network("Interception cannot change a navigation's URL scheme".into()));
+                                    }
+                                    validate_url(&url, self.allow_private_network)?;
+                                    validate_request_mode(&request, &url)?;
+                                    current_url = url;
+                                }
+                                if headers.is_some() { request_headers = headers; }
+                            }
+                            RedirectDecision::Fail(error) => return Err(ObscuraNetError::Network(error)),
+                            RedirectDecision::Fulfill(mut response) => {
+                                drop(in_flight);
+                                response.redirected_from = redirects;
+                                let mut captured = document_request.response(response, method.as_str(), referer.as_deref().unwrap_or(""));
+                                captured.complete();
+                                if let Some(callbacks) = callbacks {
+                                    callbacks.fire_response(&request_info, captured.get()).await;
+                                }
+                                return Ok(captured.finish());
+                            }
                         }
                     }
                     continue;

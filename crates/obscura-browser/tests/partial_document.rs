@@ -132,6 +132,14 @@ async fn recovered_intercepted_rewrites_preserve_document_urls_and_real_redirect
             request.resolver.send(InterceptResolution::Continue {
                 url: Some(rewritten), method: None, headers: None, body: None,
             }).ok().unwrap();
+            // A real redirect pauses again before its target, as in Chrome (#1540).
+            if path == "redirect" {
+                let target = requests.recv().await.unwrap();
+                assert_eq!(target.url, format!("{origin}/slow"));
+                target.resolver.send(InterceptResolution::Continue {
+                    url: None, method: None, headers: None, body: None,
+                }).ok().unwrap();
+            }
         });
         assert!(result.is_err());
         assert_eq!(page.title, "partial");
