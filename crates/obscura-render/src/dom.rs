@@ -1359,6 +1359,21 @@ impl DomLayout {
             }));
             let visual_padding = padding_rect.map(visual);
             let mut local = visual_padding;
+            // Shaped text has no separate DOM box. Include its natural line
+            // extents before clipping this node's contribution to ancestors.
+            #[cfg(feature = "paint")]
+            {
+                let items = self.ifc_items.get(&id).into_iter()
+                    .chain(self.run_ifc_items.get(&id).into_iter().flatten())
+                    .chain(self.word_ifc_items.get(&id).into_iter().flatten());
+                for &item in items {
+                    if let Some(bounds) = self.text_engine.scrolling_bounds(item) {
+                        let bounds = visual(bounds);
+                        local = Some(local.map_or(bounds, |local| local.union(&bounds)));
+                    }
+                }
+            }
+
             if style.is_some_and(|style| {
                 style.overflow_scroll_container && !style.overflow_propagated_to_viewport
             }) {
