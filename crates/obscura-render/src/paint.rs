@@ -5527,6 +5527,7 @@ fn paint_laid_dom_scrolled(
                     rect.width as u32,
                     rect.height as u32,
                     &svg_fonts,
+                    true,
                 ) {
                     let mut mask = element_clip_mask.cloned();
                     if has_radius {
@@ -11068,30 +11069,8 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
         }
         None
     };
-    let length = |value: &str| -> Option<f32> {
-        let value = value.trim();
-        if value.is_empty() || value.ends_with('%') || value.eq_ignore_ascii_case("auto") {
-            return None;
-        }
-        let split = value
-            .find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E')))
-            .unwrap_or(value.len());
-        let number = value[..split].parse::<f32>().ok()?;
-        let factor = match value[split..].trim().to_ascii_lowercase().as_str() {
-            "" | "px" => 1.0,
-            "in" => 96.0,
-            "cm" => 96.0 / 2.54,
-            "mm" => 96.0 / 25.4,
-            "q" => 96.0 / 101.6,
-            "pt" => 96.0 / 72.0,
-            "pc" => 16.0,
-            _ => return None,
-        };
-        let result = number * factor;
-        (result.is_finite() && result > 0.0).then_some(result)
-    };
-    let width = attribute("width").and_then(length);
-    let height = attribute("height").and_then(length);
+    let width = attribute("width").and_then(svg_absolute_length);
+    let height = attribute("height").and_then(svg_absolute_length);
     let view_box_ratio = attribute("viewBox").and_then(|value| {
         let values = value
             .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
@@ -11115,6 +11094,29 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
         height,
         ratio,
     })
+}
+
+fn svg_absolute_length(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.is_empty() || value.ends_with('%') || value.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let split = value
+        .find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E')))
+        .unwrap_or(value.len());
+    let number = value[..split].parse::<f32>().ok()?;
+    let factor = match value[split..].trim().to_ascii_lowercase().as_str() {
+        "" | "px" => 1.0,
+        "in" => 96.0,
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "q" => 96.0 / 101.6,
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        _ => return None,
+    };
+    let result = number * factor;
+    (result.is_finite() && result > 0.0).then_some(result)
 }
 
 /// A full-pixmap clip mask admitting only the pixels inside `rect`, used to
@@ -11315,7 +11317,7 @@ fn is_svg(bytes: &[u8]) -> bool {
 /// how a replaced element like `<img>` sizes its intrinsic content).
 fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     let fonts = svg_font_database();
-    render_svg_with_font_database(bytes, width, height, &fonts)
+    render_svg_with_font_database(bytes, width, height, &fonts, false)
 }
 
 fn render_svg_with_font_database(
@@ -11323,6 +11325,7 @@ fn render_svg_with_font_database(
     width: u32,
     height: u32,
     fonts: &std::sync::Arc<usvg::fontdb::Database>,
+    inline_viewport: bool,
 ) -> Option<Pixmap> {
     if width == 0 || height == 0 {
         return None;
@@ -11337,7 +11340,7 @@ fn render_svg_with_font_database(
     // Author `preserveAspectRatio` still controls fitting inside this viewport.
     // usvg resolves root dimensions before an injected stylesheet can
     // override them, so provide the used viewport as actual root attributes.
-    let viewport_svg = svg_with_root_viewport(bytes, width, height)?;
+    let viewport_svg = svg_with_root_viewport(bytes, width, height, inline_viewport)?;
     opts.default_size = usvg::Size::from_wh(width as f32, height as f32)?;
     opts.font_family = "Liberation Serif".to_string();
     opts.fontdb = std::sync::Arc::clone(fonts);
@@ -11419,14 +11422,14 @@ fn has_inline_svg_text(tree: &DomTree) -> bool {
         })
 }
 
-/// Return SVG XML whose root `width`/`height` are the resolved CSS viewport.
+/// Apply the used viewport to inline SVG and images with a viewBox.
 ///
 /// This is deliberately a narrow XML start-tag rewrite rather than a DOM
 /// reserialization: all namespaces, styles, definitions, and source order
 /// remain byte-for-byte intact. Existing attribute values are replaced;
 /// missing ones are appended. Quoted `>` characters are respected while
 /// finding the end of the root tag.
-fn svg_with_root_viewport(bytes: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+fn svg_with_root_viewport(bytes: &[u8], width: u32, height: u32, inline_viewport: bool) -> Option<Vec<u8>> {
     let source = std::str::from_utf8(bytes).ok()?;
     let start = source.find("<svg")?;
     let tail = &source[start..];
@@ -11445,6 +11448,14 @@ fn svg_with_root_viewport(bytes: &[u8], width: u32, height: u32) -> Option<Vec<u
     }
     let tag_end = tag_end?;
     let mut root = source[start..=tag_end].to_string();
+    // A viewBox-less image scales its intrinsic viewport, not its user coordinates.
+    if !inline_viewport && svg_root_attr_value_range(&root, "viewBox").is_none()
+        && ["width", "height"].iter().all(|name| {
+            svg_root_attr_value_range(&root, name)
+                .and_then(|(start, end)| svg_absolute_length(&root[start..end])).is_some()
+        }) {
+        return Some(bytes.to_vec());
+    }
     for (name, value) in [("width", width), ("height", height)] {
         if let Some((value_start, value_end)) = svg_root_attr_value_range(&root, name) {
             root.replace_range(value_start..value_end, &value.to_string());
@@ -17992,7 +18003,7 @@ mod tests {
             <text x="8" y="34" font-size="24" fill="#00cc55">★</text>
             <text x="8" y="4" font-size="24" fill="#00cc55">&#x378;</text>
         </svg>"##;
-        let pixmap = render_svg_with_font_database(svg.as_bytes(), 60, 50, &svg_font_database())
+        let pixmap = render_svg_with_font_database(svg.as_bytes(), 60, 50, &svg_font_database(), true)
             .expect("raster");
         assert!(
             pixmap
@@ -18049,6 +18060,41 @@ mod tests {
             }
         }
         assert!(found_red, "expected inline svg <rect> to paint red");
+    }
+
+    #[test]
+    fn svg_image_without_viewbox_scales_its_intrinsic_viewport() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+            <rect width="40" height="20" fill="black"/>
+        </svg>"#;
+        let image = render_svg(svg, 300, 160).expect("image raster");
+        for (x, y) in [(20, 10), (150, 80), (299, 159)] {
+            let pixel = image.pixel(x, y).unwrap();
+            assert_eq!(pixel.alpha(), 255, "image viewport must cover {x},{y}");
+            assert!(pixel.red() < 10 && pixel.green() < 10 && pixel.blue() < 10);
+        }
+
+        let tree = parse_html(r#"<style>body{margin:0}svg{display:block;width:300px;height:160px}</style>
+            <svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+                <rect width="40" height="20" fill="black"/>
+            </svg>"#);
+        let inline = paint_dom(&tree, (320.0, 200.0), None).expect("inline raster");
+        let inside = inline.pixel(20, 10).unwrap();
+        assert!(inside.alpha() > 0 && inside.red() < 10 && inside.green() < 10 && inside.blue() < 10);
+        let outside = inline.pixel(150, 80).unwrap();
+        assert!(outside.alpha() == 0 || outside.red() > 240,
+            "inline SVG must retain its CSS viewport without scaling user coordinates");
+    }
+
+    #[test]
+    fn svg_image_percentage_viewport_keeps_user_coordinates() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">
+            <rect width="40" height="20" fill="black"/>
+        </svg>"#;
+        let image = render_svg(svg, 300, 160).expect("image raster");
+        assert_eq!(image.pixel(20, 10).unwrap().alpha(), 255);
+        assert_eq!(image.pixel(150, 80).unwrap().alpha(), 0,
+            "percentage dimensions must use the supplied viewport without scaling the artwork");
     }
 
     #[test]
