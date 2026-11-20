@@ -63,6 +63,7 @@ integration_tests!(
     runtime_by_value_undefined,
     runtime_console_events,
     runtime_get_properties_objectid_escaping,
+    runtime_nodelist_subtype,
     runtime_primitives,
     runtime_terminate_execution,
     scroll_event_on_assignment,
