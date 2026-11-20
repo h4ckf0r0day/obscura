@@ -667,6 +667,34 @@ fn percentage_padding_uses_final_flex_containing_block_width() {
 }
 
 #[test]
+fn aspect_ratio_height_resolves_percentage_child_before_nested_absolute_fill() {
+    let tree = parse_html(r#"
+        <style>
+          html,body{margin:0}*{box-sizing:border-box}
+          #frame{width:300px;aspect-ratio:3/4;position:relative}
+          #control{width:100%;height:100%;position:relative;display:flex;
+                   border:1px solid black;padding:0;overflow:hidden}
+          #fill{position:absolute;inset:-1px}
+          #image{position:absolute;inset:0;width:100%;height:100%}
+          #auto{width:300px}#auto-child{height:100%;line-height:24px}
+        </style>
+        <div id="frame"><button id="control"><div id="fill"><div id="image"></div></div></button></div>
+        <div id="auto"><div id="auto-child">ordinary auto height</div></div>
+    "#);
+    let layout = layout_dom(&tree, (1280.0, 720.0));
+    for id in ["frame", "control", "fill", "image"] {
+        let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!((rect.width - 300.0).abs() < 0.01 && (rect.height - 400.0).abs() < 0.01,
+            "ratio-derived height must remain a percentage basis for {id}: {rect:?}");
+    }
+    for id in ["auto", "auto-child"] {
+        let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!((rect.height - 24.0).abs() < 0.01,
+            "ordinary indefinite height must still resolve to content for {id}: {rect:?}");
+    }
+}
+
+#[test]
 fn final_flex_main_size_drives_auto_cross_size_through_aspect_ratio() {
     let tree = parse_html(include_str!("../../../render-repros/flex-post-ratio-cross-size.html"));
     let layout = layout_dom(&tree, (1080.0, 1000.0));

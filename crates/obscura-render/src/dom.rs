@@ -5557,8 +5557,13 @@ fn layout_dom_once(
             let mut child_cb_width = inh.cb_width;
             let mut child_cb_height = inh.cb_height;
             let mut child_cb_height_definite = false;
-            let mut child_cb_height_deferred =
-                (inh.cb_height_definite || inh.cb_height_deferred)
+            // A ratio-derived height becomes definite during layout; keep
+            // descendant percentages for Taffy to resolve against that size.
+            let mut child_cb_height_deferred = styles.get(&id).is_some_and(|style| {
+                style.height == crate::Dimension::Auto
+                    && style.aspect_ratio.is_some()
+                    && !style.ignores_used_box_sizes()
+            }) || (inh.cb_height_definite || inh.cb_height_deferred)
                     && styles.get(&id).is_some_and(|style| {
                         style.height == crate::Dimension::Auto
                             && !style.display_contents
