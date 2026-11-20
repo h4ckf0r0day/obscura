@@ -4641,7 +4641,7 @@ fn paint_laid_dom_scrolled(
         }
     }
 
-    for (paint_index, nid) in paint_order.into_iter().enumerate() {
+    for (paint_index, nid) in paint_order.iter().copied().enumerate() {
         if svg_subtree_skip.contains(&nid) {
             continue;
         }
@@ -5917,70 +5917,67 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
             );
         }
-    }
 
-    // Inline formatting contexts shaped by cosmic-text (paragraphs, headings,
-    // cells, labels) draw last, in tree order, so their glyphs sit above the
-    // box backgrounds/borders painted in the loop above. Each item already
-    // carries its final origin and clip from `TextEngine::finalize`.
-    for nid in paint_nodes {
-        if svg_subtree_skip.contains(&nid) || opacity_subtree_skip.contains(&nid) {
-            continue;
-        }
-        let whole = laid.ifc_items.get(&nid).copied();
-        let run_items = laid.run_ifc_items.get(&nid).cloned();
-        if whole.is_none() && run_items.is_none() {
-            continue;
-        }
-        if laid
-            .styles
-            .get(&nid)
-            .map(|s| s.effectively_invisible)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        // Shift the shaped glyphs by the same accumulated translate as the
-        // container's box so text under a transformed ancestor moves with
-        // it. Computed before the mutable `paint_item` borrow.
-        let off = scroll_state.translation_for(laid, nid);
-        let overflow_clip = scroll_state.shaped_text_overflow_clip_for(laid, nid);
-        let clip = overflow_clip
-            .as_ref()
-            .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
-        let clip_mask = overflow_clip.as_ref().and_then(|clip| {
-            cached_overflow_clip_mask(
-                &mut overflow_mask_cache,
-                pixmap.width(),
-                pixmap.height(),
-                clip,
-                scroll_state.surface_extent.unwrap_or(viewport),
-            )
-        });
-        if let Some(idx) = whole {
-            laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
-                idx,
-                &mut pixmap,
-                off,
-                clip,
-                clip_mask.as_deref(),
-                raster_scale,
-                print_economy,
-            );
-        }
-        // Anonymous inline-run leaves of a mixed block (see
-        // `build_mixed_block`), pinned to their own boxes at finalize.
-        if let Some(items) = run_items {
-            for idx in items {
-                laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
-                    idx,
-                    &mut pixmap,
-                    off,
-                    clip,
-                    clip_mask.as_deref(),
-                    raster_scale,
-                    print_economy,
-                );
+        // Paint this node's shaped text immediately after its own box, so the
+        // glyphs sit in the same z-order as the box they belong to.
+        //
+        // Painting every IFC in one final pass (in DOM order) let normal-flow
+        // page text (z=auto) land on top of a later stacking unit such as a
+        // modal with `z-index:120`. WeCom's「企业可信IP」dialog hit exactly
+        // that: its white background painted correctly, yet the page's card
+        // titles showed through it, which read as "the dialog is transparent".
+        // Stacking units `continue` above (they repaint their whole subtree,
+        // text included), so this only handles nodes painted in place.
+        if !svg_subtree_skip.contains(&nid) && !opacity_subtree_skip.contains(&nid) {
+            let text_whole = laid.ifc_items.get(&nid).copied();
+            let text_runs = laid.run_ifc_items.get(&nid).cloned();
+            let text_visible = !laid
+                .styles
+                .get(&nid)
+                .map(|s| s.effectively_invisible)
+                .unwrap_or(false);
+            if text_visible && (text_whole.is_some() || text_runs.is_some()) {
+                let text_off = scroll_state.translation_for(laid, nid);
+                let text_clip = scroll_state
+                    .shaped_text_overflow_clip_for(laid, nid)
+                    .as_ref()
+                    .map(|c| c.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
+                let text_mask = scroll_state
+                    .shaped_text_overflow_clip_for(laid, nid)
+                    .as_ref()
+                    .and_then(|c| {
+                        cached_overflow_clip_mask(
+                            &mut overflow_mask_cache,
+                            pixmap.width(),
+                            pixmap.height(),
+                            c,
+                            scroll_state.surface_extent.unwrap_or(viewport),
+                        )
+                    });
+                if let Some(idx) = text_whole {
+                    laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                        idx,
+                        &mut pixmap,
+                        text_off,
+                        text_clip,
+                        text_mask.as_deref(),
+                        raster_scale,
+                        print_economy,
+                    );
+                }
+                if let Some(items) = text_runs {
+                    for idx in items {
+                        laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                            idx,
+                            &mut pixmap,
+                            text_off,
+                            text_clip,
+                            text_mask.as_deref(),
+                            raster_scale,
+                            print_economy,
+                        );
+                    }
+                }
             }
         }
     }

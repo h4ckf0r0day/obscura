@@ -4964,6 +4964,22 @@ async fn fetch_url_inner(
             req = req.header("User-Agent", &user_agent);
         }
 
+        // Send the default Referer on fetch()/XHR the way browsers do.
+        // Servers like WeCom's admin APIs reject scripted requests that lack it
+        // (upstream issue #875: "fetch() omits the default Referer on
+        // same-origin requests"), which makes whole SPA pages fail to render —
+        // the 403s on getCorpApplication/contacts/report left the app list empty.
+        // An explicit `Referer` set by the page still wins (checked below).
+        if !current_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("referer"))
+        {
+            req = req.header(
+                "Referer",
+                format!("{}/", page_origin.trim_end_matches('/')),
+            );
+        }
+
         for (k, v) in &current_headers {
             req = req.header(k.as_str(), v.as_str());
         }
