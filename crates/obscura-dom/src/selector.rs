@@ -394,13 +394,7 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
-        self.tree
-            .with_node(self.node_id, |n| {
-                n.as_element()
-                    .map(|name| name.ns == ns!(html))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false)
+        self.tree.is_html_element_in_html_document(self.node_id)
     }
 
     fn has_local_name(&self, local_name: &CssLocalName) -> bool {
@@ -733,7 +727,7 @@ impl DomTree {
             MatchingMode::Normal,
             None,
             &mut caches,
-            self.selector_quirks_mode(),
+            self.selector_quirks_mode(root),
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
@@ -763,8 +757,8 @@ impl DomTree {
 
     // Map the document's quirks flag onto the selector crate's QuirksMode. In
     // quirks mode the crate matches class/id selectors ASCII-case-insensitively.
-    fn selector_quirks_mode(&self) -> QuirksMode {
-        if self.is_quirks() {
+    fn selector_quirks_mode(&self, root: NodeId) -> QuirksMode {
+        if self.is_quirks() && !self.is_in_xml_document(root) {
             QuirksMode::Quirks
         } else {
             QuirksMode::NoQuirks
@@ -782,7 +776,7 @@ impl DomTree {
             MatchingMode::Normal,
             None,
             &mut caches,
-            self.selector_quirks_mode(),
+            self.selector_quirks_mode(root),
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
