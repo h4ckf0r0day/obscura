@@ -150,6 +150,8 @@ enum Command {
         // explicitly passed: a bare --eval returns its own value, while --eval
         // combined with --dump (or --selector) runs the eval, lets its async
         // work settle, then reads the page (issue #248).
+        /// Output format for the page [default: html]. With --eval, the page
+        /// is printed after the expression runs instead of its value.
         #[arg(long)]
         dump: Option<DumpFormat>,
 
@@ -166,6 +168,9 @@ enum Command {
         #[arg(long, default_value_t = std::num::NonZeroUsize::new(1).unwrap())]
         concurrency: std::num::NonZeroUsize,
 
+        /// Wait up to --wait seconds for an element matching this CSS
+        /// selector, then print the page. With --eval, the page is printed
+        /// instead of the expression's value.
         #[arg(long)]
         selector: Option<String>,
 
@@ -184,6 +189,10 @@ enum Command {
         #[arg(long)]
         user_agent: Option<String>,
 
+        /// Evaluate a JavaScript expression in the loaded page and print its
+        /// value. Combined with --dump or --selector, the expression runs for
+        /// its effect on the page and the page is printed instead; combined
+        /// with --screenshot, its value is printed as JSON.
         #[arg(long, short)]
         eval: Option<String>,
 
@@ -1382,6 +1391,12 @@ async fn run_fetch(
             if screenshot.is_some() {
                 deferred_eval_output = Some(result);
             }
+            // The page replaces the value here by design (issue #248). Say so,
+            // so a command that expected the value does not succeed silently
+            // with HTML instead (issue #1542).
+            if screenshot.is_none() {
+                eprintln!("{}", eval_value_replaced_notice(dump_specified));
+            }
 
             // --eval combined with --selector, --dump, and/or --screenshot
             // typically kicks off async work (a fetch promise, a timer, a scroll
@@ -1577,6 +1592,15 @@ async fn run_fetch(
     context.save_storage();
 
     Ok(())
+}
+
+/// Why `fetch --eval` printed the page rather than the expression's value.
+fn eval_value_replaced_notice(dump_specified: bool) -> String {
+    let flag = if dump_specified { "--dump" } else { "--selector" };
+    format!(
+        "Note: --eval ran, but {flag} prints the page instead of its value. \
+         Drop {flag} to print the value (wait with --wait-until, or inside the expression)."
+    )
 }
 
 async fn fetch_original_response(
