@@ -347,6 +347,15 @@ impl StealthHttpClient {
         self.fetch_with_profile(url, request, callbacks).await
     }
 
+    /// Continue an intercepted subresource with request-local overrides.
+    pub async fn fetch_resource_request_with_callbacks(
+        &self, url: &Url, request: ResourceRequest, method: &str,
+        body: Option<Vec<u8>>, headers: Option<HashMap<String, String>>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request(url, request, callbacks, method, body, headers).await
+    }
+
     async fn fetch_with_profile(
         &self,
         url: &Url,
