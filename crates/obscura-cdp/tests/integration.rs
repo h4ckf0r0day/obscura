@@ -67,6 +67,7 @@ integration_tests!(
     runtime_terminate_execution,
     scroll_event_on_assignment,
     structured_clone_crypto_parity,
+    systeminfo_process_info,
     textarea_enter_selection,
     treewalker_document_order,
     window_conformance_parity,
