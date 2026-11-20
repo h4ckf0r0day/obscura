@@ -58,6 +58,14 @@ struct Args {
     #[arg(long, global = true)]
     allow_private_network: bool,
 
+    /// Skip TLS certificate verification, like Chrome's flag of the same
+    /// name: accept self-signed, expired, wrong-host, and incomplete-chain
+    /// certificates. Any network path can then read and alter HTTPS traffic,
+    /// so use it only for testing or for misconfigured hosts you trust.
+    /// Equivalent to `OBSCURA_IGNORE_CERTIFICATE_ERRORS=1`.
+    #[arg(long, global = true)]
+    ignore_certificate_errors: bool,
+
     /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
     /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
     /// Applied once at startup before any isolate is created.
@@ -447,6 +455,18 @@ async fn run_cli() -> anyhow::Result<()> {
         unsafe {
             std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         }
+    }
+
+    // Every TLS client reads the env var at build time, and worker processes
+    // inherit it, so mirror the flag the same way.
+    if args.ignore_certificate_errors {
+        // SAFETY: as above, no other thread reads the env yet.
+        unsafe {
+            std::env::set_var("OBSCURA_IGNORE_CERTIFICATE_ERRORS", "1");
+        }
+    }
+    if obscura_net::env_ignores_certificate_errors() {
+        tracing::warn!("TLS certificate verification is disabled");
     }
 
     let global_proxy = args.proxy.clone();
