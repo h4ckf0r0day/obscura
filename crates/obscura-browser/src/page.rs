@@ -1889,6 +1889,76 @@ impl Page {
         Ok(Some(response))
     }
 
+    async fn fetch_intercepted_script(
+        &self, url: &Url, initiator: &Url, request_id: &str,
+    ) -> Result<(String, Response), ObscuraNetError> {
+        use obscura_js::ops::{InterceptedRequest, InterceptResolution};
+        let headers = self.http_client.extra_headers.read().await.clone();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let tx = self.intercept_tx.as_ref().ok_or_else(|| ObscuraNetError::Network("net::ERR_ABORTED".into()))?;
+        tx.send(InterceptedRequest { request_id: request_id.into(), page_id: self.id.clone(),
+            url: url.to_string(), method: "GET".into(), headers: headers.clone(),
+            resource_type: "Script".into(), resolver })
+            .map_err(|_| ObscuraNetError::Network("net::ERR_ABORTED".into()))?;
+        let request = ResourceRequest::subresource(ResourceType::Script, initiator);
+        match resolution.await {
+            Ok(InterceptResolution::Fulfill { status, headers: supplied, body, body_base64 }) => {
+                let bytes = if body_base64.is_empty() { body.into_bytes() } else {
+                    BASE64.decode(body_base64).map_err(|error| ObscuraNetError::Network(error.to_string()))?
+                };
+                if bytes.len() > request.max_response_bytes {
+                    return Err(ObscuraNetError::Network("Fulfilled script exceeds the response body limit".into()));
+                }
+                let mut response_headers = std::collections::HashMap::new();
+                for (name, value) in supplied {
+                    let name = name.to_ascii_lowercase();
+                    if name == "set-cookie" {
+                        response_headers.entry(name).and_modify(|cookies: &mut String| {
+                            cookies.push('\n'); cookies.push_str(&value);
+                        }).or_insert(value);
+                    } else { response_headers.insert(name, value); }
+                }
+                if let Some(cookies) = response_headers.get("set-cookie") {
+                    for cookie in cookies.lines() { self.context.cookie_jar.set_cookie(cookie, url); }
+                }
+                let response = Response { url: url.clone(), status, headers: response_headers,
+                    body: bytes, redirected_from: Vec::new() };
+                let info = obscura_net::RequestInfo { url: url.clone(), method: "GET".into(),
+                    headers, resource_type: ResourceType::Script };
+                self.callbacks.fire_request(&info).await;
+                self.callbacks.fire_response(&info, &response).await;
+                Ok(("GET".into(), response))
+            }
+            Ok(InterceptResolution::Continue { url: rewrite, method, headers, body }) => {
+                let target = rewrite.as_deref().map(Url::parse).transpose()
+                    .map_err(|error| ObscuraNetError::Network(error.to_string()))?
+                    .unwrap_or_else(|| url.clone());
+                if !subresource_allowed(self.url.as_ref(), target.as_str()) {
+                    return Err(ObscuraNetError::Network("Blocked script URL scheme".into()));
+                }
+                let method = method.unwrap_or_else(|| "GET".into());
+                #[cfg(feature = "stealth")]
+                if let Some(client) = &self.stealth_client {
+                    let response = client.fetch_resource_request_with_callbacks(&target, request,
+                        &method, body, headers, Some(&self.callbacks)).await?;
+                    return Ok((method, response));
+                }
+                let response = self.http_client.fetch_resource_request_with_callbacks(&target,
+                    request, &method, body, headers, Some(&self.callbacks)).await?;
+                Ok((method, response))
+            }
+            Ok(InterceptResolution::Fail { reason }) => {
+                let mut error = String::from("net::ERR_");
+                for (index, ch) in reason.chars().enumerate() {
+                    if index > 0 && ch.is_ascii_uppercase() { error.push('_'); }
+                    error.push(ch.to_ascii_uppercase());
+                }
+                Err(ObscuraNetError::Network(error))
+            }
+            Err(_) => Err(ObscuraNetError::Network("net::ERR_ABORTED".into())),
+        }
+    }
+
     async fn fetch_navigation_from_document(
         &self, url: &Url, method: &str, body: Option<Vec<u8>>,
         headers: Option<std::collections::HashMap<String, String>>, initiator: Option<&Url>,
@@ -2590,6 +2660,7 @@ impl Page {
             .url
             .clone()
             .unwrap_or_else(|| Url::parse("about:blank").unwrap());
+        let page = &*self;
         let fetch_futures: Vec<_> = fetch_tasks
             .iter()
             .map(|(idx, url)| {
@@ -2601,6 +2672,20 @@ impl Page {
                 async move {
                     let parsed =
                         Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    if page.intercept_enabled && page.intercept_tx.is_some()
+                        && matches!(parsed.scheme(), "http" | "https")
+                        && (page.intercept_block_patterns.is_empty()
+                            || page.intercept_block_patterns.iter()
+                                .any(|pattern| url_matches_cdp_pattern(pattern, &url)))
+                    {
+                        static NEXT_PARSER_REQUEST: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(1);
+                        let id = format!("parser-{}", NEXT_PARSER_REQUEST.fetch_add(1,
+                            std::sync::atomic::Ordering::Relaxed));
+                        let result = page.fetch_intercepted_script(&parsed, &initiator, &id).await
+                            .map(|(method, response)| (Some(method), response));
+                        return Some((idx, url, result, Some(id)));
+                    }
                     if parsed.scheme() == "data" {
                         // data: URIs are inline; decode locally, no network fetch.
                         // Instagram and other Meta properties serve their bootstrap
@@ -2623,14 +2708,14 @@ impl Page {
                             body,
                             redirected_from: Vec::new(),
                         };
-                        return Some((idx, url, resp));
+                        return Some((idx, url, Ok((None, resp)), None));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
                         .await
                     {
-                        Ok(resp) => Some((idx, url, resp)),
+                        Ok(resp) => Some((idx, url, Ok((None, resp)), None)),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
                             None
@@ -2662,11 +2747,33 @@ impl Page {
             }
         };
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response, bool)> =
             std::collections::HashMap::new();
         for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
+            if let Some((idx, url, result, intercepted_id)) = result {
+                let intercepted = intercepted_id.is_some();
+                if let Some(id) = intercepted_id {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                    let (method, status, response_headers, body_size, error_text) = match &result {
+                        Ok((method, response)) => {
+                            self.store_response_body(id.clone(), &response.body, false);
+                            (method.clone().unwrap_or_else(|| "GET".into()), response.status,
+                                response.headers.clone(), response.body.len(), None)
+                        }
+                        Err(error) => ("GET".into(), 0, Default::default(), 0, Some(error.to_string())),
+                    };
+                    self.network_events.push(NetworkEvent { request_id: id, intercepted: true,
+                        url: url.clone(), method, resource_type: "Script".into(), status,
+                        headers: Default::default(), response_headers: Arc::new(response_headers),
+                        body_size, timestamp, error_text });
+                }
+                let (_, resp) = match result {
+                    Ok(response) => response,
+                    Err(error) => { tracing::warn!("Failed to fetch script {}: {}", url, error); continue; }
+                };
                 if !script_response_is_executable(resp.status) {
+                    if !intercepted {
                     self.record_network_event_with_body(
                         &url,
                         "GET",
@@ -2676,6 +2783,7 @@ impl Page {
                         &resp.body,
                         false,
                     );
+                    }
                     tracing::warn!(
                         "Refusing to execute script {} after HTTP {}",
                         url,
@@ -2686,7 +2794,7 @@ impl Page {
                 // Script bodies: only the HTTP Content-Type charset matters
                 // (no in-band meta-charset for JS).
                 let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                fetched.insert(idx, (url, code, resp));
+                fetched.insert(idx, (url, code, resp, intercepted));
             }
         }
 
@@ -2804,12 +2912,12 @@ impl Page {
         let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
-             fetched_script: Option<(String, String, obscura_net::Response)>| {
+             fetched_script: Option<(String, String, obscura_net::Response, bool)>| {
                 if script.src.is_some() {
-                    if let Some((url, code, resp)) = fetched_script {
+                    if let Some((url, code, resp, intercepted)) = fetched_script {
                         tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                         let execution_url = resp.url.to_string();
-                        page.record_network_event_with_body(
+                        if !intercepted { page.record_network_event_with_body(
                             &url,
                             "GET",
                             "Script",
@@ -2817,7 +2925,7 @@ impl Page {
                             &resp.headers,
                             &resp.body,
                             false,
-                        );
+                        ); }
                         if let Some(js) = &mut page.js {
                             let _ = js.execute_script(
                                 "<current-script>",
@@ -7562,6 +7670,136 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_scripts_execute_fulfilled_bodies_before_transport() {
+        use obscura_js::ops::InterceptResolution;
+        use std::sync::atomic::Ordering;
+        let (url, script_requests) = spawn_script_resource_cache_server(false);
+        let context = Arc::new(BrowserContext::with_storage_and_network(
+            "parser-script-interception".into(), None, false, None, None, true,
+        ));
+        let mut page = Page::new("parser-script-interception".into(), context);
+        page.intercept_block_patterns = vec!["*/shared.js".into()];
+        let mut requests = page.enable_interception();
+        let mut intercepted = 0;
+        {
+            let navigation = page.navigate(&url);
+            tokio::pin!(navigation);
+            loop {
+                tokio::select! {
+                    result = &mut navigation => { result.unwrap(); break; }
+                    request = requests.recv() => {
+                        let request = request.unwrap();
+                        assert_eq!(request.resource_type, "Script");
+                        intercepted += 1;
+                        request.resolver.send(InterceptResolution::Fulfill {
+                            status: 200,
+                            headers: [("content-type".into(), "application/javascript".into())].into(),
+                            body: "not the script body".into(),
+                            body_base64: BASE64.encode("globalThis.__runs += 10;"),
+                        }).ok().unwrap();
+                    }
+                }
+            }
+        }
+        assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.__runs").unwrap(),
+            serde_json::json!(320.0), "every parser script must execute its fulfilled body");
+        assert_eq!(intercepted, 32);
+        assert_eq!(script_requests.load(Ordering::SeqCst), 0,
+            "fulfilled scripts must never reach the origin server");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_interception_continues_with_request_local_overrides() {
+        assert_parser_script_request_overrides(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_interception_continues_with_stealth_transport() {
+        assert_parser_script_request_overrides(true).await;
+    }
+
+    async fn assert_parser_script_request_overrides(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/changed.js", listener.local_addr().unwrap());
+        let body = "globalThis.__continued = true;";
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new(); let mut chunk = [0; 4096];
+            loop {
+                let length = socket.read(&mut chunk).await.unwrap(); assert!(length > 0);
+                bytes.extend_from_slice(&chunk[..length]);
+                if bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                    .is_some_and(|end| bytes.len() >= end + 7) { break; }
+            }
+            let head = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+            assert!(head.starts_with("post /changed.js http/1.1"));
+            assert!(head.contains("x-script-probe: isolated"));
+            assert!(bytes.ends_with(&[0, 255, 128]));
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let context = Arc::new(BrowserContext::with_storage_and_network(
+            "continued-parser-script".into(), None, stealth, None, None, true,
+        ));
+        let mut page = Page::new("continued-parser-script".into(), context);
+        let mut requests = page.enable_interception();
+        let (result, id) = tokio::join!(page.navigate("http://127.0.0.1:9/initial"), async {
+            let document = requests.recv().await.unwrap();
+            assert_eq!(document.resource_type, "Document");
+            document.resolver.send(InterceptResolution::Fulfill { status: 200,
+                headers: [("content-type".into(), "text/html".into())].into(),
+                body: "<!doctype html><script src='/original.js'></script>".into(),
+                body_base64: String::new() }).ok().unwrap();
+            let script = requests.recv().await.unwrap();
+            assert_eq!(script.resource_type, "Script");
+            let id = script.request_id;
+            script.resolver.send(InterceptResolution::Continue { url: Some(target),
+                method: Some("POST".into()), body: Some(vec![0, 255, 128]),
+                headers: Some([("x-script-probe".into(), "isolated".into())].into()) }).ok().unwrap();
+            id
+        });
+        result.unwrap(); server.await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.__continued").unwrap(), serde_json::json!(true));
+        let event = page.network_events.iter().find(|event| event.request_id == id).unwrap();
+        assert!(event.intercepted); assert_eq!(event.method, "POST");
+        assert_eq!(page.get_response_body(&id).unwrap().body, body.as_bytes());
+        assert!(page.http_client.extra_headers.read().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_interception_rejects_private_rewrites_and_explicit_failures() {
+        use obscura_js::ops::InterceptResolution;
+        for rewrite in [false, true] {
+            let context = Arc::new(BrowserContext::with_storage_and_network(
+                "blocked-parser-script".into(), None, false, None, None, false,
+            ));
+            let mut page = Page::new("blocked-parser-script".into(), context);
+            let mut requests = page.enable_interception();
+            let (result, id) = tokio::join!(page.navigate("http://example.test/"), async {
+                let document = requests.recv().await.unwrap();
+                document.resolver.send(InterceptResolution::Fulfill { status: 200,
+                    headers: [("content-type".into(), "text/html".into())].into(),
+                    body: "<!doctype html><script src='/original.js'></script>".into(),
+                    body_base64: String::new() }).ok().unwrap();
+                let script = requests.recv().await.unwrap(); let id = script.request_id;
+                let resolution = if rewrite { InterceptResolution::Continue {
+                    url: Some("http://127.0.0.1:9/rewritten.js".into()),
+                    method: None, headers: None, body: None,
+                } } else { InterceptResolution::Fail { reason: "Aborted".into() } };
+                script.resolver.send(resolution).ok().unwrap(); id
+            });
+            result.unwrap();
+            let event = page.network_events.iter().find(|event| event.request_id == id).unwrap();
+            assert!(event.intercepted); assert_eq!(event.status, 0);
+            let error = event.error_text.as_deref().unwrap();
+            if rewrite { assert!(error.contains("private") || error.contains("forbidden"), "{error}"); }
+            else { assert!(error.contains("net::ERR_ABORTED"), "{error}"); }
+        }
     }
 
     /// Issue #678: `localStorage` belongs to the BrowserContext and
