@@ -1588,6 +1588,57 @@ fn float_exclusion_continues_through_non_bfc_block_wrappers() {
     );
 }
 
+#[test]
+fn resolved_float_margins_preserve_ordinary_block_width() {
+    for side in ["left", "right"] {
+        let away = if side == "left" { "right" } else { "left" };
+        for margin in ["16px", "1em", "1rem", "1.25vw", "2ex", "1vmin", "1vmax"] {
+            for width in ["30em", "46em"] {
+                for control in ["", "<input style='display:inline-block;width:100px;height:20px;border:0;padding:0'>",
+                    "<button style='display:inline-block;width:100px;height:20px;border:0;padding:0'>Action</button>"] {
+                let tree = parse_html(&format!(r#"<style>
+                    html {{font-size:16px}} body {{margin:0;font:16px/20px sans-serif}}
+                    #float {{float:{side};width:{width};height:100px;margin-{away}:{margin};padding:8px;border:1px solid}}
+                    #main {{margin-{side}:32em;padding:8px}}
+                    </style><div id="float">Links</div><div id="main">
+                    <h1>Account details</h1><p>The main panel keeps its border box width beside a float. {control}</p></div>"#));
+                let layout = layout_dom(&tree, (1280.0, 720.0));
+                let main = layout.rects[&tree.get_element_by_id("main").unwrap()];
+                let expected_x = if side == "left" { 512.0 } else { 0.0 };
+                assert!((main.width - 768.0).abs() < 0.01 && (main.x - expected_x).abs() < 0.01,
+                    "{side}, {margin}, {width}, {control}: {main:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn resolved_float_margins_preserve_independent_context_avoidance() {
+    for side in ["left", "right"] {
+        let away = if side == "left" { "right" } else { "left" };
+        for (flow, inner, measured) in [
+            ("display:flow-root", "", "flow"),
+            ("overflow:hidden", "", "flow"),
+            ("display:flex", "", "flow"),
+            ("display:grid", "", "flow"),
+            ("", "display:flow-root", "inner"),
+        ] {
+            let tree = parse_html(&format!(r#"<style>
+                body {{margin:0;font-size:16px}} #root {{width:800px}}
+                #float {{float:{side};width:200px;height:100px;margin-{away}:1em}}
+                #flow {{height:20px;{flow}}} #inner {{height:20px;{inner}}}
+                </style><div id="root"><div id="float"></div>
+                <div id="flow"><div id="inner"></div></div></div>"#));
+            let layout = layout_dom(&tree, (1280.0, 720.0));
+            let content = layout.rects[&tree.get_element_by_id(measured).unwrap()];
+            let expected_x = if side == "left" { 216.0 } else { 0.0 };
+            assert!((content.width - 584.0).abs() < 0.01 && (content.x - expected_x).abs() < 0.01,
+                "{side}, {flow}, {inner}: {content:?}");
+        }
+    }
+}
+
 #[cfg(feature = "paint")]
 #[test]
 fn nested_text_wraps_around_floats_and_recovers_full_line_width() {

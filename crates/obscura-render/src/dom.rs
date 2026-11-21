@@ -14721,7 +14721,6 @@ fn clear_matches_float_sides(clear: crate::Clear, has_left: bool, has_right: boo
 
 fn has_deferred_or_auto_margin(style: &crate::LayoutStyle) -> bool {
     style.margin_auto.iter().any(|value| *value)
-        || style.margin_relative.iter().any(Option::is_some)
         || style.margin_expressions.iter().any(Option::is_some)
 }
 
@@ -14787,6 +14786,7 @@ fn can_use_native_float_band(
     let mut saw_float = false;
     let mut saw_clear_after_floats = false;
     let mut saw_flow_after_floats = false;
+    let mut has_resolved_float_margin = false;
 
     if let Some(before) = parent_style.before_pseudo.as_deref() {
         if !is_structural_native_float_pseudo(before) {
@@ -14836,6 +14836,8 @@ fn can_use_native_float_band(
             {
                 return false;
             }
+            // Font and viewport margins already have used pixel values here.
+            has_resolved_float_margin |= style.margin_relative.iter().any(Option::is_some);
             saw_float = true;
             has_left |= side == crate::Float::Left;
             has_right |= side == crate::Float::Right;
@@ -14866,6 +14868,26 @@ fn can_use_native_float_band(
             saw_flow_after_floats = true;
         } else {
             return false;
+        }
+    }
+
+    // shortcut: independent contexts retain their old path until native BFC float avoidance handles margins and fit.
+    if has_resolved_float_margin {
+        for &id in dom_children {
+            let Some(style) = styles.get(&id) else { continue; };
+            if style.float.is_some() || style.display == crate::Display::None {
+                continue;
+            }
+            if (is_in_flow_block_level(style) && establishes_block_formatting_context(style))
+                || tree.descendants(id).into_iter().any(|child| {
+                    styles.get(&child).is_some_and(|style| {
+                        (style.float.is_some() || is_in_flow_block_level(style))
+                            && establishes_block_formatting_context(style)
+                    })
+                })
+            {
+                return false;
+            }
         }
     }
 
