@@ -1580,6 +1580,7 @@ struct ContainerQuery {
 #[derive(Clone, Debug, PartialEq)]
 enum ContainerQueryExpr {
     Feature(ContainerSizeFeature),
+    Style { name: String, value: Option<String> },
     /// Syntactically valid future/general-enclosed syntax has Kleene
     /// `unknown` truth. Retaining it prevents one unknown comma arm from
     /// discarding supported alternatives in the same `@container` rule.
@@ -2184,9 +2185,23 @@ pub(crate) struct ContainerQueryStats {
     pub(crate) ancestor_steps: usize,
 }
 
+struct StyleQueryContainer {
+    id: NodeId,
+    container_type: crate::ContainerType,
+    names: Vec<String>,
+    props: std::rc::Rc<HashMap<String, String>>,
+}
+
+struct StyleQueryValues<'a> {
+    props: &'a HashMap<String, String>,
+    parent_props: Option<&'a HashMap<String, String>>,
+    registrations: &'a HashMap<String, RegisteredCustomProperty>,
+}
+
 pub(crate) struct ContainerQueryEvaluator<'a> {
     tree: &'a DomTree,
     snapshot: &'a ContainerSnapshot,
+    style_containers: Option<Vec<StyleQueryContainer>>,
     cache: HashMap<ContainerQueryCacheKey, ContainerQueryDecision>,
     stats: ContainerQueryStats,
 }
@@ -2196,8 +2211,33 @@ impl<'a> ContainerQueryEvaluator<'a> {
         Self {
             tree,
             snapshot,
+            style_containers: None,
             cache: HashMap::new(),
             stats: ContainerQueryStats::default(),
+        }
+    }
+
+    pub(crate) fn enable_style_queries(&mut self) {
+        self.style_containers = Some(Vec::new());
+    }
+
+    pub(crate) fn push_style_container(
+        &mut self, id: NodeId, style: &LayoutStyle,
+        props: &std::rc::Rc<HashMap<String, String>>,
+    ) {
+        if let Some(containers) = self.style_containers.as_mut() {
+            containers.push(StyleQueryContainer {
+                id, container_type: style.container_type,
+                names: style.container_names.clone(), props: props.clone(),
+            });
+        }
+    }
+
+    pub(crate) fn pop_style_container(&mut self, id: NodeId) {
+        if let Some(containers) = self.style_containers.as_mut() {
+            if containers.last().is_some_and(|container| container.id == id) {
+                containers.pop();
+            }
         }
     }
 
@@ -2249,7 +2289,7 @@ impl<'a> ContainerQueryEvaluator<'a> {
         let mut own_truth = ContainerQueryTruth::False;
         let mut selected_containers = Vec::with_capacity(node.alternatives.len());
         for query in &node.alternatives {
-            let (truth, selected) = self.evaluate_query(subject, kind, query);
+            let (truth, selected) = self.evaluate_query(sheet, subject, kind, query);
             own_truth = own_truth.or(truth);
             selected_containers.push(selected);
             if own_truth == ContainerQueryTruth::True {
@@ -2276,6 +2316,7 @@ impl<'a> ContainerQueryEvaluator<'a> {
 
     fn evaluate_query(
         &mut self,
+        sheet: &Stylesheet,
         subject: NodeId,
         kind: ContainerQuerySubjectKind,
         query: &ContainerQuery,
@@ -2285,6 +2326,41 @@ impl<'a> ContainerQueryEvaluator<'a> {
             .as_ref()
             .map(container_query_required_axes)
             .unwrap_or_default();
+        if required_axes.style {
+            if let Some(containers) = self.style_containers.as_ref() {
+                for (index, current) in containers.iter().enumerate().rev() {
+                    self.stats.ancestor_steps += 1;
+                    let supports_axis = match current.container_type {
+                        crate::ContainerType::Normal => !required_axes.inline && !required_axes.block,
+                        crate::ContainerType::InlineSize => !required_axes.block,
+                        crate::ContainerType::Size => true,
+                    };
+                    if !supports_axis || query.name.as_ref().is_some_and(|name|
+                        !current.names.iter().any(|item| item == name)) {
+                        continue;
+                    }
+                    let container = self.snapshot.boxes.get(&current.id);
+                    let axis_available = container.is_some_and(|container| match container.available_type {
+                        crate::ContainerType::Normal => !required_axes.inline && !required_axes.block,
+                        crate::ContainerType::InlineSize => !required_axes.block,
+                        crate::ContainerType::Size => true,
+                    });
+                    if (required_axes.inline || required_axes.block) && !axis_available {
+                        return (ContainerQueryTruth::Unknown, Some(current.id));
+                    }
+                    let values = StyleQueryValues {
+                        props: &current.props,
+                        parent_props: index.checked_sub(1).map(|parent| &*containers[parent].props),
+                        registrations: &sheet.registered_custom_properties,
+                    };
+                    return (evaluate_container_query_expr(
+                        query.condition.as_ref().expect("style query condition"), container,
+                        self.snapshot.root_font_size, Some(&values),
+                    ), Some(current.id));
+                }
+            }
+            return (ContainerQueryTruth::False, None);
+        }
         let mut candidate = match kind {
             ContainerQuerySubjectKind::Element => {
                 self.tree.borrow_node(subject).and_then(|node| node.parent)
@@ -2322,8 +2398,9 @@ impl<'a> ContainerQueryEvaluator<'a> {
                             .map_or(ContainerQueryTruth::True, |condition| {
                                 evaluate_container_query_expr(
                                     condition,
-                                    container,
+                                    Some(container),
                                     self.snapshot.root_font_size,
+                                    None,
                                 )
                             });
                     return (truth, Some(id));
@@ -2339,6 +2416,7 @@ impl<'a> ContainerQueryEvaluator<'a> {
 struct ContainerQueryRequiredAxes {
     inline: bool,
     block: bool,
+    style: bool,
 }
 
 fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryRequiredAxes {
@@ -2348,14 +2426,19 @@ fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryReq
                 ContainerQueryRequiredAxes {
                     inline: true,
                     block: false,
+                    style: false,
                 }
             }
             ContainerQueryAxis::Height | ContainerQueryAxis::BlockSize => {
                 ContainerQueryRequiredAxes {
                     inline: false,
                     block: true,
+                    style: false,
                 }
             }
+        },
+        ContainerQueryExpr::Style { .. } => ContainerQueryRequiredAxes {
+            style: true, ..Default::default()
         },
         ContainerQueryExpr::Unknown => ContainerQueryRequiredAxes::default(),
         ContainerQueryExpr::Not(inner) => container_query_required_axes(inner),
@@ -2366,6 +2449,7 @@ fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryReq
                     let item = container_query_required_axes(item);
                     axes.inline |= item.inline;
                     axes.block |= item.block;
+                    axes.style |= item.style;
                     axes
                 })
         }
@@ -2374,11 +2458,13 @@ fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryReq
 
 fn evaluate_container_query_expr(
     expr: &ContainerQueryExpr,
-    container: &ContainerBox,
+    container: Option<&ContainerBox>,
     root_font_size: f32,
+    style_values: Option<&StyleQueryValues<'_>>,
 ) -> ContainerQueryTruth {
     match expr {
         ContainerQueryExpr::Feature(feature) => {
+            let Some(container) = container else { return ContainerQueryTruth::Unknown };
             let actual = match feature.axis {
                 ContainerQueryAxis::Width | ContainerQueryAxis::InlineSize => {
                     container.content_width
@@ -2408,9 +2494,33 @@ fn evaluate_container_query_expr(
                 ContainerQueryTruth::False
             }
         }
+        ContainerQueryExpr::Style { name, value } => {
+            let Some(values) = style_values else { return ContainerQueryTruth::Unknown };
+            // shortcut: Typed registrations need retained computed values before their style queries can be evaluated.
+            if values.registrations.contains_key(name) {
+                return ContainerQueryTruth::Unknown;
+            }
+            let actual = values.props.get(name).map(|value| value.trim());
+            let matches = match value {
+                None => actual.is_some(),
+                Some(value) => {
+                    let computed = substitute_var_value(value, values.props, 0);
+                    let expected = computed.as_deref().map(str::trim);
+                    match expected {
+                        Some(value) if ["revert", "revert-layer", "revert-rule"].iter()
+                            .any(|keyword| value.eq_ignore_ascii_case(keyword)) => false,
+                        Some(value) if value.eq_ignore_ascii_case("initial") => actual.is_none(),
+                        Some(value) if value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset") => actual == values.parent_props
+                            .and_then(|props| props.get(name)).map(|value| value.trim()),
+                        _ => actual == expected,
+                    }
+                }
+            };
+            if matches { ContainerQueryTruth::True } else { ContainerQueryTruth::False }
+        }
         ContainerQueryExpr::Unknown => ContainerQueryTruth::Unknown,
         ContainerQueryExpr::Not(inner) => {
-            evaluate_container_query_expr(inner, container, root_font_size).not()
+            evaluate_container_query_expr(inner, container, root_font_size, style_values).not()
         }
         ContainerQueryExpr::And(items) => {
             let mut truth = ContainerQueryTruth::True;
@@ -2419,6 +2529,7 @@ fn evaluate_container_query_expr(
                     item,
                     container,
                     root_font_size,
+                    style_values,
                 ));
                 if truth == ContainerQueryTruth::False {
                     break;
@@ -2433,6 +2544,7 @@ fn evaluate_container_query_expr(
                     item,
                     container,
                     root_font_size,
+                    style_values,
                 ));
                 if truth == ContainerQueryTruth::True {
                     break;
@@ -2609,6 +2721,19 @@ impl Stylesheet {
                     | AnimatedProperty::BackgroundColor | AnimatedProperty::Visibility
             ))
         })
+    }
+
+    pub(crate) fn has_style_container_queries(&self) -> bool {
+        self.container_conditions.iter().any(|node| node.alternatives.iter().any(|query|
+            query.condition.as_ref().is_some_and(|condition| container_query_required_axes(condition).style)))
+    }
+
+    pub(crate) fn has_geometry_container_queries(&self) -> bool {
+        self.container_conditions.iter().any(|node| node.alternatives.iter().any(|query|
+            query.condition.as_ref().map_or(true, |condition| {
+                let axes = container_query_required_axes(condition);
+                axes.inline || axes.block
+            })))
     }
 
     pub(crate) fn has_container_queries(&self) -> bool {
@@ -6410,7 +6535,8 @@ fn parse_container_query(input: &str) -> Option<ContainerQuery> {
         return None;
     }
     let starts_with_condition =
-        input.starts_with('(') || strip_ascii_keyword(input, "not").is_some();
+        input.starts_with('(') || strip_ascii_keyword(input, "not").is_some()
+            || input.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("style("));
     let (name, condition) = if starts_with_condition {
         (None, Some(input))
     } else if let Some(split) = input.find(char::is_whitespace) {
@@ -6460,14 +6586,19 @@ fn is_reserved_container_custom_ident(lower: &str) -> bool {
 const MAX_CONTAINER_QUERY_DEPTH: usize = 64;
 
 fn parse_container_query_expr(input: &str) -> Option<ContainerQueryExpr> {
-    parse_container_query_expr_at_depth(input, 0)
+    parse_container_query_expr_at_depth(input, 0, false)
 }
 
-fn parse_container_query_expr_at_depth(input: &str, depth: usize) -> Option<ContainerQueryExpr> {
+fn parse_container_query_expr_at_depth(input: &str, depth: usize, style: bool) -> Option<ContainerQueryExpr> {
     if depth >= MAX_CONTAINER_QUERY_DEPTH {
         return None;
     }
     let input = input.trim();
+    if style {
+        if let Some(feature) = parse_container_style_feature(input) {
+            return Some(feature);
+        }
+    }
     let or_parts = split_supports_operator(input, "or");
     let and_parts = split_supports_operator(input, "and");
     // One grammar level is either a homogeneous AND chain or a homogeneous OR
@@ -6479,7 +6610,7 @@ fn parse_container_query_expr_at_depth(input: &str, depth: usize) -> Option<Cont
         return Some(ContainerQueryExpr::Or(
             parts
                 .into_iter()
-                .map(|part| parse_container_query_in_parens(part, depth + 1))
+                .map(|part| parse_container_query_in_parens(part, depth + 1, style))
                 .collect::<Option<_>>()?,
         ));
     }
@@ -6487,29 +6618,71 @@ fn parse_container_query_expr_at_depth(input: &str, depth: usize) -> Option<Cont
         return Some(ContainerQueryExpr::And(
             parts
                 .into_iter()
-                .map(|part| parse_container_query_in_parens(part, depth + 1))
+                .map(|part| parse_container_query_in_parens(part, depth + 1, style))
                 .collect::<Option<_>>()?,
         ));
     }
     if let Some(rest) = strip_ascii_keyword(input, "not") {
         return Some(ContainerQueryExpr::Not(Box::new(
-            parse_container_query_in_parens(rest, depth + 1)?,
+            parse_container_query_in_parens(rest, depth + 1, style)?,
         )));
     }
-    parse_container_query_in_parens(input, depth + 1)
+    parse_container_query_in_parens(input, depth + 1, style)
 }
 
-fn parse_container_query_in_parens(input: &str, depth: usize) -> Option<ContainerQueryExpr> {
+fn parse_container_query_in_parens(input: &str, depth: usize, style: bool) -> Option<ContainerQueryExpr> {
     if depth >= MAX_CONTAINER_QUERY_DEPTH {
         return None;
     }
-    let inner = enclosing_parenthesized(input)?;
-    if let Some(feature) = parse_container_size_feature(inner) {
-        return Some(feature);
+    if !style && input.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("style(")) {
+        let inner = enclosing_parenthesized(&input[5..])?;
+        return Some(parse_container_query_expr_at_depth(inner, depth + 1, true)
+            .unwrap_or(ContainerQueryExpr::Unknown));
     }
-    parse_container_query_expr_at_depth(inner, depth + 1).or_else(|| {
+    let inner = enclosing_parenthesized(input)?;
+    if !style {
+        if let Some(feature) = parse_container_size_feature(inner) {
+            return Some(feature);
+        }
+    }
+    parse_container_query_expr_at_depth(inner, depth + 1, style).or_else(|| {
         is_general_enclosed_container_query(inner).then_some(ContainerQueryExpr::Unknown)
     })
+}
+
+fn parse_container_style_feature(input: &str) -> Option<ContainerQueryExpr> {
+    let mut source = cssparser::ParserInput::new(input);
+    let mut parser = cssparser::Parser::new(&mut source);
+    let name = parser.expect_ident_cloned().ok()?.to_string();
+    if !name.starts_with("--") || name.len() <= 2 { return None; }
+    if parser.is_exhausted() {
+        return Some(ContainerQueryExpr::Style { name, value: None });
+    }
+    parser.expect_colon().ok()?;
+    let start = parser.position();
+    let mut end = start;
+    while !parser.is_exhausted() {
+        let position = parser.position();
+        if parser.try_parse(cssparser::parse_important).is_ok() {
+            if !parser.is_exhausted() { return None; }
+            end = position;
+            break;
+        }
+        match parser.next_including_whitespace_and_comments().ok()? {
+            cssparser::Token::Semicolon | cssparser::Token::Delim('!' | '<' | '>' | '=')
+                | cssparser::Token::BadString(_) | cssparser::Token::BadUrl(_) => return None,
+            cssparser::Token::Function(_) | cssparser::Token::ParenthesisBlock
+                | cssparser::Token::SquareBracketBlock | cssparser::Token::CurlyBracketBlock => {
+                parser.parse_nested_block(|inner| {
+                    while inner.next_including_whitespace_and_comments().is_ok() {}
+                    Ok::<(), cssparser::ParseError<'_, ()>>(())
+                }).ok()?;
+            }
+            _ => {}
+        }
+        end = parser.position();
+    }
+    Some(ContainerQueryExpr::Style { name, value: Some(parser.slice(start..end).trim().to_string()) })
 }
 
 fn is_general_enclosed_container_query(input: &str) -> bool {
@@ -10027,32 +10200,36 @@ mod tests {
         assert_eq!(
             evaluate_container_query_expr(
                 &ContainerQueryExpr::Or(vec![min_width(100.0), ContainerQueryExpr::Unknown,]),
-                &container,
+                Some(&container),
                 16.0,
+                None,
             ),
             ContainerQueryTruth::True
         );
         assert_eq!(
             evaluate_container_query_expr(
                 &ContainerQueryExpr::And(vec![min_width(300.0), ContainerQueryExpr::Unknown,]),
-                &container,
+                Some(&container),
                 16.0,
+                None,
             ),
             ContainerQueryTruth::False
         );
         assert_eq!(
             evaluate_container_query_expr(
                 &ContainerQueryExpr::Or(vec![min_width(300.0), ContainerQueryExpr::Unknown,]),
-                &container,
+                Some(&container),
                 16.0,
+                None,
             ),
             ContainerQueryTruth::Unknown
         );
         assert_eq!(
             evaluate_container_query_expr(
                 &ContainerQueryExpr::Not(Box::new(ContainerQueryExpr::Unknown)),
-                &container,
+                Some(&container),
                 16.0,
+                None,
             ),
             ContainerQueryTruth::Unknown
         );
@@ -10072,7 +10249,7 @@ mod tests {
         ] {
             let expression = parse_container_query_expr(query).expect("valid range query");
             assert_eq!(
-                evaluate_container_query_expr(&expression, &container, 16.0),
+                evaluate_container_query_expr(&expression, Some(&container), 16.0, None),
                 ContainerQueryTruth::True,
                 "{query}"
             );
@@ -10085,7 +10262,7 @@ mod tests {
         ] {
             let expression = parse_container_query_expr(query).expect("valid range query");
             assert_eq!(
-                evaluate_container_query_expr(&expression, &container, 16.0),
+                evaluate_container_query_expr(&expression, Some(&container), 16.0, None),
                 ContainerQueryTruth::False,
                 "{query}"
             );

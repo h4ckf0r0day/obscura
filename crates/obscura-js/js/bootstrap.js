@@ -445,10 +445,11 @@ async function __runDynScriptTask(task) {
         // parser script happened to trigger the microtask checkpoint.
         await new Promise(resolve => {
           const execute = () => {
+            const previousNid = globalThis.__currentScriptNid;
             globalThis.__currentScriptNid = task.nid;
             try { _executeClassicScript(body); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
-            finally { globalThis.__currentScriptNid = task.prevNid || 0; }
+            finally { globalThis.__currentScriptNid = previousNid || 0; }
             resolve();
           };
           if (_scheduleAfter(0, execute) === undefined) execute();
@@ -2291,7 +2292,6 @@ function __prepareInsertedScript(script) {
       url: fullUrl,
       isModule,
       nid: script._nid,
-      prevNid,
       pageOrigin,
       fireEvent: (type) => _fireResourceEvent(script, type),
     };
@@ -2302,7 +2302,6 @@ function __prepareInsertedScript(script) {
     task.delaysLoad = globalThis.document?.readyState !== 'complete';
     if (task.delaysLoad) __dynLoadDelayingPending++;
     if (parserInserted && !isModule) {
-      task.prevNid = 0;
       if (parserBlocking) __parserBlockingScriptPending++;
       __parserBlockingScriptQueue.push({ task, blocking: parserBlocking });
       __processParserBlockingScriptQueue();
@@ -2336,7 +2335,6 @@ function __prepareInsertedScript(script) {
       url: dataUrl,
       isModule: true,
       nid: script._nid,
-      prevNid,
       pageOrigin: "",
       fireEvent: (type) => _fireResourceEvent(script, type),
       delaysLoad: globalThis.document?.readyState !== 'complete',
@@ -2352,7 +2350,6 @@ function __prepareInsertedScript(script) {
         inlineCode: code,
         isModule: false,
         nid: script._nid,
-        prevNid: 0,
         fireEvent: () => {},
         delaysLoad: false,
       },
@@ -14817,6 +14814,26 @@ for (const [name, tags] of Object.entries({
     _additionalHtmlElementClasses[tag] = Interface;
     _additionalHtmlElementClasses[tag.toUpperCase()] = Interface;
   }
+}
+
+// Ordinary elements must be able to store their own form references.
+{
+  const descriptor = { ...Object.getOwnPropertyDescriptor(Element.prototype, 'form'), enumerable: true };
+  for (const Interface of [HTMLButtonElement, HTMLFieldSetElement, HTMLInputElement,
+      HTMLLabelElement, HTMLLegendElement, HTMLObjectElement, HTMLOutputElement,
+      HTMLSelectElement, HTMLTextAreaElement, HTMLOptionElement]) {
+    Object.defineProperty(Interface.prototype, 'form', descriptor);
+  }
+  delete Element.prototype.form;
+}
+
+// URL members on ordinary elements make detached roots look like shadow hosts.
+for (const name of ['protocol','username','password','host','hostname',
+    'port','pathname','search','hash','origin']) {
+  const descriptor = { ...Object.getOwnPropertyDescriptor(Element.prototype, name), enumerable: true };
+  Object.defineProperty(HTMLAnchorElement.prototype, name, descriptor);
+  Object.defineProperty(HTMLAreaElement.prototype, name, descriptor);
+  delete Element.prototype[name];
 }
 
 HTMLScriptElement.supports = {

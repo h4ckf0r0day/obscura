@@ -2686,6 +2686,9 @@ fn cascade_node_style(
             .cloned()
             .unwrap_or_else(|| parent_props.clone());
         descendant_color_scheme_dark = styles.get(&id).is_some_and(|style| style.color_scheme_dark);
+        if let Some(evaluator) = container_evaluator.as_deref_mut() {
+            evaluator.push_style_container(id, &styles[&id], &this_props);
+        }
         tree.with_node(id, |node| {
             if node.as_element().is_some_and(|elem| elem.local.as_ref() == "table") {
                 descendant_cell_padding = node
@@ -2867,6 +2870,9 @@ fn cascade_node_style(
         custom_properties.insert(id, this_props.clone());
         style.is_replaced_box |= style.content_image.is_some();
         style.has_replaced_sizing |= style.content_image.is_some();
+        if let Some(evaluator) = container_evaluator.as_deref_mut() {
+            evaluator.push_style_container(id, &style, &this_props);
+        }
         let (mut before_pseudo, mut after_pseudo, placeholder_pseudo) = sheet.all_pseudo_styles(
             tree,
             matcher,
@@ -2960,7 +2966,7 @@ fn cascade_walk(
 
     enum Work<'a> {
         Visit(Visit<'a>),
-        PopAncestor,
+        PopAncestor(NodeId),
         PopSubtreeMatcher,
     }
 
@@ -2978,7 +2984,10 @@ fn cascade_walk(
 
     while let Some(item) = work.pop() {
         match item {
-            Work::PopAncestor => {
+            Work::PopAncestor(id) => {
+                if let Some(evaluator) = container_evaluator.as_deref_mut() {
+                    evaluator.pop_style_container(id);
+                }
                 if let Some(top) = subtree_matchers.last_mut() {
                     top.pop_ancestor();
                 } else {
@@ -3046,7 +3055,7 @@ fn cascade_walk(
                     .is_some_and(|style| style.display == crate::Display::None);
                 if is_element {
                     current_matcher.push_ancestor(tree, visit.id);
-                    work.push(Work::PopAncestor);
+                    work.push(Work::PopAncestor(visit.id));
                 }
                 // LIFO: push the later phases first so regular children run
                 // first, then assigned nodes, then the shadow subtree, all in
@@ -3327,6 +3336,7 @@ const CONTAINER_LAYOUT_SAFETY_LIMIT: usize = 512;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContainerLayoutTermination {
     NoQueries,
+    StyleQueriesStable,
     NoContainers,
     NoMatchingRules,
     GeometryStable,
@@ -5019,7 +5029,8 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
             animation_sample,
             animation_timeline,
         );
-    if !sheet.has_container_queries() {
+    let style_only = sheet.has_style_container_queries() && !sheet.has_geometry_container_queries();
+    if !sheet.has_container_queries() || style_only {
         if timing {
             let (r, i, c, a, l, u) = sheet.debug_stats();
             eprintln!(
@@ -5042,7 +5053,8 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
             laid,
             ContainerLayoutTelemetry {
                 passes: 1,
-                termination: ContainerLayoutTermination::NoQueries,
+                termination: if style_only { ContainerLayoutTermination::StyleQueriesStable }
+                    else { ContainerLayoutTermination::NoQueries },
                 query,
                 retained_reused,
                 retained_fresh,
@@ -5289,8 +5301,15 @@ fn layout_dom_once(
         None => (HashMap::new(), HashMap::new(), None),
     };
     let root_props = std::rc::Rc::new(HashMap::new());
-    let mut evaluator =
-        snapshot.map(|snapshot| crate::css::ContainerQueryEvaluator::new(tree, snapshot));
+    let empty_snapshot = crate::css::ContainerSnapshot::default();
+    let style_queries = sheet.has_style_container_queries();
+    let mut evaluator = (snapshot.is_some() || style_queries).then(|| {
+        let mut evaluator = crate::css::ContainerQueryEvaluator::new(
+            tree, snapshot.unwrap_or(&empty_snapshot),
+        );
+        if style_queries { evaluator.enable_style_queries(); }
+        evaluator
+    });
     let mut evaluator_ref = evaluator.as_mut();
     // A real preorder walk (not a flat descendants() scan) so the matcher's
     // ancestor bloom filter tracks the current path: push before recursing
@@ -5538,8 +5557,13 @@ fn layout_dom_once(
             let mut child_cb_width = inh.cb_width;
             let mut child_cb_height = inh.cb_height;
             let mut child_cb_height_definite = false;
-            let mut child_cb_height_deferred =
-                (inh.cb_height_definite || inh.cb_height_deferred)
+            // A ratio-derived height becomes definite during layout; keep
+            // descendant percentages for Taffy to resolve against that size.
+            let mut child_cb_height_deferred = styles.get(&id).is_some_and(|style| {
+                style.height == crate::Dimension::Auto
+                    && style.aspect_ratio.is_some()
+                    && !style.ignores_used_box_sizes()
+            }) || (inh.cb_height_definite || inh.cb_height_deferred)
                     && styles.get(&id).is_some_and(|style| {
                         style.height == crate::Dimension::Auto
                             && !style.display_contents
@@ -16747,6 +16771,155 @@ mod tests {
             sticky.translations((120.0, 100.0), (0.0, 0.0))[&id].1,
             -40.0
         );
+    }
+
+    #[test]
+    fn style_container_queries_use_the_nearest_computed_ancestor() {
+        let tree = parse_html(r#"<style>
+            .probe { width:10px; height:10px }
+            @container style(--mode:wide) { .probe { width:20px } }
+            @container host style(--mode:wide) { #named-child { width:30px } }
+            @container style(--present) { #boolean { width:25px } }
+            @container not style(--mode:wide) { #negated { width:35px } }
+            @container style(--mode:wide) and style(--flag:on) { #combined { width:40px } }
+        </style>
+        <div style="--mode:wide">
+            <div id="plain" class="probe"></div>
+            <div style="--mode:narrow"><div id="override" class="probe"></div></div>
+        </div>
+        <div style="container-name:host;--mode:wide">
+            <div style="--mode:narrow"><div id="named-child" class="probe"></div></div>
+        </div>
+        <div style="--present:yes"><div id="boolean" class="probe"></div></div>
+        <div style="--mode:narrow"><div id="negated" class="probe"></div></div>
+        <div style="--mode:wide;--flag:on"><div id="combined" class="probe"></div></div>
+        <div style="--mode:narrow">
+            <div id="self" class="probe" style="--mode:wide">
+                <div id="self-child" class="probe"></div>
+            </div>
+        </div>"#);
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        for (name, width) in [("plain",20.0),("override",10.0),("named-child",30.0),
+                ("boolean",25.0),("negated",35.0),("combined",40.0),
+                ("self",10.0),("self-child",20.0)] {
+            let id = tree.get_element_by_id(name).unwrap();
+            assert_eq!(laid.styles[&id].width, crate::Dimension::Px(width), "{name}");
+        }
+    }
+
+    #[test]
+    fn style_container_queries_compare_unregistered_values_without_normalizing_tokens() {
+        let cases = [
+            ("foo  bar", "foo bar", false), ("foo bar", "foobar", false),
+            ("1", "1.0", false), ("01", "1", false), ("1.0", "1", false),
+            ("RED", "red", false), ("1PX", "1px", false), ("'a'", "\"a\"", false),
+            ("foo/**/bar", "foo bar", false), ("rgb(1,2,3)", "rgb(1, 2, 3)", false),
+            ("2px", "2PX", false), ("", "", true), ("initial", "initial", true),
+            ("foo", "foo !important", true), ("foo  bar", "foo  bar", true),
+            ("wide", "var(--other)", true), ("wide", "var(--missing, wide)", true),
+            ("initial", "var(--missing)", true), ("wide", "inherit", true),
+            ("narrow", "inherit", false), ("wide", "unset", true),
+            ("initial", "INITIAL", true), ("wide", "INHERIT", true), ("wide", "UNSET", true),
+        ];
+        let mut css = String::from("body{--other:wide;--v:wide}");
+        let mut body = String::new();
+        for (index, (value, query, _)) in cases.iter().enumerate() {
+            css.push_str(&format!("#p{index}{{--v:{value}}}#t{index}{{width:1px}}@container style(--v:{query}){{#t{index}{{width:2px}}}}"));
+            body.push_str(&format!("<div id='p{index}'><div id='t{index}'></div></div>"));
+        }
+        let tree = parse_html(&format!("<html><head><style>{css}</style></head><body>{body}</body></html>"));
+        let (laid, telemetry) = layout_dom_with_web_fonts_measured(&tree, (1280.0,720.0), &HashMap::new(), &[]);
+        for (index, (value, query, matched)) in cases.iter().enumerate() {
+            let id = tree.get_element_by_id(&format!("t{index}")).unwrap();
+            assert_eq!(laid.styles[&id].width, crate::Dimension::Px(if *matched { 2.0 } else { 1.0 }),
+                "--v:{value}; style(--v:{query})");
+        }
+        assert_eq!(telemetry.passes, 1);
+    }
+
+    #[test]
+    fn style_container_queries_combine_size_conditions_and_originating_pseudos() {
+        let tree = parse_html(r#"<style>
+            #outer { container:shell / inline-size; width:400px; --mode:wide }
+            #inner { --mode:narrow }
+            #target { width:1px; height:1px }
+            #host { --mode:wide; --flag:on }
+            @container shell style(--mode:wide) and (width > 300px) { #target { width:33px } }
+            @container style(--mode:wide) { #target { height:44px } }
+            @container not style(color:red) { #target { height:55px } }
+            @container absent not style(--missing) { #target { width:66px } }
+            @container style((--mode:wide) and (--flag:on)) {
+                #host::before { content:"active"; display:block }
+            }
+            @container style(not (--mode:narrow)) {
+                #host::after { content:"wide"; display:block }
+            }
+        </style><div id="outer"><div id="inner"><div id="target"></div></div></div>
+        <div id="host"></div>"#);
+        let laid = layout_dom(&tree, (1280.0,720.0));
+        let target = tree.get_element_by_id("target").unwrap();
+        assert_eq!(laid.styles[&target].width, crate::Dimension::Px(33.0));
+        assert_eq!(laid.styles[&target].height, crate::Dimension::Px(1.0));
+        let host = tree.get_element_by_id("host").unwrap();
+        assert_eq!(laid.styles[&host].before_content.as_deref(), Some("active"));
+        assert_eq!(laid.styles[&host].after_content.as_deref(), Some("wide"));
+    }
+
+    #[test]
+    fn style_container_queries_propagate_ancestor_changes_in_one_cascade() {
+        let mut html = String::from(r#"<style>
+            .stage { --ready:no; width:1px }
+            @container style(--ready:yes) { .stage { --ready:yes; width:3px } }
+        </style><div style="--ready:yes">"#);
+        for _ in 0..128 { html.push_str("<div class='stage'>"); }
+        html.push_str(&"</div>".repeat(129));
+        let tree = parse_html(&html);
+        let (laid, telemetry) = layout_dom_with_web_fonts_measured(&tree, (1280.0,720.0), &HashMap::new(), &[]);
+        let mut stages = 0;
+        for id in tree.descendants(tree.document()) {
+            if tree.with_node(id, |node| node.get_attribute("class") == Some("stage")).unwrap_or(false) {
+                assert_eq!(laid.styles[&id].width, crate::Dimension::Px(3.0));
+                stages += 1;
+            }
+        }
+        assert_eq!(stages, 128);
+        assert_eq!(telemetry.passes, 1);
+    }
+
+    #[test]
+    fn retained_style_container_queries_match_full_layout_after_ancestor_mutation() {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            .wide{{--mode:wide}} .narrow{{--mode:narrow}}
+            #target{{width:10px;height:1px}}
+            @container style(--mode:wide){{#target{{width:20px}}}}
+        </style><div id="parent" class="wide"><div id="target"></div></div><aside>{}</aside>"#,
+            "<i class='clean'></i>".repeat(200)));
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut previous = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree, (500.0,300.0), &HashMap::new(), &[], &mut cache,
+        );
+        assert_eq!(previous.styles[&target].width, crate::Dimension::Px(20.0));
+        for (old, new, width) in [("wide","narrow",10.0),("narrow","wide",20.0)] {
+            tree.with_node_mut(parent, |node| node.set_attribute("class", new.into()));
+            let retained = RetainedStyleMaps {
+                styles: std::mem::take(&mut previous.styles),
+                custom_properties: std::mem::take(&mut previous.custom_properties),
+            };
+            let mutation = RetainedStyleMutation::Attribute(AttributeStyleMutation {
+                node: parent, name:"class".into(), old_value:Some(old.into()), new_value:Some(new.into()),
+            });
+            let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+                &tree, (500.0,300.0), &HashMap::new(), &[], None, Some(&mut cache), Some(retained), &[mutation],
+            );
+            let full = layout_dom(&tree, (500.0,300.0));
+            assert_computed_styles_match("style container mutation", &incremental, &full);
+            assert_eq!(incremental.rects, full.rects);
+            assert_eq!(incremental.styles[&target].width, crate::Dimension::Px(width));
+            assert!(telemetry.retained_reused >= 200, "{telemetry:?}");
+            previous = incremental;
+        }
     }
 
     #[test]

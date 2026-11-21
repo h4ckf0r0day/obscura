@@ -578,7 +578,7 @@ mod tests {
             const doc = globalThis.__obscura_frameObjects[1].document;
             const form = doc.querySelector('form'), outside = doc.getElementById('outside');
             const elements = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get;
-            const owner = Object.getOwnPropertyDescriptor(Element.prototype, 'form').get;
+            const owner = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'form').get;
             return [owner.call(outside) === form, elements.call(form)[1] === outside,
                 Array.from(elements.call(form), n => n.id).join(','),
                 document.querySelector('form').elements[0].id];
