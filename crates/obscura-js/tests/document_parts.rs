@@ -111,3 +111,25 @@ fn xml_error_documents_use_native_nodes_and_ignore_author_hooks() {
     })()"#).unwrap();
     assert_eq!(result, serde_json::json!({"document":true,"namespace":true,"metadata":true,"hooks":true}));
 }
+
+#[test]
+fn document_id_lookup_rejects_non_descendant_index_entries() {
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_dom(obscura_dom::parse_html("<html><body><div id='live'>original</div></body></html>"));
+    rt.set_url("https://example.test/");
+    rt.run_page_init();
+    rt.with_dom(|dom| dom.update_id_index(dom.document(), None, Some("document-id"))).unwrap();
+    let result = rt.evaluate(r#"(() => {
+        const live = document.getElementById('live');
+        const detached = live.cloneNode(true);
+        const detachedIndex = document.getElementById('live') === live;
+        const host = document.createElement('section');
+        document.body.appendChild(host);
+        host.attachShadow({mode:'open'}).appendChild(detached);
+        const shadowIndex = document.getElementById('live') === live;
+        live.remove();
+        return [document.getElementById('document-id') === null,
+            detachedIndex, shadowIndex, document.getElementById('live') === null];
+    })()"#).unwrap();
+    assert_eq!(result, serde_json::json!([true,true,true,true]));
+}

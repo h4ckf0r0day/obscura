@@ -2994,7 +2994,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             // it can point to a detached clone while the live node is elsewhere in the tree.
             let doc = dom.document();
             let nid = dom.get_element_by_id(&arg1);
-            let live = nid.filter(|&n| dom.ancestors(n).contains(&doc));
+            let live = nid.filter(|&n| n != doc && dom.is_inclusive_ancestor(doc, n));
             match live {
                 Some(n) => n.index().to_string(),
                 None => {
