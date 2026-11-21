@@ -7705,8 +7705,11 @@ fn op_posted_task(
             }
             PostedTaskOwnerStatus::Generation(generation) => generation as f64,
         };
-        v8::tc_scope!(let scope, scope);
         let callback = v8::Local::new(scope, callback);
+        // The task spawner enters the page; frame callbacks need their own context.
+        let Some(context) = callback.get_creation_context(scope) else { return; };
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(let scope, scope);
         let receiver = v8::undefined(scope).into();
         let current_generation = v8::Number::new(scope, current_generation);
         if callback
