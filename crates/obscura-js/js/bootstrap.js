@@ -2544,7 +2544,7 @@ function _registerForeignDocument() { _foreignDocumentCount++; }
 // A Document without a browsing context, backed by its own native tree root.
 function _createDetachedDocument(contentType, xml) {
   const nid = +_dom("create_document_fragment");
-  const DocumentClass = xml ? (globalThis.XMLDocument || Document) : Document;
+  const DocumentClass = xml ? _nativeXMLDocument : Document;
   const doc = new DocumentClass(nid);
   doc._detached = true;
   doc._contentType = contentType;
@@ -3064,7 +3064,7 @@ class Node {
   cloneNode(deep) {
     const t = this.nodeType;
     if (t === 9) {
-      const xml = this instanceof XMLDocument || (this._documentShim && _isXMLDocument(this));
+      const xml = this instanceof _nativeXMLDocument || (this._documentShim && _isXMLDocument(this));
       const clone = _createDetachedDocument(this.contentType, !!xml);
       clone._documentURL = this.URL;
       clone._documentEncoding = this.characterSet;
@@ -6595,11 +6595,21 @@ class DOMImplementation {
   get [Symbol.toStringTag]() { return "DOMImplementation"; }
 }
 
-const _documentInstances = new WeakSet();
+const _documentInstances = new WeakMap();
+const _documentRootState = Function.prototype.call.bind(WeakMap.prototype.get);
+const _setDocumentRootState = Function.prototype.call.bind(WeakMap.prototype.set);
+function _documentPart(receiver, name, command) {
+  if (receiver === _document) return _wrapEl(+_dom(command));
+  const member = _documentRealmMember(receiver, name);
+  if (member) return Reflect.apply(member, receiver, []);
+  const root = _documentRootState(_documentInstances, receiver);
+  if (root === undefined) throw new TypeError('Illegal invocation');
+  return _wrapEl(+_dom(command, root.nid, root.element ? 'element' : ''));
+}
 class Document extends Node {
   constructor(nid) {
     super(nid);
-    _documentInstances.add(this);
+    _setDocumentRootState(_documentInstances, this, { nid:typeof nid === 'number' ? nid : -1, element:false });
   }
   get timeline() {
     if (!this._timeline) {
@@ -6611,10 +6621,7 @@ class Document extends Node {
     return Array.from(_waapiAnimations).filter(animation => animation.playState !== 'idle'
       && (animation.playState !== 'finished' || animation.effect?._timing.fill === 'forwards' || animation.effect?._timing.fill === 'both'));
   }
-  get documentElement() {
-    if (this._detached) return _childNodeOfType(this, 1);
-    return _wrapEl(+_dom("document_element"));
-  }
+  get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); }
   get children() {
     const root = this.documentElement;
     return HTMLCollection._from(root ? [root] : []);
@@ -6622,8 +6629,8 @@ class Document extends Node {
   get childElementCount() { return this.documentElement ? 1 : 0; }
   get firstElementChild() { return this.documentElement; }
   get lastElementChild() { return this.documentElement; }
-  get head() { return this.querySelector("head"); }
-  get body() { return this.querySelector("body"); }
+  get head() { return _documentPart(this, 'head', 'document_head'); }
+  get body() { return _documentPart(this, 'body', 'document_body'); }
   get doctype() {
     if (this._detached) return _childNodeOfType(this, 10);
     if (this._doctype !== undefined) return this._doctype;
@@ -6715,7 +6722,7 @@ class Document extends Node {
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
   // backing encoding and reports UTF-8.
   get characterSet() { return this._documentEncoding || ((this._nid === undefined || this._nid === null || this._detached) ? "UTF-8" : _docEncoding()); }
-  get [Symbol.toStringTag]() { return this instanceof XMLDocument ? "XMLDocument" : (_isXMLDocument(this) ? "Document" : "HTMLDocument"); }
+  get [Symbol.toStringTag]() { return this instanceof _nativeXMLDocument ? "XMLDocument" : (_isXMLDocument(this) ? "Document" : "HTMLDocument"); }
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
@@ -7250,7 +7257,7 @@ class Document extends Node {
   queryCommandSupported(commandId) {
     const method = _documentRealmMember(this, 'queryCommandSupported');
     if (method) return Reflect.apply(method, this, arguments);
-    if (!_documentInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (_documentRootState(_documentInstances, this) === undefined) throw new TypeError('Illegal invocation');
     if (arguments.length < 1) throw new TypeError('queryCommandSupported requires 1 argument');
     commandId = `${commandId}`;
     // execCommand currently implements no editing commands. Feature detection
@@ -8174,7 +8181,7 @@ function _eventHandlerState(receiver, kind) {
     return existing.values;
   }
   const valid = kind === 'window' ? receiver === globalThis
-    : kind === 'document' ? _documentInstances.has(receiver)
+    : kind === 'document' ? _documentRootState(_documentInstances, receiver) !== undefined
     : receiver && _nodeCacheGet(receiver._nid) === receiver && +_dom('node_type', receiver._nid) === 1;
   if (!valid) return null;
   const values = Object.create(null);
@@ -12897,6 +12904,10 @@ function _xmlWellFormed(src) {
 const _escapeXmlErrorText = (text) =>
   String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+const _parserCreateElementNS = Function.prototype.call.bind(Document.prototype.createElementNS);
+const _parserCreateText = Function.prototype.call.bind(Document.prototype.createTextNode);
+const _parserAppend = Function.prototype.call.bind(Node.prototype.appendChild);
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
@@ -12908,7 +12919,6 @@ globalThis.DOMParser = class DOMParser {
       doc._documentCompatMode = _dom("parse_html_document", doc._nid, html);
       return doc;
     }
-    const root = document.createElement("html");
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
     // error-detection code (doc.querySelector('parsererror')) works, matching
@@ -12926,20 +12936,19 @@ globalThis.DOMParser = class DOMParser {
     const xmlError = isXml ? _checkXmlWellFormed(html) : null;
     const isParserError = isXml && (!_xmlWellFormed(html) || !xmlError.wellFormed);
     if (isParserError) {
-      const detail = (xmlError && xmlError.error) || 'error while parsing XML';
-      try {
-        root.innerHTML =
-          '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>' +
-          _escapeXmlErrorText(detail) +
-          '</div></parsererror>';
-      } catch (e) { /* ignore */ }
-    } else {
-      // innerHTML parses children via html5ever fragment-parsing rules. Most
-      // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
-      // fragment parser strips the outer `<html>` and emits its head+body
-      // children, which is what callers want.
-      try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+      const doc = _createDetachedDocument(mimeType, true);
+      doc._documentURL = parserURL;
+      const report = _parserCreateElementNS(doc, "http://www.mozilla.org/newlayout/xml/parsererror.xml", "parsererror");
+      _parserAppend(report, _parserCreateText(doc, "This page contains the following errors:"));
+      const detail = _parserCreateElementNS(doc, "http://www.w3.org/1999/xhtml", "div");
+      _parserAppend(detail, _parserCreateText(doc, (xmlError && xmlError.error) || 'error while parsing XML'));
+      _parserAppend(report, detail);
+      _parserAppend(doc, report);
+      return doc;
     }
+    // shortcut: valid XML still uses HTML fragments; replace this with a native XML parser.
+    const root = document.createElement("html");
+    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
 
     // Helper: depth-first walk to find an element by predicate.
     const walk = (node, pred) => {
@@ -12961,14 +12970,9 @@ globalThis.DOMParser = class DOMParser {
       nodeType: 9,
       queryCommandSupported: Document.prototype.queryCommandSupported,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
-      get documentElement() {
-        // For XML parsererror docs, return the <parsererror> child, not the
-        // <html> wrapper, matching Chrome's behavior.
-        if (isParserError) return root.firstElementChild;
-        return root;
-      },
-      get body() { return findByTagName("BODY"); },
-      get head() { return findByTagName("HEAD"); },
+      get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); },
+      get body() { return _documentPart(this, 'body', 'document_body'); },
+      get head() { return _documentPart(this, 'head', 'document_head'); },
       get title() {
         const t = findByTagName("TITLE");
         return t ? (t.textContent || "").replace(/[\t\n\f\r ]+/g, " ").trim() : "";
@@ -13064,7 +13068,7 @@ globalThis.DOMParser = class DOMParser {
     // The parsed tree belongs to this document, not the main one.
     _registerForeignDocument();
     _stampNodeDocument(root, docNode);
-    _documentInstances.add(docNode);
+    _setDocumentRootState(_documentInstances, docNode, { nid:root._nid, element:true });
     return docNode;
   }
 };
@@ -15402,6 +15406,7 @@ Object.assign(globalThis.XPathResult, {
 // XMLDocument is a subclass of Document (DOMParser of an XML type and
 // implementation.createDocument produce one). The interface must exist globally.
 if (typeof XMLDocument === "undefined") globalThis.XMLDocument = class XMLDocument extends Document {};
+const _nativeXMLDocument = XMLDocument;
 // ParentNode mixin: Document and DocumentFragment are ParentNodes too, so they
 // share Element's append / prepend / replaceChildren.
 for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
@@ -16336,6 +16341,7 @@ class _IframeDocument {
     this.hidden = false;
 
     this._root = document.createElement('html');
+    _setDocumentRootState(_documentInstances, this, { nid:this._root._nid, element:true });
     this._head = document.createElement('head');
     this._body = document.createElement('body');
     _iframeDocumentRoots.add(this._root);
@@ -16360,9 +16366,9 @@ class _IframeDocument {
     }
   }
 
-  get documentElement() { return this._root; }
-  get head() { return this._head; }
-  get body() { return this._body; }
+  get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); }
+  get head() { return _documentPart(this, 'head', 'document_head'); }
+  get body() { return _documentPart(this, 'body', 'document_body'); }
   get title() { return this._title; }
   set title(v) { this._title = v; }
   get URL() { return this._url; }
@@ -19788,7 +19794,7 @@ const _nativeElementClick = Element.prototype.click;
 const _nativeDocumentUrl = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Document.prototype, 'URL').get);
 const _nativeNodeBaseUri = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI').get);
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['documentElement', 'head', 'body', 'URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
