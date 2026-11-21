@@ -8081,7 +8081,9 @@ function __locationNavigate(url, replace) {
     globalThis.__obscuraNavigateToFragment(target, replace);
     return;
   }
-  globalThis.__virtualUrl = r;
+  // Location keeps describing the current document until the new one
+  // commits (Chrome reads the old URL right after `location.href = x`), so a
+  // navigation that fails never leaves location on a URL that did not load.
   __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId);
 }
 // Location setters (HTML spec): change one component of a copy of the current
@@ -8119,7 +8121,7 @@ globalThis.location = {
   set port(v) { __locationSetPart('port', v); },
   toString() { return this.href; },
   assign(url) { __locationNavigate(url, false); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId); },
+  reload() { var r = _resolveUrl(this.href); __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId); },
   replace(url) { __locationNavigate(url, true); },
 };
 const _locationObj = globalThis.location;
