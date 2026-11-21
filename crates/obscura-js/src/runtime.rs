@@ -641,6 +641,16 @@ impl ObscuraJsRuntime {
         self.runtime().v8_isolate().low_memory_notification();
     }
 
+    /// Serialize the V8 heap as a `.heapsnapshot` JSON document.
+    pub fn take_heap_snapshot(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.runtime().v8_isolate().take_heap_snapshot(|chunk| {
+            out.extend_from_slice(chunk);
+            true
+        });
+        out
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
