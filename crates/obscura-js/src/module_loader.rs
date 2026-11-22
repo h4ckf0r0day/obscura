@@ -366,52 +366,61 @@ async fn fetch_module(
         proxy_url.as_deref().unwrap_or("direct")
     );
 
-    match page_network {
-        Ok((client, stealth, callbacks)) => {
-            let requested = ModuleSpecifier::parse(&url)
-                .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
-            static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(1);
-            let request_id = format!("module-{}", NEXT_MODULE_REQUEST_ID.fetch_add(
-                1, std::sync::atomic::Ordering::Relaxed,
-            ));
-            // Keep failed and cancelled graph fetches visible to the
-            // same Network listeners as ordinary fetch/XHR failures.
-            let mut network_guard = page_state.as_ref().map(|state| FetchNetworkGuard {
-                state: state.clone(), cancel: None,
-                event: Some(JsNetworkEvent {
-                    request_id: request_id.clone(), intercepted: false,
-                    url: url.clone(), method: "GET".to_string(),
-                    resource_type: "Script".to_string(), status: 0,
-                    response_headers: Default::default(), body_size: 0,
-                    timestamp: 0.0, error_text: None,
-                }),
-            });
-            let request =
-                obscura_net::ResourceRequest::module_script(&document_url, &referrer);
-            #[cfg(feature = "stealth")]
-            let resp = match stealth {
-                Some(stealth) => stealth
-                    .fetch_resource_with_callbacks(
-                        &requested,
-                        request,
-                        callbacks.as_deref(),
-                    )
-                    .await,
-                None => {
-                    client
-                        .fetch_resource_with_callbacks(
-                            &requested,
-                            request,
-                            callbacks.as_deref(),
-                        )
-                        .await
-                }
+    let requested = ModuleSpecifier::parse(&url)
+        .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+    static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let request_id = format!("module-{}", NEXT_MODULE_REQUEST_ID.fetch_add(
+        1, std::sync::atomic::Ordering::Relaxed,
+    ));
+    // Keep failed and cancelled graph fetches visible to the
+    // same Network listeners as ordinary fetch/XHR failures.
+    let mut network_guard = page_state.as_ref().map(|state| FetchNetworkGuard {
+        state: state.clone(), cancel: None,
+        event: Some(JsNetworkEvent {
+            request_id: request_id.clone(), intercepted: false,
+            url: url.clone(), method: "GET".to_string(),
+            resource_type: "Script".to_string(), status: 0,
+            response_headers: Default::default(), body_size: 0,
+            timestamp: 0.0, error_text: None,
+        }),
+    });
+    let is_data = requested.scheme() == "data";
+    let resp = if is_data {
+        let data = data_url::DataUrl::process(&url)
+            .map_err(|error| io_err(format!("Invalid module data URL: {error}")))?;
+        let content_type = data.mime_type().to_string();
+        let max_body_bytes = obscura_net::ResourceRequest::module_script(
+            &document_url, &referrer,
+        ).max_response_bytes;
+        let mut body = Vec::new();
+        data.decode(|bytes| {
+            if bytes.len() > max_body_bytes.saturating_sub(body.len()) {
+                return Err("maximum module body size exceeded");
             }
-            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
-            #[cfg(not(feature = "stealth"))]
-            let resp = {
-                let _ = &stealth;
+            body.extend_from_slice(bytes);
+            Ok(())
+        })
+            .map_err(|error| io_err(format!("Invalid module data encoding: {error}")))?;
+        obscura_net::Response {
+            url: requested.clone(), status: 200,
+            headers: HashMap::from([("content-type".to_string(), content_type)]),
+            body, redirected_from: Vec::new(),
+        }
+    } else {
+        let (client, stealth, callbacks) = page_network.map_err(io_err)?;
+        let request =
+            obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+        #[cfg(feature = "stealth")]
+        let response = match stealth {
+            Some(stealth) => stealth
+                .fetch_resource_with_callbacks(
+                    &requested,
+                    request,
+                    callbacks.as_deref(),
+                )
+                .await,
+            None => {
                 client
                     .fetch_resource_with_callbacks(
                         &requested,
@@ -419,52 +428,81 @@ async fn fetch_module(
                         callbacks.as_deref(),
                     )
                     .await
-                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
-            };
-            // A response (including the blocked-tracker sentinel) is
-            // not a transport failure, even if evaluation later fails.
-            if let Some(guard) = &mut network_guard { guard.event = None; }
-            // A module response belongs to the owning page regardless
-            // of whether graph preparation or evaluation later fails.
-            // Status 0 is the transport's blocked-tracker sentinel.
-            if resp.status != 0 {
-                if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
-                    let mut state = state.try_borrow_mut().map_err(|_| {
-                        io_err("Module loader page state is already borrowed".to_string())
-                    })?;
-                    record_network_completion(&mut state, JsNetworkEvent {
-                        request_id, intercepted: false,
-                        url: resp.url.to_string(), method: "GET".to_string(),
-                        resource_type: "Script".to_string(), status: resp.status,
-                        response_headers: resp.headers.clone(), body_size: resp.body.len(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default().as_secs_f64(),
-                        error_text: None,
-                    }, |_| CachedNetworkResponseBody::Encoded(match std::str::from_utf8(&resp.body) {
-                        Ok(body) => StoredNetworkResponseBody {
-                            body: body.to_string(), base64_encoded: false,
-                        },
-                        Err(_) => StoredNetworkResponseBody {
-                            body: BASE64.encode(&resp.body), base64_encoded: true,
-                        },
-                    }));
-                }
             }
-            if !(200..=299).contains(&resp.status) {
-                return Err(io_err(format!(
-                    "Module {} returned HTTP {}",
-                    url, resp.status
-                )));
-            }
-            let found = ModuleSpecifier::parse(resp.url.as_str()).map_err(|e| {
-                io_err(format!("Invalid final module URL {}: {}", resp.url, e))
-            })?;
-            let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-            Ok(FetchedModule { found, code: Arc::from(code) })
         }
-        Err(error) => Err(io_err(error)),
+        .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+        #[cfg(not(feature = "stealth"))]
+        let response = {
+            let _ = &stealth;
+            client
+                .fetch_resource_with_callbacks(
+                    &requested,
+                    request,
+                    callbacks.as_deref(),
+                )
+                .await
+                .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
+        };
+        response
+    };
+    // A response (including the blocked-tracker sentinel) is
+    // not a transport failure, even if evaluation later fails.
+    if let Some(guard) = &mut network_guard { guard.event = None; }
+    // A module response belongs to the owning page regardless
+    // of whether graph preparation or evaluation later fails.
+    // Status 0 is the transport's blocked-tracker sentinel.
+    if resp.status != 0 {
+        if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
+            let mut state = state.try_borrow_mut().map_err(|_| {
+                io_err("Module loader page state is already borrowed".to_string())
+            })?;
+            record_network_completion(&mut state, JsNetworkEvent {
+                request_id, intercepted: false,
+                url: resp.url.to_string(), method: "GET".to_string(),
+                resource_type: "Script".to_string(), status: resp.status,
+                response_headers: resp.headers.clone(), body_size: resp.body.len(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64(),
+                error_text: None,
+            }, |_| CachedNetworkResponseBody::Encoded(match std::str::from_utf8(&resp.body) {
+                Ok(body) => StoredNetworkResponseBody {
+                    body: body.to_string(), base64_encoded: false,
+                },
+                Err(_) => StoredNetworkResponseBody {
+                    body: BASE64.encode(&resp.body), base64_encoded: true,
+                },
+            }));
+        }
     }
+    if !(200..=299).contains(&resp.status) {
+        return Err(io_err(format!(
+            "Module {} returned HTTP {}",
+            url, resp.status
+        )));
+    }
+    let found = ModuleSpecifier::parse(resp.url.as_str()).map_err(|e| {
+        io_err(format!("Invalid final module URL {}: {}", resp.url, e))
+    })?;
+    let code = if is_data {
+        let mime = resp.content_type().unwrap_or("").split(';').next().unwrap_or("");
+        // Module scripts require a JavaScript MIME type and always decode as UTF-8.
+        if !matches!(mime,
+            "application/ecmascript" | "application/javascript"
+            | "application/x-ecmascript" | "application/x-javascript"
+            | "text/ecmascript" | "text/javascript" | "text/javascript1.0"
+            | "text/javascript1.1" | "text/javascript1.2" | "text/javascript1.3"
+            | "text/javascript1.4" | "text/javascript1.5" | "text/jscript"
+            | "text/livescript" | "text/x-ecmascript" | "text/x-javascript"
+        ) {
+            return Err(io_err(format!("Module data URL has non-JavaScript MIME type {mime}")));
+        }
+        let source = resp.body.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&resp.body);
+        String::from_utf8_lossy(source).into_owned()
+    } else {
+        obscura_net::decode_non_html(&resp.body, resp.content_type())
+    };
+    Ok(FetchedModule { found, code: Arc::from(code) })
 }
 
 #[cfg(test)]
