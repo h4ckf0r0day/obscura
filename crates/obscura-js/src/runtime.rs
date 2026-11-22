@@ -20164,6 +20164,94 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_content_handlers_run_without_reading_image_properties() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let loader_requests = requests.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img src="ready.png" onload="document.body.dataset.loaded='yes'">
+               <img src="missing.png" onerror="document.body.dataset.fallback=String(this instanceof HTMLImageElement);this.onerror=null;this.src='ready.png'">
+               <img src="unobserved.png">"#,
+            move |url: &str| {
+                loader_requests.lock().unwrap().push(url.to_string());
+                url.ends_with("ready.png").then(|| png.clone())
+            },
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[document.body.dataset.loaded, document.body.dataset.fallback]").unwrap(),
+            serde_json::json!(["yes", "true"]),
+            "HTML content handlers must observe completion before script reads the image",
+        );
+        assert_eq!(
+            rt.evaluate("Array.from(document.images).slice(0,2).map(image => [image.complete,image.naturalWidth,image.naturalHeight])").unwrap(),
+            serde_json::json!([[true, 2, 3], [true, 2, 3]]),
+        );
+        let mut requests = requests.lock().unwrap().clone();
+        requests.sort();
+        assert_eq!(requests, vec![
+            "http://example.com/page/missing.png",
+            "http://example.com/page/ready.png",
+        ], "unobserved images stay lazy and the fallback reuses retained bytes");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn fragment_image_content_handlers_observe_cached_completion() {
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            "<div id='host'></div><img src='ready.png'>",
+            move |url: &str| url.ends_with("ready.png").then(|| png.clone()),
+        );
+        {
+            let mut state = rt.state.borrow_mut();
+            assert!(ensure_prepared_render(&mut state).is_some());
+        }
+        rt.execute_script("insert-image-handlers", r#"
+            document.getElementById('host').innerHTML = `<img src="ready.png" onload="document.body.dataset.cached='loaded'">
+                <img src="missing.png" onerror="document.body.dataset.failed='yes';this.onerror=null;this.src='ready.png'">`;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[document.body.dataset.cached,document.body.dataset.failed]").unwrap(),
+            serde_json::json!(["loaded", "yes"]),
+        );
+        assert_eq!(
+            rt.evaluate("Array.from(document.getElementById('host').children).map(image => [image.complete,image.naturalWidth,image.naturalHeight])").unwrap(),
+            serde_json::json!([[true, 2, 3], [true, 2, 3]]),
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_content_handler_completion_is_not_replayed_by_late_observers() {
+        let mut rt = parser_image_runtime(
+            r#"<img src="missing.png" onerror="document.body.dataset.errors=(Number(document.body.dataset.errors)||0)+1">"#,
+            move |_url: &str| None,
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("Number(document.body.dataset.errors)").unwrap().as_f64(),
+            Some(1.0));
+        rt.execute_script("late-image-observers", r#"
+            const failed = document.querySelector('img');
+            failed.onerror = () => { document.body.dataset.errors = Number(document.body.dataset.errors)+1; };
+            failed.onload = () => { document.body.dataset.loaded = 'unexpected'; };
+            for (let index = 0; index < 5; index++) {
+                void failed.complete;
+                void failed.naturalWidth;
+                void failed.currentSrc;
+            }
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt.evaluate("[Number(document.body.dataset.errors),document.body.hasAttribute('data-loaded'),failed.complete,failed.naturalWidth]").unwrap();
+        assert_eq!(result[0].as_f64(), Some(1.0));
+        assert_eq!(result[1], serde_json::json!(false));
+        assert_eq!(result[2], serde_json::json!(true));
+        assert_eq!(result[3].as_f64(), Some(0.0));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn parser_image_failure_completes_and_rejects_decode() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = calls.clone();

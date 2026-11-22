@@ -2476,7 +2476,7 @@ function __prepareInsertedSubtree(root) {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe,img[onload],img[onerror]") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
     if (script && !seen.has(script._nid)) {
@@ -2485,6 +2485,8 @@ function __prepareInsertedSubtree(root) {
     }
   }
   for (const script of scripts) {
+    // Constructing an image wrapper starts its content-handler lifecycle.
+    if (script.localName === 'img') continue;
     if (_postConnection) _postConnection.cursor = script;
     if (script.localName === 'iframe') {
       if (script.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
@@ -4335,7 +4337,7 @@ class Element extends Node {
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
-    _connectInsertedFrames(this, html);
+    _connectInsertedResources(this, html);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -7337,7 +7339,7 @@ class DocumentFragment extends Node {
     } else {
       _dom("set_inner_html", this._nid, html);
     }
-    _connectInsertedFrames(this, html);
+    _connectInsertedResources(this, html);
     _disconnectCustomElements(leavingCustomElements);
     _connectCustomElements(this, false);
   }
@@ -7523,9 +7525,9 @@ class HTMLImageElement extends Element {
     this._imageInitialized = true;
     // Parser images stay lazy until script observes their lifecycle or paint
     // asks for the same cache entry. Inline handlers are observers too.
-    if (!this._imageComplete
+    if ((!this._imageComplete || this._imageCurrentSrc)
         && (this.hasAttribute("onload") || this.hasAttribute("onerror"))) {
-      this._queueImageRequest();
+      this._queueImageRequest(true);
     }
   }
 
@@ -7654,12 +7656,12 @@ class HTMLImageElement extends Element {
     this._imageComplete = !this._imageCurrentSrc;
   }
 
-  _queueImageRequest() {
-    if (this._imageQueued || this._imageComplete) return;
+  _queueImageRequest(reportCachedCompletion = false) {
+    if (this._imageQueued || (this._imageComplete && !reportCachedCompletion)) return;
     this._imageQueued = true;
     const request = this._imageRequest;
     setTimeout(() => {
-      if (request === this._imageRequest && !this._imageComplete) {
+      if (request === this._imageRequest && (!this._imageComplete || reportCachedCompletion)) {
         this._runImageRequest(request);
       } else if (request === this._imageRequest) {
         this._imageQueued = false;
@@ -16668,9 +16670,9 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
-function _connectInsertedFrames(root, html) {
-  if (root.isConnected && /<iframe[\s/>]/i.test(html)) {
-    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe')));
+function _connectInsertedResources(root, html) {
+  if (root.isConnected && /<(?:iframe|img)[\s/>]/i.test(html)) {
+    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe,img[onload],img[onerror]')));
   }
 }
 
@@ -19874,6 +19876,8 @@ globalThis.__obscura_init = (function(skipFrames) {
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);
+  // Materialize only parser images whose HTML handlers observe completion.
+  document.querySelectorAll('img[onload],img[onerror]');
 
   const scr = _fp('screen');
   const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0
