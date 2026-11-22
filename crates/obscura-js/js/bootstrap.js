@@ -17833,39 +17833,57 @@ const WORKER_GLOBALS = [
 
 globalThis.Worker = class Worker {
   constructor(url) {
+    if (arguments.length === 0) throw new TypeError("Worker requires a script URL");
+    url = `${url}`;
+    // Stored blob URLs are already canonical; avoid reparsing each worker's source.
+    if (!url.startsWith('blob:') || globalThis.__blobStore?.[url] === undefined) {
+      url = _urlResolveOp(url, _documentBase() || 'about:blank');
+      if (!url) throw new TypeError("Failed to construct 'Worker': Invalid URL");
+    }
     this.onmessage = null;
     this.onerror = null;
     this._terminated = false;
     this._listeners = {};
     this._scope = null;
+    this._url = url;
     this._pendingMessages = [];
     const worker = this;
 
-    let resolvedUrl = url;
-    if (typeof url === 'string') {
-      const blob = globalThis.__blobStore?.[url];
-      if (blob) {
-        worker._code = blob;
-        // Auto-start on next tick so caller can set onmessage first.
-        setTimeout(() => worker._autoRun(), 0);
-        return;
-      }
-      // Resolve relative URLs against the current page.
-      if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
-        try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
-      }
-      (async () => {
-        try {
-          const resp = await fetch(resolvedUrl);
-          worker._code = await resp.text();
-          if (!worker._terminated) worker._autoRun();
-        } catch(e) { if (worker.onerror) worker.onerror(e); }
-      })();
+    const blob = globalThis.__blobStore?.[url];
+    if (blob) {
+      worker._code = blob;
+      // Auto-start on next tick so caller can set onmessage first.
+      setTimeout(() => worker._autoRun(), 0);
+      return;
     }
+    (async () => {
+      try {
+        const resp = await fetch(url);
+        worker._url = resp.url || url;
+        worker._code = await resp.text();
+        if (!worker._terminated) worker._autoRun();
+      } catch(e) { if (worker.onerror) worker.onerror(e); }
+    })();
   }
   _makeScope() {
     const worker = this;
+    const workerUrl = worker._url;
+    const URLImpl = globalThis.URL;
+    const fetchImpl = globalThis.fetch;
+    const RequestImpl = globalThis.Request;
+    let workerLocation;
     const scope = {
+      get location() {
+        if (!workerLocation) {
+          const parsed = new URLImpl(workerUrl);
+          workerLocation = {};
+          for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
+            Object.defineProperty(workerLocation, name, {value:parsed[name], enumerable:true});
+          }
+          Object.defineProperty(workerLocation, 'toString', {value:_markNative({toString() { return parsed.href; }}.toString)});
+        }
+        return workerLocation;
+      },
       onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
@@ -17894,11 +17912,32 @@ globalThis.Worker = class Worker {
       clearInterval: globalThis.clearInterval,
       scheduler: globalThis.scheduler,
       Scheduler: globalThis.Scheduler,
-      fetch: globalThis.fetch,
+      // Only URL resolution is worker-local; transport and its security policy stay shared.
+      fetch(input, init = {}) {
+        try {
+          return fetchImpl.call(this, input instanceof RequestImpl ? input : new URLImpl(input, workerUrl).href, init);
+        } catch (error) { return Promise.reject(error); }
+      },
       console: globalThis.console,
       performance: globalThis.performance,
-      location: globalThis.location,
     };
+    _markNative(Object.getOwnPropertyDescriptor(scope, 'location').get);
+    Object.defineProperty(scope, 'Request', {value:class Request extends RequestImpl {
+      constructor(input, init = {}) {
+        super(input instanceof RequestImpl ? input : new URLImpl(input, workerUrl).href, init);
+      }
+      clone() { return Object.setPrototypeOf(super.clone(), Request.prototype); }
+    }, writable:true, configurable:true});
+    Object.defineProperty(scope, 'Worker', {value:class Worker extends globalThis.Worker {
+      constructor(url, ...options) {
+        if (arguments.length === 0) throw new TypeError("Worker requires a script URL");
+        super(new URLImpl(url, workerUrl).href, ...options);
+      }
+    }, writable:true, configurable:true});
+    _markNative(scope.fetch);
+    _markNative(scope.Request);
+    _markNative(scope.Request.prototype.clone);
+    _markNative(scope.Worker);
     scope.self = scope;
     // A worker global carries the ECMAScript builtins and the worker-visible
     // web APIs as properties. Bare identifiers already resolved through the
