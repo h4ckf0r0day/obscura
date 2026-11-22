@@ -2099,6 +2099,7 @@ dependencies = [
  "base64",
  "cbc",
  "ctr",
+ "data-url",
  "deno_core",
  "deno_error",
  "getrandom 0.2.17",

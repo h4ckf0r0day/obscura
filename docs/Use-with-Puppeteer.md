@@ -209,3 +209,9 @@ status, response headers, and body size. Retained bodies remain readable by
 request ID when a page's JavaScript runtime is suspended, subject to
 `OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`.
 Cached imports do not produce another network request.
+
+JavaScript modules can also load from `data:` URLs, including nested and dynamic
+imports. These decode as UTF-8 and require a JavaScript MIME type. Unmapped
+relative imports are rejected; absolute network dependencies retain the page's
+network policy. Decoded sources use `OBSCURA_FETCH_MAX_BODY_BYTES`. Their responses
+remain available through `Network.getResponseBody`.
