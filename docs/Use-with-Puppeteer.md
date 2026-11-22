@@ -183,6 +183,10 @@ builds also cancel pending image/font loads, including `Image`/`decode()`
 requests, without restarting those URLs on the next render turn. Already-loaded
 resources are preserved. Ordinary JavaScript `fetch()` calls are not canceled.
 
+HTML image `onload` and `onerror` handlers run asynchronously for parser-created
+images and inserted HTML fragments, even when script never reads the image.
+Reading cached image dimensions does not replay completion events.
+
 `Page.close` runs the top-level document's `beforeunload` handlers. A document
 activated through native input can request confirmation, reported through
 `Page.javascriptDialogOpening` with type `beforeunload`. Use
