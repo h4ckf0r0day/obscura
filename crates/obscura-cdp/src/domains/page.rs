@@ -554,14 +554,15 @@ fn encode_long_full_page_png(
 pub(crate) async fn prepare_capture_resources_if_requested(
     page: &mut obscura_browser::Page,
 ) {
-    let Some(deadline_ms) = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value != 0)
-    else {
-        return;
-    };
-    let _ = page.prepare_screenshot_resources(deadline_ms).await;
+    if let Some(deadline_ms) = capture_resource_deadline_ms() {
+        let _ = page.prepare_screenshot_resources(deadline_ms).await;
+    }
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn capture_resource_deadline_ms() -> Option<u64> {
+    std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS").ok()
+        .and_then(|value| value.parse::<u64>().ok()).filter(|value| *value != 0)
 }
 
 #[cfg(feature = "render")]

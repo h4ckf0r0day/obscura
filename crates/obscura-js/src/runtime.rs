@@ -2468,9 +2468,7 @@ impl ObscuraJsRuntime {
         }
         // The page transport is the plain client or, when installed, the
         // stealth client; either one on its own is enough (`has_page_transport`).
-        let http_client = state.http_client.clone();
-        #[cfg(feature = "stealth")]
-        let stealth_client = state.stealth_client.clone();
+        let fetcher = crate::ops::RenderResourceFetcher::from_state(&state);
         let initiator = url::Url::parse(&state.url).ok();
         if !crate::ops::has_page_transport(&state) || initiator.is_none() {
             // No transport or no document URL: nothing can be loaded; forget
@@ -2481,7 +2479,6 @@ impl ObscuraJsRuntime {
             return 0;
         }
         let initiator = initiator.expect("checked above");
-        let callbacks = state.callbacks.clone();
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
         let limiter = state.render_resource_limiter.clone();
@@ -2495,10 +2492,7 @@ impl ObscuraJsRuntime {
             use deno_core::futures::StreamExt as _;
             let loads = deno_core::futures::stream::iter(requests.into_iter().map(
                 |(raw, profile, is_font, image_request_generation)| {
-                let http_client = http_client.clone();
-                #[cfg(feature = "stealth")]
-                let stealth_client = stealth_client.clone();
-                let callbacks = callbacks.clone();
+                let fetcher = fetcher.clone();
                 let initiator = initiator.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
@@ -2516,6 +2510,7 @@ impl ObscuraJsRuntime {
                                 image_request_generation,
                                 is_font,
                                 response: None,
+                                network_event: None,
                                 };
                         }
                     };
@@ -2536,44 +2531,14 @@ impl ObscuraJsRuntime {
                         }
                         _ => {}
                     }
-                    #[cfg(feature = "stealth")]
-                    let response = match (stealth_client, http_client) {
-                        (Some(stealth_client), _) => stealth_client
-                                .fetch_resource_with_callbacks(
-                                    &parsed,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                            .await
-                            .ok(),
-                        (None, Some(http_client)) => http_client
-                                .fetch_resource_with_callbacks(
-                                    &parsed,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                            .await
-                            .ok(),
-                        (None, None) => None,
-                    };
-                    #[cfg(not(feature = "stealth"))]
-                    let response = match http_client {
-                        Some(http_client) => http_client
-                                .fetch_resource_with_callbacks(
-                                    &parsed,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                            .await
-                            .ok(),
-                        None => None,
-                    };
+                    let (response, network_event) = fetcher.fetch(&parsed, request).await;
                     crate::ops::RenderResourceLoad {
                         generation,
                         url: raw,
                         profile,
                         image_request_generation,
                         is_font,
+                        network_event,
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
                             status: response.status,
@@ -2595,6 +2560,7 @@ impl ObscuraJsRuntime {
                             image_request_generation,
                             is_font: fallback.2,
                             response: None,
+                            network_event: None,
                         })
                     })
                 },
@@ -2685,6 +2651,15 @@ impl ObscuraJsRuntime {
                 load.profile,
                 load.is_font,
             ));
+            let intercepted = load.network_event.is_some();
+            if let Some(event) = load.network_event {
+                crate::ops::record_network_completion(&mut self.state.borrow_mut(), event, |_| {
+                    match &load.response {
+                        Some(response) => crate::ops::CachedNetworkResponseBody::raw(&response.body, response.headers.get("content-type").map(String::as_str)),
+                        None => crate::ops::CachedNetworkResponseBody::raw(&[], None),
+                    }
+                });
+            }
             let is_font = load.is_font;
             let bytes = match &load.response {
                 Some(response) if (200..300).contains(&response.status) => {
@@ -2698,7 +2673,7 @@ impl ObscuraJsRuntime {
                 Some(profile) => self.seed_shared_render_image_resource_for_request(load.url, profile, bytes, load.image_request_generation),
                 None => self.seed_shared_render_resource(load.url, bytes),
             }
-            if let Some(response) = load.response {
+            if let Some(response) = load.response.filter(|_| !intercepted) {
                 self.state
                     .borrow_mut()
                     .render_resource_events
@@ -6423,6 +6398,7 @@ mod tests {
                 profile: None,
                 image_request_generation: None,
                 is_font: false,
+                network_event: None,
                 response: Some(crate::ops::RenderResourceResponse {
                     url: url.clone(),
                     status: 200,

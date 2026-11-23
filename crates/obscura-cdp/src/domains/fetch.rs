@@ -30,10 +30,36 @@ pub enum FetchResolution {
     },
 }
 
+#[derive(Clone)]
 struct FetchSubscription {
     page_id: String,
     session_id: Option<String>,
     patterns: Vec<(String, Option<String>)>,
+}
+
+pub(crate) struct FetchSubscriptionSnapshot {
+    subscriptions: Vec<FetchSubscription>,
+    configured: bool,
+}
+
+fn matching_subscribers(subscriptions: &[FetchSubscription], configured: bool,
+    page_id: &str, url: &str, resource_type: &str) -> Option<Vec<Option<String>>> {
+    if !configured { return None; }
+    Some(subscriptions.iter().rev().filter(|subscription|
+        subscription.page_id == page_id && subscription.patterns.iter().any(|(pattern, kind)|
+            kind.as_deref().is_none_or(|kind| kind == resource_type)
+                && obscura_browser::url_matches_cdp_pattern(pattern, url)))
+        .map(|subscription| subscription.session_id.clone()).collect())
+}
+
+impl FetchSubscriptionSnapshot {
+    pub(crate) fn subscribers(&self, page_id: &str, url: &str, resource_type: &str) -> Option<Vec<Option<String>>> {
+        matching_subscribers(&self.subscriptions, self.configured, page_id, url, resource_type)
+    }
+
+    pub(crate) fn remove_session(&mut self, session_id: &Option<String>) {
+        self.subscriptions.retain(|subscription| &subscription.session_id != session_id);
+    }
 }
 
 pub struct FetchInterceptState {
@@ -58,12 +84,11 @@ impl FetchInterceptState {
     }
 
     pub(crate) fn subscribers(&self, page_id: &str, url: &str, resource_type: &str) -> Option<Vec<Option<String>>> {
-        if !self.configured { return None; }
-        Some(self.subscriptions.iter().rev().filter(|subscription|
-            subscription.page_id == page_id && subscription.patterns.iter().any(|(pattern, kind)|
-                kind.as_deref().is_none_or(|kind| kind == resource_type)
-                    && obscura_browser::url_matches_cdp_pattern(pattern, url)))
-            .map(|subscription| subscription.session_id.clone()).collect())
+        matching_subscribers(&self.subscriptions, self.configured, page_id, url, resource_type)
+    }
+
+    pub(crate) fn subscription_snapshot(&self) -> FetchSubscriptionSnapshot {
+        FetchSubscriptionSnapshot { subscriptions: self.subscriptions.clone(), configured: self.configured }
     }
 
     pub(crate) fn remove_session(&mut self, session_id: &Option<String>) {
