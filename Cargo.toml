@@ -50,7 +50,7 @@ tokio-tungstenite = "0.26"
 reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "socks"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-url = "2"
+url = "2.5.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }

@@ -23653,6 +23653,24 @@ mod tests {
     }
 
     #[test]
+    fn url_blob_origins_follow_inner_scheme_rules() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let origins = rt.evaluate(r#"[
+            'blob:https://example.test:8443/id',
+            'blob:http://example.test/id',
+            'blob:blob:https://example.test/id',
+            'blob:ws://example.test/id',
+            'blob:wss://example.test/id',
+            'blob:ftp://example.test/id',
+            'blob:file:///tmp/id',
+        ].map(value => new URL(value).origin)"#).unwrap();
+        assert_eq!(origins, serde_json::json!([
+            "https://example.test:8443", "http://example.test",
+            "null", "null", "null", "null", "null"
+        ]));
+    }
+
+    #[test]
     fn test_url_relative_resolution() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
