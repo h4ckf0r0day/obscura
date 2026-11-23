@@ -90,6 +90,7 @@ impl CookieJar {
         let mut secure = false;
         let mut http_only = false;
         let mut expires: Option<u64> = None;
+        let mut max_age: Option<u64> = None;
         let mut same_site = "Lax".to_string();
 
         if parts.len() > 1 {
@@ -111,13 +112,13 @@ impl CookieJar {
                         "max-age" => {
                             if let Ok(secs) = val.trim().parse::<i64>() {
                                 if secs <= 0 {
-                                    expires = Some(0);
+                                    max_age = Some(0);
                                 } else {
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs();
-                                    expires = Some(now + secs as u64);
+                                    max_age = Some(now + secs as u64);
                                 }
                             }
                         }
@@ -139,6 +140,8 @@ impl CookieJar {
         // Validate Domain against the response origin (RFC 6265): an unrelated
         // or public-suffix Domain rejects the cookie so a response from attacker.test
         // cannot scope a cookie to victim.test (GHSA-f22c-8v6q-v6h6).
+        // RFC 6265 5.3 step 3: Max-Age wins over Expires regardless of order.
+        let expires = max_age.or(expires);
         if !cookie_prefix_allows(&name, secure, domain_attr.is_some(), path_attr) {
             return;
         }
@@ -416,6 +419,7 @@ impl CookieJar {
         let mut path_attr: Option<&str> = None;
         let mut secure = false;
         let mut expires: Option<u64> = None;
+        let mut max_age: Option<u64> = None;
         let mut same_site = "Lax".to_string();
 
         if parts.len() > 1 {
@@ -437,13 +441,13 @@ impl CookieJar {
                         "max-age" => {
                             if let Ok(secs) = val.trim().parse::<i64>() {
                                 if secs <= 0 {
-                                    expires = Some(0);
+                                    max_age = Some(0);
                                 } else {
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs();
-                                    expires = Some(now + secs as u64);
+                                    max_age = Some(now + secs as u64);
                                 }
                             }
                         }
@@ -461,6 +465,8 @@ impl CookieJar {
             }
         }
 
+        // RFC 6265 5.3 step 3: Max-Age wins over Expires regardless of order.
+        let expires = max_age.or(expires);
         if !cookie_prefix_allows(&name, secure, domain_attr.is_some(), path_attr) {
             return;
         }
@@ -1149,6 +1155,38 @@ mod tests {
 
         jar.set_cookie("session=abc; Max-Age=0", &url);
         assert!(jar.get_cookie_header_same_site(&url).is_empty());
+    }
+
+    #[test]
+    fn max_age_takes_precedence_over_expires_in_any_order() {
+        // RFC 6265 5.3 step 3: when Max-Age is present it decides the expiry,
+        // whichever order the two attributes appear in.
+        let url = Url::parse("https://example.com/").unwrap();
+        let past = "Thu, 01 Jan 2015 00:00:00 GMT";
+        let future = "Fri, 01 Jan 2100 00:00:00 GMT";
+
+        let jar = CookieJar::new();
+        jar.set_cookie(&format!("sid=abc; Max-Age=3600; Expires={past}"), &url);
+        assert_eq!(jar.get_cookie_header_same_site(&url), "sid=abc");
+        jar.set_cookie(&format!("sid=abc; Max-Age=0; Expires={future}"), &url);
+        assert!(jar.get_cookie_header_same_site(&url).is_empty());
+
+        let jar = CookieJar::new();
+        jar.set_cookie_from_js(&format!("sid=abc; Max-Age=3600; Expires={past}"), &url);
+        assert_eq!(jar.get_js_visible_cookies(&url), "sid=abc");
+        jar.set_cookie_from_js(&format!("sid=abc; Max-Age=0; Expires={future}"), &url);
+        assert!(jar.get_js_visible_cookies(&url).is_empty());
+    }
+
+    #[test]
+    fn invalid_max_age_falls_back_to_expires() {
+        // A Max-Age that is not an integer is ignored, so Expires still applies.
+        let url = Url::parse("https://example.com/").unwrap();
+        let jar = CookieJar::new();
+        jar.set_cookie("sid=abc; Max-Age=soon; Expires=Thu, 01 Jan 2015 00:00:00 GMT", &url);
+        assert!(jar.get_cookie_header_same_site(&url).is_empty());
+        jar.set_cookie("sid=abc; Expires=Fri, 01 Jan 2100 00:00:00 GMT; Max-Age=soon", &url);
+        assert_eq!(jar.get_cookie_header_same_site(&url), "sid=abc");
     }
 
     #[test]
