@@ -185,13 +185,30 @@ fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
 }
 
 fn path_matches(path: &str, pattern: &str) -> bool {
-    if pattern.ends_with('*') {
-        path.starts_with(&pattern[..pattern.len() - 1])
-    } else if pattern.ends_with('$') {
-        path == &pattern[..pattern.len() - 1]
-    } else {
-        path.starts_with(pattern)
+    // RFC 9309 2.2.3: '*' matches any sequence of characters anywhere in the
+    // pattern, and a trailing '$' anchors it to the end of the path.
+    let (pattern, anchored) = match pattern.strip_suffix('$') {
+        Some(rest) => (rest, true),
+        None => (pattern, false),
+    };
+    let mut parts = pattern.split('*');
+    let Some(mut rest) = path.strip_prefix(parts.next().unwrap_or("")) else {
+        return false;
+    };
+    let tail: Vec<&str> = parts.collect();
+    for (i, part) in tail.iter().enumerate() {
+        // The last literal of an anchored pattern must sit at the very end.
+        if anchored && i + 1 == tail.len() {
+            return rest.ends_with(part);
+        }
+        // Earliest match leaves the most room for the remaining literals, so
+        // no backtracking is needed.
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
     }
+    !anchored || rest.is_empty()
 }
 
 #[cfg(test)]
@@ -248,6 +265,43 @@ mod tests {
         assert!(cache.is_allowed("paths.test", "/p"));
         assert!(!cache.is_allowed("paths.test", "/p/private/x"));
         assert!(cache.is_allowed("paths.test", "/tie"));
+    }
+
+    #[test]
+    fn wildcards_match_anywhere_in_the_pattern() {
+        // RFC 9309 2.2.3: '*' matches any sequence of characters, not only at
+        // the end, and a trailing '$' anchors the pattern to the end of the path.
+        let body = "User-agent: *\nDisallow: /*/pulse\nDisallow: /*.pdf$\nDisallow: /fish*\nDisallow: /$\nAllow: /*/pulse/ok\n";
+        let cache = RobotsCache::new();
+        cache.parse_and_store("glob.test", body, "Obscura");
+        assert!(!cache.is_allowed("glob.test", "/owner/repo/pulse"));
+        assert!(!cache.is_allowed("glob.test", "/docs/report.pdf"));
+        assert!(cache.is_allowed("glob.test", "/docs/report.pdf.html"));
+        assert!(!cache.is_allowed("glob.test", "/fish/salmon"));
+        assert!(!cache.is_allowed("glob.test", "/"));
+        assert!(cache.is_allowed("glob.test", "/owner/repo"));
+        assert!(cache.is_allowed("glob.test", "/owner/repo/pulse/ok"));
+    }
+
+    #[test]
+    fn path_matches_handles_every_wildcard_position() {
+        assert!(path_matches("/o/r/pulse", "/*/pulse"));
+        assert!(!path_matches("/o/r/pull", "/*/pulse"));
+        assert!(path_matches("/a/b.pdf", "/*.pdf$"));
+        assert!(!path_matches("/a/b.pdf.bak", "/*.pdf$"));
+        assert!(path_matches("/a/b/c", "/a/*/c"));
+        assert!(path_matches("/a/x/y/c/d", "/a/*/c"));
+        assert!(path_matches("/fish", "/fish*"));
+        assert!(path_matches("/fishing", "/fish"));
+        assert!(path_matches("/fish", "/fish$"));
+        assert!(!path_matches("/fishing", "/fish$"));
+        assert!(path_matches("/", "/$"));
+        assert!(!path_matches("/a", "/$"));
+        assert!(path_matches("/anything", "*"));
+        assert!(path_matches("/fish.php", "/*$"));
+        assert!(path_matches("/x.php", "/*.php*"));
+        assert!(!path_matches("/a", "/a*b$"));
+        assert!(path_matches("/abab", "/a*b$"));
     }
 
     #[test]
