@@ -1097,6 +1097,7 @@ pub fn emit_navigation_events(
         let idle_ts = timestamp();
         lifecycle_timestamps[3] = Some(idle_ts);
         lifecycle_timestamps[4] = Some(idle_ts);
+        phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkAlmostIdle", "timestamp": idle_ts}), session_id: es.clone() });
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
     phase3.push(CdpEvent {
@@ -1509,6 +1510,7 @@ pub async fn handle(
                     CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
                     CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
                     CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkAlmostIdle", "timestamp": ts}), session_id: es.clone() },
                     CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() },
                     CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id, "timestamp": ts}), session_id: es },
                 ];
