@@ -2538,7 +2538,7 @@ impl ObscuraJsRuntime {
                         profile,
                         image_request_generation,
                         is_font,
-                        network_event,
+                        network_event: network_event.map(Box::new),
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
                             status: response.status,
@@ -2653,7 +2653,7 @@ impl ObscuraJsRuntime {
             ));
             let intercepted = load.network_event.is_some();
             if let Some(event) = load.network_event {
-                crate::ops::record_network_completion(&mut self.state.borrow_mut(), event, |_| {
+                crate::ops::record_network_completion(&mut self.state.borrow_mut(), *event, |_| {
                     match &load.response {
                         Some(response) => crate::ops::CachedNetworkResponseBody::raw(&response.body, response.headers.get("content-type").map(String::as_str)),
                         None => crate::ops::CachedNetworkResponseBody::raw(&[], None),

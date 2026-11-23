@@ -2119,7 +2119,7 @@ pub struct RenderResourceLoad {
     /// Final URL, status, headers and body of the response; `None` when the
     /// request failed or was blocked.
     pub response: Option<RenderResourceResponse>,
-    pub network_event: Option<JsNetworkEvent>,
+    pub network_event: Option<Box<JsNetworkEvent>>,
 }
 
 #[cfg(feature = "render")]
