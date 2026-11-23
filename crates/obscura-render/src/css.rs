@@ -6216,12 +6216,30 @@ fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
             };
             buffer.push(c);
             if c == '\\' {
-                if let Some(escaped) = chars.next() {
+                if let Some(mut escaped) = chars.next() {
                     buffer.push(escaped);
+                    if escaped.is_ascii_hexdigit() {
+                        for _ in 0..5 {
+                            match chars.next_if(|c| c.is_ascii_hexdigit()) {
+                                Some(hex) => buffer.push(hex),
+                                None => break,
+                            }
+                        }
+                        // Hex escapes consume one optional CSS whitespace character.
+                        if let Some(space) = chars.next_if(|c| matches!(*c, ' ' | '\t' | '\n' | '\r' | '\u{c}')) {
+                            buffer.push(space);
+                            escaped = space;
+                        }
+                    }
+                    // CSS treats CRLF as one newline, including in a string continuation.
+                    if escaped == '\r' && chars.peek() == Some(&'\n') {
+                        buffer.push('\n');
+                        chars.next();
+                    }
                 }
             } else if quote.is_none() {
                 quote = Some(c);
-            } else if Some(c) == quote || c == '\n' {
+            } else if Some(c) == quote || matches!(c, '\n' | '\r' | '\u{c}') {
                 quote = None;
             }
             continue;
@@ -7397,7 +7415,7 @@ fn denest(
                 while j < n && depth > 0 {
                     let cj = chars[j];
                     if !cm2 && cj == '\\' {
-                        j += 2;
+                        j = (j + 2).min(n);
                         continue;
                     }
                     if cm2 {
@@ -9476,6 +9494,47 @@ mod tests {
         assert!(decls(".f").contains("color:blue"));
         assert!(decls(".h").contains("color:green"));
         assert!(decls(".j").contains("color:black"));
+    }
+
+    #[test]
+    fn stylesheet_scanner_keeps_rules_after_malformed_nested_escape() {
+        let rules = parse_stylesheet(".a{.b{content:\"\n} \\ }.after{color:blue}");
+        assert!(rules.iter().any(|(sel, decls)| sel == ".after" && decls == "color:blue;"));
+    }
+
+    #[test]
+    fn stylesheet_scanner_keeps_css_string_line_continuations() {
+        for newline in ["\n", "\r", "\u{c}", "\r\n"] {
+            let css = format!(".a{{content:\"a\\{newline}b\";color:red}}.after{{color:blue}}");
+            let rules = parse_stylesheet(&css);
+            assert_eq!(rules.len(), 2, "newline {newline:?}: {rules:?}");
+            assert_eq!(rules[0].0, ".a");
+            assert!(rules[0].1.contains("color:red;"));
+            assert_eq!(rules[1], (".after".to_string(), "color:blue;".to_string()));
+        }
+    }
+
+    #[test]
+    fn stylesheet_scanner_recovers_bad_strings_at_css_newlines() {
+        for newline in ["\n", "\r", "\u{c}", "\r\n"] {
+            let css = format!(".a{{content:\"bad{newline}}}.after{{color:blue}}");
+            let rules = parse_stylesheet(&css);
+            assert!(rules.iter().any(|(sel, decls)| sel == ".after" && decls == "color:blue;"),
+                "newline {newline:?}: {rules:?}");
+        }
+    }
+
+    #[test]
+    fn stylesheet_scanner_keeps_hex_escape_newline_terminators() {
+        for escape in ["\\4", "\\41", "\\000041"] {
+            for newline in ["\n", "\r", "\u{c}", "\r\n"] {
+                let css = format!(".a{{content:\"a{escape}{newline}b\";color:red}}.after{{color:blue}}");
+                let rules = parse_stylesheet(&css);
+                assert_eq!(rules.len(), 2, "escape {escape:?}, newline {newline:?}: {rules:?}");
+                assert_eq!(rules[0].1, format!("content:\"a{escape}{newline}b\";color:red;"));
+                assert_eq!(rules[1], (".after".to_string(), "color:blue;".to_string()));
+            }
+        }
     }
 
     #[test]
