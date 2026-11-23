@@ -191,14 +191,13 @@ fn path_matches(path: &str, pattern: &str) -> bool {
         Some(rest) => (rest, true),
         None => (pattern, false),
     };
-    let mut parts = pattern.split('*');
+    let mut parts = pattern.split('*').peekable();
     let Some(mut rest) = path.strip_prefix(parts.next().unwrap_or("")) else {
         return false;
     };
-    let tail: Vec<&str> = parts.collect();
-    for (i, part) in tail.iter().enumerate() {
+    while let Some(part) = parts.next() {
         // The last literal of an anchored pattern must sit at the very end.
-        if anchored && i + 1 == tail.len() {
+        if anchored && parts.peek().is_none() {
             return rest.ends_with(part);
         }
         // Earliest match leaves the most room for the remaining literals, so

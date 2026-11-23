@@ -3802,7 +3802,7 @@ impl Page {
                     );
                 }
 
-                if !self.context.robots_cache.is_allowed(&origin, url.path()) {
+                if !self.context.robots_cache.is_allowed(&origin, &url[url::Position::BeforePath..url::Position::AfterQuery]) {
                     self.lifecycle = LifecycleState::Failed;
                     return Err(PageError::NetworkError(format!(
                         "Blocked by robots.txt: {}",
