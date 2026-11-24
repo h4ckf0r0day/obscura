@@ -12,4 +12,5 @@ pub mod page;
 pub mod pdf;
 pub mod runtime;
 pub mod storage;
+pub mod systeminfo;
 pub mod target;
