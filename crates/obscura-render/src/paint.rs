@@ -6,7 +6,8 @@
 //! dependencies, so a screenshot is reproducible across hosts.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use obscura_dom::tree::DomTree;
+use obscura_dom::tree::{DomTree, NodeId};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tiny_skia::{
@@ -34,6 +35,7 @@ const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// intrinsic geometry before that cascade instead of always laying out twice.
 const DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES: usize = 256;
 const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+const MAX_HTML_IMAGE_REQUESTS: usize = 16 * 1024;
 /// Exact formats the renderer can decode. Do not use `image/*` or `*/*` here:
 /// either wildcard permits a content-negotiating server to choose AVIF,
 /// JPEG-XL, or another format that this build cannot rasterize.
@@ -157,6 +159,116 @@ struct CachedRasterPaint {
     raster: Arc<Pixmap>,
 }
 
+// A failure belongs to an element's current request, not every future use
+// of its URL. Pending cohorts also cover elements sharing one transport load.
+#[derive(Default)]
+struct HtmlImageRequests {
+    // Request key, failure state, arena allocation identity, attempt generation.
+    nodes: HashMap<NodeId, (Arc<str>, bool, u64, Option<u64>)>,
+    cohorts: HashMap<Arc<str>, HtmlImageCohort>,
+    next_generation: u64,
+}
+
+#[derive(Default)]
+struct HtmlImageCohort {
+    // Terminal members remain indexed while another transport of their own
+    // attempt may finish. Every indexed member also occupies one bounded node record.
+    attempts: HashMap<u64, HashSet<NodeId>>,
+    count: usize,
+    pending: Option<u64>,
+    started: bool,
+}
+
+impl HtmlImageRequests {
+    fn forget(&mut self, node: NodeId) {
+        let Some((key, _, _, generation)) = self.nodes.remove(&node) else { return; };
+        let empty = self.cohorts.get_mut(key.as_ref()).is_some_and(|cohort| {
+            if let Some(generation) = generation {
+                let empty = cohort.attempts.get_mut(&generation).is_some_and(|members| {
+                    members.remove(&node);
+                    if members.len() < members.capacity() / 4 { members.shrink_to_fit(); }
+                    members.is_empty()
+                });
+                if empty {
+                    cohort.attempts.remove(&generation);
+                    if cohort.attempts.len() < cohort.attempts.capacity() / 4 { cohort.attempts.shrink_to_fit(); }
+                    if cohort.pending == Some(generation) { cohort.pending = None; cohort.started = false; }
+                }
+            }
+            cohort.count -= 1;
+            cohort.count == 0
+        });
+        if empty { self.cohorts.remove(key.as_ref()); }
+    }
+
+    fn observe(&mut self, node: NodeId, key: &str, failed: bool, allocation: u64) {
+        if let Some((old, state, identity, _)) = self.nodes.get_mut(&node) {
+            if old.as_ref() == key && *identity == allocation {
+                if *state == failed { return; }
+                if failed { *state = true; return; }
+            }
+        }
+        self.forget(node);
+        // Keep established attempts stable. Untracked excess elements retain
+        // the ordinary bounded byte cache's retry behavior.
+        if self.nodes.len() >= MAX_HTML_IMAGE_REQUESTS { return; }
+        let key = self.cohorts.get_key_value(key)
+            .map(|(key, _)| Arc::clone(key)).unwrap_or_else(|| Arc::from(key));
+        let cohort = self.cohorts.entry(Arc::clone(&key)).or_default();
+        cohort.count += 1;
+        let generation = if failed { None } else {
+            if cohort.pending.is_none() {
+                self.next_generation = self.next_generation.wrapping_add(1).max(1);
+                cohort.pending = Some(self.next_generation);
+            }
+            let generation = cohort.pending.unwrap();
+            cohort.attempts.entry(generation).or_default().insert(node);
+            Some(generation)
+        };
+        self.nodes.insert(node, (key, failed, allocation, generation));
+    }
+
+    fn complete(&mut self, key: &str, expected: Option<u64>, failed: bool) {
+        let Some(generation) = expected else { return; };
+        let Some(cohort) = self.cohorts.get_mut(key) else { return; };
+        let Some(mut members) = cohort.attempts.remove(&generation) else { return; };
+        for node in &members {
+            if failed {
+                if let Some((_, state, _, _)) = self.nodes.get_mut(node) { *state = true; }
+            } else if self.nodes.remove(node).is_some() {
+                cohort.count -= 1;
+            }
+        }
+        if cohort.pending == Some(generation) { cohort.pending = None; cohort.started = false; }
+        if failed {
+            // Keep only this attempt's members, not historical table capacity.
+            members.shrink_to_fit();
+            cohort.attempts.insert(generation, members);
+        }
+        if cohort.attempts.len() < cohort.attempts.capacity() / 4 { cohort.attempts.shrink_to_fit(); }
+        if cohort.count == 0 { self.cohorts.remove(key); }
+    }
+
+    fn observe_success(&mut self, node: NodeId) {
+        // Bytes from another consumer may become visible while this attempt's
+        // own transport is still running. Keep its completion membership.
+        let active = self.nodes.get(&node).is_some_and(|(key, _, _, generation)| {
+            self.cohorts.get(key.as_ref()).is_some_and(|cohort| cohort.started && cohort.pending == *generation)
+        });
+        if !active { self.forget(node); }
+    }
+
+    fn begin(&mut self, key: &str) -> Option<u64> {
+        let cohort = self.cohorts.get_mut(key)?;
+        if cohort.pending.is_some() { cohort.started = true; }
+        cohort.pending
+    }
+
+    fn generation(&self, key: &str) -> Option<u64> {
+        self.cohorts.get(key).and_then(|cohort| cohort.pending)
+    }
+}
+
 /// Page-scoped raw resource bytes shared by layout preparation and repeated
 /// paints. Entries are FIFO-bounded by both count and retained byte size.
 /// Successful bytes use `Arc` so consumers never clone an image/font body.
@@ -182,6 +294,8 @@ pub struct RenderResourceCache {
     /// Deduplicated so repeated layouts do not grow the list.
     sync_misses: Vec<(String, Option<ImageRequestProfile>, bool)>,
     sync_miss_keys: HashSet<String>,
+    document_scoped: bool,
+    html_image_requests: RefCell<HtmlImageRequests>,
     loader: Box<dyn RenderResourceLoader>,
 }
 
@@ -226,6 +340,8 @@ impl RenderResourceCache {
             sync_loading_enabled: true,
             sync_misses: Vec::new(),
             sync_miss_keys: HashSet::new(),
+            document_scoped: false,
+            html_image_requests: RefCell::new(HtmlImageRequests::default()),
             loader: Box::new(loader),
         }
     }
@@ -243,6 +359,86 @@ impl RenderResourceCache {
     /// the page transport instead.
     pub fn sync_loading_enabled(&self) -> bool {
         self.sync_loading_enabled
+    }
+
+    /// Retain failed HTML image attempts for this document. Generic resource
+    /// failures keep their normal retry window.
+    pub fn set_document_scoped(&mut self, enabled: bool) {
+        self.document_scoped = enabled;
+        if !enabled { *self.html_image_requests.get_mut() = HtmlImageRequests::default(); }
+    }
+
+    pub fn forget_html_image_request(&self, node: NodeId) {
+        self.html_image_requests.borrow_mut().forget(node);
+    }
+
+    /// An explicit source assignment may retry a failed attempt without
+    /// discarding successful bytes or changing another element's failure.
+    pub fn retry_html_image_request(&mut self, node: NodeId, url: &str, profile: ImageRequestProfile) {
+        self.html_image_requests.get_mut().forget(node);
+        let key = image_resource_key(url, profile);
+        if matches!(self.entries.get(&key), Some(CachedResource::Missing(_))) {
+            self.remove(&key);
+        }
+    }
+
+    fn failed_html_image(&self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile) -> bool {
+        if !self.document_scoped { return false; }
+        let mut requests = self.html_image_requests.borrow_mut();
+        let Some((key, failed, allocation, _)) = requests.nodes.get(&node) else { return false; };
+        if tree.node_allocation_generation(node) != Some(*allocation) {
+            requests.forget(node);
+            return false;
+        }
+        *failed && key.as_ref() == image_resource_key(url, profile)
+    }
+
+    fn observe_html_image(&self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile, outcome: Option<bool>) {
+        if !self.document_scoped { return; }
+        let mut requests = self.html_image_requests.borrow_mut();
+        if url.starts_with("data:") {
+            requests.forget(node);
+            return;
+        }
+        if outcome == Some(true) {
+            requests.observe_success(node);
+        } else {
+            if let Some(allocation) = tree.node_allocation_generation(node) {
+                requests.observe(node, &image_resource_key(url, profile), outcome == Some(false), allocation);
+            }
+        }
+    }
+
+    fn html_image_intrinsic(&mut self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile) -> Option<crate::ReplacedIntrinsic> {
+        if self.failed_html_image(tree, node, url, profile) { return None; }
+        if self.document_scoped && !url.starts_with("data:") {
+            // Keep the ordinary image loader's scheme/resolution gate before
+            // consulting retained bytes or registering a transport attempt.
+            resolve_resource_url(url, None)?;
+            // A new logical image may retry a different element's failure,
+            // including before the generic negative-cache window expires.
+            let key = image_resource_key(url, profile);
+            if let Some(entry @ CachedResource::Bytes { .. }) = self.entries.get(&key) {
+                let intrinsic = entry.image_intrinsic();
+                self.observe_html_image(tree, node, url, profile, Some(intrinsic.is_some()));
+                return intrinsic;
+            }
+            self.observe_html_image(tree, node, url, profile, None);
+            if self.html_image_requests.borrow().nodes.contains_key(&node)
+                && matches!(self.entries.get(&key), Some(CachedResource::Missing(_))) {
+                self.remove(&key);
+            }
+        }
+        let intrinsic = self.profiled_image_intrinsic(url, profile);
+        let outcome = if intrinsic.is_some() { Some(true) } else {
+            let key = image_resource_key(url, profile);
+            match self.entries.get(&key) {
+                Some(CachedResource::Bytes { .. } | CachedResource::Missing(_)) => Some(false),
+                _ => self.stopped.contains(&key).then_some(false),
+            }
+        };
+        self.observe_html_image(tree, node, url, profile, outcome);
+        intrinsic
     }
 
     /// Take the resources that cache-only layout or paint asked for and did
@@ -308,24 +504,56 @@ impl RenderResourceCache {
     }
 
     pub fn has_live_image_outcome(&self, url: &str, profile: ImageRequestProfile) -> bool {
-        self.has_live_outcome(&image_resource_key(url, profile))
+        let key = image_resource_key(url, profile);
+        if matches!(self.entries.get(&key), Some(CachedResource::Missing(_)))
+            && self.html_image_requests.borrow().generation(&key).is_some() { return false; }
+        self.has_live_outcome(&key)
+    }
+
+    /// Cohort identity captured when transport starts, not when it finishes.
+    pub fn html_image_request_generation(&self, url: &str, profile: ImageRequestProfile) -> Option<u64> {
+        if !self.document_scoped { return None; }
+        self.html_image_requests.borrow().generation(&image_resource_key(url, profile))
+    }
+
+    pub fn begin_html_image_request(&self, url: &str, profile: ImageRequestProfile) -> Option<u64> {
+        if !self.document_scoped { return None; }
+        self.html_image_requests.borrow_mut().begin(&image_resource_key(url, profile))
     }
 
     pub fn seed_image(&mut self, url: String, profile: ImageRequestProfile, bytes: Vec<u8>) {
-        self.seed_shared(image_resource_key(&url, profile), Arc::from(bytes));
+        self.seed_image_shared(url, profile, Arc::from(bytes));
     }
 
-    pub fn seed_image_shared(
-        &mut self,
-        url: String,
-        profile: ImageRequestProfile,
-        bytes: Arc<[u8]>,
+    pub fn seed_image_shared(&mut self, url: String, profile: ImageRequestProfile, bytes: Arc<[u8]>) {
+        let generation = self.html_image_request_generation(&url, profile);
+        self.seed_image_shared_for_request(url, profile, bytes, generation);
+    }
+
+    pub fn seed_image_shared_for_request(
+        &mut self, url: String, profile: ImageRequestProfile, bytes: Arc<[u8]>, generation: Option<u64>,
     ) {
-        self.seed_shared(image_resource_key(&url, profile), bytes);
+        let key = image_resource_key(&url, profile);
+        if generation.is_none() { self.seed_shared(key, bytes); return; }
+        let intrinsic = generation.map(|_| image_intrinsic_metadata(&bytes));
+        if let Some(intrinsic) = intrinsic {
+            self.html_image_requests.get_mut().complete(&key, generation, intrinsic.is_none());
+        }
+        self.seed_shared(key.clone(), bytes);
+        if let (Some(intrinsic), Some(CachedResource::Bytes { intrinsic: cached, .. })) = (intrinsic, self.entries.get(&key)) {
+            let _ = cached.set(intrinsic);
+        }
     }
 
     pub fn seed_image_missing(&mut self, url: String, profile: ImageRequestProfile) {
-        self.seed_missing(image_resource_key(&url, profile));
+        let generation = self.html_image_request_generation(&url, profile);
+        self.seed_image_missing_for_request(url, profile, generation);
+    }
+
+    pub fn seed_image_missing_for_request(&mut self, url: String, profile: ImageRequestProfile, generation: Option<u64>) {
+        let key = image_resource_key(&url, profile);
+        self.html_image_requests.get_mut().complete(&key, generation, true);
+        self.seed_missing(key);
     }
 
     /// Seed bytes fetched by the owning page's asynchronous browser transport.
@@ -354,6 +582,8 @@ impl RenderResourceCache {
         };
         if self.has_cached_bytes(&key) { return; }
         self.remove(&key);
+        let generation = self.html_image_requests.get_mut().generation(&key);
+        self.html_image_requests.get_mut().complete(&key, generation, true);
         self.stopped.insert(key);
     }
 
@@ -455,7 +685,7 @@ impl RenderResourceCache {
         let (src, density) = resolve_img_url(tree, id, viewport)?;
         let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
         let profile = image_request_profile(tree, id);
-        let dimensions = self.profiled_image_intrinsic(&resolved_url, profile)
+        let dimensions = self.html_image_intrinsic(tree, id, &resolved_url, profile)
             .and_then(crate::ReplacedIntrinsic::natural_size)
             .map(|(width, height)| (width / density, height / density));
         Some((resolved_url, density, dimensions))
@@ -474,7 +704,20 @@ impl RenderResourceCache {
         let (src, density) = resolve_img_url(tree, id, viewport)?;
         let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
         let profile = image_request_profile(tree, id);
-        match self.cached_profiled_image_metadata(&resolved_url, None, profile) {
+        if self.failed_html_image(tree, id, &resolved_url, profile) {
+            return Some((resolved_url, density, true, None));
+        }
+        let mut metadata = self.cached_profiled_image_metadata(&resolved_url, None, profile);
+        let can_track = self.document_scoped && {
+            let requests = self.html_image_requests.borrow();
+            requests.nodes.contains_key(&id) || requests.nodes.len() < MAX_HTML_IMAGE_REQUESTS
+        };
+        if can_track && metadata == Some(None)
+            && matches!(self.entries.get(&image_resource_key(&resolved_url, profile)), Some(CachedResource::Missing(_))) {
+            metadata = None;
+        }
+        self.observe_html_image(tree, id, &resolved_url, profile, metadata.as_ref().map(Option::is_some));
+        match metadata {
             None => Some((resolved_url, density, false, None)),
             Some(dimensions) => Some((
                 resolved_url,
@@ -599,10 +842,20 @@ impl RenderResourceCache {
             .map(Arc::<[u8]>::from);
         match loaded {
             Some(bytes) => {
-                self.insert_bytes(key, Arc::clone(&bytes));
+                let generation = self.html_image_requests.get_mut().generation(&key);
+                let intrinsic = generation.map(|_| image_intrinsic_metadata(&bytes));
+                if let Some(intrinsic) = intrinsic {
+                    self.html_image_requests.get_mut().complete(&key, generation, intrinsic.is_none());
+                }
+                self.insert_bytes(key.clone(), Arc::clone(&bytes));
+                if let (Some(intrinsic), Some(CachedResource::Bytes { intrinsic: cached, .. })) = (intrinsic, self.entries.get(&key)) {
+                    let _ = cached.set(intrinsic);
+                }
                 Some(bytes)
             }
             None => {
+                let generation = self.html_image_requests.get_mut().generation(&key);
+                self.html_image_requests.get_mut().complete(&key, generation, true);
                 self.insert_missing(key);
                 None
             }
@@ -1754,6 +2007,132 @@ impl PreparedRender {
         id: obscura_dom::tree::NodeId,
     ) -> Option<HashMap<&'static str, String>> {
         Some(non_geometric_computed_style(self.layout.styles.get(&id)?))
+    }
+
+    /// CSSOM insets use containing-block distances, before transforms and
+    /// scrolling. Keep this separate from size/observer snapshots, which do
+    /// not need to find a positioned element's containing block.
+    pub fn resolved_insets(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<[String; 4]> {
+        let style = self.layout.styles.get(&id)?;
+        let computed = std::array::from_fn(|index| {
+            style.inset_expressions[index].as_ref().filter(|value| value.contains('%'))
+                .cloned().unwrap_or_else(|| {
+                dimension_css(style.inset[index].unwrap_or_default(), "auto")
+            })
+        });
+        let rect = self.layout.rects.get(&id);
+        if style.position.is_none() || style.display == crate::Display::None
+            || style.display_contents || rect.is_none()
+        {
+            return Some(computed);
+        }
+        let rect = rect.unwrap();
+        let absolute = style.position == Some(taffy::Position::Absolute);
+        let inline = style.ignores_used_box_sizes();
+        let percentage: [bool; 4] = std::array::from_fn(|index| {
+            matches!(style.inset[index], Some(crate::Dimension::Percent(_)))
+                || style.inset_expressions[index].as_ref().is_some_and(|value| value.contains('%'))
+        });
+        let mut containing = crate::Rect {
+            x: 0.0, y: 0.0, width: self.viewport.0, height: self.viewport.1,
+        };
+        let needs_containing = (!inline && percentage.iter().any(|value| *value))
+            || (absolute && style.inset.iter()
+                .any(|value| matches!(value, None | Some(crate::Dimension::Auto))));
+        let sticky_container = style.position_sticky.then(|| {
+            self.scroll_tree.movement_owner.get(id.index()).copied().flatten()
+                .map(|owner| &self.scroll_tree.containers[owner.index()])
+        }).flatten();
+        if needs_containing {
+            if let Some(container) = sticky_container.filter(|container| {
+                container.node.is_some() || !(percentage[1] || percentage[3])
+            }) {
+                let padding = container.node.and_then(|node| self.layout.styles.get(&node))
+                    .map_or_else(crate::Edges::default, |style| style.padding);
+                containing.width = (container.client_size.0 - padding.left - padding.right).max(0.0);
+                containing.height = (container.client_size.1 - padding.top - padding.bottom).max(0.0);
+            } else {
+                let mut ancestor = Some(id);
+                for _ in 0..=tree.len() {
+                    let Some(parent) = ancestor else { break; };
+                    ancestor = crate::dom::rendered_parent(tree, parent);
+                    let Some(parent_style) = self.layout.styles.get(&parent) else { continue; };
+                    if ancestor == Some(tree.document()) {
+                        containing = crate::dom::initial_containing_block(
+                            self.viewport, parent_style.scrollbar_gutters);
+                    }
+                    if parent == id || style.position_sticky || parent_style.display_contents { continue; }
+                    let is_containing = if absolute {
+                        parent_style.establishes_positioning_containing_block()
+                            || (!style.position_fixed && parent_style.position.is_some())
+                    } else {
+                        !parent_style.ignores_used_box_sizes()
+                    };
+                    if !is_containing { continue; }
+                    let Some(parent_rect) = self.layout.rects.get(&parent) else { continue; };
+                    containing = crate::Rect {
+                        x: parent_rect.x + parent_style.border.left,
+                        y: parent_rect.y + parent_style.border.top,
+                        width: (parent_rect.width - parent_style.border.left
+                            - parent_style.border.right).max(0.0),
+                        height: (parent_rect.height - parent_style.border.top
+                            - parent_style.border.bottom).max(0.0),
+                    };
+                    if !absolute {
+                        containing.width = (containing.width - parent_style.padding.left
+                            - parent_style.padding.right).max(0.0);
+                        containing.height = (containing.height - parent_style.padding.top
+                            - parent_style.padding.bottom).max(0.0);
+                    }
+                    break;
+                }
+            }
+        }
+        let values: [Option<f32>; 4] = std::array::from_fn(|index| {
+            if inline && percentage[index] { return None; }
+            let basis = if index % 2 == 0 { containing.height } else { containing.width };
+            if let Some(expression) = style.inset_expressions[index].as_deref() {
+                return crate::style::resolve_contextual_length(expression,
+                    style.font_size.unwrap_or(16.0), self.root_font_size,
+                    self.viewport.0 / 100.0, self.viewport.1 / 100.0, basis);
+            }
+            match style.inset[index] {
+                Some(crate::Dimension::Px(value)) => Some(value),
+                Some(crate::Dimension::Percent(value)) => Some(value * basis),
+                _ => None,
+            }
+        });
+        Some(std::array::from_fn(|index| {
+            let opposite = (index + 2) % 4;
+            // Ordinary inline boxes retain unresolved percentages and their
+            // opposing auto sides, but pixel offsets still have used values.
+            if inline && (percentage[index] || percentage[opposite]) {
+                return computed[index].clone();
+            }
+            if let Some(value) = values[index] { return css_px(value); }
+            if style.position_sticky { return computed[index].clone(); }
+            if !absolute { return css_px(-values[opposite].unwrap_or(0.0)); }
+            let (size, box_size, start_margin, end_margin) = if index % 2 == 0 {
+                (containing.height, rect.height, style.margin.top, style.margin.bottom)
+            } else {
+                (containing.width, rect.width, style.margin.left, style.margin.right)
+            };
+            let value = if let Some(other) = values[opposite] {
+                size - other - box_size - start_margin - end_margin
+            } else {
+                match index {
+                    0 => rect.y - containing.y - style.margin.top,
+                    1 => containing.x + size - rect.x - box_size - style.margin.right,
+                    2 => containing.y + size - rect.y - box_size - style.margin.bottom,
+                    _ => rect.x - containing.x - style.margin.left,
+                }
+            };
+            css_px(value)
+        }))
     }
 
     /// A compact CSSOM snapshot derived from the same final cascade and
@@ -3032,7 +3411,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
                 let (url, density) = resolve_img_url(tree, id, viewport)?;
                 let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
                 let profile = image_request_profile(tree, id);
-                let mut intrinsic = resources.profiled_image_intrinsic(&resolved_url, profile)?;
+                let mut intrinsic = resources.html_image_intrinsic(tree, id, &resolved_url, profile)?;
                 intrinsic.width = intrinsic.width.map(|width| width / density);
                 intrinsic.height = intrinsic.height.map(|height| height / density);
                 // Identical density-adjusted metadata leaves every intrinsic
@@ -5038,7 +5417,10 @@ fn paint_laid_dom_scrolled(
                 // ancestor overflow clip: the raster must not paint past it (a
                 // half-scrolled carousel slide's image otherwise bleeds over
                 // the viewport edge).
-                let painted = paint_image(
+                let failed = name.local.as_ref() == "img"
+                    && style.content_image.is_none()
+                    && image_cache.failed_html_image(tree, nid, &source.resolved_url, source.profile);
+                let painted = !failed && paint_image(
                     &source.resolved_url,
                     None,
                     &rect,
@@ -5145,6 +5527,7 @@ fn paint_laid_dom_scrolled(
                     rect.width as u32,
                     rect.height as u32,
                     &svg_fonts,
+                    true,
                 ) {
                     let mut mask = element_clip_mask.cloned();
                     if has_radius {
@@ -5194,7 +5577,8 @@ fn paint_laid_dom_scrolled(
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
-                let mw = measure_text(&marker, fsize, false, style.font_family.as_deref());
+                let is_bold = crate::style::used_font_weight(style) >= 600;
+                let mw = measure_text(&marker, fsize, is_bold, style.font_family.as_deref());
                 let mx = rect.x + style.padding.left - mw - 6.0;
                 let my = rect.y + style.border.top + style.padding.top;
                 draw_text(
@@ -5204,7 +5588,7 @@ fn paint_laid_dom_scrolled(
                     my,
                     color,
                     fsize,
-                    false,
+                    is_bold,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     style.word_spacing.unwrap_or(0.0),
@@ -5421,6 +5805,30 @@ fn paint_laid_dom_scrolled(
                 .or_else(|| node.get_attribute("value"));
             let has_value = value.is_some_and(|v| !v.is_empty())
                 || (name.local.as_ref() == "textarea" && !tree.text_content(nid).is_empty());
+            let single_line = name.local.as_ref() == "input";
+            let text_x = rect.x + style.padding.left + style.border.left;
+            // Single-line editors clip horizontally to the content box, but
+            // glyph ink may use the vertical padding. Textareas use the
+            // padding box on both axes. Preserve the ancestor overflow clip.
+            let text_clip = crate::Rect {
+                x: rect.x + style.border.left + if single_line { style.padding.left } else { 0.0 },
+                y: rect.y + style.border.top,
+                width: (rect.width - style.border.left - style.border.right
+                    - if single_line { style.padding.left + style.padding.right } else { 0.0 }).max(0.0),
+                height: (rect.height - style.border.top - style.border.bottom).max(0.0),
+            }.intersect(&visible_rect).unwrap_or_default();
+            let text_y = |size| {
+                let font = FontRef::try_from_slice(crate::inline::bundled_font_bytes(
+                    style.font_family.as_deref(), crate::style::used_font_weight(style) >= 600)).unwrap();
+                let font_height = font.as_scaled(native_font_scale(&font, size)).height();
+                let line_height = if single_line {
+                    (rect.height - style.border.top - style.border.bottom
+                        - style.padding.top - style.padding.bottom).max(0.0)
+                } else {
+                    crate::inline::used_line_height(style)
+                };
+                rect.y + style.border.top + style.padding.top + (line_height - font_height) / 2.0
+            };
             // A text `<input>`'s value is not a DOM text node either, so it
             // needs painting from its live state, falling back to the attribute.
             // Without this the
@@ -5432,8 +5840,6 @@ fn paint_laid_dom_scrolled(
                 if let Some(value) = value {
                     if !value.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
-                        let text_x = rect.x + style.padding.left + style.border.left;
-                        let text_y = rect.y + style.padding.top + style.border.top;
                         let color = style.color.unwrap_or([0, 0, 0, 255]);
                         let masked;
                         let shown = if input_type
@@ -5449,14 +5855,14 @@ fn paint_laid_dom_scrolled(
                                 &mut pixmap,
                                 shown,
                                 text_x,
-                                text_y,
+                                text_y(fsize),
                                 color,
                                 fsize,
-                                false,
+                                crate::style::used_font_weight(style) >= 600,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
                                 style.word_spacing.unwrap_or(0.0),
-                                clip,
+                                Some(text_clip),
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -5468,8 +5874,6 @@ fn paint_laid_dom_scrolled(
                 if let Some(placeholder) = node.get_attribute("placeholder") {
                     if !placeholder.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
-                        let text_x = rect.x + style.padding.left + style.border.left;
-                        let text_y = rect.y + style.padding.top + style.border.top;
                         let placeholder_style = style.placeholder_pseudo.as_deref();
                         let mut color = placeholder_style
                             .and_then(|pseudo| pseudo.color)
@@ -5484,14 +5888,14 @@ fn paint_laid_dom_scrolled(
                                 &mut pixmap,
                                 placeholder,
                                 text_x,
-                                text_y,
+                                text_y(fsize),
                                 color,
                                 fsize,
-                                false,
+                                crate::style::used_font_weight(style) >= 600,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
                                 style.word_spacing.unwrap_or(0.0),
-                                clip,
+                                Some(text_clip),
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -7451,69 +7855,29 @@ fn paint_text_node(
     Some(())
 }
 
-fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
-    let Some(family) = family else {
-        return FONT_BYTES;
-    };
-    for token in family.split(',') {
-        let token = token
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_ascii_lowercase();
-        if token == "system-ui" || token == "ui-sans-serif" {
-            return SYSTEM_FONT_BYTES;
-        }
-        if token == "monospace"
-            || token.contains("mono")
-            || token.contains("courier")
-            || token.contains("consol")
-            || token == "menlo"
-            || token == "monaco"
-            || token == "code"
-        {
-            return MONO_FONT_BYTES;
-        }
-        if token == "serif"
-            || token == "georgia"
-            || token.contains("times")
-            || token == "cambria"
-            || token.contains("garamond")
-            || token.contains("liberation serif")
-            || token == "roman"
-        {
-            return SERIF_FONT_BYTES;
-        }
-        if token == "sans-serif"
-            || token.contains("sans")
-            || token == "arial"
-            || token == "helvetica"
-            || token == "helvetica neue"
-            || token == "-apple-system"
-            || token == "roboto"
-            || token == "segoe ui"
-            || token == "inter"
-            || token == "verdana"
-            || token == "tahoma"
-        {
-            return FONT_BYTES;
-        }
-    }
-    FONT_BYTES
+// CSS font-size is pixels per em; ab_glyph scales ascent minus descent.
+fn native_font_scale(font: &FontRef<'_>, size: f32) -> PxScale {
+    let size = font.units_per_em()
+        .map(|em| size * font.height_unscaled() / em)
+        .unwrap_or(size);
+    PxScale::from(size)
 }
 
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
-    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size);
-    let scaled_font = font.as_scaled(scale);
+    let font = FontRef::try_from_slice(crate::inline::bundled_font_bytes(family, is_bold)).unwrap();
+    let scaled_font = font.as_scaled(native_font_scale(&font, size));
     let mut width = 0.0;
+    let mut previous = None;
     for c in text.chars() {
         if c.is_control() {
             continue;
         }
-        width += scaled_font.h_advance(font.glyph_id(c));
-    }
-    if is_bold {
-        width += text.chars().filter(|c| !c.is_control()).count() as f32;
+        let glyph = font.glyph_id(c);
+        if let Some(previous) = previous {
+            width += scaled_font.kern(previous, glyph);
+        }
+        width += scaled_font.h_advance(glyph);
+        previous = Some(glyph);
     }
     width
 }
@@ -7540,8 +7904,8 @@ fn draw_text(
             return;
         }
     }
-    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size * raster_scale);
+    let font = FontRef::try_from_slice(crate::inline::bundled_font_bytes(family, is_bold)).unwrap();
+    let scale = native_font_scale(&font, size * raster_scale);
     let scaled_font = font.as_scaled(scale);
     let mut caret = ab_glyph::point(x * raster_scale, y * raster_scale + scaled_font.ascent());
 
@@ -7558,12 +7922,15 @@ fn draw_text(
     let pixels = pixmap.pixels_mut();
     let (r, g, b, a_full) = (color[0], color[1], color[2], color[3]);
 
+    let mut previous = None;
     for c in text.chars() {
         if c.is_control() {
             continue;
         }
         let glyph_id = font.glyph_id(c);
-        let id = glyph_id;
+        if let Some(previous) = previous {
+            caret.x += scaled_font.kern(previous, glyph_id);
+        }
         let glyph = glyph_id.with_scale_and_position(scale, caret);
         if let Some(outlined) = font.outline_glyph(glyph) {
             let bounds = outlined.px_bounds();
@@ -7582,67 +7949,48 @@ fn draw_text(
                 if px >= 0 && px < width && py >= 0 && py < height {
                     let alpha = (a_full as f32 * c) as u8;
                     if alpha > 0 {
-                        let mut px_indices = vec![(py * width + px) as usize];
-                        if is_bold {
-                            for dx in 1..raster_scale.ceil().max(1.0) as i32 {
-                                if px + dx < width {
-                                    px_indices.push((py * width + px + dx) as usize);
-                                }
-                            }
+                        let idx = (py * width + px) as usize;
+                        let mask_alpha = clip_mask
+                            .and_then(|mask| mask.data().get(idx))
+                            .copied()
+                            .unwrap_or(255) as u32;
+                        let alpha = alpha as u32 * mask_alpha / 255;
+                        if alpha == 0 {
+                            return;
                         }
-                        for idx in px_indices {
-                            let mask_alpha = clip_mask
-                                .and_then(|mask| mask.data().get(idx))
-                                .copied()
-                                .unwrap_or(255) as u32;
-                            let alpha = alpha as u32 * mask_alpha / 255;
-                            if alpha == 0 {
-                                continue;
-                            }
-                            let dst = pixels[idx];
+                        let dst = pixels[idx];
 
-                            let src_a = alpha;
-                            let src_r = (r as u32 * src_a) / 255;
-                            let src_g = (g as u32 * src_a) / 255;
-                            let src_b = (b as u32 * src_a) / 255;
+                        let src_a = alpha;
+                        let src_r = (r as u32 * src_a) / 255;
+                        let src_g = (g as u32 * src_a) / 255;
+                        let src_b = (b as u32 * src_a) / 255;
 
-                            let dst_a = dst.alpha() as u32;
-                            let out_a = src_a + (dst_a * (255 - src_a) / 255);
+                        let dst_a = dst.alpha() as u32;
+                        let out_a = src_a + (dst_a * (255 - src_a) / 255);
 
-                            if out_a > 0 {
-                                let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
-                                let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
-                                let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
+                        if out_a > 0 {
+                            let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
+                            let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
+                            let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
 
-                                pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
-                                    out_r as u8,
-                                    out_g as u8,
-                                    out_b as u8,
-                                    out_a as u8,
-                                )
-                                .unwrap_or_else(|| {
-                                    tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
-                                });
-                            }
+                            pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
+                                out_r as u8,
+                                out_g as u8,
+                                out_b as u8,
+                                out_a as u8,
+                            )
+                            .unwrap_or_else(|| {
+                                tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
+                            });
                         }
                     }
                 }
             });
-            // Matches measure_text's +1px-per-character bold compensation:
-            // without it, a word's reserved layout width (from measure_text)
-            // is wider than what draw_text actually advances through, and
-            // the difference shows up as a visible gap after every word once
-            // each word is its own independently-positioned box.
-            caret.x += scaled_font.h_advance(id)
-                + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale
-                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
-        } else {
-            caret.x += scaled_font.h_advance(id)
-                + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale
-                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         }
+        caret.x += scaled_font.h_advance(glyph_id)
+            + letter_spacing * raster_scale
+            + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
+        previous = Some(glyph_id);
     }
 }
 
@@ -9882,6 +10230,7 @@ fn collect_image_intrinsics(
             }
         }).flatten();
         // Release the scoped borrow before responsive selection reads the tree.
+        let is_html_image = matches!(&source, Some(Source::Image));
         let (url, density) = match source {
             Some(Source::Image) => {
                 let Some(candidate) = resolve_img_url(tree, nid, viewport) else {
@@ -9902,7 +10251,12 @@ fn collect_image_intrinsics(
                 profile,
             },
         );
-        if let Some(mut intrinsic) = cache.profiled_image_intrinsic(&resolved_url, profile) {
+        let intrinsic = if is_html_image {
+            cache.html_image_intrinsic(tree, nid, &resolved_url, profile)
+        } else {
+            cache.profiled_image_intrinsic(&resolved_url, profile)
+        };
+        if let Some(mut intrinsic) = intrinsic {
             // A 2x (or w-descriptor) candidate's raw pixels are density times
             // its CSS size. A ratio is dimensionless and remains unchanged.
             intrinsic.width = intrinsic.width.map(|width| width / density);
@@ -10715,30 +11069,8 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
         }
         None
     };
-    let length = |value: &str| -> Option<f32> {
-        let value = value.trim();
-        if value.is_empty() || value.ends_with('%') || value.eq_ignore_ascii_case("auto") {
-            return None;
-        }
-        let split = value
-            .find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E')))
-            .unwrap_or(value.len());
-        let number = value[..split].parse::<f32>().ok()?;
-        let factor = match value[split..].trim().to_ascii_lowercase().as_str() {
-            "" | "px" => 1.0,
-            "in" => 96.0,
-            "cm" => 96.0 / 2.54,
-            "mm" => 96.0 / 25.4,
-            "q" => 96.0 / 101.6,
-            "pt" => 96.0 / 72.0,
-            "pc" => 16.0,
-            _ => return None,
-        };
-        let result = number * factor;
-        (result.is_finite() && result > 0.0).then_some(result)
-    };
-    let width = attribute("width").and_then(length);
-    let height = attribute("height").and_then(length);
+    let width = attribute("width").and_then(svg_absolute_length);
+    let height = attribute("height").and_then(svg_absolute_length);
     let view_box_ratio = attribute("viewBox").and_then(|value| {
         let values = value
             .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
@@ -10762,6 +11094,29 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
         height,
         ratio,
     })
+}
+
+fn svg_absolute_length(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.is_empty() || value.ends_with('%') || value.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let split = value
+        .find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E')))
+        .unwrap_or(value.len());
+    let number = value[..split].parse::<f32>().ok()?;
+    let factor = match value[split..].trim().to_ascii_lowercase().as_str() {
+        "" | "px" => 1.0,
+        "in" => 96.0,
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "q" => 96.0 / 101.6,
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        _ => return None,
+    };
+    let result = number * factor;
+    (result.is_finite() && result > 0.0).then_some(result)
 }
 
 /// A full-pixmap clip mask admitting only the pixels inside `rect`, used to
@@ -10962,7 +11317,7 @@ fn is_svg(bytes: &[u8]) -> bool {
 /// how a replaced element like `<img>` sizes its intrinsic content).
 fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     let fonts = svg_font_database();
-    render_svg_with_font_database(bytes, width, height, &fonts)
+    render_svg_with_font_database(bytes, width, height, &fonts, false)
 }
 
 fn render_svg_with_font_database(
@@ -10970,6 +11325,7 @@ fn render_svg_with_font_database(
     width: u32,
     height: u32,
     fonts: &std::sync::Arc<usvg::fontdb::Database>,
+    inline_viewport: bool,
 ) -> Option<Pixmap> {
     if width == 0 || height == 0 {
         return None;
@@ -10984,7 +11340,7 @@ fn render_svg_with_font_database(
     // Author `preserveAspectRatio` still controls fitting inside this viewport.
     // usvg resolves root dimensions before an injected stylesheet can
     // override them, so provide the used viewport as actual root attributes.
-    let viewport_svg = svg_with_root_viewport(bytes, width, height)?;
+    let viewport_svg = svg_with_root_viewport(bytes, width, height, inline_viewport)?;
     opts.default_size = usvg::Size::from_wh(width as f32, height as f32)?;
     opts.font_family = "Liberation Serif".to_string();
     opts.fontdb = std::sync::Arc::clone(fonts);
@@ -11066,14 +11422,14 @@ fn has_inline_svg_text(tree: &DomTree) -> bool {
         })
 }
 
-/// Return SVG XML whose root `width`/`height` are the resolved CSS viewport.
+/// Apply the used viewport to inline SVG and images with a viewBox.
 ///
 /// This is deliberately a narrow XML start-tag rewrite rather than a DOM
 /// reserialization: all namespaces, styles, definitions, and source order
 /// remain byte-for-byte intact. Existing attribute values are replaced;
 /// missing ones are appended. Quoted `>` characters are respected while
 /// finding the end of the root tag.
-fn svg_with_root_viewport(bytes: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+fn svg_with_root_viewport(bytes: &[u8], width: u32, height: u32, inline_viewport: bool) -> Option<Vec<u8>> {
     let source = std::str::from_utf8(bytes).ok()?;
     let start = source.find("<svg")?;
     let tail = &source[start..];
@@ -11092,6 +11448,14 @@ fn svg_with_root_viewport(bytes: &[u8], width: u32, height: u32) -> Option<Vec<u
     }
     let tag_end = tag_end?;
     let mut root = source[start..=tag_end].to_string();
+    // A viewBox-less image scales its intrinsic viewport, not its user coordinates.
+    if !inline_viewport && svg_root_attr_value_range(&root, "viewBox").is_none()
+        && ["width", "height"].iter().all(|name| {
+            svg_root_attr_value_range(&root, name)
+                .and_then(|(start, end)| svg_absolute_length(&root[start..end])).is_some()
+        }) {
+        return Some(bytes.to_vec());
+    }
     for (name, value) in [("width", width), ("height", height)] {
         if let Some((value_start, value_end)) = svg_root_attr_value_range(&root, name) {
             root.replace_range(value_start..value_end, &value.to_string());
@@ -12425,6 +12789,198 @@ mod tests {
             blurred_edge.red() < 240 && blurred_edge.green() < 240 && blurred_edge.blue() < 240,
             "the issue's 2px 2px 3px shadow must retain ink outside the box: {blurred_edge:?}"
         );
+    }
+
+    #[test]
+    fn html_image_failure_belongs_to_the_attempt_not_the_url() {
+        let tree = parse_html(r#"<img id="old" src="retry.svg"><img id="new" src="retry.svg">"#);
+        let old = tree.get_element_by_id("old").unwrap();
+        let new = tree.get_element_by_id("new").unwrap();
+        let url = "https://assets.test/retry.svg";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let mut cache = RenderResourceCache::with_loader(|_: &str| None);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        assert_eq!(cache.html_image_intrinsic(&tree, old, url, profile), None);
+        cache.seed_image_missing(url.into(), profile);
+        assert!(cache.failed_html_image(&tree, old, url, profile));
+        assert_eq!(cache.cached_image_element_metadata(&tree, new, (80.0, 60.0), Some("https://assets.test/")),
+            Some((url.into(), 1.0, false, None)), "a fresh image must not inherit another attempt's failure");
+        assert!(!cache.has_live_image_outcome(url, profile));
+        cache.seed_image(url.into(), profile,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"/>"#.to_vec());
+        assert_eq!(cache.html_image_intrinsic(&tree, new, url, profile).unwrap().natural_size(), Some((23.0, 17.0)));
+        assert_eq!(cache.html_image_intrinsic(&tree, old, url, profile), None,
+            "another consumer's success must not revive the failed image");
+        cache.retry_html_image_request(old, url, profile);
+        assert_eq!(cache.html_image_intrinsic(&tree, old, url, profile).unwrap().natural_size(), Some((23.0, 17.0)));
+        assert!(cache.html_image_requests.borrow().nodes.is_empty());
+        assert!(cache.html_image_requests.borrow().cohorts.is_empty());
+    }
+
+    #[test]
+    fn css_content_can_replace_a_failed_html_image_with_the_same_url() {
+        let tree = parse_html(r#"<body style="margin:0"><img id="image" src="retry.svg" width="20" height="20">"#);
+        let node = tree.get_element_by_id("image").unwrap();
+        let url = "https://assets.test/retry.svg";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let mut cache = RenderResourceCache::with_loader(|_: &str| None);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        cache.html_image_intrinsic(&tree, node, url, profile);
+        cache.seed_image_missing(url.into(), profile);
+        assert!(cache.failed_html_image(&tree, node, url, profile));
+        cache.seed(url.into(), br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="blue"/></svg>"#.to_vec());
+        tree.with_node_mut(node, |node| node.set_attribute("style", "content:url(retry.svg);display:block".into()));
+        let mut prepared = prepare_dom(&tree, (40.0, 40.0), Some("https://assets.test/"), &mut cache).unwrap();
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut cache, (0.0, 0.0)).unwrap();
+        let pixel = pixmap.pixel(10, 10).unwrap();
+        assert!(pixel.blue() > 240 && pixel.red() < 20 && pixel.green() < 20,
+            "CSS replacement bytes must paint despite the independent failed src: {pixel:?}");
+        assert!(cache.failed_html_image(&tree, node, url, profile));
+    }
+
+    #[test]
+    fn native_image_slot_reuse_does_not_inherit_a_failed_attempt() {
+        let tree = parse_html(r#"<img id="old" src="retry.svg"><img id="retained" src="other.svg">"#);
+        let old = tree.get_element_by_id("old").unwrap();
+        let retained = tree.get_element_by_id("retained").unwrap();
+        let old_data = tree.get_node(old).unwrap().data;
+        let url = "https://assets.test/retry.svg";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let mut cache = RenderResourceCache::with_loader(|_: &str| None);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        cache.html_image_intrinsic(&tree, old, url, profile);
+        cache.html_image_intrinsic(&tree, retained, "https://assets.test/other.svg", profile);
+        cache.seed_image_missing(url.into(), profile);
+        cache.seed_image_missing("https://assets.test/other.svg".into(), profile);
+        assert!(cache.failed_html_image(&tree, old, url, profile));
+        tree.remove(old);
+        let replacement = tree.new_node(old_data);
+        assert_eq!(replacement, old);
+        assert!(!cache.failed_html_image(&tree, replacement, url, profile));
+        assert!(cache.failed_html_image(&tree, retained, "https://assets.test/other.svg", profile));
+        assert_eq!(cache.cached_image_element_metadata(&tree, replacement, (80.0, 60.0), Some("https://assets.test/")),
+            Some((url.into(), 1.0, false, None)));
+    }
+
+    #[test]
+    fn responsive_data_image_selection_discards_the_previous_network_attempt() {
+        let tree = parse_html(r#"<picture><source media="(max-width:500px)"
+            srcset="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='23'%20height='17'/%3E">
+            <img id="image" src="retry.svg"></picture>"#);
+        let node = tree.get_element_by_id("image").unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let mut cache = RenderResourceCache::with_loader(move |_: &str| {
+            (loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0)
+                .then(|| br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"/>"#.to_vec())
+        });
+        cache.set_document_scoped(true);
+        assert_eq!(cache.image_element_metadata(&tree, node, (800.0, 600.0), Some("https://assets.test/")).unwrap().2, None);
+        assert_eq!(cache.image_element_metadata(&tree, node, (400.0, 600.0), Some("https://assets.test/")).unwrap().2, Some((23.0, 17.0)));
+        assert!(cache.html_image_requests.borrow().nodes.is_empty(),
+            "inline image selection must release the previous network attempt");
+        assert_eq!(cache.image_element_metadata(&tree, node, (800.0, 600.0), Some("https://assets.test/")).unwrap().2, Some((23.0, 17.0)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn html_image_cohorts_keep_profile_and_source_changes_separate() {
+        let mut requests = HtmlImageRequests::default();
+        let a = NodeId::new(1);
+        let b = NodeId::new(2);
+        requests.observe(a, "old", false, 0);
+        requests.observe(b, "old", false, 0);
+        assert!(Arc::ptr_eq(&requests.nodes[&a].0, &requests.nodes[&b].0));
+        requests.observe(a, "new-profile", false, 0);
+        let generation = requests.generation("old");
+        requests.complete("old", generation, true);
+        assert!(!requests.nodes[&a].1);
+        assert!(requests.nodes[&b].1);
+        let generation = requests.generation("new-profile");
+        requests.complete("new-profile", generation, false);
+        assert!(!requests.nodes.contains_key(&a));
+        requests.forget(b);
+        assert!(requests.cohorts.is_empty());
+    }
+
+    #[test]
+    fn overlapping_html_transports_settle_only_their_own_attempt() {
+        let tree = parse_html(r#"<img id="old" src="retry.svg"><img id="new" src="retry.svg"><img id="unrelated" src="retry.svg">"#);
+        let old = tree.get_element_by_id("old").unwrap();
+        let new = tree.get_element_by_id("new").unwrap();
+        let unrelated = tree.get_element_by_id("unrelated").unwrap();
+        let url = "https://assets.test/retry.svg";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let mut cache = RenderResourceCache::with_loader(|_: &str| None);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        cache.html_image_intrinsic(&tree, unrelated, url, profile);
+        cache.seed_image_missing(url.into(), profile);
+        cache.html_image_intrinsic(&tree, old, url, profile);
+        let old_generation = cache.html_image_request_generation(url, profile);
+        cache.seed_image_missing_for_request(url.into(), profile, old_generation);
+        assert!(cache.failed_html_image(&tree, old, url, profile));
+        cache.html_image_intrinsic(&tree, new, url, profile);
+        let new_generation = cache.begin_html_image_request(url, profile);
+        assert_ne!(old_generation, new_generation);
+        cache.seed_image_shared_for_request(url.into(), profile,
+            Arc::from(br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"/>"#.as_slice()), old_generation);
+        assert!(!cache.failed_html_image(&tree, old, url, profile));
+        assert!(!cache.html_image_requests.borrow().nodes[&new].1);
+        assert!(cache.failed_html_image(&tree, unrelated, url, profile));
+        assert_eq!(cache.cached_image_element_metadata(&tree, new, (80.0, 60.0), Some("https://assets.test/")).unwrap().3,
+            Some((23.0, 17.0)));
+        assert_eq!(cache.html_image_request_generation(url, profile), new_generation,
+            "observing another consumer's bytes must not discard this active attempt");
+        cache.seed_image_missing_for_request(url.into(), profile, new_generation);
+        assert!(cache.failed_html_image(&tree, new, url, profile));
+        assert!(cache.failed_html_image(&tree, unrelated, url, profile));
+    }
+
+    #[test]
+    fn late_html_image_completion_cannot_fail_a_new_attempt() {
+        let mut requests = HtmlImageRequests::default();
+        let node = NodeId::new(1);
+        requests.observe(node, "url", false, 0);
+        let old_generation = requests.generation("url");
+        requests.complete("url", old_generation, true);
+        requests.forget(node);
+        requests.observe(node, "url", false, 0);
+        let new_generation = requests.generation("url");
+        assert_ne!(old_generation, new_generation);
+        requests.complete("url", old_generation, true);
+        assert!(!requests.nodes[&node].1);
+        requests.complete("url", new_generation, false);
+        assert!(requests.nodes.is_empty());
+        assert!(requests.cohorts.is_empty());
+    }
+
+    #[test]
+    fn html_image_request_limit_preserves_established_failures() {
+        let mut requests = HtmlImageRequests::default();
+        for id in 0..MAX_HTML_IMAGE_REQUESTS {
+            requests.observe(NodeId::new(id as u32), "shared", true, 0);
+        }
+        requests.observe(NodeId::new(MAX_HTML_IMAGE_REQUESTS as u32), "other", false, 0);
+        assert_eq!(requests.nodes.len(), MAX_HTML_IMAGE_REQUESTS);
+        assert!(requests.nodes[&NodeId::new(0)].1);
+        assert!(!requests.nodes.contains_key(&NodeId::new(MAX_HTML_IMAGE_REQUESTS as u32)));
+        assert_eq!(requests.cohorts.len(), 1);
+        let tree = parse_html(r#"<img id="overflow" src="overflow.svg">"#);
+        let node = tree.get_element_by_id("overflow").unwrap();
+        requests.forget(node);
+        // Fill the slot occupied by this real DOM identity without tracking it.
+        requests.observe(NodeId::new((MAX_HTML_IMAGE_REQUESTS + 1) as u32), "shared", true, 0);
+        let mut cache = RenderResourceCache::with_loader(|_: &str| None);
+        cache.set_document_scoped(true);
+        *cache.html_image_requests.get_mut() = requests;
+        cache.seed_missing("https://assets.test/overflow.svg".into());
+        assert_eq!(cache.cached_image_element_metadata(&tree, node, (80.0, 60.0), Some("https://assets.test/")),
+            Some(("https://assets.test/overflow.svg".into(), 1.0, true, None)),
+            "untracked overflow keeps the generic negative-cache retry window");
     }
 
     #[test]
@@ -17125,6 +17681,158 @@ mod tests {
     }
 
     #[test]
+    fn native_text_metrics_match_css_em_sizes_and_font_weights() {
+        // Chrome at 14 CSS px with the same Liberation/DejaVu faces.
+        for (family, bold, text, expected) in [
+            ("Arial", false, "abcdefghij", 63.828125),
+            ("Arial", false, "Create new form", 103.484375),
+            ("Arial", false, "AVATAR Toffee", 93.390625),
+            ("Arial", false, "caf\u{e9} \u{3a9}mega", 75.84375),
+            ("Arial", true, "abcdefghij", 70.015625),
+            ("Times New Roman", false, "abcdefghij", 59.09375),
+            ("Times New Roman", true, "abcdefghij", 63.0),
+            ("Courier New", false, "abcdefghij", 84.015625),
+            ("Courier New", true, "abcdefghij", 84.015625),
+            ("system-ui", false, "abcdefghij", 73.140625),
+            ("system-ui", true, "abcdefghij", 82.96875),
+            ("MissingFont, Arial", false, "abcdefghij", 63.828125),
+        ] {
+            let width = measure_text(text, 14.0, bold, Some(family));
+            assert!((width - expected).abs() < 0.5,
+                "{family}, bold={bold}, {text:?}: {width}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn native_button_and_select_labels_keep_inline_text_width() {
+        for (family, weight, text) in [
+            ("Arial", 400, "abcdefghij"), ("Arial", 700, "Create new form"),
+            ("Arial", 400, "AVATAR Toffee"), ("Times New Roman", 700, "abcdefghij"),
+            ("Courier New", 700, "abcdefghij"), ("MissingFont, Arial", 400, "caf\u{e9} \u{3a9}mega"),
+        ] {
+            let tree = parse_html(&format!(r#"<style>
+                body{{margin:0}} .q{{display:inline-block;padding:0;border:0;
+                font:14px {family};font-weight:{weight};white-space:nowrap;appearance:none}}
+                </style><span class=q id=reference>{text}</span><button class=q id=button>{text}</button>
+                <select class=q id=select><option>{text}</option></select>"#));
+            let mut resources = RenderResourceCache::default();
+            let prepared = prepare_dom(&tree, (800.0, 120.0), None, &mut resources).unwrap();
+            let width = |id| prepared.document_rect(tree.get_element_by_id(id).unwrap()).unwrap().width;
+            for id in ["button", "select"] {
+                assert!((width(id) - width("reference")).abs() <= 1.0,
+                    "{family}, weight={weight}, {text:?}: {id}={}, span={}", width(id), width("reference"));
+            }
+        }
+    }
+
+    #[test]
+    fn native_control_glyph_size_matches_shaped_inline_text() {
+        for (family, weight) in [("Arial", 400), ("Times New Roman", 700), ("Courier New", 700), ("system-ui", 700)] {
+            for control in ["input", "select", "button"] {
+                let control = match control {
+                    "input" => "<input value=abcdefghij>",
+                    "select" => "<select><option>abcdefghij</option></select>",
+                    _ => "<button>abcdefghij</button>",
+                };
+                let tree = parse_html(&format!(r#"<style>
+                    body{{margin:0;background:white}} span,input,select,button{{display:block;
+                    width:380px;height:50px;padding:0;border:0;font:32px {family};
+                    font-weight:{weight};line-height:40px;background:transparent;white-space:nowrap}}
+                    span{{color:red}}input,select,button{{color:blue}}
+                    </style><span>abcdefghij</span>{control}"#));
+                let pixmap = paint_dom(&tree, (420.0, 120.0), None).unwrap();
+                let bounds = |blue| {
+                    let mut bounds = (u32::MAX, u32::MAX, 0, 0);
+                    for y in 0..pixmap.height() {
+                        // The select disclosure arrow is outside this text region.
+                        for x in 0..320 {
+                            let p = pixmap.pixel(x, y).unwrap();
+                            let hit = if blue { p.blue() > 200 && p.red() < 50 && p.green() < 50 }
+                                else { p.red() > 200 && p.blue() < 50 && p.green() < 50 };
+                            if hit { bounds = (bounds.0.min(x), bounds.1.min(y), bounds.2.max(x), bounds.3.max(y)); }
+                        }
+                    }
+                    assert!(bounds.0 != u32::MAX, "missing glyphs: {family}, {control}");
+                    ((bounds.2 - bounds.0 + 1) as i32, (bounds.3 - bounds.1 + 1) as i32)
+                };
+                let reference = bounds(false);
+                let native = bounds(true);
+                assert!((reference.0 - native.0).abs() <= 2 && (reference.1 - native.1).abs() <= 2,
+                    "{family}, weight={weight}, {control}: inline={reference:?}, native={native:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_input_text_respects_its_box_and_ancestor_clip() {
+        for control in [
+            "<input id=control value=abcdefghijabcdefghij>",
+            "<input id=control placeholder=abcdefghijabcdefghij>",
+            "<textarea id=control placeholder=abcdefghijabcdefghij wrap=off></textarea>",
+        ] {
+            for height in [8.0, 40.0] {
+                for clipped in [false, true] {
+                    let overflow = if clipped { "hidden" } else { "visible" };
+                    let tree = parse_html(&format!(r#"<style>
+                        body{{margin:0;background:white}}
+                        #parent{{position:absolute;left:20px;top:20px;width:60px;height:40px;overflow:{overflow}}}
+                        #control{{position:absolute;left:10px;top:6px;box-sizing:content-box;
+                        width:80px;height:{height}px;padding:8px;border:3px solid red;
+                        font:32px Arial;line-height:{height}px;color:blue;background:white;
+                        white-space:pre;overflow:visible;resize:none}}
+                        #control::placeholder{{color:blue;opacity:1}}
+                        </style><div id=parent>{control}</div>"#));
+                    let mut resources = RenderResourceCache::with_loader(|_: &str| None);
+                    let mut prepared = prepare_dom(&tree, (220.0, 140.0), None, &mut resources).unwrap();
+                    let rect = prepared.document_rect(tree.get_element_by_id("control").unwrap()).unwrap();
+                    // Chrome clips single-line text to the content width but
+                    // allows ink into vertical padding. A textarea clips to its
+                    // padding box on both axes.
+                    let textarea = control.starts_with("<textarea");
+                    let mut allowed = crate::Rect {
+                        x: rect.x + if textarea { 3.0 } else { 11.0 },
+                        y: rect.y + 3.0,
+                        width: rect.width - if textarea { 6.0 } else { 22.0 },
+                        height: rect.height - 6.0,
+                    };
+                    if clipped {
+                        let parent = prepared.document_rect(tree.get_element_by_id("parent").unwrap()).unwrap();
+                        allowed = allowed.intersect(&parent).unwrap();
+                    }
+                    let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+                    for scale in [1.0, 2.0] {
+                        let pixmap = paint_prepared_region_with_scroll(&tree, &mut prepared,
+                            &mut resources, &scroll, CaptureRegion::new(0.0, 0.0, 220.0, 140.0, scale)).unwrap();
+                        let mut count = 0;
+                        let mut min_y = u32::MAX;
+                        let mut max_y = 0;
+                        for y in 0..pixmap.height() {
+                            for x in 0..pixmap.width() {
+                                let p = pixmap.pixel(x, y).unwrap();
+                                if p.blue() > 200 && p.red() < 50 && p.green() < 50 {
+                                    let cx = (x as f32 + 0.5) / scale;
+                                    let cy = (y as f32 + 0.5) / scale;
+                                    assert!(cx >= allowed.x && cx < allowed.x + allowed.width
+                                        && cy >= allowed.y && cy < allowed.y + allowed.height,
+                                        "text outside clip: {control}, height={height}, clipped={clipped}, scale={scale}, ({cx},{cy}), {allowed:?}");
+                                    count += 1;
+                                    min_y = min_y.min(y);
+                                    max_y = max_y.max(y);
+                                }
+                            }
+                        }
+                        assert!(count > 30, "clipping must leave visible text: {control}, height={height}, clipped={clipped}, scale={scale}");
+                        if !clipped && height == 8.0 {
+                            assert!((max_y - min_y + 1) as f32 / scale >= 20.0,
+                                "short controls must retain the centered glyph ink visible in Chrome: {control}, scale={scale}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn word_measurement_honors_generic_font_family() {
         let sans = measure_text("iiiiiiii", 16.0, false, Some("sans-serif"));
         let mono = measure_text("iiiiiiii", 16.0, false, Some("monospace"));
@@ -17295,7 +18003,7 @@ mod tests {
             <text x="8" y="34" font-size="24" fill="#00cc55">★</text>
             <text x="8" y="4" font-size="24" fill="#00cc55">&#x378;</text>
         </svg>"##;
-        let pixmap = render_svg_with_font_database(svg.as_bytes(), 60, 50, &svg_font_database())
+        let pixmap = render_svg_with_font_database(svg.as_bytes(), 60, 50, &svg_font_database(), true)
             .expect("raster");
         assert!(
             pixmap
@@ -17352,6 +18060,41 @@ mod tests {
             }
         }
         assert!(found_red, "expected inline svg <rect> to paint red");
+    }
+
+    #[test]
+    fn svg_image_without_viewbox_scales_its_intrinsic_viewport() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+            <rect width="40" height="20" fill="black"/>
+        </svg>"#;
+        let image = render_svg(svg, 300, 160).expect("image raster");
+        for (x, y) in [(20, 10), (150, 80), (299, 159)] {
+            let pixel = image.pixel(x, y).unwrap();
+            assert_eq!(pixel.alpha(), 255, "image viewport must cover {x},{y}");
+            assert!(pixel.red() < 10 && pixel.green() < 10 && pixel.blue() < 10);
+        }
+
+        let tree = parse_html(r#"<style>body{margin:0}svg{display:block;width:300px;height:160px}</style>
+            <svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+                <rect width="40" height="20" fill="black"/>
+            </svg>"#);
+        let inline = paint_dom(&tree, (320.0, 200.0), None).expect("inline raster");
+        let inside = inline.pixel(20, 10).unwrap();
+        assert!(inside.alpha() > 0 && inside.red() < 10 && inside.green() < 10 && inside.blue() < 10);
+        let outside = inline.pixel(150, 80).unwrap();
+        assert!(outside.alpha() == 0 || outside.red() > 240,
+            "inline SVG must retain its CSS viewport without scaling user coordinates");
+    }
+
+    #[test]
+    fn svg_image_percentage_viewport_keeps_user_coordinates() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">
+            <rect width="40" height="20" fill="black"/>
+        </svg>"#;
+        let image = render_svg(svg, 300, 160).expect("image raster");
+        assert_eq!(image.pixel(20, 10).unwrap().alpha(), 255);
+        assert_eq!(image.pixel(150, 80).unwrap().alpha(), 0,
+            "percentage dimensions must use the supplied viewport without scaling the artwork");
     }
 
     #[test]
@@ -17561,6 +18304,41 @@ mod tests {
         assert!(ink(0) > 10, "a value from markup must paint");
         assert_eq!(ink(30), 0, "an empty control paints nothing");
         assert!(ink(60) > 10, "a password value must paint as bullets");
+    }
+
+    #[test]
+    fn a_hidden_float_does_not_widen_a_shrink_to_fit_parent() {
+        let case = |inner: &str| {
+            let html = format!(
+                r#"<body style="margin:0;font:14px Arial,sans-serif">
+                   <style>.ib{{display:inline-block;width:20px}}</style>
+                   <div id="t" style="float:left">{inner}</div></body>"#
+            );
+            let tree = parse_html(&html);
+            let mut resources = RenderResourceCache::default();
+            let prepared =
+                prepare_dom(&tree, (800.0, 600.0), None, &mut resources).expect("prepared render");
+            prepared
+                .document_rect(tree.get_element_by_id("t").unwrap())
+                .expect("rect")
+                .width
+        };
+        let icons = r##"<a href="#"><i class="ib"></i>CMS<i class="ib"></i></a>"##;
+        let baseline = case(icons);
+        let formatted = format!("\n  {icons}\n  ");
+        assert_eq!(case(&formatted), baseline);
+        for side in ["left", "right"] {
+            let hidden = format!(
+                r#"<div style="display:none;float:{side}">A much longer hidden string</div>"#
+            );
+            assert_eq!(case(&format!("{icons}{hidden}")), baseline);
+            // Indentation exposed the wrong float path even when compact markup did not.
+            assert_eq!(case(&format!("{formatted}{hidden}\n")), baseline);
+        }
+        let visible = r#"<div style="float:left;width:100px;height:20px"></div>"#;
+        assert!((case(&format!("{icons}{visible}")) - baseline - 100.0).abs() < 1.0);
+        let hidden_block = r#"<div style="display:none">hidden</div>"#;
+        assert_eq!(case(&format!("{formatted}{hidden_block}\n")), baseline);
     }
 
     #[test]

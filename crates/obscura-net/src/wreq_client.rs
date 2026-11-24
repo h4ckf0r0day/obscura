@@ -16,11 +16,11 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
-    cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
+    cors_required, env_allows_private_network, error_chain, request_error, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_origin_header, request_referrer, response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
     validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, SsrfGuardResolver,
+    BodyReadFailure, ResourceRequest, Response, SsrfGuardResolver,
 };
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
@@ -43,12 +43,11 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
                 .collect();
             if !allow {
                 if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
-                    return Err(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "SSRF blocked: '{}' resolves to forbidden address {}",
                         host,
                         bad.ip()
-                    )
-                    .into());
+                    )).into());
                 }
             }
             let iter: wreq::dns::Addrs = Box::new(addrs.into_iter());
@@ -135,6 +134,18 @@ async fn read_wreq_body_limited(
     url: &Url,
     limit: usize,
 ) -> Result<Vec<u8>, ObscuraNetError> {
+    let mut body = Vec::new();
+    read_wreq_body_into(response, url, limit, &mut body).await.map_err(|failure| failure.error)?;
+    Ok(body)
+}
+
+#[cfg(feature = "stealth")]
+async fn read_wreq_body_into(
+    response: wreq::Response,
+    url: &Url,
+    limit: usize,
+    body: &mut Vec<u8>,
+) -> Result<(), BodyReadFailure> {
     if response
         .headers()
         .get("content-length")
@@ -142,7 +153,7 @@ async fn read_wreq_body_limited(
         .and_then(|value| value.trim().parse::<u64>().ok())
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(response_too_large(url, limit));
+        return Err(BodyReadFailure::failed(response_too_large(url, limit)));
     }
 
     let capacity = response
@@ -152,17 +163,20 @@ async fn read_wreq_body_limited(
         .min(limit);
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
-    let mut body = Vec::with_capacity(capacity);
+    body.reserve_exact(capacity);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
+            BodyReadFailure {
+                timeout: error.is_timeout(),
+                error: ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error))),
+            }
         })?;
         if chunk.len() > limit.saturating_sub(body.len()) {
-            return Err(response_too_large(url, limit));
+            return Err(BodyReadFailure::failed(response_too_large(url, limit)));
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(())
 }
 
 #[cfg(feature = "stealth")]
@@ -301,6 +315,15 @@ impl StealthHttpClient {
         self
     }
 
+    /// Browser-generated requests use the same identity as navigation.
+    pub async fn user_agent(&self) -> String {
+        self.extra_headers.read().await.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, value)| value.as_str())
+            .or(self.user_agent.as_deref())
+            .unwrap_or(STEALTH_USER_AGENT).to_string()
+    }
+
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_callbacks(url, None).await
     }
@@ -321,6 +344,15 @@ impl StealthHttpClient {
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
         self.fetch_with_profile(url, request, callbacks).await
+    }
+
+    /// Continue an intercepted subresource with request-local overrides.
+    pub async fn fetch_resource_request_with_callbacks(
+        &self, url: &Url, request: ResourceRequest, method: &str,
+        body: Option<Vec<u8>>, headers: Option<HashMap<String, String>>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request(url, request, callbacks, method, body, headers).await
     }
 
     async fn fetch_with_profile(
@@ -359,6 +391,7 @@ impl StealthHttpClient {
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
+        let document_request = crate::DocumentRequest::claim(request.resource_type);
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes, self.allow_file_access).await;
         }
@@ -463,7 +496,7 @@ impl StealthHttpClient {
             } else { req.send().await }
 
                 .map_err(|e| {
-                    ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
+                    request_error(&current_url, &e)
                 })?;
 
             let status = resp.status();
@@ -524,21 +557,28 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
-                .await?;
-            drop(in_flight);
-
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
-                body,
+                body: Vec::new(),
                 redirected_from: redirects,
             };
-            if let Some(callbacks) = callbacks {
-                callbacks.fire_response(&request_info, &response).await;
+            let mut captured = document_request.response(response, method.as_str(), referer.as_deref().unwrap_or(""));
+            let read = {
+                let response = captured.get_mut();
+                read_wreq_body_into(resp, &response.url, request.max_response_bytes, &mut response.body).await
+            };
+            if let Err(failure) = read {
+                captured.failed(failure.timeout);
+                return Err(failure.error);
             }
-            return Ok(response);
+            captured.complete();
+            drop(in_flight);
+            if let Some(callbacks) = callbacks {
+                callbacks.fire_response(&request_info, captured.get()).await;
+            }
+            return Ok(captured.finish());
         }
 
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
@@ -637,7 +677,7 @@ impl StealthHttpClient {
 
         let in_flight = InFlightGuard::new(&self.in_flight);
         let resp = req.send().await.map_err(|e| {
-            ObscuraNetError::Network(format!("{}: {}", url, error_chain(&e)))
+            request_error(url, &e)
         })?;
 
         let status = resp.status();
@@ -693,6 +733,31 @@ mod tests {
     use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
+
+    #[tokio::test]
+    async fn stealth_typed_dns_policy_refusals_survive_transport_wrapping() {
+        struct Resolver(bool);
+        impl Resolve for Resolver {
+            fn resolve(&self, _: Name) -> wreq::dns::Resolving {
+                let blocked = self.0;
+                Box::pin(async move {
+                    let error = if blocked {
+                        ObscuraNetError::Blocked("test resolver denied the destination".into())
+                    } else {
+                        ObscuraNetError::Network("SSRF blocked: untrusted error text".into())
+                    };
+                    Err(error.into())
+                })
+            }
+        }
+        for blocked in [true, false] {
+            let mut client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+            client.client = wreq::Client::builder().no_proxy()
+                .dns_resolver(Arc::new(Resolver(blocked))).build().unwrap();
+            let error = client.fetch(&Url::parse("http://policy.example.test/").unwrap()).await.unwrap_err();
+            assert_eq!(matches!(error, ObscuraNetError::Blocked(_)), blocked, "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn stealth_user_agent_override_has_one_wire_value_for_navigation_and_script_fetch() {

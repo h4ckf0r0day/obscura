@@ -30,11 +30,45 @@ pub enum FetchResolution {
     },
 }
 
+#[derive(Clone)]
+struct FetchSubscription {
+    page_id: String,
+    session_id: Option<String>,
+    patterns: Vec<(String, Option<String>)>,
+}
+
+pub(crate) struct FetchSubscriptionSnapshot {
+    subscriptions: Vec<FetchSubscription>,
+    configured: bool,
+}
+
+fn matching_subscribers(subscriptions: &[FetchSubscription], configured: bool,
+    page_id: &str, url: &str, resource_type: &str) -> Option<Vec<Option<String>>> {
+    if !configured { return None; }
+    Some(subscriptions.iter().rev().filter(|subscription|
+        subscription.page_id == page_id && subscription.patterns.iter().any(|(pattern, kind)|
+            kind.as_deref().is_none_or(|kind| kind == resource_type)
+                && obscura_browser::url_matches_cdp_pattern(pattern, url)))
+        .map(|subscription| subscription.session_id.clone()).collect())
+}
+
+impl FetchSubscriptionSnapshot {
+    pub(crate) fn subscribers(&self, page_id: &str, url: &str, resource_type: &str) -> Option<Vec<Option<String>>> {
+        matching_subscribers(&self.subscriptions, self.configured, page_id, url, resource_type)
+    }
+
+    pub(crate) fn remove_session(&mut self, session_id: &Option<String>) {
+        self.subscriptions.retain(|subscription| &subscription.session_id != session_id);
+    }
+}
+
 pub struct FetchInterceptState {
     pub enabled: bool,
     pub patterns: Vec<String>,
     pub paused: HashMap<String, PausedRequest>,
     request_counter: u64,
+    subscriptions: Vec<FetchSubscription>,
+    configured: bool,
 }
 
 impl FetchInterceptState {
@@ -44,7 +78,32 @@ impl FetchInterceptState {
             patterns: Vec::new(),
             paused: HashMap::new(),
             request_counter: 0,
+            subscriptions: Vec::new(),
+            configured: false,
         }
+    }
+
+    pub(crate) fn subscribers(&self, page_id: &str, url: &str, resource_type: &str) -> Option<Vec<Option<String>>> {
+        matching_subscribers(&self.subscriptions, self.configured, page_id, url, resource_type)
+    }
+
+    pub(crate) fn subscription_snapshot(&self) -> FetchSubscriptionSnapshot {
+        FetchSubscriptionSnapshot { subscriptions: self.subscriptions.clone(), configured: self.configured }
+    }
+
+    pub(crate) fn remove_session(&mut self, session_id: &Option<String>) {
+        self.subscriptions.retain(|subscription| &subscription.session_id != session_id);
+        self.enabled = !self.subscriptions.is_empty();
+        self.patterns = self.subscriptions.iter().flat_map(|subscription|
+            subscription.patterns.iter().map(|(pattern, _)| pattern.clone())).collect();
+    }
+
+    pub(crate) fn sync_page(&self, page: &mut obscura_browser::Page) {
+        if !self.configured { return; }
+        page.intercept_block_patterns = self.subscriptions.iter()
+            .filter(|subscription| subscription.page_id == page.id)
+            .flat_map(|subscription| subscription.patterns.iter().map(|(pattern, _)| pattern.clone())).collect();
+        page.enable_intercept(!page.intercept_block_patterns.is_empty());
     }
 
     pub fn next_request_id(&mut self) -> String {
@@ -61,48 +120,37 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
-            let patterns = params
-                .get("patterns")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|p| {
-                            p.get("urlPattern")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec!["*".to_string()]);
-
+            let page_id = session_id.as_ref().and_then(|session| ctx.sessions.get(session))
+                .cloned().ok_or("No page")?;
+            let patterns = params.get("patterns").and_then(Value::as_array)
+                .filter(|patterns| !patterns.is_empty())
+                .map(|patterns| patterns.iter().map(|pattern| (
+                    pattern.get("urlPattern").and_then(Value::as_str).unwrap_or("*").to_string(),
+                    pattern.get("resourceType").and_then(Value::as_str).map(str::to_string),
+                )).collect()).unwrap_or_else(|| vec![("*".to_string(), None)]);
+            ctx.fetch_intercept.configured = true;
+            ctx.fetch_intercept.remove_session(session_id);
+            ctx.fetch_intercept.subscriptions.push(FetchSubscription { page_id: page_id.clone(), session_id: session_id.clone(), patterns });
             ctx.fetch_intercept.enabled = true;
-            ctx.fetch_intercept.patterns = patterns.clone();
-            let tx_clone = ctx.intercept_tx.clone();
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.intercept_block_patterns = patterns.clone();
-                if let Some(tx) = tx_clone {
-                    page.set_intercept_tx(tx);
-                }
-                page.enable_intercept(true);
+            ctx.fetch_intercept.patterns = ctx.fetch_intercept.subscriptions.iter().flat_map(|subscription|
+                subscription.patterns.iter().map(|(pattern, _)| pattern.clone())).collect();
+            if let Some(page) = ctx.pages.iter_mut().find(|page| page.id == page_id) {
+                if let Some(tx) = &ctx.intercept_tx { page.set_intercept_tx(tx.clone()); }
+                ctx.fetch_intercept.sync_page(page);
             }
-
-            tracing::info!("Fetch interception enabled");
             Ok(json!({}))
         }
         "disable" => {
-            ctx.fetch_intercept.enabled = false;
-            ctx.fetch_intercept.patterns.clear();
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.intercept_block_patterns.clear();
-                page.enable_intercept(false);
+            ctx.fetch_intercept.remove_session(session_id);
+            if let Some(page_id) = session_id.as_ref().and_then(|session| ctx.sessions.get(session)) {
+                if let Some(page) = ctx.pages.iter_mut().find(|page| &page.id == page_id) {
+                    ctx.fetch_intercept.sync_page(page);
+                }
             }
             let paused: Vec<_> = ctx.fetch_intercept.paused.drain().collect();
             for (_, req) in paused {
                 let _ = req.resolver.send(FetchResolution::Continue {
-                    url: None,
-                    method: None,
-                    headers: None,
-                    post_data: None,
+                    url: None, method: None, headers: None, post_data: None,
                 });
             }
             Ok(json!({}))

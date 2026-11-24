@@ -3,11 +3,11 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
-use obscura_js::ops::{OriginStorage, max_live_frames, NavigationTiming};
+use obscura_js::ops::{CachedNetworkResponseBody, OriginStorage, max_live_frames, NavigationTiming, StoredNetworkResponseBody};
 use obscura_js::runtime::{HistoryUpdate, ObscuraJsRuntime};
 use obscura_net::{
-    CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
-    ResourceType, Response, ResponseCallback,
+    CallbackRegistry, DocumentInterruption, DocumentProgress, DocumentRequest, InterruptedDocument,
+    ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest, ResourceType, Response, ResponseCallback,
 };
 use url::Url;
 
@@ -191,16 +191,15 @@ pub struct NetworkEvent {
 
 #[derive(Debug, Clone)]
 pub struct StoredResponseBody {
-    /// Raw response bytes. The CDP wire form (lossy text or base64, per
-    /// `base64_encoded`) is produced on read by `cdp_body`, so the common
-    /// case — a body that no CDP client ever asks for — pays no decode at
-    /// store time and holds one copy instead of two.
+    /// Raw response bytes. MIME/charset-decoded CDP presentation is available
+    /// through `Page::get_response_body_for_cdp` without changing these bytes.
     pub body: Vec<u8>,
     pub base64_encoded: bool,
 }
 
 impl StoredResponseBody {
-    /// The body as CDP `Network.getResponseBody` reports it.
+    /// The raw body's UTF-8/base64 view. Use `Page::get_response_body_for_cdp`
+    /// for the response's MIME type and charset decoding.
     pub fn cdp_body(&self) -> String {
         if self.base64_encoded {
             BASE64.encode(&self.body)
@@ -309,6 +308,7 @@ pub struct Page {
     /// latency does not incorrectly advance newly-created animations.
     document_timeline_origin: std::time::Instant,
     navigation_timing: NavigationTiming,
+    navigation_blocked: bool,
     /// Optional page-scoped ceiling for an end-to-end navigation. Automation
     /// frontends set this from their request timeout so a caller asking for a
     /// 50-second navigation is not silently cut off by the process default.
@@ -329,7 +329,7 @@ pub struct Page {
     /// to the entry instead of appending a new one.
     pending_history_traversal: std::sync::Mutex<Option<usize>>,
     pub network_events: Vec<NetworkEvent>,
-    response_bodies: std::collections::HashMap<String, StoredResponseBody>,
+    response_bodies: std::collections::HashMap<String, CachedNetworkResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
@@ -1154,6 +1154,7 @@ impl Page {
             content_type: String::new(),
             document_timeline_origin: std::time::Instant::now(),
             navigation_timing: NavigationTiming::default(),
+            navigation_blocked: false,
             navigation_timeout: None,
             navigation_chain_limit: None,
             history: Vec::new(),
@@ -1640,6 +1641,10 @@ impl Page {
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
     async fn advance_frames(&mut self) -> bool {
+        if self.js.as_ref().map_or_else(
+            || self.dom.as_ref().is_some_and(DomTree::is_document_incomplete),
+            ObscuraJsRuntime::document_is_incomplete,
+        ) { return false; }
         let mut queued_new = self.queue_pending_frames();
         self.release_detached_frames();
         if self.pending_frame_work.is_empty() && self.queue_pending_frames() {
@@ -1832,6 +1837,8 @@ impl Page {
         if tx.send(request).is_err() { return Ok(None); }
         let response = match resolution.await {
             Ok(InterceptResolution::Fulfill {status, headers: supplied, body, body_base64}) => {
+                DocumentProgress::mark_intercepted(None);
+                let document_request = DocumentRequest::claim(ResourceType::Document);
                 let bytes = if body_base64.is_empty() { body.into_bytes() } else {
                     BASE64.decode(body_base64).map_err(|error| PageError::NetworkError(error.to_string()))?
                 };
@@ -1851,17 +1858,21 @@ impl Page {
                     for cookie in cookies.lines() { self.context.cookie_jar.set_cookie(cookie, url); }
                 }
                 let response = Response {url: url.clone(), status, headers, body: bytes, redirected_from: Vec::new()};
+                let referrer = initiator.map(|source| navigation_referrer(source, url)).unwrap_or_default();
+                let mut captured = document_request.response(response, method, &referrer);
+                captured.complete();
                 let request = obscura_net::RequestInfo {url: url.clone(), method: method.into(), headers: request_headers,
                     resource_type: ResourceType::Document};
                 self.callbacks.fire_request(&request).await;
-                self.callbacks.fire_response(&request, &response).await;
-                response
+                self.callbacks.fire_response(&request, captured.get()).await;
+                captured.finish()
             }
             Ok(InterceptResolution::Continue {url: rewrite, method: changed_method, headers, body: changed_body}) => {
                 let target = match rewrite { Some(value) => Url::parse(&value).map_err(|error| PageError::InvalidUrl(error.to_string()))?, None => url.clone() };
                 if target.scheme() != url.scheme() {
                     return Err(PageError::NetworkError("Interception cannot change a navigation's URL scheme".into()));
                 }
+                DocumentProgress::mark_intercepted((target != *url).then_some(url));
                 let method = changed_method.as_deref().unwrap_or(method);
                 let body = changed_body.or_else(|| (method == "POST" || !body.is_empty()).then(|| body.as_bytes().to_vec()));
                 self.fetch_navigation_from_document(&target, method, body, headers, initiator).await
@@ -1878,6 +1889,76 @@ impl Page {
             Err(_) => return Err(PageError::NetworkError("net::ERR_ABORTED".into())),
         };
         Ok(Some(response))
+    }
+
+    async fn fetch_intercepted_script(
+        &self, url: &Url, initiator: &Url, request_id: &str,
+    ) -> Result<(String, Response), ObscuraNetError> {
+        use obscura_js::ops::{InterceptedRequest, InterceptResolution};
+        let headers = self.http_client.extra_headers.read().await.clone();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let tx = self.intercept_tx.as_ref().ok_or_else(|| ObscuraNetError::Network("net::ERR_ABORTED".into()))?;
+        tx.send(InterceptedRequest { request_id: request_id.into(), page_id: self.id.clone(),
+            url: url.to_string(), method: "GET".into(), headers: headers.clone(),
+            resource_type: "Script".into(), resolver })
+            .map_err(|_| ObscuraNetError::Network("net::ERR_ABORTED".into()))?;
+        let request = ResourceRequest::subresource(ResourceType::Script, initiator);
+        match resolution.await {
+            Ok(InterceptResolution::Fulfill { status, headers: supplied, body, body_base64 }) => {
+                let bytes = if body_base64.is_empty() { body.into_bytes() } else {
+                    BASE64.decode(body_base64).map_err(|error| ObscuraNetError::Network(error.to_string()))?
+                };
+                if bytes.len() > request.max_response_bytes {
+                    return Err(ObscuraNetError::Network("Fulfilled script exceeds the response body limit".into()));
+                }
+                let mut response_headers = std::collections::HashMap::new();
+                for (name, value) in supplied {
+                    let name = name.to_ascii_lowercase();
+                    if name == "set-cookie" {
+                        response_headers.entry(name).and_modify(|cookies: &mut String| {
+                            cookies.push('\n'); cookies.push_str(&value);
+                        }).or_insert(value);
+                    } else { response_headers.insert(name, value); }
+                }
+                if let Some(cookies) = response_headers.get("set-cookie") {
+                    for cookie in cookies.lines() { self.context.cookie_jar.set_cookie(cookie, url); }
+                }
+                let response = Response { url: url.clone(), status, headers: response_headers,
+                    body: bytes, redirected_from: Vec::new() };
+                let info = obscura_net::RequestInfo { url: url.clone(), method: "GET".into(),
+                    headers, resource_type: ResourceType::Script };
+                self.callbacks.fire_request(&info).await;
+                self.callbacks.fire_response(&info, &response).await;
+                Ok(("GET".into(), response))
+            }
+            Ok(InterceptResolution::Continue { url: rewrite, method, headers, body }) => {
+                let target = rewrite.as_deref().map(Url::parse).transpose()
+                    .map_err(|error| ObscuraNetError::Network(error.to_string()))?
+                    .unwrap_or_else(|| url.clone());
+                if !subresource_allowed(self.url.as_ref(), target.as_str()) {
+                    return Err(ObscuraNetError::Network("Blocked script URL scheme".into()));
+                }
+                let method = method.unwrap_or_else(|| "GET".into());
+                #[cfg(feature = "stealth")]
+                if let Some(client) = &self.stealth_client {
+                    let response = client.fetch_resource_request_with_callbacks(&target, request,
+                        &method, body, headers, Some(&self.callbacks)).await?;
+                    return Ok((method, response));
+                }
+                let response = self.http_client.fetch_resource_request_with_callbacks(&target,
+                    request, &method, body, headers, Some(&self.callbacks)).await?;
+                Ok((method, response))
+            }
+            Ok(InterceptResolution::Fail { reason }) => {
+                let mut error = String::from("net::ERR_");
+                for (index, ch) in reason.chars().enumerate() {
+                    if index > 0 && ch.is_ascii_uppercase() { error.push('_'); }
+                    error.push(ch.to_ascii_uppercase());
+                }
+                Err(ObscuraNetError::Network(error))
+            }
+            Err(_) => Err(ObscuraNetError::Network("net::ERR_ABORTED".into())),
+        }
     }
 
     async fn fetch_navigation_from_document(
@@ -1906,6 +1987,7 @@ impl Page {
             .await
     }
     fn init_js(&mut self) {
+        let incomplete = self.dom.as_ref().is_some_and(DomTree::is_document_incomplete);
         // init_js is also the new-document path.  Only resume_js explicitly
         // takes these IDs out before entering here and restores them after the
         // same DomTree is installed; a navigation must never inherit IDs from
@@ -1935,6 +2017,7 @@ impl Page {
             &self.url_string(),
             self.context.proxy_url.clone(),
         );
+        rt.set_watchdog_scope(&self.id);
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
         rt.set_content_type(&self.content_type);
@@ -2020,7 +2103,7 @@ impl Page {
 
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.set_frame_preload_scripts(&self.preload_scripts);
-        rt.run_page_init();
+        if incomplete { rt.run_incomplete_page_init(); } else { rt.run_page_init(); }
         rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
             "<device-metrics>",
@@ -2454,6 +2537,9 @@ impl Page {
                     let mut scripts = Vec::new();
 
                     for sid in script_ids {
+                        if dom.parser_script_already_started(sid) {
+                            continue;
+                        }
                         if let Some(node) = dom.get_node(sid) {
                             let src = node.get_attribute("src").map(|s| s.to_string());
                             let script_type = node
@@ -2576,6 +2662,7 @@ impl Page {
             .url
             .clone()
             .unwrap_or_else(|| Url::parse("about:blank").unwrap());
+        let page = &*self;
         let fetch_futures: Vec<_> = fetch_tasks
             .iter()
             .map(|(idx, url)| {
@@ -2587,6 +2674,20 @@ impl Page {
                 async move {
                     let parsed =
                         Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    if page.intercept_enabled && page.intercept_tx.is_some()
+                        && matches!(parsed.scheme(), "http" | "https")
+                        && (page.intercept_block_patterns.is_empty()
+                            || page.intercept_block_patterns.iter()
+                                .any(|pattern| url_matches_cdp_pattern(pattern, &url)))
+                    {
+                        static NEXT_PARSER_REQUEST: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(1);
+                        let id = format!("parser-{}", NEXT_PARSER_REQUEST.fetch_add(1,
+                            std::sync::atomic::Ordering::Relaxed));
+                        let result = page.fetch_intercepted_script(&parsed, &initiator, &id).await
+                            .map(|(method, response)| (Some(method), response));
+                        return Some((idx, url, result, Some(id)));
+                    }
                     if parsed.scheme() == "data" {
                         // data: URIs are inline; decode locally, no network fetch.
                         // Instagram and other Meta properties serve their bootstrap
@@ -2609,14 +2710,14 @@ impl Page {
                             body,
                             redirected_from: Vec::new(),
                         };
-                        return Some((idx, url, resp));
+                        return Some((idx, url, Ok((None, resp)), None));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
                         .await
                     {
-                        Ok(resp) => Some((idx, url, resp)),
+                        Ok(resp) => Some((idx, url, Ok((None, resp)), None)),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
                             None
@@ -2648,11 +2749,33 @@ impl Page {
             }
         };
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response, bool)> =
             std::collections::HashMap::new();
         for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
+            if let Some((idx, url, result, intercepted_id)) = result {
+                let intercepted = intercepted_id.is_some();
+                if let Some(id) = intercepted_id {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                    let (method, status, response_headers, body_size, error_text) = match &result {
+                        Ok((method, response)) => {
+                            self.store_response_body(id.clone(), &response.body, false);
+                            (method.clone().unwrap_or_else(|| "GET".into()), response.status,
+                                response.headers.clone(), response.body.len(), None)
+                        }
+                        Err(error) => ("GET".into(), 0, Default::default(), 0, Some(error.to_string())),
+                    };
+                    self.network_events.push(NetworkEvent { request_id: id, intercepted: true,
+                        url: url.clone(), method, resource_type: "Script".into(), status,
+                        headers: Default::default(), response_headers: Arc::new(response_headers),
+                        body_size, timestamp, error_text });
+                }
+                let (_, resp) = match result {
+                    Ok(response) => response,
+                    Err(error) => { tracing::warn!("Failed to fetch script {}: {}", url, error); continue; }
+                };
                 if !script_response_is_executable(resp.status) {
+                    if !intercepted {
                     self.record_network_event_with_body(
                         &url,
                         "GET",
@@ -2662,6 +2785,7 @@ impl Page {
                         &resp.body,
                         false,
                     );
+                    }
                     tracing::warn!(
                         "Refusing to execute script {} after HTTP {}",
                         url,
@@ -2672,7 +2796,7 @@ impl Page {
                 // Script bodies: only the HTTP Content-Type charset matters
                 // (no in-band meta-charset for JS).
                 let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                fetched.insert(idx, (url, code, resp));
+                fetched.insert(idx, (url, code, resp, intercepted));
             }
         }
 
@@ -2790,12 +2914,12 @@ impl Page {
         let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
-             fetched_script: Option<(String, String, obscura_net::Response)>| {
+             fetched_script: Option<(String, String, obscura_net::Response, bool)>| {
                 if script.src.is_some() {
-                    if let Some((url, code, resp)) = fetched_script {
+                    if let Some((url, code, resp, intercepted)) = fetched_script {
                         tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                         let execution_url = resp.url.to_string();
-                        page.record_network_event_with_body(
+                        if !intercepted { page.record_network_event_with_body(
                             &url,
                             "GET",
                             "Script",
@@ -2803,7 +2927,7 @@ impl Page {
                             &resp.headers,
                             &resp.body,
                             false,
-                        );
+                        ); }
                         if let Some(js) = &mut page.js {
                             let _ = js.execute_script(
                                 "<current-script>",
@@ -3151,6 +3275,12 @@ impl Page {
         self.sync_js_network_events();
     }
 
+    /// Policy-refusal marker for target startup, before Page interception is enabled.
+    #[doc(hidden)]
+    pub fn navigation_was_blocked(&self) -> bool {
+        self.navigation_blocked
+    }
+
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
         self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load)
             .await
@@ -3181,27 +3311,80 @@ impl Page {
         // one slow primary GET plus one slow JS-redirect chain step. Override
         // with `OBSCURA_NAV_TIMEOUT_MS=NN`, or set a page-scoped deadline when
         // the automation request already has an explicit timeout.
-        let nav_timeout = self.navigation_timeout();
-        let nav_timeout_ms = duration_millis_u64(nav_timeout);
-
-        let result = match tokio::time::timeout(
-            nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, "", None),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                Err(PageError::NetworkError(format!(
-                    "navigation exceeded {nav_timeout_ms}ms deadline"
-                )))
-            }
-        };
+        let result = self.within_navigation_deadline(url_str, wait_until, method, body, "", None).await;
         if result.is_ok() {
             self.push_history(self.url_string());
         }
         result
+    }
+
+    async fn within_navigation_deadline(
+        &mut self, url: &str, wait: crate::lifecycle::WaitUntil, method: &str, body: &str,
+        referrer: &str, initiator: Option<&Url>,
+    ) -> Result<(), PageError> {
+        self.navigation_blocked = false;
+        let timeout = self.navigation_timeout();
+        let progress = DocumentProgress::default();
+        let outcome = tokio::time::timeout(timeout,
+            self.navigate_with_wait_post_inner(url, wait, method, body, referrer, initiator, &progress)).await;
+        let expired = outcome.is_err();
+        let mut result = outcome.unwrap_or_else(|_| {
+            self.lifecycle = LifecycleState::Failed;
+            Err(PageError::NetworkError(format!("navigation exceeded {}ms deadline", duration_millis_u64(timeout))))
+        });
+        if result.is_err() {
+            if let Some(interrupted) = progress.take().filter(|document|
+                expired || document.cause == DocumentInterruption::BodyTimeout)
+            {
+                let timeout_kind = if expired { "navigation deadline" } else { "document body timeout" };
+                self.retain_interrupted_document(interrupted);
+                if let Err(PageError::NetworkError(message)) = &mut result {
+                    message.push_str(&format!("; received HTML retained after {timeout_kind}"));
+                }
+            }
+        }
+        result
+    }
+
+    fn retain_interrupted_document(&mut self, interrupted: InterruptedDocument) {
+        let InterruptedDocument { response, method, referrer, body_complete, intercepted,
+            intercepted_document_url, .. } = interrupted;
+        let (text, encoding) = obscura_net::decode_response_with_name(&response.body, response.content_type());
+        let dom = parse_html(&text);
+        dom.mark_document_incomplete(true);
+        self.title = dom.query_selector("title").ok().flatten()
+            .map(|title| dom.text_content(title)).unwrap_or_default();
+        self.encoding = encoding.into();
+        self.content_type = base_content_type(response.content_type()).unwrap_or_default();
+        self.url = Some(if response.redirected_from.is_empty() {
+            intercepted_document_url.unwrap_or_else(|| response.url.clone())
+        } else { response.url.clone() });
+        self.referrer = referrer;
+        // No author/preload/frame code runs after the expired navigation. Drop
+        // frame handles before their isolate and create fresh globals lazily.
+        self.retire_render_resources();
+        self.pending_frame_work.clear();
+        self.frames.clear();
+        self.js = None;
+        self.suspended_started_script_ids.clear();
+        self.suspended_cdp_object_state = obscura_js::runtime::CdpObjectState::default();
+        self.dom = Some(dom);
+        self.lifecycle = LifecycleState::Failed;
+        self.document_timeline_origin = std::time::Instant::now();
+        self.navigation_timing.record("domLoading");
+        let document_url = self.url_string();
+        let request_id = self.record_network_event_inner(&document_url, &method,
+            "Document", response.status, &response.headers, response.body.len());
+        if let Some(event) = self.network_events.last_mut() {
+            event.intercepted = intercepted;
+            if !body_complete { event.error_text = Some("net::ERR_TIMED_OUT".into()); }
+        }
+        if body_complete {
+            self.navigation_timing.record("responseEnd");
+            self.store_response_body_with(request_id, response.body.len(), || {
+                CachedNetworkResponseBody::raw(&response.body, response.content_type())
+            });
+        }
     }
 
     /// Drive the JS event loop after navigation so deferred work can run:
@@ -3501,6 +3684,7 @@ impl Page {
         body: &str,
         initial_referrer: &str,
         initial_initiator: Option<&Url>,
+        progress: &DocumentProgress,
     ) -> Result<(), PageError> {
         self.sync_history_updates();
         // file:// is a local file read. Every client route (CLI, CDP's
@@ -3530,6 +3714,7 @@ impl Page {
                 &document_referrer,
                 document_initiator.as_ref(),
                 deadline,
+                progress,
             )
             .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
@@ -3589,6 +3774,7 @@ impl Page {
         referrer: &str,
         initiator: Option<&Url>,
         deadline: tokio::time::Instant,
+        progress: &DocumentProgress,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
         self.navigation_timing = NavigationTiming::default();
@@ -3596,8 +3782,6 @@ impl Page {
         // The previous document's background loads end with the document.
         self.retire_render_resources();
         self.lifecycle = LifecycleState::Loading;
-        self.referrer = referrer.to_string();
-        self.url = Some(url.clone());
         let page_id = self.id.as_str();
         self.network_events.retain(|event| event.intercepted && event.resource_type == "Document"
             && event.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.')));
@@ -3627,7 +3811,7 @@ impl Page {
                     );
                 }
 
-                if !self.context.robots_cache.is_allowed(&origin, url.path()) {
+                if !self.context.robots_cache.is_allowed(&origin, &url[url::Position::BeforePath..url::Position::AfterQuery]) {
                     self.lifecycle = LifecycleState::Failed;
                     return Err(PageError::NetworkError(format!(
                         "Blocked by robots.txt: {}",
@@ -3639,6 +3823,7 @@ impl Page {
 
         if url.scheme() == "about" {
             self.navigate_blank();
+            self.referrer = referrer.to_string();
             self.init_js();
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
             // Runtime.addBinding shim) must run on about:blank too —
@@ -3660,62 +3845,63 @@ impl Page {
         }
 
         self.navigation_timing.record("fetchStart");
-        let intercepted = self.intercept_navigation(&url, method, body, initiator).await.map_err(|error| {
-            self.lifecycle = LifecycleState::Failed; error
-        })?;
-        let was_intercepted = intercepted.is_some();
-        let response = if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
-            let content_type = url_str
-                .strip_prefix("data:")
-                .and_then(|s| s.split(',').next())
-                .unwrap_or("text/html")
-                .split(';')
-                .next()
-                .unwrap_or("text/html")
-                .to_string();
-            let body_bytes = decode_data_uri(url_str).unwrap_or_default();
-            let mut headers = std::collections::HashMap::new();
-            headers.insert("content-type".to_string(), content_type);
-            Ok(obscura_net::Response {
-                url: url.clone(),
-                status: 200,
-                headers,
-                body: body_bytes,
-                redirected_from: Vec::new(),
+        let response = progress.scope(async {
+            let intercepted = self.intercept_navigation(&url, method, body, initiator).await.map_err(|error| {
+                self.lifecycle = LifecycleState::Failed; error
+            })?;
+            let was_intercepted = intercepted.is_some();
+            if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
+                let content_type = url_str
+                    .strip_prefix("data:")
+                    .and_then(|s| s.split(',').next())
+                    .unwrap_or("text/html")
+                    .split(';')
+                    .next()
+                    .unwrap_or("text/html")
+                    .to_string();
+                let body_bytes = decode_data_uri(url_str).unwrap_or_default();
+                let mut headers = std::collections::HashMap::new();
+                headers.insert("content-type".to_string(), content_type);
+                Ok(obscura_net::Response {
+                    url: url.clone(),
+                    status: 200,
+                    headers,
+                    body: body_bytes,
+                    redirected_from: Vec::new(),
+                })
+            } else if method == "POST" || initiator.is_some() {
+                self.fetch_navigation_from_document(
+                    &url, if method == "POST" { "POST" } else { "GET" },
+                    (method == "POST").then(|| body.as_bytes().to_vec()), None, initiator,
+                ).await
+            } else {
+                self.do_fetch(&url).await
+            }
+            .map(|response| (response, was_intercepted))
+            .map_err(|e| {
+                self.lifecycle = LifecycleState::Failed;
+                self.navigation_blocked = matches!(&e, ObscuraNetError::Blocked(_));
+                PageError::NetworkError(e.to_string())
             })
-        } else if method == "POST" || initiator.is_some() {
-            self.fetch_navigation_from_document(
-                &url, if method == "POST" { "POST" } else { "GET" },
-                (method == "POST").then(|| body.as_bytes().to_vec()), None, initiator,
-            ).await
-        } else {
-            self.do_fetch(&url).await
-        }
-        .map_err(|e| {
-            self.lifecycle = LifecycleState::Failed;
-            PageError::NetworkError(e.to_string())
-        })?;
+        }).await;
+        let (response, was_intercepted) = response?;
         self.navigation_timing.record("responseEnd");
 
-        // Store binary main resources (images, PDFs, octet-stream) base64 so
-        // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
-        // corrupts them (issue #340). Text-like types stay as text.
-        let main_is_binary = !is_text_like_content_type(response.content_type());
-        self.record_network_event_with_body(
+        // Keep transport bytes for streams; DevTools decoding happens on read.
+        let request_id = self.record_network_event_inner(
             if was_intercepted && response.redirected_from.is_empty() { url.as_str() } else { response.url.as_str() },
             method,
             "Document",
             response.status,
             &response.headers,
-            &response.body,
-            main_is_binary,
+            response.body.len(),
         );
+        self.store_response_body_with(request_id, response.body.len(), || {
+            CachedNetworkResponseBody::raw(&response.body, response.content_type())
+        });
 
         if was_intercepted {
             if let Some(event) = self.network_events.last_mut() { event.intercepted = true; }
-        }
-        if !response.redirected_from.is_empty() {
-            self.url = Some(response.url.clone());
         }
 
         // An HTTP error status with no body at all (a bare 429/403/503 from a
@@ -3760,6 +3946,8 @@ impl Page {
             .map(|title_id| dom.text_content(title_id))
             .unwrap_or_default();
 
+        self.url = Some(if response.redirected_from.is_empty() { url.clone() } else { response.url.clone() });
+        self.referrer = referrer.to_string();
         self.dom = Some(dom);
         self.init_js();
         let author_stylesheets = self.fetch_stylesheets().await;
@@ -4006,6 +4194,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.navigation_blocked = false;
         self.navigation_timing = NavigationTiming::default();
         self.retire_render_resources();
         self.pending_frame_work.clear();
@@ -4897,18 +5086,23 @@ impl Page {
     }
 
     fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
+        self.store_response_body_with(request_id, body.len(), || CachedNetworkResponseBody::Bytes {
+            bytes: body.to_vec(), base64_encoded,
+        });
+    }
+
+    fn store_response_body_with(
+        &mut self,
+        request_id: String,
+        source_len: usize,
+        make_stored: impl FnOnce() -> CachedNetworkResponseBody,
+    ) {
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
-        if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
+        if max_entries == 0 || max_bytes == 0 || source_len > max_bytes {
             return;
         }
-        self.response_bodies.insert(
-            request_id.clone(),
-            StoredResponseBody {
-                body: body.to_vec(),
-                base64_encoded,
-            },
-        );
+        self.response_bodies.insert(request_id.clone(), make_stored());
         self.response_body_order.push_back(request_id);
         while self.response_body_order.len() > max_entries {
             if let Some(oldest) = self.response_body_order.pop_front() {
@@ -4918,49 +5112,29 @@ impl Page {
     }
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
-        self.response_bodies.get(request_id).cloned().or_else(|| {
-            let body = self
-                .js
-                .as_ref()?
-                .get_network_response_body(request_id)?;
-            // The JS-side store holds the lossy/base64 text form; convert to
-            // raw bytes so the page-side store stays uniformly lazy.
-            let raw = if body.base64_encoded {
-                BASE64.decode(body.body.as_bytes()).ok()?
-            } else {
-                body.body.into_bytes()
-            };
-            Some(StoredResponseBody {
-                body: raw,
-                base64_encoded: body.base64_encoded,
-            })
+        let (body, base64_encoded) = if let Some(body) = self.response_bodies.get(request_id) {
+            body.raw_bytes()?
+        } else {
+            self.js.as_ref()?.get_network_response_body_raw(request_id)?
+        };
+        Some(StoredResponseBody { body, base64_encoded })
+    }
+
+    pub fn get_response_body_for_cdp(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
+        self.response_bodies.get(request_id).map(CachedNetworkResponseBody::decoded).or_else(|| {
+            self.js.as_ref()?.get_network_response_body(request_id)
         })
     }
 
-    /// Take a stored response body as raw bytes for CDP streaming
-    /// (Fetch.takeResponseBodyAsStream). Removes it from the in-memory cache and
-    /// transfers ownership to the caller, so a large body is held once and freed
-    /// when the stream is closed rather than lingering in this long-running
-    /// process (issue #360). Binary bodies are stored base64 (byte-exact); text
-    /// bodies return their UTF-8 bytes. Returns None if the body was never
-    /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
-    /// dropped) or the id is unknown.
+    /// Transfer original response bytes to a CDP stream, removing the cached
+    /// entry. The body's MIME type and charset affect only the text getter.
+    /// Returns None for unknown, evicted, or oversized bodies.
     pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
         if let Some(body) = self.response_bodies.remove(request_id) {
             self.response_body_order.retain(|id| id != request_id);
-            // Raw bytes are what this returns; the base64 flag only says how
-            // CDP would report the body, not how it is stored.
-            return Some(body.body);
+            return body.into_bytes();
         }
-        let b = self
-            .js
-            .as_ref()?
-            .get_network_response_body(request_id)?;
-        if b.base64_encoded {
-            BASE64.decode(b.body.as_bytes()).ok()
-        } else {
-            Some(b.body.into_bytes())
-        }
+        self.js.as_ref()?.take_network_response_body_raw(request_id)
     }
 
     /// Make the body stored under `from_id` also retrievable under `to_id`.
@@ -5003,18 +5177,8 @@ impl Page {
         // Completed module and JS requests must survive the realm's teardown.
         self.sync_js_network_events();
         let max_entries = response_body_entry_limit();
-        for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
-            // The JS-side store holds the lossy/base64 text form; convert to
-            // raw bytes so the page-side store stays uniformly lazy.
-            let raw = if body.base64_encoded {
-                BASE64.decode(body.body.as_bytes()).unwrap_or_default()
-            } else {
-                body.body.into_bytes()
-            };
-            self.response_bodies.insert(id.clone(), StoredResponseBody {
-                body: raw,
-                base64_encoded: body.base64_encoded,
-            });
+        for (id, body) in self.js.as_ref().unwrap().take_cached_network_response_bodies() {
+            self.response_bodies.insert(id.clone(), body);
             self.response_body_order.push_back(id);
         }
         while self.response_body_order.len() > max_entries {
@@ -5209,8 +5373,8 @@ impl Page {
         Ok(self.process_pending_navigation_outcome().await? != PendingNavigationOutcome::None)
     }
 
-    /// Reject a document-driven cross-scheme jump to `file://` and restore
-    /// the virtual URL that the location setter changed before queuing it.
+    /// Reject a document-driven cross-scheme jump to `file://`. Location never
+    /// previewed the target, so the document keeps its URL as it is.
     pub fn reject_page_initiated_file_navigation(&mut self, target: &str) -> bool {
         let current_url = self.url_string();
         if !cross_scheme_to_file(&current_url, target) {
@@ -5221,15 +5385,6 @@ impl Page {
             current_url,
             target,
         );
-        if let Some(js) = self.js.as_mut() {
-            let _ = js.execute_script(
-                "<blocked-navigation>",
-                &format!(
-                    "globalThis.__virtualUrl = {};",
-                    serde_json::to_string(&current_url).unwrap_or_else(|_| "null".into())
-                ),
-            );
-        }
         true
     }
 
@@ -5272,17 +5427,8 @@ impl Page {
         let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
         }).unwrap_or_default();
-        let nav_timeout = self.navigation_timeout();
-        let nav_timeout_ms = duration_millis_u64(nav_timeout);
-        tokio::time::timeout(
-            nav_timeout,
-            self.navigate_with_wait_post_inner(
-                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url, initiator.as_ref(),
-            ),
-        ).await.map_err(|_| {
-            self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-            PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
-        })??;
+        self.within_navigation_deadline(url, crate::lifecycle::WaitUntil::Load,
+            method, body, &source_url, initiator.as_ref()).await?;
         self.push_history(self.url_string());
         Ok(())
     }
@@ -5375,7 +5521,7 @@ mod tests {
         assert_eq!(page.title, "Fulfilled");
         let document = page.network_events.iter().find(|event| event.resource_type == "Document").unwrap();
         assert_eq!(document.status, 201);assert!(document.intercepted);
-        assert_eq!(page.response_bodies.get(&document.request_id).unwrap().body, expected);
+        assert_eq!(page.get_response_body(&document.request_id).unwrap().body, expected);
         let mut set_cookies = document.response_headers.get("set-cookie").unwrap().lines().collect::<Vec<_>>();
         set_cookies.sort_unstable();
         assert_eq!(set_cookies, ["first=1; Path=/", "second=2; Path=/"]);
@@ -6830,6 +6976,41 @@ mod tests {
         assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
     }
 
+    // #1628: location used to report a script navigation's target at once and
+    // keep it when that navigation failed, while the old document stayed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_script_navigation_leaves_location_on_the_current_document() {
+        let url = "data:text/html,<title>current</title>";
+        let mut page = page_without_chain_limit("failed-location-navigation");
+        page.navigate(url).await.unwrap();
+        assert_eq!(page.evaluate("(() => { location.href = 'https://nonexistent-host.invalid/next'; return location.href; })()"),
+            serde_json::json!(url), "location keeps the current URL until a navigation commits");
+        assert!(page.process_pending_navigation().await.is_err());
+        assert_eq!(page.evaluate("[location.href, location.origin === new URL(document.URL).origin, document.URL, document.title]"),
+            serde_json::json!([url, true, url, "current"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_policy_refusal_state_tracks_the_latest_attempt() {
+        use crate::PageError;
+        let mut page = Page::new("navigation-policy-state".into(),
+            std::sync::Arc::new(BrowserContext::new("navigation-policy-context".into())));
+        let denied = "http://127.0.0.1:9/";
+        let error = page.navigate(denied).await.unwrap_err();
+        match error {
+            PageError::NetworkError(_) => {},
+            PageError::InvalidUrl(_) | PageError::ParseError(_) |
+            PageError::TooManyClientNavigations(_) => panic!("policy refusals keep the existing network error variant"),
+        }
+        assert!(page.navigation_was_blocked());
+        page.navigate("data:text/html,<title>permitted</title>").await.unwrap();
+        assert!(!page.navigation_was_blocked());
+        assert!(page.navigate(denied).await.is_err());
+        assert!(page.navigation_was_blocked());
+        page.navigate_blank();
+        assert!(!page.navigation_was_blocked());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn history_urls_keep_the_committed_origin_during_pending_navigation() {
         let mut page = import_map_test_page("history-committed-origin", "http://example.com/current", "<title>history</title>");
@@ -7528,6 +7709,136 @@ mod tests {
         assert!(!script_response_is_executable(500));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_scripts_execute_fulfilled_bodies_before_transport() {
+        use obscura_js::ops::InterceptResolution;
+        use std::sync::atomic::Ordering;
+        let (url, script_requests) = spawn_script_resource_cache_server(false);
+        let context = Arc::new(BrowserContext::with_storage_and_network(
+            "parser-script-interception".into(), None, false, None, None, true,
+        ));
+        let mut page = Page::new("parser-script-interception".into(), context);
+        page.intercept_block_patterns = vec!["*/shared.js".into()];
+        let mut requests = page.enable_interception();
+        let mut intercepted = 0;
+        {
+            let navigation = page.navigate(&url);
+            tokio::pin!(navigation);
+            loop {
+                tokio::select! {
+                    result = &mut navigation => { result.unwrap(); break; }
+                    request = requests.recv() => {
+                        let request = request.unwrap();
+                        assert_eq!(request.resource_type, "Script");
+                        intercepted += 1;
+                        request.resolver.send(InterceptResolution::Fulfill {
+                            status: 200,
+                            headers: [("content-type".into(), "application/javascript".into())].into(),
+                            body: "not the script body".into(),
+                            body_base64: BASE64.encode("globalThis.__runs += 10;"),
+                        }).ok().unwrap();
+                    }
+                }
+            }
+        }
+        assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.__runs").unwrap(),
+            serde_json::json!(320.0), "every parser script must execute its fulfilled body");
+        assert_eq!(intercepted, 32);
+        assert_eq!(script_requests.load(Ordering::SeqCst), 0,
+            "fulfilled scripts must never reach the origin server");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_interception_continues_with_request_local_overrides() {
+        assert_parser_script_request_overrides(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_interception_continues_with_stealth_transport() {
+        assert_parser_script_request_overrides(true).await;
+    }
+
+    async fn assert_parser_script_request_overrides(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/changed.js", listener.local_addr().unwrap());
+        let body = "globalThis.__continued = true;";
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new(); let mut chunk = [0; 4096];
+            loop {
+                let length = socket.read(&mut chunk).await.unwrap(); assert!(length > 0);
+                bytes.extend_from_slice(&chunk[..length]);
+                if bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                    .is_some_and(|end| bytes.len() >= end + 7) { break; }
+            }
+            let head = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+            assert!(head.starts_with("post /changed.js http/1.1"));
+            assert!(head.contains("x-script-probe: isolated"));
+            assert!(bytes.ends_with(&[0, 255, 128]));
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let context = Arc::new(BrowserContext::with_storage_and_network(
+            "continued-parser-script".into(), None, stealth, None, None, true,
+        ));
+        let mut page = Page::new("continued-parser-script".into(), context);
+        let mut requests = page.enable_interception();
+        let (result, id) = tokio::join!(page.navigate("http://127.0.0.1:9/initial"), async {
+            let document = requests.recv().await.unwrap();
+            assert_eq!(document.resource_type, "Document");
+            document.resolver.send(InterceptResolution::Fulfill { status: 200,
+                headers: [("content-type".into(), "text/html".into())].into(),
+                body: "<!doctype html><script src='/original.js'></script>".into(),
+                body_base64: String::new() }).ok().unwrap();
+            let script = requests.recv().await.unwrap();
+            assert_eq!(script.resource_type, "Script");
+            let id = script.request_id;
+            script.resolver.send(InterceptResolution::Continue { url: Some(target),
+                method: Some("POST".into()), body: Some(vec![0, 255, 128]),
+                headers: Some([("x-script-probe".into(), "isolated".into())].into()) }).ok().unwrap();
+            id
+        });
+        result.unwrap(); server.await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.__continued").unwrap(), serde_json::json!(true));
+        let event = page.network_events.iter().find(|event| event.request_id == id).unwrap();
+        assert!(event.intercepted); assert_eq!(event.method, "POST");
+        assert_eq!(page.get_response_body(&id).unwrap().body, body.as_bytes());
+        assert!(page.http_client.extra_headers.read().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_interception_rejects_private_rewrites_and_explicit_failures() {
+        use obscura_js::ops::InterceptResolution;
+        for rewrite in [false, true] {
+            let context = Arc::new(BrowserContext::with_storage_and_network(
+                "blocked-parser-script".into(), None, false, None, None, false,
+            ));
+            let mut page = Page::new("blocked-parser-script".into(), context);
+            let mut requests = page.enable_interception();
+            let (result, id) = tokio::join!(page.navigate("http://example.test/"), async {
+                let document = requests.recv().await.unwrap();
+                document.resolver.send(InterceptResolution::Fulfill { status: 200,
+                    headers: [("content-type".into(), "text/html".into())].into(),
+                    body: "<!doctype html><script src='/original.js'></script>".into(),
+                    body_base64: String::new() }).ok().unwrap();
+                let script = requests.recv().await.unwrap(); let id = script.request_id;
+                let resolution = if rewrite { InterceptResolution::Continue {
+                    url: Some("http://127.0.0.1:9/rewritten.js".into()),
+                    method: None, headers: None, body: None,
+                } } else { InterceptResolution::Fail { reason: "Aborted".into() } };
+                script.resolver.send(resolution).ok().unwrap(); id
+            });
+            result.unwrap();
+            let event = page.network_events.iter().find(|event| event.request_id == id).unwrap();
+            assert!(event.intercepted); assert_eq!(event.status, 0);
+            let error = event.error_text.as_deref().unwrap();
+            if rewrite { assert!(error.contains("private") || error.contains("forbidden"), "{error}"); }
+            else { assert!(error.contains("net::ERR_ABORTED"), "{error}"); }
+        }
+    }
+
     /// Issue #678: `localStorage` belongs to the BrowserContext and
     /// `sessionStorage` to the Page, so both survive the realm rebuild that
     /// `init_js` performs on every navigation. The fixture serves one origin on
@@ -7948,6 +8259,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fetched_frame_window_event_handler_assignments_use_the_real_window() {
+        let (base, mut requests) = spawn_form_target_server().await;
+        let mut page = import_map_test_page("frame-window-handlers", &base,
+            "<html><body><iframe src='/child'></iframe></body></html>");
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(requests.try_recv().unwrap().0, "GET /child HTTP/1.1");
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const child = document.querySelector('iframe').contentWindow;
+            let calls = 0; const fn = function(event) { if (this === child.window && event.type === 'message') calls++; };
+            child.onmessage = fn;
+            const same = child.onmessage === fn;
+            child.eval("dispatchEvent(new MessageEvent('message', {data:'hello'}))");
+            child.onmessage = null;
+            child.eval("dispatchEvent(new MessageEvent('message', {data:'ignored'}))");
+            return [same, calls, child.onmessage === null, typeof window.onmessage];
+        })()"#).unwrap(), serde_json::json!([true,1,true,"object"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn form_submission_to_named_iframe_keeps_the_top_document() {
         let (base, mut requests) = spawn_form_target_server().await;
         for method in ["GET", "POST"] {
@@ -8228,9 +8558,11 @@ mod tests {
         let mut page = import_map_test_page("srcdoc-sandbox", "https://parent.test", "<body></body>");
         page.evaluate_script(r#"(() => {
             globalThis.escaped = false;
-            for (const [id, policy] of [['opaque', 'ALLOW-SCRIPTS'], ['inert', 'ALLOW-SAME-ORIGIN']]) {
+            for (const [id, policy] of [['opaque', 'ALLOW-SCRIPTS'], ['inert', 'ALLOW-SAME-ORIGIN'],
+                ['opaque-property', 'ALLOW-SCRIPTS'], ['inert-property', 'ALLOW-SAME-ORIGIN']]) {
                 const f = document.createElement('iframe'); f.id = id;
-                f.setAttribute('sandbox', policy);
+                if (id.endsWith('-property')) f.sandbox = policy;
+                else f.setAttribute('sandbox', policy);
                 f.srcdoc = '<button onclick="parent.escaped=true">hello</button><script>globalThis.ran=true;try{parent.escaped=true}catch(e){}</script><noscript><i>fallback</i></noscript>';
                 document.body.appendChild(f);
             }
@@ -8238,16 +8570,23 @@ mod tests {
         })()"#).unwrap();
         pump_srcdoc_frames(&mut page).await;
         assert_eq!(page.evaluate_script(r#"(() => {
-            const opaque = document.getElementById('opaque');
-            const inert = document.getElementById('inert');
-            inert.contentDocument.querySelector('button').click();
-            return [opaque.contentDocument === null, inert.contentDocument.URL,
-                inert.contentDocument.querySelector('button').textContent,
-                typeof inert.contentWindow.ran, escaped,
-                inert.contentDocument.querySelector('noscript i')?.textContent];
-        })()"#).unwrap(), serde_json::json!([true, "about:srcdoc", "hello", "undefined", false, "fallback"]));
-        assert_eq!(page.evaluate_in_frame(0, "[document.URL, globalThis.ran, location.origin]").unwrap(),
-            serde_json::json!(["about:srcdoc", true, "null"]));
+            return ['', '-property'].map(suffix => {
+                const opaque = document.getElementById('opaque' + suffix);
+                const inert = document.getElementById('inert' + suffix);
+                inert.contentDocument.querySelector('button').click();
+                return [opaque.contentDocument === null, inert.contentDocument.URL,
+                    inert.contentDocument.querySelector('button').textContent,
+                    typeof inert.contentWindow.ran, escaped,
+                    inert.contentDocument.querySelector('noscript i')?.textContent];
+            });
+        })()"#).unwrap(), serde_json::json!([
+            [true, "about:srcdoc", "hello", "undefined", false, "fallback"],
+            [true, "about:srcdoc", "hello", "undefined", false, "fallback"],
+        ]));
+        for index in [0, 2] {
+            assert_eq!(page.evaluate_in_frame(index, "[document.URL, globalThis.ran, location.origin]").unwrap(),
+                serde_json::json!(["about:srcdoc", true, "null"]));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8841,6 +9180,35 @@ mod tests {
             Some(0.0),
             "a reference to the discarded frame survived, so its context cannot be collected"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eof_scripts_are_not_fetched_or_executed() {
+        use std::sync::atomic::Ordering;
+
+        for module in [false, true] {
+            for external in [false, true] {
+                for complete in [false, true] {
+                    let (url, requests) = spawn_script_resource_cache_server(false);
+                    let mut page = frame_page("eof-script");
+                    page.url = Some(url::Url::parse(&url).unwrap());
+                    let kind = if module { "type=module" } else { "" };
+                    let source = if external { "src=/shared.js" } else { "" };
+                    let end = if complete { "</script>" } else { "" };
+                    page.dom = Some(parse_html(&format!(
+                        "<!doctype html><body><script {kind} {source}>globalThis.__runs=(globalThis.__runs||0)+1;{end}"
+                    )));
+                    page.init_js();
+                    page.execute_scripts().await;
+                    assert_eq!(
+                        page.js.as_mut().unwrap().evaluate("globalThis.__runs||0").unwrap(),
+                        serde_json::json!(if complete { 1.0 } else { 0.0 }),
+                        "module={module}, external={external}, complete={complete}"
+                    );
+                    assert_eq!(requests.load(Ordering::SeqCst), usize::from(complete && external));
+                }
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9636,16 +10004,16 @@ mod tests {
     async fn document_write_external_script_blocks_later_parser_scripts() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(75),
-            "globalThis.__writtenOrder.push('external'); globalThis.__writtenValue = 1;",
+            "globalThis.__writtenOrder.push('external'); let __writtenValue = 1;",
         );
         let html = format!(
             r#"<html><body>
                 <script>globalThis.__writtenOrder = [];</script>
                 <script>
                     document.write('<script src="{base}/written.js"><\/script>');
-                    document.write('<script>globalThis.__writtenOrder.push("written:" + String(globalThis.__writtenValue));<\/script>');
+                    document.write('<script>const __writtenInlineValue = 2; globalThis.__writtenOrder.push("written:" + String(__writtenValue));<\/script>');
                 </script>
-                <script>globalThis.__writtenOrder.push('after:' + String(globalThis.__writtenValue));</script>
+                <script>globalThis.__writtenOrder.push('after:' + String(__writtenValue) + ':' + __writtenInlineValue);</script>
             </body></html>"#,
         );
         let mut page = import_map_test_page(
@@ -9668,7 +10036,7 @@ mod tests {
                 .unwrap()
                 .evaluate("globalThis.__writtenOrder")
                 .unwrap(),
-            serde_json::json!(["external", "written:1", "after:1"]),
+            serde_json::json!(["external", "written:1", "after:1:2"]),
         );
     }
 
@@ -11102,6 +11470,162 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn aborted_image_requests_never_reach_transport_or_retry_during_paint() {
+        use obscura_js::ops::InterceptResolution;
+        for mode in ["parser", "dynamic", "css"] {
+            let (address, _peak, _open, seen) = spawn_counting_svg_server(0, 4);
+            let image = format!("http://{address}/{mode}.svg");
+            let body = match mode {
+                "parser" => format!(r#"<img src="{image}">"#),
+                "css" => format!(r#"<div style="width:20px;height:10px;background-image:url({image})"></div>"#),
+                _ => String::new(),
+            };
+            let mut page = page_with_transport_and_body(mode, &format!("http://{address}/page"), "");
+            page.js.as_ref().unwrap().set_intercept_page_id(mode);
+            page.intercept_block_patterns = vec![image.clone()];
+            let mut requests = page.enable_interception();
+            page.js.as_mut().unwrap().set_dom(parse_html(&format!("<html><body>{body}</body></html>")));
+            page.js.as_mut().unwrap().run_page_init();
+            if mode == "dynamic" {
+                page.evaluate_script(&format!(r#"const image = new Image(); image.src = '{image}'; document.body.appendChild(image);"#)).unwrap();
+            }
+            let ((), paused) = tokio::join!(async {
+                for _ in 0..2 {
+                    page.prepare_screenshot_resources(1_000).await;
+                    page.settle_for_duration(50).await;
+                    assert!(page.screenshot((400.0, 300.0)).is_some());
+                }
+                assert!(seen.try_recv().is_err(), "an aborted {mode} image reached the HTTP sink");
+                if mode != "css" {
+                    assert_eq!(page.evaluate("document.images[0].naturalWidth"), serde_json::json!(0.0));
+                }
+                drop(page);
+            }, async {
+                let mut paused = Vec::new();
+                while let Some(request) = requests.recv().await {
+                    assert_eq!(request.url, image);
+                    assert_eq!(request.resource_type, "Image");
+                    paused.push(request.request_id);
+                    request.resolver.send(InterceptResolution::Fail { reason: "BlockedByClient".into() }).ok().unwrap();
+                }
+                paused
+            });
+            assert!(!paused.is_empty(), "{mode} image must pause before transport");
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_interception_continues_and_fulfills_with_one_request_identity() {
+        use obscura_js::ops::InterceptResolution;
+        for fulfill in [false, true] {
+            let (address, _peak, _open, seen) = spawn_counting_svg_server(0, 4);
+            let image = format!("http://{address}/image.svg");
+            let mut page = page_with_transport_and_body("image-resolution", &format!("http://{address}/page"), "");
+            page.js.as_ref().unwrap().set_intercept_page_id("image-resolution");
+            let mut requests = page.enable_interception();
+            page.js.as_mut().unwrap().set_dom(parse_html(&format!(r#"<html><body><img src="{image}"></body></html>"#)));
+            page.js.as_mut().unwrap().run_page_init();
+            let fulfilled = r#"<svg xmlns="http://www.w3.org/2000/svg" width="31" height="17"/>"#;
+            let ((events, bodies), paused) = tokio::join!(async {
+                page.prepare_screenshot_resources(1_000).await;
+                page.settle_for_duration(50).await;
+                assert_eq!(page.evaluate("document.images[0].naturalWidth"), serde_json::json!(if fulfill { 31.0 } else { 20.0 }));
+                page.sync_js_network_events();
+                let events: Vec<_> = page.network_events.iter().filter(|event| event.intercepted).map(|event| event.request_id.clone()).collect();
+                let bodies: Vec<_> = events.iter().map(|id| page.get_response_body(id).unwrap().body).collect();
+                drop(page);
+                (events, bodies)
+            }, async {
+                let mut paused = Vec::new();
+                while let Some(request) = requests.recv().await {
+                    assert_eq!(request.url, image);
+                    paused.push(request.request_id);
+                    let resolution = if fulfill { InterceptResolution::Fulfill {
+                        status: 200, headers: [("content-type".into(), "image/svg+xml".into())].into(),
+                        body: "ignored lossy view".into(), body_base64: BASE64.encode(fulfilled),
+                    } } else { InterceptResolution::Continue { url: None, method: None, headers: None, body: None } };
+                    request.resolver.send(resolution).ok().unwrap();
+                }
+                paused
+            });
+            assert!(!paused.is_empty(), "image must pause before its response is resolved");
+            assert_eq!(events, paused, "completion and retained body must use the live pause identity");
+            if fulfill {
+                assert!(seen.try_recv().is_err(), "fulfilled image must not reach transport");
+                assert!(bodies.iter().all(|body| body.as_slice() == fulfilled.as_bytes()));
+            } else {
+                assert!(seen.try_recv().unwrap().starts_with("GET /image.svg "));
+                assert!(seen.try_recv().is_err(), "continued image must not be fetched twice");
+            }
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intercepted_image_rewrites_keep_the_private_network_gate() {
+        use obscura_js::ops::InterceptResolution;
+        let (address, _peak, _open, seen) = spawn_counting_svg_server(0, 4);
+        let mut page = page_with_transport_and_body("private-image-rewrite", "http://192.0.2.1/page", "");
+        page.http_client = Arc::new(obscura_net::ObscuraHttpClient::new());
+        page.js.as_ref().unwrap().set_http_client(page.http_client.clone());
+        page.js.as_ref().unwrap().set_intercept_page_id("private-image-rewrite");
+        let mut requests = page.enable_interception();
+        page.js.as_mut().unwrap().set_dom(parse_html(r#"<html><body><img src="http://192.0.2.1/image.svg"></body></html>"#));
+        page.js.as_mut().unwrap().run_page_init();
+        let ((), paused) = tokio::join!(async {
+            page.prepare_screenshot_resources(1_000).await;
+            page.settle_for_duration(50).await;
+            assert_eq!(page.evaluate("document.images[0].naturalWidth"), serde_json::json!(0.0));
+            assert!(seen.try_recv().is_err(), "private rewrite must never reach the sink");
+            drop(page);
+        }, async {
+            let mut paused = 0;
+            while let Some(request) = requests.recv().await {
+                paused += 1;
+                request.resolver.send(InterceptResolution::Continue { url: Some(format!("http://{address}/private.svg")),
+                    method: None, headers: None, body: None }).ok().unwrap();
+            }
+            paused
+        });
+        assert!(paused > 0, "the rewrite must actually be applied to an intercepted image");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intercepted_images_can_rewrite_between_http_and_https() {
+        use obscura_js::ops::InterceptResolution;
+        let (address, _peak, _open, seen) = spawn_counting_svg_server(0, 4);
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let source = format!("https://{}/source.svg", unused.local_addr().unwrap());
+        drop(unused);
+        let mut page = page_with_transport_and_body("image-scheme-rewrite", &format!("http://{address}/page"), "");
+        page.js.as_ref().unwrap().set_intercept_page_id("image-scheme-rewrite");
+        let mut requests = page.enable_interception();
+        page.js.as_mut().unwrap().set_dom(parse_html(&format!(r#"<html><body><img src="{source}"></body></html>"#)));
+        page.js.as_mut().unwrap().run_page_init();
+        let ((), paused) = tokio::join!(async {
+            page.prepare_screenshot_resources(1_000).await;
+            page.settle_for_duration(50).await;
+            assert_eq!(page.evaluate("document.images[0].naturalWidth"), serde_json::json!(20.0));
+            assert!(seen.try_recv().unwrap().starts_with("GET /target.svg "));
+            assert!(seen.try_recv().is_err(), "rewritten image must be fetched exactly once");
+            drop(page);
+        }, async {
+            let mut paused = 0;
+            while let Some(request) = requests.recv().await {
+                assert_eq!(request.url, source);
+                paused += 1;
+                request.resolver.send(InterceptResolution::Continue { url: Some(format!("http://{address}/target.svg")),
+                    method: None, headers: None, body: None }).ok().unwrap();
+            }
+            paused
+        });
+        assert_eq!(paused, 1, "the HTTPS source must pause before the HTTP rewrite");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn render_resource_loads_share_one_page_wide_concurrency_limit() {
         let (address, peak, _open, _seen_rx) = spawn_counting_svg_server(300, 8);
         let page_url = format!("http://{address}/page");
@@ -12065,29 +12589,6 @@ impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
     }
-}
-
-/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
-/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
-/// be base64-encoded so Network.getResponseBody returns intact bytes.
-fn is_text_like_content_type(content_type: Option<&str>) -> bool {
-    let ct = match content_type {
-        Some(c) => c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase(),
-        // No Content-Type: assume text (matches the HTML-parse default).
-        None => return true,
-    };
-    if ct.is_empty() {
-        return true;
-    }
-    ct.starts_with("text/")
-        || ct == "application/json"
-        || ct == "application/xml"
-        || ct == "application/xhtml+xml"
-        || ct == "application/javascript"
-        || ct == "application/ecmascript"
-        || ct == "image/svg+xml"
-        || ct.ends_with("+json")
-        || ct.ends_with("+xml")
 }
 
 /// Lowercased MIME type of a Content-Type header, without parameters.

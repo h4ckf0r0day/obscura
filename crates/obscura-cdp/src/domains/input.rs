@@ -33,7 +33,7 @@ fn insert_text_js(text: &str, ime_commit: bool) -> String {
             var commitStart = {ime_commit} ? t.selectionStart : null;\
             if ({ime_commit} && commitStart == null) commitStart = (t.value || '').length;\
             var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:ins,inputType:'insertText'}}));\
-            if (!t.dispatchEvent(before)) return;\
+            if (!globalThis.__obscura_dispatchDomEvent(t, before)) return;\
             if (t.hasAttribute('readonly') || globalThis.__obscura_isDisabled(t)) return;\
             var v = t.value || '';\
             var s = t.selectionStart, e = t.selectionEnd;\
@@ -47,7 +47,7 @@ fn insert_text_js(text: &str, ime_commit: bool) -> String {
                 var caret = Math.max(0, Math.min((commitStart == null ? lo : commitStart) + ins.length, t.value.length));\
                 t.setSelectionRange(caret, caret);\
             }}\
-            t.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,data:ins,inputType:'insertText'}})));\
+            globalThis.__obscura_dispatchDomEvent(t, globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,data:ins,inputType:'insertText'}})));\
         }})()",
         text = literal,
     )
@@ -86,7 +86,7 @@ const BACKSPACE_JS: &str = "(function() {\
             t.setSelectionRange(s - d, s - d);\
         }\
     }\
-    t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
+    globalThis.__obscura_dispatchDomEvent(t, globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
 })()";
 
 const DELETE_JS: &str = "(function() {\
@@ -103,7 +103,7 @@ const DELETE_JS: &str = "(function() {\
     if (lo === hi) return;\
     globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + v.slice(hi));\
     t.setSelectionRange(lo, lo);\
-    t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
+    globalThis.__obscura_dispatchDomEvent(t, globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
 })()";
 
 fn mouse_button_code(button: &str) -> u8 {
@@ -169,11 +169,11 @@ pub async fn handle(
                             globalThis.__obscura_setHovered(target);\
                             var init = {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}};\
                             if (old !== target) {{\
-                                if (old) old.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseout', Object.assign({{}}, init, {{relatedTarget:target}}))));\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseover', Object.assign({{}}, init, {{relatedTarget:old}}))));\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', Object.assign({{}}, init, {{bubbles:false,relatedTarget:old}}))));\
+                                if (old) globalThis.__obscura_dispatchDomEvent(old, globalThis.__obscura_markTrusted(new MouseEvent('mouseout', Object.assign({{}}, init, {{relatedTarget:target}}))));\
+                                globalThis.__obscura_dispatchDomEvent(target, globalThis.__obscura_markTrusted(new MouseEvent('mouseover', Object.assign({{}}, init, {{relatedTarget:old}}))));\
+                                globalThis.__obscura_dispatchDomEvent(target, globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', Object.assign({{}}, init, {{bubbles:false,relatedTarget:old}}))));\
                             }}\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', init)));\
+                            globalThis.__obscura_dispatchDomEvent(target, globalThis.__obscura_markTrusted(new MouseEvent('mousemove', init)));\
                         }})()",
                         x = x,
                         y = y,
@@ -197,8 +197,8 @@ pub async fn handle(
                             var previousTarget = globalThis.__obscura_mouse_over_target || null;\
                             if (previousTarget !== target) {{\
                                 function ancestry(node) {{ var path=[]; while (node) {{ path.push(node); node=node.parentNode || null; }} return path; }}\
-                                function pointerEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
-                                function mouseEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
+                                function pointerEvent(node,type,bubbles,related) {{ globalThis.__obscura_dispatchDomEvent(node, globalThis.__obscura_markTrusted(new PointerEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
+                                function mouseEvent(node,type,bubbles,related) {{ globalThis.__obscura_dispatchDomEvent(node, globalThis.__obscura_markTrusted(new MouseEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
                                 var oldPath = previousTarget && previousTarget.isConnected ? ancestry(previousTarget) : [];\
                                 var newPath = ancestry(target);\
                                 var common = newPath.find(function(node) {{ return oldPath.includes(node); }}) || null;\
@@ -216,9 +216,9 @@ pub async fn handle(
                             }}\
                             var focusTarget = target.closest && target.closest('input,select,textarea,button,a[href],[tabindex],[contenteditable]');\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(pointer);\
+                            globalThis.__obscura_dispatchDomEvent(target, pointer);\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
+                            globalThis.__obscura_dispatchDomEvent(target, evt);\
                             if (!evt.defaultPrevented) {{\
                                 var focusTarget = globalThis.__obscura_interactiveHost(target) || (target.closest && target.closest('[tabindex]'));\
                                 if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) focusTarget.focus();\
@@ -247,9 +247,9 @@ pub async fn handle(
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(pointer);\
+                            globalThis.__obscura_dispatchDomEvent(target, pointer);\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
+                            globalThis.__obscura_dispatchDomEvent(target, evt);\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
                             var clickTarget = down.target;\
                             while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
@@ -281,7 +281,7 @@ pub async fn handle(
                                 globalThis.__obscura_setInputIndeterminate(clickTarget, false);\
                             }}\
                             var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            var cancelled = !clickTarget.dispatchEvent(click);\
+                            var cancelled = !globalThis.__obscura_dispatchDomEvent(clickTarget, click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
                                     for (var rr = 0; rr < radioStates.length; rr++) globalThis.__obscura_setInputChecked(radioStates[rr][0], radioStates[rr][1]);\
@@ -290,11 +290,11 @@ pub async fn handle(
                             }}\
                             if ({click_count} === 2) {{\
                                 var doubleClick = globalThis.__obscura_markTrusted(new MouseEvent('dblclick', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:2,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                clickTarget.dispatchEvent(doubleClick);\
+                                globalThis.__obscura_dispatchDomEvent(clickTarget, doubleClick);\
                             }}\
                             if (checkable && globalThis.__obscura_inputChecked(clickTarget) !== oldChecked) {{\
-                                try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
-                                try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
+                                try {{ globalThis.__obscura_dispatchDomEvent(clickTarget, globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
+                                try {{ globalThis.__obscura_dispatchDomEvent(clickTarget, globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
                                 return;\
                             }}\
                             var labelHost = tag === 'LABEL' ? clickTarget : (clickTarget.closest ? clickTarget.closest('label') : null);\
@@ -358,7 +358,7 @@ pub async fn handle(
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement;\
                             if (!target) return;\
                             var wheel = globalThis.__obscura_markTrusted(new WheelEvent('wheel', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},deltaX:{delta_x},deltaY:{delta_y},deltaMode:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            if (!target.dispatchEvent(wheel)) return;\
+                            if (!globalThis.__obscura_dispatchDomEvent(target, wheel)) return;\
                             var dx = {delta_x}, dy = {delta_y};\
                             var root = document.scrollingElement || document.documentElement || document.body;\
                             var scrollTarget = null;\
@@ -432,7 +432,7 @@ pub async fn handle(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                return target.dispatchEvent(evt);\
+                                return globalThis.__obscura_dispatchDomEvent(target, evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
@@ -458,7 +458,7 @@ pub async fn handle(
                             let js = "(function() {\
                                 var target = document.activeElement;\
                                 if (!target) return;\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})));\
+                                globalThis.__obscura_dispatchDomEvent(target, globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})));\
                                 if (target.localName === 'textarea') {\
                                     if (target.hasAttribute('readonly')) return;\
                                     var value = target.value || '';\
@@ -468,7 +468,7 @@ pub async fn handle(
                                     var lower = Math.min(start, end), upper = Math.max(start, end);\
                                     globalThis.__obscura_setFieldValue(target, 'value', value.slice(0, lower) + '\\n' + value.slice(upper));\
                                     target.setSelectionRange(lower + 1, lower + 1);\
-                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
+                                    globalThis.__obscura_dispatchDomEvent(target, globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
                                 } else {\
                                     var form = target.form;\
                                     if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
@@ -491,7 +491,7 @@ pub async fn handle(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                target.dispatchEvent(evt);\
+                                globalThis.__obscura_dispatchDomEvent(target, evt);\
                             }})()",
                             key = js_str(key),
                             code = js_str(code),

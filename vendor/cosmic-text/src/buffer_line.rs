@@ -260,6 +260,28 @@ impl BufferLine {
         self.layout_opt.get().expect("layout not found")
     }
 
+    /// Reflow a paragraph into varying line widths while preserving shaped runs.
+    pub fn layout_with_line_widths(
+        &mut self,
+        font_system: &mut FontSystem,
+        font_size: f32,
+        width: f32,
+        widths: &[f32],
+        wrap: Wrap,
+        match_mono_width: Option<f32>,
+        tab_width: u16,
+    ) -> &mut [LayoutLine] {
+        let align = self.align;
+        self.layout_opt.set_unused();
+        let mut layout = self.layout_opt.take_unused().unwrap_or_default();
+        let shape = self.shape(font_system, tab_width);
+        shape.layout_to_buffer_with_line_widths(&mut font_system.shape_buffer, font_size,
+            Some(width), wrap, align, &mut layout, match_mono_width,
+            |index| Some(widths.get(index).copied().unwrap_or(width)));
+        self.layout_opt.set_used(layout);
+        self.layout_opt.get_mut().expect("layout not found")
+    }
+
     /// Get line layout cache
     pub fn layout_opt(&self) -> Option<&Vec<LayoutLine>> {
         self.layout_opt.get()

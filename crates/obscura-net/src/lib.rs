@@ -1,4 +1,6 @@
 pub mod client;
+mod document_progress;
+pub use document_progress::{DocumentInterruption, DocumentProgress, DocumentRequest, DocumentResponse, InterruptedDocument};
 pub mod cookies;
 pub mod encoding;
 pub mod interceptor;

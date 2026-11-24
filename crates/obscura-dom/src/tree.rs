@@ -299,9 +299,19 @@ pub struct FormControlState {
     pub indeterminate: bool,
 }
 
+#[derive(Default)]
+struct NodeAllocationGenerations {
+    reused: HashMap<NodeId, u64>,
+    next: u64,
+    // EOF state shares this rare allocation without enlarging ordinary DOM storage.
+    parser_started_scripts: HashSet<NodeId>,
+    incomplete_document: bool,
+}
+
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
+    node_generations: Option<Box<NodeAllocationGenerations>>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
     form_controls: HashMap<NodeId, FormControlState>,
@@ -344,6 +354,7 @@ impl DomTree {
             inner: RefCell::new(DomTreeInner {
                 nodes: vec![Some(doc_node)],
                 free_list: Vec::new(),
+                node_generations: None,
                 document: NodeId(0),
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
@@ -566,6 +577,39 @@ impl DomTree {
     /// selectors match ASCII-case-insensitively.
     pub fn is_quirks(&self) -> bool {
         self.inner.borrow().quirks
+    }
+
+    /// EOF in script text makes the element already started, even before a
+    /// JavaScript realm is installed. This state follows the node, not its markup.
+    pub fn parser_script_already_started(&self, node: NodeId) -> bool {
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| metadata.parser_started_scripts.contains(&node))
+    }
+
+    pub fn has_parser_started_scripts(&self) -> bool {
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| !metadata.parser_started_scripts.is_empty())
+    }
+
+    pub fn is_document_incomplete(&self) -> bool {
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| metadata.incomplete_document)
+    }
+
+    pub fn mark_document_incomplete(&self, incomplete: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if incomplete {
+            inner.node_generations.get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()))
+                .incomplete_document = true;
+        } else if let Some(metadata) = inner.node_generations.as_mut() {
+            metadata.incomplete_document = false;
+        }
+    }
+
+    pub(crate) fn mark_parser_script_started(&self, node: NodeId) {
+        self.inner.borrow_mut().node_generations
+            .get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()))
+            .parser_started_scripts.insert(node);
     }
 
     pub(crate) fn set_allow_declarative_shadow_roots(&self, allow: bool) {
@@ -868,6 +912,11 @@ impl DomTree {
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
+            let generations = inner.node_generations
+                .get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()));
+            generations.next = generations.next.wrapping_add(1).max(1);
+            let generation = generations.next;
+            generations.reused.insert(NodeId(slot), generation);
             NodeId(slot)
         } else {
             let idx = inner.nodes.len() as u32;
@@ -895,6 +944,15 @@ impl DomTree {
             data,
         });
         id
+    }
+
+    /// Identity of this allocation of an arena slot. Appended slots need no
+    /// generation entry; reuse changes only the reused slot's identity.
+    pub fn node_allocation_generation(&self, id: NodeId) -> Option<u64> {
+        let inner = self.inner.borrow();
+        inner.nodes.get(id.index())?.as_ref()?;
+        Some(inner.node_generations.as_ref()
+            .and_then(|generations| generations.reused.get(&id)).copied().unwrap_or(0))
     }
 
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
@@ -1268,6 +1326,9 @@ impl DomTree {
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
+                if let Some(metadata) = inner.node_generations.as_mut() {
+                    metadata.parser_started_scripts.remove(&id);
+                }
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -2195,15 +2256,19 @@ impl DomTree {
         let mut imported_root = None;
         let mut stack = vec![(parent_id, source_node_id)];
         while let Some((dest_parent, src_id)) = stack.pop() {
-            let node_data = {
+            let (node_data, parser_started) = {
                 let source_inner = source.inner.borrow();
                 match source_inner.nodes.get(src_id.index()) {
-                    Some(Some(node)) => node.data.clone(),
+                    Some(Some(node)) => (node.data.clone(), source_inner.node_generations.as_ref()
+                        .is_some_and(|metadata| metadata.parser_started_scripts.contains(&src_id))),
                     _ => continue,
                 }
             };
 
             let new_id = self.new_node(node_data);
+            if parser_started {
+                self.mark_parser_script_started(new_id);
+            }
             self.append_child(dest_parent, new_id);
             // The first node off the stack is source_node_id itself.
             if imported_root.is_none() {
@@ -2338,6 +2403,25 @@ impl Default for DomTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_node_slots_have_distinct_allocation_identities() {
+        let tree = DomTree::new();
+        let retained = tree.new_node(NodeData::Text { contents: "retained".into() });
+        let removed = tree.new_node(NodeData::Text { contents: "removed".into() });
+        let old = tree.node_allocation_generation(removed).unwrap();
+        tree.remove(removed);
+        assert_eq!(tree.node_allocation_generation(removed), None);
+        let reused = tree.new_node(NodeData::Text { contents: "new".into() });
+        assert_eq!(reused, removed);
+        assert_ne!(tree.node_allocation_generation(reused), Some(old));
+        assert_eq!(tree.node_allocation_generation(retained), Some(0));
+        tree.remove(reused);
+        let next = tree.new_node(NodeData::Text { contents: "next".into() });
+        assert_eq!(next, reused);
+        assert_ne!(tree.node_allocation_generation(next), Some(old));
+        assert_eq!(tree.node_allocation_generation(retained), Some(0));
+    }
 
     #[test]
     fn cssom_stylesheet_storage_is_released_when_owner_is_detached() {

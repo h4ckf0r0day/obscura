@@ -299,10 +299,8 @@ impl ResourceRequest {
         match self.resource_type {
             ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             ResourceType::Stylesheet => "text/css,*/*;q=0.1",
-            // AVIF is intentionally omitted until obscura's decoder can paint
-            // it. Advertising a format and then discarding the selected body
-            // is less faithful than negotiating the best format we can use.
-            ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            // Wildcards also permit AVIF/JXL, which the renderer cannot decode.
+            ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/png,image/jpeg,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon",
             ResourceType::Script
             | ResourceType::Font
             | ResourceType::Xhr
@@ -644,12 +642,11 @@ impl Resolve for SsrfGuardResolver {
                 .collect();
             if !allow {
                 if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
-                    return Err(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "SSRF blocked: '{}' resolves to forbidden address {}",
                         host,
                         bad.ip()
-                    )
-                    .into());
+                    )).into());
                 }
             }
             let iter: Addrs = Box::new(addrs.into_iter());
@@ -676,7 +673,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
         match host {
             url::Host::Ipv4(ip) => {
                 if is_forbidden_ip(IpAddr::V4(ip)) {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
                     )));
@@ -684,7 +681,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
             }
             url::Host::Ipv6(ip) => {
                 if is_forbidden_ip(IpAddr::V6(ip)) {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip
                     )));
@@ -702,7 +699,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                     || lower_domain == "127.0.0.1"
                     || lower_domain == "::1"
                 {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to localhost domain '{}' is not allowed",
                         domain
                     )));
@@ -839,26 +836,49 @@ fn reject_oversized_content_length(
 
 /// Read a response with a cap on both advertised and decoded body bytes.
 pub async fn read_reqwest_body_limited(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     url: &Url,
     limit: usize,
 ) -> Result<Vec<u8>, ObscuraNetError> {
-    reject_oversized_content_length(response.headers(), url, limit)?;
+    let mut body = Vec::new();
+    read_reqwest_body_into(response, url, limit, &mut body).await.map_err(|failure| failure.error)?;
+    Ok(body)
+}
+
+pub(crate) struct BodyReadFailure {
+    pub error: ObscuraNetError,
+    pub timeout: bool,
+}
+
+impl BodyReadFailure {
+    pub(crate) fn failed(error: ObscuraNetError) -> Self { Self { error, timeout: false } }
+}
+
+async fn read_reqwest_body_into(
+    mut response: reqwest::Response,
+    url: &Url,
+    limit: usize,
+    body: &mut Vec<u8>,
+) -> Result<(), BodyReadFailure> {
+    reject_oversized_content_length(response.headers(), url, limit).map_err(BodyReadFailure::failed)?;
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(0)
         .min(limit);
-    let mut body = Vec::with_capacity(capacity);
+    body.reserve_exact(capacity);
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
+        BodyReadFailure {
+            timeout: error.is_timeout(),
+            error: ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error))),
+        }
     })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
-            return Err(response_too_large(url, limit));
+            return Err(BodyReadFailure::failed(response_too_large(url, limit)));
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(())
 }
 
 pub struct ObscuraHttpClient {
@@ -1277,6 +1297,17 @@ impl ObscuraHttpClient {
             .await
     }
 
+    /// Continue an intercepted subresource with request-local overrides.
+    pub async fn fetch_resource_request_with_callbacks(
+        &self, url: &Url, request: ResourceRequest, method: &str,
+        body: Option<Vec<u8>>, headers: Option<HashMap<String, String>>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
+    }
+
     async fn resource_cache_key(
         &self,
         method: &Method,
@@ -1514,6 +1545,7 @@ impl ObscuraHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
+        let document_request = crate::DocumentRequest::claim(request.resource_type);
 
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes, self.allow_file_access()).await;
@@ -1715,7 +1747,7 @@ impl ObscuraHttpClient {
 
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
+                request_error(&current_url, &e)
             })?;
 
             let status = resp.status();
@@ -1778,27 +1810,30 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
-                resp,
-                &current_url,
-                request.max_response_bytes,
-            )
-            .await?;
-            drop(in_flight);
-
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
-                body: body_bytes,
+                body: Vec::new(),
                 redirected_from: redirects,
             };
+            let mut captured = document_request.response(response, method.as_str(), referer.as_deref().unwrap_or(""));
+            let read = {
+                let response = captured.get_mut();
+                read_reqwest_body_into(resp, &response.url, request.max_response_bytes, &mut response.body).await
+            };
+            if let Err(failure) = read {
+                captured.failed(failure.timeout);
+                return Err(failure.error);
+            }
+            captured.complete();
+            drop(in_flight);
 
             if let Some(cbs) = callbacks {
-                cbs.fire_response(&request_info, &response).await;
+                cbs.fire_response(&request_info, captured.get()).await;
             }
 
-            return Ok(response);
+            return Ok(captured.finish());
         }
 
         Err(ObscuraNetError::TooManyRedirects(current_url.to_string()))
@@ -1850,6 +1885,19 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
+// Keep a resolver's policy refusal typed through transport error wrappers.
+pub(crate) fn request_error(url: &Url, error: &(dyn std::error::Error + 'static)) -> ObscuraNetError {
+    let text = format!("{}: {}", url, error_chain(error));
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if matches!(error.downcast_ref::<ObscuraNetError>(), Some(ObscuraNetError::Blocked(_))) {
+            return ObscuraNetError::Blocked(text);
+        }
+        cause = error.source();
+    }
+    ObscuraNetError::Network(text)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObscuraNetError {
     #[error("Network error: {0}")]
@@ -1867,6 +1915,10 @@ pub enum ObscuraNetError {
     #[error("Response body exceeded {limit} byte limit: {url}")]
     ResponseTooLarge { url: String, limit: usize },
 }
+
+#[cfg(test)]
+#[path = "document_progress_tests.rs"]
+mod document_progress_tests;
 
 #[cfg(test)]
 mod resource_cache_tests {
@@ -2280,6 +2332,39 @@ mod ssrf_tests {
     }
 
     #[test]
+    fn private_network_denials_have_a_blocked_error_kind() {
+        for text in ["http://127.0.0.1/", "http://localhost/", "http://[::1]/"] {
+            assert!(matches!(validate_url(&Url::parse(text).unwrap(), false),
+                Err(ObscuraNetError::Blocked(_))), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_dns_policy_refusals_survive_transport_wrapping() {
+        struct Resolver(bool);
+        impl Resolve for Resolver {
+            fn resolve(&self, _: Name) -> reqwest::dns::Resolving {
+                let blocked = self.0;
+                Box::pin(async move {
+                    let error = if blocked {
+                        ObscuraNetError::Blocked("test resolver denied the destination".into())
+                    } else {
+                        ObscuraNetError::Network("SSRF blocked: untrusted error text".into())
+                    };
+                    Err(error.into())
+                })
+            }
+        }
+        for blocked in [true, false] {
+            let client = ObscuraHttpClient::new();
+            client.client.set(reqwest::Client::builder().no_proxy()
+                .dns_resolver(Arc::new(Resolver(blocked))).build().unwrap()).unwrap();
+            let error = client.fetch(&Url::parse("http://policy.example.test/").unwrap()).await.unwrap_err();
+            assert_eq!(matches!(error, ObscuraNetError::Blocked(_)), blocked, "{error}");
+        }
+    }
+
+    #[test]
     fn validate_url_blocks_unspecified_and_allows_public() {
         // 0.0.0.0 previously slipped through validate_url's literal-host check.
         assert!(validate_url(&Url::parse("http://0.0.0.0:8080/").unwrap(), false).is_err());
@@ -2414,6 +2499,63 @@ mod ssrf_tests {
     fn redirect_to_self() -> String {
         "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .to_string()
+    }
+
+    async fn assert_image_negotiates_supported_format(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Url::parse(&format!("http://{}/image", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            let accept = request.lines().find_map(|line| line.strip_prefix("accept:")).unwrap();
+            let ranges: Vec<_> = accept.split(',').map(|part| part.split(';').next().unwrap().trim()).collect();
+            // This server prefers AVIF when allowed, with PNG as its supported fallback.
+            let mime = if ranges.iter().any(|range| ["image/avif", "image/*", "*/*"].contains(range)) {
+                "image/avif"
+            } else if ranges.contains(&"image/png") {
+                "image/png"
+            } else {
+                "application/octet-stream"
+            };
+            stream.write_all(ok_response(&format!("Content-Type: {mime}\r\n"), "image").as_bytes()).await.unwrap();
+        });
+        let request = ResourceRequest::subresource(ResourceType::Image, &target);
+        let jar = Arc::new(CookieJar::new());
+        #[cfg(feature = "stealth")]
+        let response = if stealth {
+            crate::StealthHttpClient::with_proxy(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        } else {
+            ObscuraHttpClient::with_full_options(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        };
+        #[cfg(not(feature = "stealth"))]
+        let response = {
+            assert!(!stealth);
+            ObscuraHttpClient::with_full_options(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        };
+        server.await.unwrap();
+        assert_eq!(response.content_type(), Some("image/png"));
+    }
+
+    #[tokio::test]
+    async fn image_request_negotiates_supported_format() {
+        assert_image_negotiates_supported_format(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn stealth_image_request_negotiates_supported_format() {
+        assert_image_negotiates_supported_format(true).await;
     }
 
     async fn form_navigation_probe(

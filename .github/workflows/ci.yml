@@ -43,6 +43,7 @@ jobs:
         shell: bash
         env:
           EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           base_sha="$EVENT_BASE_SHA"
@@ -51,6 +52,16 @@ jobs:
             exit 1
           fi
           git cat-file -e "${base_sha}^{commit}"
+          if [[ "$(git rev-parse HEAD^2)" != "$EVENT_HEAD_SHA" ]]; then
+            echo "Checkout is not the tested pull request merge" >&2
+            exit 1
+          fi
+          merge_base="$(git rev-parse HEAD^1)"
+          if ! git merge-base --is-ancestor "$base_sha" "$merge_base"; then
+            echo "Tested merge base does not descend from the event base" >&2
+            exit 1
+          fi
+          base_sha="$merge_base"
 
           policy_root="$RUNNER_TEMP/obscura-policy"
           mkdir -p "$policy_root"
@@ -142,8 +153,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
-      - name: Test obstacle comparison gate
-        if: github.event_name == 'push'
+      - name: Test CI helpers
         run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 
       - name: Install cargo-nextest
@@ -320,11 +330,11 @@ jobs:
           set +e
           OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-base" \
             python3 obscura-benchmark/obstacle-course/run.py \
-              --json --runs 3 --warmup 1 > "$results_root/obstacle-base.json"
+              --json --runs 3 --warmup 0 > "$results_root/obstacle-base.json"
           base_status=$?
           OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-pr" \
             python3 obscura-benchmark/obstacle-course/run.py \
-              --json --runs 3 --warmup 1 > "$results_root/obstacle-pr.json"
+              --json --runs 3 --warmup 0 > "$results_root/obstacle-pr.json"
           pr_status=$?
           set -e
           printf 'Obstacle commands exited base=%s candidate=%s\n' "$base_status" "$pr_status"

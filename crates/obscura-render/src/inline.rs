@@ -116,6 +116,20 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
     FAMILY
 }
 
+#[cfg(feature = "paint")]
+pub(crate) fn bundled_font_bytes(family: Option<&str>, bold: bool) -> &'static [u8] {
+    match (resolve_font_family(family), bold) {
+        (SYSTEM_FAMILY, true) => SYSTEM_B,
+        (SYSTEM_FAMILY, false) => SYSTEM_R,
+        (SERIF_FAMILY, true) => SERIF_B,
+        (SERIF_FAMILY, false) => SERIF_R,
+        (MONO_FAMILY, true) => MONO_B,
+        (MONO_FAMILY, false) => MONO_R,
+        (_, true) => SANS_B,
+        _ => SANS_R,
+    }
+}
+
 fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
     let token = token
         .trim()
@@ -728,10 +742,10 @@ pub struct InlineItem {
     /// from `layout_wrap` for `overflow-wrap: break-word`: emergency breaks
     /// are available during reflow but do not reduce min-content.
     min_content_wrap: Wrap,
-    /// Unmodified shaped content retained only when `text-indent` is nonzero.
-    /// Each Taffy measurement can then derive a first-line-only wrap boundary
-    /// without accumulating synthetic hard breaks across repeated probes.
+    /// Unmodified paragraphs retained for indent, inline edges or float exclusions.
+    /// Repeated measurements must not accumulate synthetic hard breaks.
     source_buffer: Option<Buffer>,
+    float_bands: Vec<Rect>,
     text_indent: Dimension,
     /// Used LTR paint offset for the first formatted line at the most recently
     /// shaped width. Later lines retain the ordinary content-box origin.
@@ -785,6 +799,60 @@ pub struct InlineItem {
     caret_run: Option<(NodeId, NodeId)>,
     /// Exact measurement results retained across repeated Taffy probes.
     measured: Vec<(Option<u32>, Wrap, (f32, f32))>,
+}
+
+pub(crate) struct TextMeasure<'a>(pub &'a mut TextEngine);
+
+impl taffy::tree::LeafMeasure<usize> for &mut TextMeasure<'_> {
+    const USES_FLOAT_CONTEXT: bool = true;
+
+    fn measure(&mut self, known: taffy::Size<Option<f32>>,
+        available: taffy::Size<taffy::AvailableSpace>, _: taffy::NodeId,
+        context: Option<&mut usize>, _: &taffy::Style) -> taffy::Size<f32>
+    {
+        context.map_or(taffy::Size::ZERO, |idx| self.0.measure_taffy(*idx, known, available))
+    }
+
+    fn measure_with_block_context(&mut self, known: taffy::Size<Option<f32>>,
+        available: taffy::Size<taffy::AvailableSpace>, _node: taffy::NodeId,
+        context: Option<&mut usize>, style: &taffy::Style,
+        parent_size: taffy::Size<Option<f32>>, block: Option<&mut taffy::BlockContext<'_>>)
+        -> taffy::Size<f32>
+    {
+        use taffy::util::ResolveOrZero;
+        let Some(idx) = context.map(|idx| *idx) else { return taffy::Size::ZERO; };
+        if idx & REPLACED_CONTEXT_BIT == 0 {
+            let item = &mut self.0.items[idx];
+            let mut bands = Vec::new();
+            if let Some(block) = block.filter(|block| block.has_active_floats(0.0)) {
+                let padding = style.padding.resolve_or_zero(parent_size.width, |_, _| 0.0);
+                let border = style.border.resolve_or_zero(parent_size.width, |_, _| 0.0);
+                let left = padding.left + border.left;
+                let top = padding.top + border.top;
+                let mut y = top;
+                while block.has_active_floats(y) {
+                    let slot = block.find_content_slot(y, taffy::style::Clear::None, None);
+                    if !slot.height.is_finite() || slot.height <= 0.0 { break; }
+                    bands.push(Rect { x: slot.x - left, y: slot.y - top,
+                        width: slot.width, height: slot.height });
+                    y = slot.y + slot.height;
+                }
+            }
+            if item.float_bands != bands {
+                if !bands.is_empty() && item.source_buffer.is_none() {
+                    item.source_buffer = Some(item.buffer.clone());
+                }
+                item.float_bands = bands;
+                item.measured.clear();
+                if item.float_bands.is_empty() && item.boundary_events.is_empty()
+                    && matches!(item.text_indent, Dimension::Px(value) if value == 0.0)
+                {
+                    if let Some(source) = item.source_buffer.take() { item.buffer = source; }
+                }
+            }
+        }
+        self.0.measure_taffy(idx, known, available)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1799,6 +1867,7 @@ impl TextEngine {
             layout_wrap,
             min_content_wrap,
             source_buffer,
+            float_bands: Vec::new(),
             text_indent,
             first_line_offset: 0.0,
             balance_wrap: base.text_wrap_style == Some(crate::TextWrapStyle::Balance),
@@ -1843,7 +1912,8 @@ impl TextEngine {
         if let Some((_, _, size)) = self.items[idx]
             .measured
             .iter()
-            .find(|(cached_width, cached_wrap, _)| *cached_width == key && *cached_wrap == wrap)
+            .find(|(cached_width, cached_wrap, _)| self.items[idx].float_bands.is_empty()
+                && *cached_width == key && *cached_wrap == wrap)
         {
             return *size;
         }
@@ -1894,8 +1964,8 @@ impl TextEngine {
             } else {
                 0.0
             };
-            let line_start = starts.get(run.line_i).copied().unwrap_or(0);
-            let line_end = line_start + run.text.len();
+            let paragraph_start = starts.get(run.line_i).copied().unwrap_or(0);
+            let (line_start, line_end) = visual_line_source_bounds(item, &run, paragraph_start);
             width = width.max(
                 (run.line_w + offset + line_edge_advance(item, line_start, line_end)).max(0.0),
             );
@@ -2002,8 +2072,7 @@ impl TextEngine {
         let content_width = content_width.max(0.0);
         let wrap = item.layout_wrap;
         shape_with_text_indent(font_system, item, Some(content_width), wrap);
-        let balanced_width = item
-            .balance_wrap
+        let balanced_width = (item.balance_wrap && item.float_bands.is_empty())
             .then(|| balance_wrap_width(font_system, &mut item.buffer, content_width))
             .flatten()
             .unwrap_or(content_width);
@@ -2124,10 +2193,10 @@ impl TextEngine {
             let line_starts = source_line_starts(&item.buffer, source);
 
             for (line_index, run) in item.buffer.layout_runs().enumerate() {
-                let Some(&line_start) = line_starts.get(run.line_i) else {
+                let Some(&paragraph_start) = line_starts.get(run.line_i) else {
                     continue;
                 };
-                let line_end = line_start.saturating_add(run.text.len());
+                let (line_start, line_end) = visual_line_source_bounds(item, &run, paragraph_start);
                 let first_line_offset = if line_index == 0 {
                     item.first_line_offset
                 } else {
@@ -2148,7 +2217,7 @@ impl TextEngine {
                     let first = owner.start >= line_start && owner.start < line_end || empty;
                     let last = owner.end > line_start && owner.end <= line_end || empty;
                     let raw_left = if first {
-                        run_cursor_x(&run, owner.start.saturating_sub(line_start))
+                        run_cursor_x(&run, owner.start.saturating_sub(paragraph_start))
                             + line_advance_before_event(
                                 item,
                                 owner.start_event,
@@ -2160,7 +2229,7 @@ impl TextEngine {
                         run_cursor_x(&run, 0)
                     };
                     let raw_right = if last {
-                        run_cursor_x(&run, owner.end.saturating_sub(line_start))
+                        run_cursor_x(&run, owner.end.saturating_sub(paragraph_start))
                             + line_advance_before_event(item, owner.end_event, line_start, line_end)
                             + owner.end_edge.border_padding()
                     } else {
@@ -2261,7 +2330,7 @@ impl TextEngine {
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
             if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
             let start = *starts.get(run.line_i)?;
-            let end = start + run.text.len();
+            let (line_start, end) = visual_line_source_bounds(item, &run, start);
             let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
             for glyph in run.glyphs {
                 if glyph.w <= 0.0 || item.marker.is_some_and(|marker|
@@ -2269,8 +2338,8 @@ impl TextEngine {
                 { continue; }
                 let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
                 let dx = item.origin.0 + indent + relative.0
-                    + line_edge_alignment_shift(item, start, end)
-                    + line_advance_before_text(item, start + glyph.start, start, end);
+                    + line_edge_alignment_shift(item, line_start, end)
+                    + line_advance_before_text(item, start + glyph.start, line_start, end);
                 let dy = item.origin.1 + relative.1;
                 let left = dx + glyph.x;
                 let top = dy + run.line_top;
@@ -2315,6 +2384,7 @@ impl TextEngine {
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
             if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
             let start = *starts.get(run.line_i)?;
+            let (line_start, line_end) = visual_line_source_bounds(item, &run, start);
             let byte = boundary.byte.checked_sub(start)?;
             let Some(glyph) = run.glyphs.iter().find(|glyph| glyph.start <= byte && byte <= glyph.end) else {
                 continue;
@@ -2323,8 +2393,8 @@ impl TextEngine {
             let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
             return Some(Rect {
                 x: item.origin.0 + run_cursor_x(&run, byte) + indent + relative.0
-                    + line_edge_alignment_shift(item, start, start + run.text.len())
-                    + line_advance_before_text(item, start + glyph.start, start, start + run.text.len()),
+                    + line_edge_alignment_shift(item, line_start, line_end)
+                    + line_advance_before_text(item, start + glyph.start, line_start, line_end),
                 y: item.origin.1 + run.line_y + relative.1 - ascent,
                 width: 0.0,
                 height: ascent + descent,
@@ -2995,8 +3065,8 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
         } else {
             0.0
         };
-        let line_start = line_starts.get(run.line_i).copied().unwrap_or(0);
-        let line_end = line_start + run.text.len();
+        let paragraph_start = line_starts.get(run.line_i).copied().unwrap_or(0);
+        let (line_start, line_end) = visual_line_source_bounds(item, &run, paragraph_start);
         let edges = line_edge_advance(item, line_start, line_end);
         w = w.max((run.line_w + offset + edges).max(0.0));
         h = h.max(run.line_top + run.line_height);
@@ -3061,6 +3131,16 @@ fn run_cursor_x(run: &cosmic_text::LayoutRun<'_>, byte: usize) -> f32 {
     }
 }
 
+fn visual_line_source_bounds(item: &InlineItem, run: &cosmic_text::LayoutRun<'_>,
+    paragraph_start: usize) -> (usize, usize)
+{
+    if item.float_bands.is_empty() {
+        return (paragraph_start, paragraph_start + run.text.len());
+    }
+    (paragraph_start + run.glyphs.iter().map(|glyph| glyph.start).min().unwrap_or(0),
+        paragraph_start + run.glyphs.iter().map(|glyph| glyph.end).max().unwrap_or(run.text.len()))
+}
+
 fn glyph_relative_offset(
     ranges: &[RelativeOwnerTextRange],
     line_start: usize,
@@ -3092,6 +3172,93 @@ fn used_text_indent(value: Dimension, width: Option<f32>) -> f32 {
     }
 }
 
+fn shape_with_floats(font_system: &mut FontSystem, item: &mut InlineItem, width: f32, wrap: Wrap) {
+    let Some(source) = &item.source_buffer else { return; };
+    item.buffer = source.clone();
+    item.buffer.set_wrap(font_system, wrap);
+    item.buffer.set_size(font_system, Some(width.max(0.0)), None);
+    item.first_line_offset = 0.0;
+    let metrics = item.buffer.metrics();
+    let mono = item.buffer.monospace_width();
+    let tab_width = item.buffer.tab_width();
+    let starts = item.owner_text.as_deref()
+        .map(|text| source_line_starts(&item.buffer, text)).unwrap_or_default();
+    let mut paragraph_y = 0.0;
+    for paragraph in 0..item.buffer.lines.len() {
+        let mut widths = Vec::<f32>::new();
+        let mut positions = Vec::<(f32, f32)>::new();
+        let mut end_y = paragraph_y;
+        // Bound retries by text and exclusion boundaries, even for degenerate fonts.
+        let retries = item.buffer.lines[paragraph].text().len() + item.float_bands.len() + 1;
+        for _ in 0..retries {
+            let layouts = item.buffer.lines[paragraph].layout_with_line_widths(font_system,
+                metrics.font_size, width, &widths, wrap, mono, tab_width)
+                .iter().map(|line| (line.line_height_opt.unwrap_or(metrics.line_height).max(0.0),
+                    line.w, line.glyphs.iter().map(|glyph| glyph.start).min().unwrap_or(0),
+                    line.glyphs.iter().map(|glyph| glyph.end).max().unwrap_or(0)))
+                .collect::<Vec<_>>();
+            let mut next_widths = Vec::with_capacity(layouts.len());
+            let mut next_positions = Vec::with_capacity(layouts.len());
+            let mut y = paragraph_y;
+            for (index, &(height, line_width, glyph_start, glyph_end)) in layouts.iter().enumerate() {
+                let (x, available) = loop {
+                    let mut left = 0.0f32;
+                    let mut right = width;
+                    let mut next_bottom = f32::INFINITY;
+                    for band in &item.float_bands {
+                        if band.y < y + height && band.y + band.height > y {
+                            left = left.max(band.x);
+                            right = right.min(band.x + band.width);
+                            next_bottom = next_bottom.min(band.y + band.height);
+                        }
+                    }
+                    let available = (right - left).max(0.0);
+                    let long_word = widths.get(index).is_some_and(|prior|
+                        (*prior - available).abs() < 0.01 && line_width > available + 0.01);
+                    if next_bottom.is_finite() && next_bottom > y
+                        && (available <= 0.0 || long_word)
+                    {
+                        y = next_bottom;
+                        continue;
+                    }
+                    break (left, available);
+                };
+                let indent = if paragraph == 0 && index == 0 {
+                    used_text_indent(item.text_indent, Some(width))
+                } else { 0.0 };
+                let line_start = starts.get(paragraph).copied().unwrap_or(0)
+                    + glyph_start;
+                let line_end = starts.get(paragraph).copied().unwrap_or(0)
+                    + glyph_end;
+                let edges = line_edge_advance(item, line_start, line_end);
+                next_widths.push((available - indent - edges).max(0.0));
+                let indent_offset = indent * match item.align {
+                    Some(Align::Center) => 0.5,
+                    Some(Align::End | Align::Right) => 0.0,
+                    _ => 1.0,
+                };
+                next_positions.push((x + indent_offset, y));
+                y += height;
+            }
+            let stable = widths == next_widths;
+            widths = next_widths;
+            positions = next_positions;
+            end_y = y;
+            if stable { break; }
+        }
+        let layouts = item.buffer.lines[paragraph].layout_with_line_widths(font_system,
+            metrics.font_size, width, &widths, wrap, mono, tab_width);
+        let mut y = paragraph_y;
+        for (line, &(x, top)) in layouts.iter_mut().zip(&positions) {
+            line.top_offset = (top - y).max(0.0);
+            for glyph in &mut line.glyphs { glyph.x += x; }
+            line.w += x;
+            y = top + line.line_height_opt.unwrap_or(metrics.line_height);
+        }
+        paragraph_y = end_y;
+    }
+}
+
 /// Shape one IFC with first-line indent and ordinary-inline boundary advances.
 ///
 /// The pristine buffer remains one shaping stream across DOM owners. For a
@@ -3106,6 +3273,10 @@ fn shape_with_text_indent(
     width: Option<f32>,
     wrap: Wrap,
 ) {
+    if let Some(width) = width.filter(|_| !item.float_bands.is_empty()) {
+        shape_with_floats(font_system, item, width, wrap);
+        return;
+    }
     let indent = used_text_indent(item.text_indent, width);
     item.first_line_offset = indent
         * match item.align {
@@ -3742,9 +3913,9 @@ impl TextEngine {
                 0.0
             };
             let line_source_start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
-            let line_source_end = line_source_start + run.text.len();
+            let (line_start, line_source_end) = visual_line_source_bounds(item, &run, line_source_start);
             let inline_alignment =
-                line_edge_alignment_shift(item, line_source_start, line_source_end);
+                line_edge_alignment_shift(item, line_start, line_source_end);
             let base_y = run.line_y;
             let mut segments: [Option<(f32, f32, f32, [u8; 4], (f32, f32))>; 3] = [None; 3];
             let mut active_decorations = 0;
@@ -3768,7 +3939,7 @@ impl TextEngine {
                     + line_advance_before_text(
                         item,
                         line_source_start + g.start,
-                        line_source_start,
+                        line_start,
                         line_source_end,
                     );
                 let decoration_flags = g.metadata & META_DECORATIONS;
@@ -3854,9 +4025,9 @@ impl TextEngine {
                 0.0
             };
             let line_source_start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
-            let line_source_end = line_source_start + run.text.len();
+            let (line_start, line_source_end) = visual_line_source_bounds(item, &run, line_source_start);
             let inline_alignment =
-                line_edge_alignment_shift(item, line_source_start, line_source_end);
+                line_edge_alignment_shift(item, line_start, line_source_end);
             for glyph in run.glyphs {
                 if item.marker.is_some_and(|marker| {
                     marker.line_index == line_index
@@ -3874,7 +4045,7 @@ impl TextEngine {
                     + line_advance_before_text(
                         item,
                         line_source_start + glyph.start,
-                        line_source_start,
+                        line_start,
                         line_source_end,
                     );
                 let physical = glyph.physical((line_offset + relative.0, relative.1), raster_scale);

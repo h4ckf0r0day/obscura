@@ -126,6 +126,14 @@ command 2. Send the commands one at a time after receiving each response.
 
 ## Common failure modes
 
+### Navigation times out while receiving HTML
+
+Obscura keeps HTML received before a document-body or navigation timeout. The
+navigation still returns an error. DOM queries and captures can use the recovered
+document; its scripts and frames do not start automatically. Later explicit
+evaluation uses a fresh JavaScript context. Failures before document bytes arrive
+keep the previous document.
+
 ### JavaScript behavior disagrees with the current bootstrap source
 
 The runtime embeds a generated V8 snapshot, not `bootstrap.js` directly.

@@ -21,7 +21,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth', '__obscura_markTrusted', '__obscura_fireBeforeUnload', '__obscura_core_handoff',
+    '__obscura_stealth', '__obscura_markTrusted', '__obscura_dispatchDomEvent', '__obscura_fireBeforeUnload', '__obscura_core_handoff',
     // Created by later evaluation, input and emulation paths. Register them
     // before the snapshot hide list is captured, just like the other internals.
     '__obscura_await_rejected', '__obscura_click_target',
@@ -143,7 +143,7 @@ globalThis.removeEventListener = function(type, fn, options) {
   _eventTargetRemove(globalThis, type, fn, options);
 };
 globalThis.dispatchEvent = function(event) {
-  return _eventTargetDispatch(globalThis, event);
+  return _eventTargetDispatch(globalThis, event, true);
 };
 
 let _domMutationEpoch = 0;
@@ -422,6 +422,9 @@ function __startDynClassicFetch(task) {
     error => ({ error }),
   );
 }
+function _executeClassicScript(source) {
+  __obscuraCore.ops.op_execute_classic_script(_executeClassicScript, source);
+}
 async function __runDynScriptTask(task) {
   try {
     if (task.isModule) {
@@ -442,23 +445,22 @@ async function __runDynScriptTask(task) {
         // parser script happened to trigger the microtask checkpoint.
         await new Promise(resolve => {
           const execute = () => {
+            const previousNid = globalThis.__currentScriptNid;
             globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(body); }
+            try { _executeClassicScript(body); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
-            finally { globalThis.__currentScriptNid = task.prevNid || 0; }
+            finally { globalThis.__currentScriptNid = previousNid || 0; }
             resolve();
           };
           if (_scheduleAfter(0, execute) === undefined) execute();
         });
       }
     }
-    // Fire load via dispatchEvent only: it invokes the element's onload
-    // property handler and any addEventListener('load') listeners, read live
-    // off the element. Calling onload separately would double-fire it.
-    try { task.dispatchEvent(new Event('load')); } catch(e) {}
+    // The internal dispatcher invokes both IDL handlers and registered listeners.
+    try { task.fireEvent('load'); } catch(e) {}
   } catch(e) {
     console.error('Dynamic script fetch error:', e.message);
-    try { task.dispatchEvent(new Event('error')); } catch(ex) {}
+    try { task.fireEvent('error'); } catch(ex) {}
   } finally {
     if (task.delaysLoad) {
       task.delaysLoad = false;
@@ -703,9 +705,9 @@ async function _loadLinkedStylesheet(c) {
       globalThis.__obscura_frameId || 0
     );
     _registerLinkedStylesheet(c, loaded.responseUrl);
-    try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
+    try { _fireResourceEvent(c, 'load'); } catch(e) {}
   } catch(e) {
-    try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
+    try { _fireResourceEvent(c, 'error'); } catch(e) {}
   }
 }
 
@@ -1652,7 +1654,7 @@ class MessagePort {
   }
   dispatchEvent(event) {
     _messagePortStateFor(this);
-    return _eventTargetDispatch(this, event);
+    return _eventTargetDispatch(this, event, true);
   }
   get onmessage() { return _messagePortStateFor(this).onmessage; }
   set onmessage(callback) {
@@ -1959,6 +1961,12 @@ function _shallowCloneNode(node) {
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
 const _eventTargetListenerChanged = new WeakMap();
+function _demoteAuthorEvent(event) {
+  if (event && (event._dispatching || _eventSetHas(__obscuraCore.ops.__obscura_activeEvents, event))) {
+    throw new DOMException("The event is already being dispatched.", "InvalidStateError");
+  }
+  _eventSetDelete(__obscuraCore.ops.__obscura_eventTrust, event);
+}
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -2016,16 +2024,17 @@ function _eventTargetRemove(target, type, callback, options) {
   if (byType.size === 0) _eventTargetListeners.delete(target);
   _eventTargetListenerChanged.get(target)?.();
 }
-function _eventTargetDispatch(target, event) {
+function _eventTargetDispatch(target, event, authorDispatch = false) {
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
   if (String(event.type) === "") {
     throw new DOMException("The event's type was not specified.", "InvalidStateError");
   }
-  if (event._dispatching) {
+  if (event._dispatching || (authorDispatch && _eventSetHas(__obscuraCore.ops.__obscura_activeEvents, event))) {
     throw new DOMException("The event is already being dispatched.", "InvalidStateError");
   }
+  if (authorDispatch) _eventSetDelete(__obscuraCore.ops.__obscura_eventTrust, event);
   event._dispatching = true;
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
@@ -2034,7 +2043,7 @@ function _eventTargetDispatch(target, event) {
   event.eventPhase = 2;
   try {
     // Other EventTargets register their IDL handlers in the listener list.
-    const eventHandler = target === globalThis ? target['on' + event.type] : null;
+    const eventHandler = target === globalThis ? _nativeEventHandler(target, 'on' + event.type) : null;
     if (typeof eventHandler === 'function') {
       try {
         const result = eventHandler.call(target, event);
@@ -2106,9 +2115,9 @@ function _domEventInvokeHandlers(target, event, capture, phase) {
   // listener group. Keep their existing position ahead of listeners installed
   // through addEventListener; changing that ordering here would be an unrelated
   // compatibility change.
-  if (!capture && typeof target._resolveInlineHandler === "function") {
+  if (!capture) {
     const handlerName = "on" + event.type;
-    const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
+    const inlineFn = _nativeEventHandler(target, handlerName);
     if (typeof inlineFn === "function") {
       try {
         if (inlineFn.call(target, event) === false) event.preventDefault();
@@ -2139,17 +2148,18 @@ function _domEventInvokeHandlers(target, event, capture, phase) {
 // and left eventPhase at NONE. Delegated framework handlers depend on capture
 // running before target/bubble listeners, so build the path once and dispatch
 // each phase explicitly.
-function _domEventDispatch(target, event) {
+function _domEventDispatch(target, event, authorDispatch = false) {
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
   if (String(event.type) === "") {
     throw new DOMException("The event's type was not specified.", "InvalidStateError");
   }
-  if (event._dispatching) {
+  if (event._dispatching || (authorDispatch && _eventSetHas(__obscuraCore.ops.__obscura_activeEvents, event))) {
     throw new DOMException("The event is already being dispatched.", "InvalidStateError");
   }
 
+  if (authorDispatch) _eventSetDelete(__obscuraCore.ops.__obscura_eventTrust, event);
   event._dispatching = true;
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
@@ -2198,6 +2208,14 @@ function _domEventDispatch(target, event) {
   }
 }
 
+function _dispatchDomEvent(target, event, authorDispatch = false) {
+  if (_cache.get(target._nid) !== target) {
+    const dispatch = _documentRealmMember(target, 'dispatchDomEvent');
+    if (dispatch) return dispatch.call(target, event, authorDispatch);
+  }
+  return _domEventDispatch(target, event, authorDispatch);
+}
+
 // During custom-element upgrade, HTMLElement's constructor must return the
 // already-existing element being upgraded. A class constructor cannot be
 // invoked with `.call(existingElement)`, so the registry and Element
@@ -2231,7 +2249,7 @@ function __prepareInsertedScript(script) {
     if (error) {
       console.error('Import map error:', error);
       queueMicrotask(() => {
-        try { script.dispatchEvent(new Event('error')); } catch (_) {}
+        try { _fireResourceEvent(script, 'error'); } catch (_) {}
       });
     }
     return;
@@ -2274,9 +2292,8 @@ function __prepareInsertedScript(script) {
       url: fullUrl,
       isModule,
       nid: script._nid,
-      prevNid,
       pageOrigin,
-      dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
+      fireEvent: (type) => _fireResourceEvent(script, type),
     };
     // Non-parser-inserted external scripts are async by default, but scripts
     // prepared while the document is still loading still delay window.load.
@@ -2285,7 +2302,6 @@ function __prepareInsertedScript(script) {
     task.delaysLoad = globalThis.document?.readyState !== 'complete';
     if (task.delaysLoad) __dynLoadDelayingPending++;
     if (parserInserted && !isModule) {
-      task.prevNid = 0;
       if (parserBlocking) __parserBlockingScriptPending++;
       __parserBlockingScriptQueue.push({ task, blocking: parserBlocking });
       __processParserBlockingScriptQueue();
@@ -2319,9 +2335,8 @@ function __prepareInsertedScript(script) {
       url: dataUrl,
       isModule: true,
       nid: script._nid,
-      prevNid,
       pageOrigin: "",
-      dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
+      fireEvent: (type) => _fireResourceEvent(script, type),
       delaysLoad: globalThis.document?.readyState !== 'complete',
     };
     if (task.delaysLoad) __dynLoadDelayingPending++;
@@ -2335,15 +2350,14 @@ function __prepareInsertedScript(script) {
         inlineCode: code,
         isModule: false,
         nid: script._nid,
-        prevNid: 0,
-        dispatchEvent: () => {},
+        fireEvent: () => {},
         delaysLoad: false,
       },
     });
     __processParserBlockingScriptQueue();
   } else {
     globalThis.__currentScriptNid = script._nid;
-    try { (0, eval)(code); }
+    try { _executeClassicScript(code); }
     catch(e) { console.error('Dynamic inline script error:', e.message); }
     finally { globalThis.__currentScriptNid = prevNid || 0; }
   }
@@ -2462,7 +2476,7 @@ function __prepareInsertedSubtree(root) {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe,img[onload],img[onerror]") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
     if (script && !seen.has(script._nid)) {
@@ -2471,6 +2485,8 @@ function __prepareInsertedSubtree(root) {
     }
   }
   for (const script of scripts) {
+    // Constructing an image wrapper starts its content-handler lifecycle.
+    if (script.localName === 'img') continue;
     if (_postConnection) _postConnection.cursor = script;
     if (script.localName === 'iframe') {
       if (script.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
@@ -2530,7 +2546,7 @@ function _registerForeignDocument() { _foreignDocumentCount++; }
 // A Document without a browsing context, backed by its own native tree root.
 function _createDetachedDocument(contentType, xml) {
   const nid = +_dom("create_document_fragment");
-  const DocumentClass = xml ? (globalThis.XMLDocument || Document) : Document;
+  const DocumentClass = xml ? _nativeXMLDocument : Document;
   const doc = new DocumentClass(nid);
   doc._detached = true;
   doc._contentType = contentType;
@@ -3050,7 +3066,7 @@ class Node {
   cloneNode(deep) {
     const t = this.nodeType;
     if (t === 9) {
-      const xml = this instanceof XMLDocument || (this._documentShim && _isXMLDocument(this));
+      const xml = this instanceof _nativeXMLDocument || (this._documentShim && _isXMLDocument(this));
       const clone = _createDetachedDocument(this.contentType, !!xml);
       clone._documentURL = this.URL;
       clone._documentEncoding = this.characterSet;
@@ -3202,7 +3218,7 @@ class Node {
     _eventTargetRemove(this, type, callback, options);
   }
   dispatchEvent(event) {
-    return _eventTargetDispatch(this, event);
+    return _eventTargetDispatch(this, event, true);
   }
 }
 class CharacterData extends Node {
@@ -3320,7 +3336,7 @@ class DOMTokenList {
   }
   get length() { return this._tokens().length; }
   get value() { return this._el.getAttribute(this._attr) || ""; }
-  set value(v) { this._el.setAttribute(this._attr, String(v)); }
+  set value(v) { this._el.setAttribute(this._attr, `${v}`); }
   item(i) { const t = this._tokens(); return (i >= 0 && i < t.length) ? t[i] : null; }
   contains(token) { return this._tokens().includes(String(token)); }
   add(...tokens) {
@@ -4121,7 +4137,7 @@ class Animation {
   reverse() { throw new DOMException('reverse() is not implemented for this animation', 'NotSupportedError'); }
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
-  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event, true); }
 }
 
 class DocumentTimeline {
@@ -4321,7 +4337,7 @@ class Element extends Node {
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
-    _connectInsertedFrames(this, html);
+    _connectInsertedResources(this, html);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -4468,11 +4484,7 @@ class Element extends Node {
       }
     }
     if (n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
-    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
-      _windowOnloadOverrideSet = false;
-      _windowOnloadOverride = null;
-      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
-    }
+    _eventHandlerAttributeChanged(this, n);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, n, null, observedOldValue);
     if (customOldValue !== undefined) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, value, null]);
@@ -4499,6 +4511,7 @@ class Element extends Node {
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttributeNS(ns, localName) : null;
     const customOldValue = _customElementObserves(this, localName) ? this.getAttributeNS(ns, localName) : undefined;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    if (ns === '') _eventHandlerAttributeChanged(this, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
     // Namespace-aware writes can replace an attribute by namespace/local name
@@ -4521,6 +4534,7 @@ class Element extends Node {
       : null;
     const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
     const customOldValue = _customElementObserves(this, n) ? this.getAttribute(n) : null;
+    const handlerWasPresent = n.startsWith('on') && this.hasAttribute(n);
     _dom("remove_attribute", this._nid, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
@@ -4533,11 +4547,7 @@ class Element extends Node {
       _reconcileWindowNamedProperty(previousWindowName);
     }
     if (n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
-    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
-      _windowOnloadOverrideSet = false;
-      _windowOnloadOverride = null;
-      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
-    }
+    if (handlerWasPresent) _eventHandlerAttributeChanged(this, n);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -4560,7 +4570,9 @@ class Element extends Node {
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe' && this.getAttributeNS(ns, n) === null) return;
     const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
     const customOldValue = _customElementObserves(this, n) ? this.getAttributeNS(ns, n) : null;
+    const handlerWasPresent = ns === '' && n.startsWith('on') && this.getAttributeNS(ns, n) !== null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    if (handlerWasPresent) _eventHandlerAttributeChanged(this, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
@@ -4695,7 +4707,7 @@ class Element extends Node {
     _eventTargetRemove(this, type, handler, opts);
   }
   dispatchEvent(event) {
-    return _domEventDispatch(this, event);
+    return _domEventDispatch(this, event, true);
   }
   _resolveInlineHandler(name) {
     if (!_scriptingEnabled) return null;
@@ -4704,7 +4716,7 @@ class Element extends Node {
     const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
     if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
     const src = this.getAttribute && this.getAttribute(name);
-    if (!src) { cache[name] = null; return null; }
+    if (src == null) { cache[name] = null; return null; }
     try {
       cache[name] = new Function('event', src);
     } catch (e) {
@@ -4766,7 +4778,7 @@ class Element extends Node {
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
     if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
-    const cancelled = !this.dispatchEvent(_clickEvent);
+    const cancelled = !_domEventDispatch(this, _clickEvent);
     if (cancelled) {
       if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _setInputChecked(_radioStates[i][0], _radioStates[i][1]); }
       else if (_checkable) { _setInputChecked(this, _oldChecked); _setInputIndeterminate(this, _oldIndeterminate); }
@@ -4776,7 +4788,7 @@ class Element extends Node {
       for (const _type of ['input', 'change']) {
         const _e = new Event(_type, {bubbles: true});
         if (_trusted) globalThis.__obscura_markTrusted(_e);
-        try { this.dispatchEvent(_e); } catch (e) {}
+        try { _domEventDispatch(this, _e); } catch (e) {}
       }
       return;
     }
@@ -4823,19 +4835,19 @@ class Element extends Node {
     const previous = globalThis.__obscura_focused || null;
     if (previous === this) return;
     if (previous) {
-      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: this })));
-      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
+      _dispatchDomEvent(previous, globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: this })));
+      _dispatchDomEvent(previous, globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
     }
     globalThis.__obscura_focused = this;
     globalThis.__obscura_click_target = this;
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
+    _dispatchDomEvent(this, globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
+    _dispatchDomEvent(this, globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
   }
   blur() {
     if (globalThis.__obscura_focused !== this) return;
     globalThis.__obscura_focused = null;
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: null })));
+    _dispatchDomEvent(this, globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
+    _dispatchDomEvent(this, globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: null })));
   }
 
   // --- Popover API (HTML "popover") ---------------------------------------
@@ -4936,10 +4948,10 @@ class Element extends Node {
   set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
   get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
   set returnValue(v) { this._returnValue = String(v); }
-  get oncancel() { return this._oncancel || null; }
-  set oncancel(f) { this._oncancel = typeof f === 'function' ? f : null; }
-  get onclose() { return this._onclose || null; }
-  set onclose(f) { this._onclose = typeof f === 'function' ? f : null; }
+  get oncancel() { return _eventHandlerGet.call(this, 'oncancel', 'element'); }
+  set oncancel(value) { _eventHandlerSet.call(this, 'oncancel', 'element', value); }
+  get onclose() { return _eventHandlerGet.call(this, 'onclose', 'element'); }
+  set onclose(value) { _eventHandlerSet.call(this, 'onclose', 'element', value); }
   get closedBy() { const v = (this.getAttribute('closedby') || '').toLowerCase(); return (v === 'any' || v === 'closerequest' || v === 'none') ? v : 'auto'; }
   set closedBy(v) { this.setAttribute('closedby', String(v)); }
   show() {
@@ -6585,11 +6597,21 @@ class DOMImplementation {
   get [Symbol.toStringTag]() { return "DOMImplementation"; }
 }
 
-const _documentInstances = new WeakSet();
+const _documentInstances = new WeakMap();
+const _documentRootState = Function.prototype.call.bind(WeakMap.prototype.get);
+const _setDocumentRootState = Function.prototype.call.bind(WeakMap.prototype.set);
+function _documentPart(receiver, name, command) {
+  if (receiver === _document) return _wrapEl(+_dom(command));
+  const member = _documentRealmMember(receiver, name);
+  if (member) return Reflect.apply(member, receiver, []);
+  const root = _documentRootState(_documentInstances, receiver);
+  if (root === undefined) throw new TypeError('Illegal invocation');
+  return _wrapEl(+_dom(command, root.nid, root.element ? 'element' : ''));
+}
 class Document extends Node {
   constructor(nid) {
     super(nid);
-    _documentInstances.add(this);
+    _setDocumentRootState(_documentInstances, this, { nid:typeof nid === 'number' ? nid : -1, element:false });
   }
   get timeline() {
     if (!this._timeline) {
@@ -6601,10 +6623,7 @@ class Document extends Node {
     return Array.from(_waapiAnimations).filter(animation => animation.playState !== 'idle'
       && (animation.playState !== 'finished' || animation.effect?._timing.fill === 'forwards' || animation.effect?._timing.fill === 'both'));
   }
-  get documentElement() {
-    if (this._detached) return _childNodeOfType(this, 1);
-    return _wrapEl(+_dom("document_element"));
-  }
+  get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); }
   get children() {
     const root = this.documentElement;
     return HTMLCollection._from(root ? [root] : []);
@@ -6612,8 +6631,8 @@ class Document extends Node {
   get childElementCount() { return this.documentElement ? 1 : 0; }
   get firstElementChild() { return this.documentElement; }
   get lastElementChild() { return this.documentElement; }
-  get head() { return this.querySelector("head"); }
-  get body() { return this.querySelector("body"); }
+  get head() { return _documentPart(this, 'head', 'document_head'); }
+  get body() { return _documentPart(this, 'body', 'document_body'); }
   get doctype() {
     if (this._detached) return _childNodeOfType(this, 10);
     if (this._doctype !== undefined) return this._doctype;
@@ -6705,7 +6724,7 @@ class Document extends Node {
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
   // backing encoding and reports UTF-8.
   get characterSet() { return this._documentEncoding || ((this._nid === undefined || this._nid === null || this._detached) ? "UTF-8" : _docEncoding()); }
-  get [Symbol.toStringTag]() { return this instanceof XMLDocument ? "XMLDocument" : (_isXMLDocument(this) ? "Document" : "HTMLDocument"); }
+  get [Symbol.toStringTag]() { return this instanceof _nativeXMLDocument ? "XMLDocument" : (_isXMLDocument(this) ? "Document" : "HTMLDocument"); }
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
@@ -6934,7 +6953,7 @@ class Document extends Node {
     _eventTargetRemove(this, type, fn, opts);
   }
   dispatchEvent(event) {
-    return _domEventDispatch(this, event);
+    return _domEventDispatch(this, event, true);
   }
   createTreeWalker(root, whatToShow, filter) {
     // whatToShow is unsigned long; default SHOW_ALL only when the arg is omitted.
@@ -7240,7 +7259,7 @@ class Document extends Node {
   queryCommandSupported(commandId) {
     const method = _documentRealmMember(this, 'queryCommandSupported');
     if (method) return Reflect.apply(method, this, arguments);
-    if (!_documentInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (_documentRootState(_documentInstances, this) === undefined) throw new TypeError('Illegal invocation');
     if (arguments.length < 1) throw new TypeError('queryCommandSupported requires 1 argument');
     commandId = `${commandId}`;
     // execCommand currently implements no editing commands. Feature detection
@@ -7293,7 +7312,7 @@ function _insertWrittenNodes(doc, placements) {
 // Preserve the receiver realm's implementations even if a membrane remaps the
 // document's public prototype. The ordinary own-document path makes no op call.
 function _documentRealmMember(receiver, name) {
-  return receiver === globalThis.document ? undefined
+  return receiver === _document ? undefined
     : __obscuraCore.ops.op_document_realm_member(receiver, name, _realmFrameId);
 }
 
@@ -7320,7 +7339,7 @@ class DocumentFragment extends Node {
     } else {
       _dom("set_inner_html", this._nid, html);
     }
-    _connectInsertedFrames(this, html);
+    _connectInsertedResources(this, html);
     _disconnectCustomElements(leavingCustomElements);
     _connectCustomElements(this, false);
   }
@@ -7506,9 +7525,9 @@ class HTMLImageElement extends Element {
     this._imageInitialized = true;
     // Parser images stay lazy until script observes their lifecycle or paint
     // asks for the same cache entry. Inline handlers are observers too.
-    if (!this._imageComplete
+    if ((!this._imageComplete || this._imageCurrentSrc)
         && (this.hasAttribute("onload") || this.hasAttribute("onerror"))) {
-      this._queueImageRequest();
+      this._queueImageRequest(true);
     }
   }
 
@@ -7540,18 +7559,16 @@ class HTMLImageElement extends Element {
     this._queueImageRequest();
     return this._imageNaturalHeight;
   }
-  get onload() { return this._imageOnload || null; }
+  get onload() { return _eventHandlerGet.call(this, 'onload', 'element'); }
   set onload(value) {
-    this._imageOnload = typeof value === "function" ? value : null;
-    if (this._imageOnload) {
+    if (_eventHandlerSet.call(this, 'onload', 'element', value)) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
   }
-  get onerror() { return this._imageOnerror || null; }
+  get onerror() { return _eventHandlerGet.call(this, 'onerror', 'element'); }
   set onerror(value) {
-    this._imageOnerror = typeof value === "function" ? value : null;
-    if (this._imageOnerror) {
+    if (_eventHandlerSet.call(this, 'onerror', 'element', value)) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
@@ -7624,7 +7641,7 @@ class HTMLImageElement extends Element {
     const hasMetadataLoader = typeof __obscuraCore.ops.op_load_image_metadata === "function";
     this._adoptImageCandidate(hasMetadataLoader ? "" : this.src);
     this._imageCompletionDeferred = true;
-    this._refreshImageFromCache(true);
+    this._refreshImageFromCache(true, true);
     if (!this._imageComplete) this._queueImageRequest();
   }
 
@@ -7639,12 +7656,12 @@ class HTMLImageElement extends Element {
     this._imageComplete = !this._imageCurrentSrc;
   }
 
-  _queueImageRequest() {
-    if (this._imageQueued || this._imageComplete) return;
+  _queueImageRequest(reportCachedCompletion = false) {
+    if (this._imageQueued || (this._imageComplete && !reportCachedCompletion)) return;
     this._imageQueued = true;
     const request = this._imageRequest;
     setTimeout(() => {
-      if (request === this._imageRequest && !this._imageComplete) {
+      if (request === this._imageRequest && (!this._imageComplete || reportCachedCompletion)) {
         this._runImageRequest(request);
       } else if (request === this._imageRequest) {
         this._imageQueued = false;
@@ -7686,11 +7703,11 @@ class HTMLImageElement extends Element {
     }
   }
 
-  _refreshImageFromCache(deferCompletion) {
+  _refreshImageFromCache(deferCompletion, sourceChanged) {
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true, _realmFrameId));
+      const metadata = JSON.parse(op(this._nid >>> 0, !sourceChanged, _realmFrameId));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
@@ -8073,7 +8090,9 @@ function __locationNavigate(url, replace) {
     globalThis.__obscuraNavigateToFragment(target, replace);
     return;
   }
-  globalThis.__virtualUrl = r;
+  // Location keeps describing the current document until the new one
+  // commits (Chrome reads the old URL right after `location.href = x`), so a
+  // navigation that fails never leaves location on a URL that did not load.
   __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId);
 }
 // Location setters (HTML spec): change one component of a copy of the current
@@ -8111,7 +8130,7 @@ globalThis.location = {
   set port(v) { __locationSetPart('port', v); },
   toString() { return this.href; },
   assign(url) { __locationNavigate(url, false); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId); },
+  reload() { var r = _resolveUrl(this.href); __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId); },
   replace(url) { __locationNavigate(url, true); },
 };
 const _locationObj = globalThis.location;
@@ -8154,79 +8173,149 @@ globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
 
+const _eventHandlerValues = new WeakMap();
+// Window lives for the realm; keep its record through snapshot restoration.
+const _windowEventHandlerState = {kind: 'window', values: Object.create(null)};
+const _nativeResolveInlineHandler = Element.prototype._resolveInlineHandler;
+const _nativeElementLocalName = Object.getOwnPropertyDescriptor(Element.prototype, 'localName').get;
+function _eventHandlerState(receiver, kind) {
+  const existing = receiver === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(receiver);
+  if (existing) {
+    if (existing.kind !== kind) throw new TypeError('Illegal invocation');
+    return existing.values;
+  }
+  const valid = kind === 'window' ? receiver === globalThis
+    : kind === 'document' ? _documentRootState(_documentInstances, receiver) !== undefined
+    : receiver && _nodeCacheGet(receiver._nid) === receiver && +_dom('node_type', receiver._nid) === 1;
+  if (!valid) return null;
+  const values = Object.create(null);
+  _eventHandlerValues.set(receiver, {kind, values});
+  return values;
+}
+function _eventHandlerValue(receiver, name, kind, values) {
+  if (values && name in values) return values[name];
+  if (kind === 'window' && name === 'onload') {
+    const body = _windowReflectingBodyElement();
+    return body ? _nativeResolveInlineHandler.call(body, name) : null;
+  }
+  return kind === 'element' ? _nativeResolveInlineHandler.call(receiver, name) : null;
+}
+function _nativeEventHandler(receiver, name) {
+  const state = receiver === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(receiver);
+  const kind = state ? state.kind
+    : typeof receiver._resolveInlineHandler === 'function' ? 'element'
+    : receiver === globalThis ? 'window' : 'document';
+  // Body load handlers belong to Window, not to a load dispatched on Body.
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(receiver)) return null;
+  return _eventHandlerValue(receiver, name, kind, state?.values);
+}
+function _eventHandlerGet(name, kind) {
+  const values = _eventHandlerState(this, kind);
+  if (!values) {
+    const get = this && _documentRealmMember(this, 'getEventHandler');
+    if (get) return get.call(this, name, kind);
+    throw new TypeError('Illegal invocation');
+  }
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(this)) {
+    return _eventHandlerGet.call(globalThis, name, 'window');
+  }
+  return _eventHandlerValue(this, name, kind, values);
+}
+function _eventHandlerSet(name, kind, value) {
+  const values = _eventHandlerState(this, kind);
+  if (!values) {
+    const set = this && _documentRealmMember(this, 'setEventHandler');
+    if (set) return set.call(this, name, kind, value);
+    throw new TypeError('Illegal invocation');
+  }
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(this)) {
+    return _eventHandlerSet.call(globalThis, name, 'window', value);
+  }
+  return values[name] = value !== null && (typeof value === 'object' || typeof value === 'function') ? value : null;
+}
+function _eventHandlerAttributeChanged(element, name) {
+  if (!name.startsWith('on')) return;
+  const state = _eventHandlerValues.get(element);
+  if (state) delete state.values[name];
+  if (element.__inlineHandlerCache) delete element.__inlineHandlerCache[name];
+  if (name === 'onload' && _isWindowReflectingBodyElement(element)) {
+    delete _windowEventHandlerState.values.onload;
+  }
+}
+
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
 // event path through these: jQuery checks `("on" + ev) in window`, and React
 // decides whether the `input` event is supported via `("oninput" in document)`.
 // When that check fails React falls back to a legacy change-detection path that
 // never fires onChange for controlled inputs (issue #324). Initialising these to
-// null on all three targets makes the checks match real browsers. On Document and
-// Element they are non-enumerable so they don't surface in `for..in` over nodes.
-for (const _ev of [
-  "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
-  "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
-  "dragenter","dragleave","dragover","dragstart","drop","durationchange","emptied",
-  "ended","error","focus","focusin","focusout","formdata","gotpointercapture",
-  "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
-  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message",
-  "mousedown","mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup",
-  "offline","online","pagehide","pageshow","paste","pause","play","playing",
-  "pointercancel","pointerdown","pointerenter","pointerleave","pointermove",
-  "pointerout","pointerover","pointerup","popstate","progress","ratechange",
-  "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
-  "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
-  "unload","volumechange","waiting","wheel",
+// null on all three targets makes the checks match real browsers. Accessors
+// also let instrumentation wrap assignments through the original IDL setter.
+const _globalEventHandlerNames = [
+  "abort","animationcancel","animationend","animationiteration","animationstart","auxclick",
+  "beforeinput","beforematch","beforeprint","beforetoggle","beforeunload","beforexrselect","blur",
+  "cancel","canplay","canplaythrough","change","click","close","command",
+  "contentvisibilityautostatechange","contextlost","contextmenu","contextrestored","cuechange",
+  "dblclick","drag","dragend","dragenter","dragleave","dragover","dragstart","drop",
+  "durationchange","emptied","ended","error","focus","focusin","focusout","formdata",
+  "gotpointercapture","hashchange","input","invalid","keydown","keypress","keyup","languagechange",
+  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message","mousedown",
+  "mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup","mousewheel","offline",
+  "online","pagehide","pageshow","paste","pause","play","playing","pointercancel","pointerdown",
+  "pointerenter","pointerleave","pointermove","pointerout","pointerover","pointerrawupdate",
+  "pointerup","popstate","progress","ratechange","rejectionhandled","reset","resize","scroll",
+  "scrollend","scrollsnapchange","scrollsnapchanging","search","securitypolicyviolation","seeked",
+  "seeking","select","selectionchange","selectstart","slotchange","stalled","storage","submit",
+  "suspend","timeupdate","toggle","transitioncancel","transitionend","transitionrun",
+  "transitionstart","unhandledrejection","unload","volumechange","waiting","webkitanimationend",
+  "webkitanimationiteration","webkitanimationstart","webkittransitionend","wheel",
+];
+for (const [_proto, _kind, _names] of [
+  [Element.prototype, 'element', [..._globalEventHandlerNames,
+    "beforecopy","beforecut","beforepaste","copy","cut","fullscreenchange","fullscreenerror",
+    "webkitfullscreenchange","webkitfullscreenerror",
+  ]],
+  [Document.prototype, 'document', [..._globalEventHandlerNames,
+    "beforecopy","beforecut","beforepaste","copy","cut","freeze","fullscreenchange",
+    "fullscreenerror","pointerlockchange","pointerlockerror","prerenderingchange",
+    "readystatechange","resume","visibilitychange","webkitfullscreenchange","webkitfullscreenerror",
+  ]],
+  [globalThis, 'window', [..._globalEventHandlerNames,
+    "afterprint","appinstalled","beforeinstallprompt","devicemotion","deviceorientation",
+    "deviceorientationabsolute","gamepadconnected","gamepaddisconnected","messageerror",
+    "pagereveal","pageswap",
+  ]],
+  [HTMLMediaElement.prototype, 'element', ['encrypted', 'waitingforkey']],
+  [HTMLVideoElement.prototype, 'element', ['enterpictureinpicture', 'leavepictureinpicture']],
 ]) {
-  const _on = "on" + _ev;
-  if (!(_on in globalThis)) globalThis[_on] = null;
-  for (const _proto of [Document.prototype, Element.prototype]) {
-    if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
+  for (const _ev of _names) {
+    const _on = "on" + _ev;
+    if (_kind === 'window' || !(_on in _proto)) {
+      const initial = _kind === 'window' ? _proto[_on] : null;
+      const descriptor = Object.getOwnPropertyDescriptor({
+        get [_on]() {
+          const state = this === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(this);
+          if (_on !== 'onload' && state?.kind === _kind && _on in state.values) return state.values[_on];
+          return _eventHandlerGet.call(this, _on, _kind);
+        },
+        set [_on](value) { _eventHandlerSet.call(this, _on, _kind, value); },
+      }, _on);
+      _markNative(descriptor.get);
+      _markNative(descriptor.set);
+      Object.defineProperty(_proto, _on, descriptor);
+      if (initial != null) _eventHandlerSet.call(_proto, _on, _kind, initial);
     }
   }
 }
 
-let _windowOnloadOverrideSet = false;
-let _windowOnloadOverride = null;
 function _windowReflectingBodyElement() {
   const document = globalThis.document;
   return document && (document.body || document.querySelector('frameset'));
 }
 function _isWindowReflectingBodyElement(element) {
-  return element === _windowReflectingBodyElement();
+  const name = _nativeElementLocalName.call(element);
+  return (name === 'body' || name === 'frameset') && element === _windowReflectingBodyElement();
 }
-Object.defineProperty(globalThis, 'onload', {
-  get() {
-    if (_windowOnloadOverrideSet) return _windowOnloadOverride;
-    const body = _windowReflectingBodyElement();
-    return body && body._resolveInlineHandler
-      ? body._resolveInlineHandler('onload')
-      : null;
-  },
-  set(value) {
-    _windowOnloadOverrideSet = true;
-    _windowOnloadOverride = typeof value === 'function' ? value : null;
-  },
-  configurable: true,
-  enumerable: true,
-});
-Object.defineProperty(Element.prototype, 'onload', {
-  get() {
-    if (_isWindowReflectingBodyElement(this)) {
-      return globalThis.onload;
-    }
-    return this.__onload || null;
-  },
-  set(value) {
-    if (_isWindowReflectingBodyElement(this)) {
-      globalThis.onload = value;
-      return;
-    }
-    this.__onload = typeof value === 'function' ? value : null;
-  },
-  configurable: true,
-  enumerable: false,
-});
 
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
@@ -8369,6 +8458,7 @@ class NetworkInformation {
     if (listeners) this._listeners[type] = listeners.filter((item) => item !== listener);
   }
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     if (!event || !event.type) return true;
     for (const listener of this._listeners[event.type] || []) {
       try { listener.call(this, event); } catch (error) { console.error(error); }
@@ -8442,7 +8532,7 @@ globalThis.navigator = {
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(event){_demoteAuthorEvent(event);return true;} },
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -8611,7 +8701,7 @@ class Screen {
     this._availW = availW === undefined ? w : availW;
     this._availH = availH === undefined ? h - 40 : availH;
     this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(event){_demoteAuthorEvent(event);return true;}};
   }
   get width() { return this._w; }
   get height() { return this._h; }
@@ -8920,7 +9010,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
     cleanup();
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
+  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : (parsed.cors ? "cors" : "basic");
   const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
   const responseBody = respType === "opaque"
     ? null
@@ -8983,6 +9073,7 @@ class XMLHttpRequestEventTarget {
     }
   }
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     if (!event || !event.type) return false;
     const ev = (typeof event === 'object') ? event : { type: event };
     ev.target = ev.target || this;
@@ -9188,6 +9279,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   // Per WHATWG DOM spec, required by zone.js which patches XHR via
   // Object.getOwnPropertyDescriptor on XMLHttpRequestEventTarget.prototype.
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     if (!event || !event.type) return false;
     const ev = (typeof event === 'object') ? event : { type: event };
     ev.target = ev.target || this;
@@ -10256,10 +10348,6 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
           return r.width != null ? `${r.width}px` : null;
         case 'height': case 'block-size':
           return r.height != null ? `${r.height}px` : null;
-        case 'left': return r.left != null ? `${r.left}px` : null;
-        case 'top': return r.top != null ? `${r.top}px` : null;
-        case 'right': return r.right != null ? `${r.right}px` : null;
-        case 'bottom': return r.bottom != null ? `${r.bottom}px` : null;
         case 'client-width': case 'offset-width':
           return r.width != null ? `${r.width}px` : null;
         case 'client-height': case 'offset-height':
@@ -10272,6 +10360,7 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   const defaultsKebab = {
     display: 'block', visibility: 'visible', opacity: '1',
     position: 'static', overflow: 'visible',
+    top: 'auto', right: 'auto', bottom: 'auto', left: 'auto',
     transform: 'none', 'transform-origin': '0px 0px',
     transition: 'none', animation: 'none',
     float: 'none', clear: 'none',
@@ -11942,19 +12031,19 @@ globalThis.DOMException = (function () {
   }
   return DOMException;
 })();
-// Per the UI Events spec, only events the user agent dispatches (real or
-// automation-synthesized input) are trusted; events page script builds with
-// `new Event(...)` must report isTrusted === false (issue #303). Returning true
-// for everything is a trivial bot-detection tell. Trusted events are tracked in
-// a closure-private WeakSet so page JS can neither read nor forge the flag.
-// obscura's CDP input pipeline marks its synthetic events via the
-// non-enumerable __obscura_markTrusted helper.
-const _trustedEvents = new WeakSet();
+// Browser-generated events are trusted (issue #303); authored dispatch clears trust.
+// The private ops handoff shares weak event registries with child realms.
+__obscuraCore.ops.__obscura_eventTrust = new WeakSet();
+__obscuraCore.ops.__obscura_activeEvents = new WeakSet();
+const _eventSetAdd = Function.prototype.call.bind(WeakSet.prototype.add);
+const _eventSetHas = Function.prototype.call.bind(WeakSet.prototype.has);
+const _eventSetDelete = Function.prototype.call.bind(WeakSet.prototype.delete);
+globalThis.__obscura_dispatchDomEvent = _dispatchDomEvent;
 let _hasStickyActivation = false;
 globalThis.__obscura_markTrusted = function(ev) {
   try {
     if (ev) {
-      _trustedEvents.add(ev);
+      _eventSetAdd(__obscuraCore.ops.__obscura_eventTrust, ev);
       if ((ev.type === 'keydown' && ev.key !== 'Escape') || ev.type === 'mousedown'
           || (ev.type === 'pointerdown' && ev.pointerType === 'mouse')
           || (ev.type === 'pointerup' && ev.pointerType !== 'mouse') || ev.type === 'touchend') {
@@ -12025,15 +12114,21 @@ globalThis.__obscura_setInputFiles = function(el, specs, validateOnly = false) {
   // trusted events; upload flows that gate their change handler on
   // event.isTrusted (common in frameworks and anti-bot code) ignore untrusted
   // ones, which would silently break the exact case this feature targets.
-  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true })));
-  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true })));
+  _dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event("input", { bubbles: true })));
+  _dispatchDomEvent(el, globalThis.__obscura_markTrusted(new Event("change", { bubbles: true })));
   return true;
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now();this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
-  get isTrusted() { return _trustedEvents.has(this); }
+  get isTrusted() { return _eventSetHas(__obscuraCore.ops.__obscura_eventTrust, this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  initEvent(type,bubbles,cancelable) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present.");
+    type = String(type);
+    if (this._dispatching || _eventSetHas(__obscuraCore.ops.__obscura_activeEvents, this)) return;
+    _eventSetDelete(__obscuraCore.ops.__obscura_eventTrust, this);
+    this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false;
+  }
   composedPath() {
     if (!this.target) return [];
     const path = [];
@@ -12043,6 +12138,14 @@ globalThis.Event = class Event {
     return path;
   }
 };
+
+// Browser resource completion must not call author-replaced constructors or dispatchEvent.
+const _BrowserEvent = Event;
+function _fireResourceEvent(target, type) {
+  const event = new _BrowserEvent(type);
+  _eventSetAdd(__obscuraCore.ops.__obscura_eventTrust, event);
+  return _dispatchDomEvent(target, event);
+}
 
 const _beforeUnloadValues = new WeakMap();
 globalThis.BeforeUnloadEvent = class BeforeUnloadEvent extends Event {
@@ -12061,7 +12164,7 @@ globalThis.__obscura_fireBeforeUnload = function() {
   _beforeUnloadValues.set(event, '');
   Object.setPrototypeOf(event, BeforeUnloadEvent.prototype);
   globalThis.__obscura_markTrusted(event);
-  const allowed = globalThis.dispatchEvent(event);
+  const allowed = _eventTargetDispatch(globalThis, event);
   return _hasStickyActivation && (!allowed || event.returnValue !== '');
 };
 _markNative(BeforeUnloadEvent);
@@ -12391,10 +12494,13 @@ let _createDependentAbortSignal;
     state.sources.clear();
     dependentsFinalizer.unregister(state.ref);
     state.dependents.clear();
-    const evt = typeof Event === "function" ? new Event("abort") : { type: "abort" };
-    _trustedEvents.add(evt);
+    const evt = new _BrowserEvent("abort");
+    _eventSetAdd(__obscuraCore.ops.__obscura_eventTrust, evt);
     try { evt.target = signal; evt.currentTarget = signal; } catch (_) {}
-    emit(signal, evt);
+    // Abort listeners can freeze the event; delivery state must remain private.
+    _eventSetAdd(__obscuraCore.ops.__obscura_activeEvents, evt);
+    try { emit(signal, evt); }
+    finally { _eventSetDelete(__obscuraCore.ops.__obscura_activeEvents, evt); }
   }
   function fire(signal, reason) {
     const state = _abortSignalState(signal);
@@ -12446,6 +12552,7 @@ let _createDependentAbortSignal;
       _retainObservedSignal(this);
     }
     dispatchEvent(evt) {
+      _demoteAuthorEvent(evt);
       if (evt && evt.type === "abort") emit(this, evt);
       return true;
     }
@@ -12801,6 +12908,10 @@ function _xmlWellFormed(src) {
 const _escapeXmlErrorText = (text) =>
   String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+const _parserCreateElementNS = Function.prototype.call.bind(Document.prototype.createElementNS);
+const _parserCreateText = Function.prototype.call.bind(Document.prototype.createTextNode);
+const _parserAppend = Function.prototype.call.bind(Node.prototype.appendChild);
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
@@ -12812,7 +12923,6 @@ globalThis.DOMParser = class DOMParser {
       doc._documentCompatMode = _dom("parse_html_document", doc._nid, html);
       return doc;
     }
-    const root = document.createElement("html");
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
     // error-detection code (doc.querySelector('parsererror')) works, matching
@@ -12830,20 +12940,19 @@ globalThis.DOMParser = class DOMParser {
     const xmlError = isXml ? _checkXmlWellFormed(html) : null;
     const isParserError = isXml && (!_xmlWellFormed(html) || !xmlError.wellFormed);
     if (isParserError) {
-      const detail = (xmlError && xmlError.error) || 'error while parsing XML';
-      try {
-        root.innerHTML =
-          '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>' +
-          _escapeXmlErrorText(detail) +
-          '</div></parsererror>';
-      } catch (e) { /* ignore */ }
-    } else {
-      // innerHTML parses children via html5ever fragment-parsing rules. Most
-      // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
-      // fragment parser strips the outer `<html>` and emits its head+body
-      // children, which is what callers want.
-      try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+      const doc = _createDetachedDocument(mimeType, true);
+      doc._documentURL = parserURL;
+      const report = _parserCreateElementNS(doc, "http://www.mozilla.org/newlayout/xml/parsererror.xml", "parsererror");
+      _parserAppend(report, _parserCreateText(doc, "This page contains the following errors:"));
+      const detail = _parserCreateElementNS(doc, "http://www.w3.org/1999/xhtml", "div");
+      _parserAppend(detail, _parserCreateText(doc, (xmlError && xmlError.error) || 'error while parsing XML'));
+      _parserAppend(report, detail);
+      _parserAppend(doc, report);
+      return doc;
     }
+    // shortcut: valid XML still uses HTML fragments; replace this with a native XML parser.
+    const root = document.createElement("html");
+    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
 
     // Helper: depth-first walk to find an element by predicate.
     const walk = (node, pred) => {
@@ -12865,14 +12974,9 @@ globalThis.DOMParser = class DOMParser {
       nodeType: 9,
       queryCommandSupported: Document.prototype.queryCommandSupported,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
-      get documentElement() {
-        // For XML parsererror docs, return the <parsererror> child, not the
-        // <html> wrapper, matching Chrome's behavior.
-        if (isParserError) return root.firstElementChild;
-        return root;
-      },
-      get body() { return findByTagName("BODY"); },
-      get head() { return findByTagName("HEAD"); },
+      get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); },
+      get body() { return _documentPart(this, 'body', 'document_body'); },
+      get head() { return _documentPart(this, 'head', 'document_head'); },
       get title() {
         const t = findByTagName("TITLE");
         return t ? (t.textContent || "").replace(/[\t\n\f\r ]+/g, " ").trim() : "";
@@ -12963,12 +13067,12 @@ globalThis.DOMParser = class DOMParser {
         return Node.prototype.cloneNode.call(this, deep);
       },
       contains(n) { return root.contains ? root.contains(n) : false; },
-      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+      addEventListener() {}, removeEventListener() {}, dispatchEvent(event) { _demoteAuthorEvent(event); return true; },
     };
     // The parsed tree belongs to this document, not the main one.
     _registerForeignDocument();
     _stampNodeDocument(root, docNode);
-    _documentInstances.add(docNode);
+    _setDocumentRootState(_documentInstances, docNode, { nid:root._nid, element:true });
     return docNode;
   }
 };
@@ -13348,7 +13452,7 @@ Object.defineProperty(Document.prototype, 'fonts', {
     _set.status = 'loaded';
     _set.addEventListener = () => {};
     _set.removeEventListener = () => {};
-    _set.dispatchEvent = () => true;
+    _set.dispatchEvent = (event) => { _demoteAuthorEvent(event); return true; };
     return _set;
   },
   configurable: true,
@@ -13854,6 +13958,7 @@ globalThis.atob = globalThis.atob || ((s) => {
       if (index >= 0) list.splice(index, 1);
     },
     dispatchEvent(event) {
+      _demoteAuthorEvent(event);
       if (!event || !event.type) return true;
       const list = (listeners[String(event.type)] || []).slice();
       for (const callback of list) {
@@ -14719,6 +14824,51 @@ for (const [name, tags] of Object.entries({
   }
 }
 
+// Ordinary elements must be able to store their own form references.
+{
+  const descriptor = { ...Object.getOwnPropertyDescriptor(Element.prototype, 'form'), enumerable: true };
+  for (const Interface of [HTMLButtonElement, HTMLFieldSetElement, HTMLInputElement,
+      HTMLLabelElement, HTMLLegendElement, HTMLObjectElement, HTMLOutputElement,
+      HTMLSelectElement, HTMLTextAreaElement, HTMLOptionElement]) {
+    Object.defineProperty(Interface.prototype, 'form', descriptor);
+  }
+  delete Element.prototype.form;
+}
+
+// URL members on ordinary elements make detached roots look like shadow hosts.
+for (const name of ['protocol','username','password','host','hostname',
+    'port','pathname','search','hash','origin']) {
+  const descriptor = { ...Object.getOwnPropertyDescriptor(Element.prototype, name), enumerable: true };
+  Object.defineProperty(HTMLAnchorElement.prototype, name, descriptor);
+  Object.defineProperty(HTMLAreaElement.prototype, name, descriptor);
+  delete Element.prototype[name];
+}
+
+HTMLScriptElement.supports = {
+  supports(type) {
+    if (arguments.length < 1) throw new TypeError("HTMLScriptElement.supports requires a script type");
+    type = `${type}`;
+    // Speculative navigation is not implemented; do not advertise its script type.
+    return type === 'classic' || type === 'module' || type === 'importmap';
+  },
+}.supports;
+_markNative(HTMLScriptElement.supports);
+
+{
+  const reflectSet = Reflect.set;
+  Object.defineProperty(HTMLIFrameElement.prototype, 'sandbox', {
+    get: Object.getOwnPropertyDescriptor(Element.prototype, 'sandbox').get,
+    set: _markNative(Object.getOwnPropertyDescriptor({
+      set sandbox(value) {
+        if (_tableElementTag(this) !== 'iframe') throw new TypeError('Illegal invocation');
+        reflectSet(this.sandbox, 'value', value);
+      },
+    }, 'sandbox').set),
+    enumerable: true,
+    configurable: true,
+  });
+}
+
 let _formOwnerSnapshots = new WeakMap();
 let _formControlSnapshots = new WeakMap();
 let _formCacheEpoch = null;
@@ -15260,6 +15410,7 @@ Object.assign(globalThis.XPathResult, {
 // XMLDocument is a subclass of Document (DOMParser of an XML type and
 // implementation.createDocument produce one). The interface must exist globally.
 if (typeof XMLDocument === "undefined") globalThis.XMLDocument = class XMLDocument extends Document {};
+const _nativeXMLDocument = XMLDocument;
 // ParentNode mixin: Document and DocumentFragment are ParentNodes too, so they
 // share Element's append / prepend / replaceChildren.
 for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
@@ -15469,6 +15620,37 @@ _defineTableGetter('HTMLTableRowElement', 'cells', 'table_row_cells', true);
 _defineTableGetter('HTMLTableRowElement', 'rowIndex', 'table_row_index');
 _defineTableGetter('HTMLTableRowElement', 'sectionRowIndex', 'table_section_row_index');
 _defineTableGetter('HTMLTableCellElement', 'cellIndex', 'table_cell_index');
+const _tableAttributeGet = Element.prototype.getAttribute;
+const _tableAttributeSet = Element.prototype.setAttribute;
+function _defineTableSpan(member, attr, minimum, maximum) {
+  const getter = function () {
+    const foreign = _tableMemberReceiver(this, 'HTMLTableCellElement', member, 'get');
+    if (foreign) return foreign.call(this);
+    if (_tableMemberValue(this, 'table_interface') !== 'HTMLTableCellElement') throw new TypeError('Illegal invocation');
+    const parsed = /^[ \t\n\f\r]*([+-]?[0-9]+)/.exec(_tableAttributeGet.call(this, attr) || '');
+    if (!parsed) return 1;
+    const value = +parsed[1];
+    return value < 0 ? 1 : value <= minimum ? minimum : value > maximum ? maximum : value;
+  };
+  const setter = function (value) {
+    const foreign = _tableMemberReceiver(this, 'HTMLTableCellElement', member, 'set');
+    if (foreign) return foreign.call(this, value);
+    if (_tableMemberValue(this, 'table_interface') !== 'HTMLTableCellElement') throw new TypeError('Illegal invocation');
+    // Reflection stores the unsigned value; only the getter applies span limits.
+    const number = value >>> 0;
+    _tableAttributeSet.call(this, attr, String(number <= 2147483647 ? number : 1));
+  };
+  for (const [accessor, implementation] of [['get', getter], ['set', setter]]) {
+    Object.defineProperty(implementation, 'name', {value: accessor + ' ' + member, configurable: true});
+    _markNative(implementation);
+    _tableRealmMembers['HTMLTableCellElement.' + member + '.' + accessor] = implementation;
+  }
+  Object.defineProperty(HTMLTableCellElement.prototype, member, {
+    get: getter, set: setter, enumerable: true, configurable: true,
+  });
+}
+_defineTableSpan('colSpan', 'colspan', 1, 1000);
+_defineTableSpan('rowSpan', 'rowspan', 0, 65534);
 function _defineTableMethod(iface, member, implementation) {
   const method = function (...args) {
     const foreign = _tableMemberReceiver(this, iface, member);
@@ -16163,6 +16345,7 @@ class _IframeDocument {
     this.hidden = false;
 
     this._root = document.createElement('html');
+    _setDocumentRootState(_documentInstances, this, { nid:this._root._nid, element:true });
     this._head = document.createElement('head');
     this._body = document.createElement('body');
     _iframeDocumentRoots.add(this._root);
@@ -16187,9 +16370,9 @@ class _IframeDocument {
     }
   }
 
-  get documentElement() { return this._root; }
-  get head() { return this._head; }
-  get body() { return this._body; }
+  get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); }
+  get head() { return _documentPart(this, 'head', 'document_head'); }
+  get body() { return _documentPart(this, 'body', 'document_body'); }
   get title() { return this._title; }
   set title(v) { this._title = v; }
   get URL() { return this._url; }
@@ -16242,6 +16425,7 @@ class _IframeDocument {
     if (index !== -1) list.splice(index, 1);
   }
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     const type = event && event.type;
     if (!type) return true;
     const list = this._listeners && this._listeners[type];
@@ -16465,7 +16649,7 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   const clone = JSON.parse(json).v;
   setTimeout(() => {
     try {
-      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+      _eventTargetDispatch(globalThis, globalThis.__obscura_markTrusted(
         new MessageEvent('message', { data: clone, origin, source: globalThis })));
     } catch (error) {
       console.error('message listener failed:', error && error.message || error);
@@ -16488,9 +16672,9 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
-function _connectInsertedFrames(root, html) {
-  if (root.isConnected && /<iframe[\s/>]/i.test(html)) {
-    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe')));
+function _connectInsertedResources(root, html) {
+  if (root.isConnected && /<(?:iframe|img)[\s/>]/i.test(html)) {
+    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe,img[onload],img[onerror]')));
   }
 }
 
@@ -16597,6 +16781,9 @@ function _frameWindowFor(frameId) {
       // itself as `this`, not with this proxy.
       return Reflect.get(target, prop);
     },
+    set(target, prop, value) {
+      return Reflect.set(target, prop, value);
+    },
     has(target, prop) {
       return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
     },
@@ -16624,7 +16811,7 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
     // postMessage, it did not dispatch this. Real embedders check the flag and
     // drop anything untrusted, so an untrusted event is not merely suspicious,
     // it is silently discarded and the widget waits forever.
-    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+    _eventTargetDispatch(globalThis, globalThis.__obscura_markTrusted(
       new MessageEvent('message', { data, origin, source })));
   } catch (error) {
     console.error('message listener failed:', error && error.message || error);
@@ -16859,6 +17046,7 @@ class _IframeWindow {
     }
   }
   dispatchEvent(event) {
+    _demoteAuthorEvent(event);
     const handlers = this._listeners?.[event?.type] || [];
     for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
     return true;
@@ -17649,39 +17837,57 @@ const WORKER_GLOBALS = [
 
 globalThis.Worker = class Worker {
   constructor(url) {
+    if (arguments.length === 0) throw new TypeError("Worker requires a script URL");
+    url = `${url}`;
+    // Stored blob URLs are already canonical; avoid reparsing each worker's source.
+    if (!url.startsWith('blob:') || globalThis.__blobStore?.[url] === undefined) {
+      url = _urlResolveOp(url, _documentBase() || 'about:blank');
+      if (!url) throw new TypeError("Failed to construct 'Worker': Invalid URL");
+    }
     this.onmessage = null;
     this.onerror = null;
     this._terminated = false;
     this._listeners = {};
     this._scope = null;
+    this._url = url;
     this._pendingMessages = [];
     const worker = this;
 
-    let resolvedUrl = url;
-    if (typeof url === 'string') {
-      const blob = globalThis.__blobStore?.[url];
-      if (blob) {
-        worker._code = blob;
-        // Auto-start on next tick so caller can set onmessage first.
-        setTimeout(() => worker._autoRun(), 0);
-        return;
-      }
-      // Resolve relative URLs against the current page.
-      if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
-        try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
-      }
-      (async () => {
-        try {
-          const resp = await fetch(resolvedUrl);
-          worker._code = await resp.text();
-          if (!worker._terminated) worker._autoRun();
-        } catch(e) { if (worker.onerror) worker.onerror(e); }
-      })();
+    const blob = globalThis.__blobStore?.[url];
+    if (blob) {
+      worker._code = blob;
+      // Auto-start on next tick so caller can set onmessage first.
+      setTimeout(() => worker._autoRun(), 0);
+      return;
     }
+    (async () => {
+      try {
+        const resp = await fetch(url);
+        worker._url = resp.url || url;
+        worker._code = await resp.text();
+        if (!worker._terminated) worker._autoRun();
+      } catch(e) { if (worker.onerror) worker.onerror(e); }
+    })();
   }
   _makeScope() {
     const worker = this;
+    const workerUrl = worker._url;
+    const URLImpl = globalThis.URL;
+    const fetchImpl = globalThis.fetch;
+    const RequestImpl = globalThis.Request;
+    let workerLocation;
     const scope = {
+      get location() {
+        if (!workerLocation) {
+          const parsed = new URLImpl(workerUrl);
+          workerLocation = {};
+          for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
+            Object.defineProperty(workerLocation, name, {value:parsed[name], enumerable:true});
+          }
+          Object.defineProperty(workerLocation, 'toString', {value:_markNative({toString() { return parsed.href; }}.toString)});
+        }
+        return workerLocation;
+      },
       onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
@@ -17710,11 +17916,32 @@ globalThis.Worker = class Worker {
       clearInterval: globalThis.clearInterval,
       scheduler: globalThis.scheduler,
       Scheduler: globalThis.Scheduler,
-      fetch: globalThis.fetch,
+      // Only URL resolution is worker-local; transport and its security policy stay shared.
+      fetch(input, init = {}) {
+        try {
+          return fetchImpl.call(this, input instanceof RequestImpl ? input : new URLImpl(input, workerUrl).href, init);
+        } catch (error) { return Promise.reject(error); }
+      },
       console: globalThis.console,
       performance: globalThis.performance,
-      location: globalThis.location,
     };
+    _markNative(Object.getOwnPropertyDescriptor(scope, 'location').get);
+    Object.defineProperty(scope, 'Request', {value:class Request extends RequestImpl {
+      constructor(input, init = {}) {
+        super(input instanceof RequestImpl ? input : new URLImpl(input, workerUrl).href, init);
+      }
+      clone() { return Object.setPrototypeOf(super.clone(), Request.prototype); }
+    }, writable:true, configurable:true});
+    Object.defineProperty(scope, 'Worker', {value:class Worker extends globalThis.Worker {
+      constructor(url, ...options) {
+        if (arguments.length === 0) throw new TypeError("Worker requires a script URL");
+        super(new URLImpl(url, workerUrl).href, ...options);
+      }
+    }, writable:true, configurable:true});
+    _markNative(scope.fetch);
+    _markNative(scope.Request);
+    _markNative(scope.Request.prototype.clone);
+    _markNative(scope.Worker);
     scope.self = scope;
     // A worker global carries the ECMAScript builtins and the worker-visible
     // web APIs as properties. Bare identifiers already resolved through the
@@ -18683,7 +18910,7 @@ if (typeof FileReader === 'undefined') {
     }
     addEventListener(t, fn) { if (typeof fn === "function") (this._listeners[t] = this._listeners[t] || []).push(fn); }
     removeEventListener(t, fn) { const ls = this._listeners[t]; if (ls) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); } }
-    dispatchEvent() { return true; }
+    dispatchEvent(event) { _demoteAuthorEvent(event); return true; }
   };
   globalThis.FileReader.EMPTY = 0; globalThis.FileReader.LOADING = 1; globalThis.FileReader.DONE = 2;
   Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
@@ -18714,6 +18941,7 @@ function _makeListenerBox(self) {
     if (i >= 0) bucket.splice(i, 1);
   };
   self.dispatchEvent = function (event) {
+    _demoteAuthorEvent(event);
     const bucket = map.get(event.type);
     if (!bucket) return true;
     for (const fn of bucket.slice()) {
@@ -18860,7 +19088,7 @@ if (typeof BroadcastChannel === 'undefined') {
     }
     dispatchEvent(event) {
       stateFor(this);
-      return _eventTargetDispatch(this, event);
+      return _eventTargetDispatch(this, event, true);
     }
     postMessage(message) {
       const state = stateFor(this);
@@ -18946,7 +19174,7 @@ globalThis.MediaQueryList = class MediaQueryList {
   removeListener(callback) { this.removeEventListener('change', callback); }
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
-  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event, true); }
   get [Symbol.toStringTag]() { return 'MediaQueryList'; }
 };
 Object.setPrototypeOf(MediaQueryList.prototype, EventTarget.prototype);
@@ -19609,13 +19837,14 @@ const _nativeElementClick = Element.prototype.click;
 const _nativeDocumentUrl = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Document.prototype, 'URL').get);
 const _nativeNodeBaseUri = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI').get);
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['documentElement', 'head', 'body', 'URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
   ['activateElement', function(trusted) {
     return _nativeElementClick.call(this, trusted ? _TRUSTED_ACTIVATION : undefined);
   }],
+  ['dispatchDomEvent', function(event, authorDispatch) { return _domEventDispatch(this, event, authorDispatch); }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
   ['selectOptions', _selectOptionsMember],
@@ -19634,6 +19863,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['windowOrigin', _windowOriginDescriptor.get],
   ['setWindowOrigin', _windowOriginDescriptor.set],
+  ['getEventHandler', _eventHandlerGet],
+  ['setEventHandler', _eventHandlerSet],
 ]));
 
 globalThis.__obscura_init_frames = function() {
@@ -19652,7 +19883,7 @@ globalThis.__obscura_init_frames = function() {
 
 };
 
-globalThis.__obscura_init = (function() {
+globalThis.__obscura_init = (function(skipFrames) {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _realmContextId = __obscuraCore.ops.op_frame_context(_realmFrameId);
@@ -19686,6 +19917,8 @@ globalThis.__obscura_init = (function() {
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);
+  // Materialize only parser images whose HTML handlers observe completion.
+  document.querySelectorAll('img[onload],img[onerror]');
 
   const scr = _fp('screen');
   const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0
@@ -19743,7 +19976,7 @@ globalThis.__obscura_init = (function() {
   // wrongly changes everything after it.
   _installFramingRelationships();
 
-  if (JSON.parse(__obscuraCore.ops.op_frame_preload_scripts()).length === 0) globalThis.__obscura_init_frames();
+  if (!skipFrames && JSON.parse(__obscuraCore.ops.op_frame_preload_scripts()).length === 0) globalThis.__obscura_init_frames();
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
