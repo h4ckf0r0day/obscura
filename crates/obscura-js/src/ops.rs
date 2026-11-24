@@ -2119,6 +2119,169 @@ pub struct RenderResourceLoad {
     /// Final URL, status, headers and body of the response; `None` when the
     /// request failed or was blocked.
     pub response: Option<RenderResourceResponse>,
+    pub network_event: Option<Box<JsNetworkEvent>>,
+}
+
+#[cfg(feature = "render")]
+#[derive(Clone)]
+pub(crate) struct RenderResourceFetcher {
+    http_client: Option<Arc<ObscuraHttpClient>>,
+    #[cfg(feature = "stealth")]
+    stealth_client: Option<Arc<StealthHttpClient>>,
+    callbacks: Option<Arc<CallbackRegistry>>,
+    interception: Option<Arc<RenderResourceInterception>>,
+}
+
+#[cfg(feature = "render")]
+struct RenderResourceInterception {
+    tx: tokio::sync::mpsc::UnboundedSender<InterceptedRequest>,
+    patterns: Vec<String>,
+    page_id: String,
+}
+
+#[cfg(feature = "render")]
+impl RenderResourceFetcher {
+    pub(crate) fn from_state(state: &ObscuraState) -> Self {
+        Self {
+            http_client: state.http_client.clone(),
+            #[cfg(feature = "stealth")]
+            stealth_client: state.stealth_client.clone(),
+            callbacks: state.callbacks.clone(),
+            interception: state.intercept_tx.as_ref().filter(|_| state.intercept_enabled).map(|tx| Arc::new(RenderResourceInterception {
+                tx: tx.clone(), patterns: state.intercept_url_patterns.clone(),
+                page_id: state.intercept_page_id.clone(),
+            })),
+        }
+    }
+
+    pub(crate) async fn fetch(&self, url: &url::Url, request: ResourceRequest) -> (Option<obscura_net::Response>, Option<JsNetworkEvent>) {
+        let Some(interception) = self.interception.as_ref().filter(|interception| {
+            matches!(url.scheme(), "http" | "https") && should_intercept_url(true, &interception.patterns, url.as_str())
+        }) else { return (self.fetch_unintercepted(url, request).await, None); };
+        let mut target = url.clone();
+        let mut method = String::from("GET");
+        let mut headers = None;
+        let mut body = None;
+        let mut event;
+        let mut fulfilled = None;
+        {
+            #[cfg(feature = "stealth")]
+            let request_headers = match (&self.stealth_client, &self.http_client) {
+                (Some(client), _) => client.extra_headers.read().await.clone(),
+                (_, Some(client)) => client.extra_headers.read().await.clone(),
+                _ => HashMap::new(),
+            };
+            #[cfg(not(feature = "stealth"))]
+            let request_headers = match &self.http_client {
+                Some(client) => client.extra_headers.read().await.clone(),
+                None => HashMap::new(),
+            };
+            static NEXT_RENDER_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let request_id = format!("render-{}", NEXT_RENDER_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            let kind = if request.resource_type == ResourceType::Font { "Font" } else { "Image" };
+            let (resolver, resolution) = tokio::sync::oneshot::channel();
+            if interception.tx.send(InterceptedRequest { request_id: request_id.clone(), page_id: interception.page_id.clone(),
+                url: url.to_string(), method: method.clone(), headers: request_headers,
+                resource_type: kind.into(), resolver }).is_ok() {
+                event = Some(JsNetworkEvent { request_id, intercepted: true, url: url.to_string(), method: method.clone(),
+                    resource_type: kind.into(), status: 0, response_headers: HashMap::new(), body_size: 0,
+                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+                    error_text: Some("net::ERR_FAILED".into()) });
+                match resolution.await {
+                    // The CDP resolution consumer emits the explicit failure.
+                    Ok(InterceptResolution::Fail { .. }) => return (None, None),
+                    Err(_) => { event.as_mut().unwrap().error_text = Some("net::ERR_ABORTED".into()); return (None, event); }
+                    Ok(InterceptResolution::Continue { url: rewrite, method: changed_method, headers: changed_headers, body: changed_body }) => {
+                        if let Some(rewrite) = rewrite {
+                            match url::Url::parse(&rewrite) {
+                                Ok(rewrite) if matches!(rewrite.scheme(), "http" | "https") => target = rewrite,
+                                _ => return (None, event),
+                            }
+                        }
+                        method = changed_method.unwrap_or(method);
+                        headers = changed_headers;
+                        body = changed_body;
+                    }
+                    Ok(InterceptResolution::Fulfill { status, headers: supplied, body, body_base64 }) => {
+                        let bytes = if body_base64.is_empty() { body.into_bytes() } else {
+                            match BASE64.decode(body_base64) { Ok(bytes) => bytes, Err(_) => return (None, event) }
+                        };
+                        if bytes.len() > request.max_response_bytes { return (None, event); }
+                        let headers: HashMap<_, _> = supplied.into_iter().map(|(name, value)| (name.to_ascii_lowercase(), value)).collect();
+                        if request.mode == RequestMode::Cors && request.initiator.as_ref().is_none_or(|origin| origin.origin() != url.origin()) {
+                            let origin = request.initiator.as_ref().map(|origin| origin.origin().ascii_serialization()).unwrap_or_else(|| "null".into());
+                            let credentials = if request.credentials == RequestCredentials::Include { FetchCredentials::Include } else { FetchCredentials::SameOrigin };
+                            if !cors_response_allows(credentials, &origin, headers.get("access-control-allow-origin").map(String::as_str).unwrap_or(""),
+                                headers.get("access-control-allow-credentials").map(String::as_str).unwrap_or("")) { return (None, event); }
+                        }
+                        let credentials = match request.credentials {
+                            RequestCredentials::Include => FetchCredentials::Include,
+                            RequestCredentials::SameOrigin => FetchCredentials::SameOrigin,
+                            RequestCredentials::Omit => FetchCredentials::Omit,
+                        };
+                        let origin = request.initiator.as_ref().map(|origin| origin.origin().ascii_serialization()).unwrap_or_else(|| "null".into());
+                        if credentials.allows(&origin, url.as_str()) {
+                            let cookie_jar = self.http_client.as_ref().map(|client| client.cookie_jar.as_ref());
+                            #[cfg(feature = "stealth")]
+                            let cookie_jar = self.stealth_client.as_ref().map(|client| client.cookie_jar.as_ref()).or(cookie_jar);
+                            if let (Some(cookie_jar), Some(cookies)) = (cookie_jar, headers.get("set-cookie")) {
+                                for cookie in cookies.lines() { cookie_jar.set_cookie(cookie, url); }
+                            }
+                        }
+                        fulfilled = Some(obscura_net::Response { url: url.clone(), status, headers, body: bytes, redirected_from: Vec::new() });
+                    }
+                }
+            } else { return (self.fetch_unintercepted(url, request).await, None); }
+        }
+        let response = if let Some(response) = fulfilled {
+            if let Some(callbacks) = &self.callbacks {
+                let info = obscura_net::RequestInfo { url: url.clone(), method: method.clone(), headers: HashMap::new(), resource_type: request.resource_type };
+                callbacks.fire_request(&info).await;
+                callbacks.fire_response(&info, &response).await;
+            }
+            Some(response)
+        } else {
+            // Both request-local transports validate the rewritten URL again,
+            // including the private-network gate and guarded DNS resolution.
+            #[cfg(feature = "stealth")]
+            let result = match (&self.stealth_client, &self.http_client) {
+                (Some(client), _) => client.fetch_resource_request_with_callbacks(&target, request, &method, body, headers, self.callbacks.as_deref()).await,
+                (_, Some(client)) => client.fetch_resource_request_with_callbacks(&target, request, &method, body, headers, self.callbacks.as_deref()).await,
+                _ => return (None, event),
+            };
+            #[cfg(not(feature = "stealth"))]
+            let result = match &self.http_client {
+                Some(client) => client.fetch_resource_request_with_callbacks(&target, request, &method, body, headers, self.callbacks.as_deref()).await,
+                None => return (None, event),
+            };
+            match result {
+                Ok(response) => Some(response),
+                Err(error) => { if let Some(event) = &mut event { event.error_text = Some(error.to_string()); } None }
+            }
+        };
+        if let Some(event) = &mut event {
+            event.method = method;
+            event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            if let Some(response) = &response {
+                event.status = response.status;
+                event.response_headers = response.headers.clone();
+                event.body_size = response.body.len();
+                event.error_text = None;
+            }
+        }
+        (response, event)
+    }
+
+    async fn fetch_unintercepted(&self, url: &url::Url, request: ResourceRequest) -> Option<obscura_net::Response> {
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            return client.fetch_resource_with_callbacks(url, request, self.callbacks.as_deref()).await.ok();
+        }
+        match &self.http_client {
+            Some(client) => client.fetch_resource_with_callbacks(url, request, self.callbacks.as_deref()).await.ok(),
+            None => None,
+        }
+    }
 }
 
 #[cfg(feature = "render")]
@@ -9712,8 +9875,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id:
         selected_url,
         request_profile,
         resource_request,
-        http_client,
-        callbacks,
+        fetcher,
+        has_page_transport,
         page_in_flight,
         blocked,
     ) = {
@@ -9759,19 +9922,13 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id:
             selected_url,
             profile,
             request,
-            gs.http_client.clone(),
-            gs.callbacks.clone(),
+            RenderResourceFetcher::from_state(&gs),
+            has_page_transport(&gs),
             Arc::clone(&gs.page_in_flight),
             blocked,
         )
     };
 
-    #[cfg(feature = "stealth")]
-    let stealth_client = shared.borrow().stealth_client.clone();
-    #[cfg(feature = "stealth")]
-    let has_page_transport = http_client.is_some() || stealth_client.is_some();
-    #[cfg(not(feature = "stealth"))]
-    let has_page_transport = http_client.is_some();
     if !has_page_transport {
         return load_image_metadata_without_page_transport(&mut shared.borrow_mut(), node_id);
     }
@@ -9815,47 +9972,24 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id:
 
     let parsed_url = url::Url::parse(&selected_url).ok();
     let fetch = async { if blocked || parsed_url.is_none() {
-        None
+        (None, None)
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
-        #[cfg(feature = "stealth")]
-        {
-            if let Some(client) = stealth_client {
-                client
-                    .fetch_resource_with_callbacks(
-                        parsed_url,
-                        resource_request.clone(),
-                        callbacks.as_deref(),
-                    )
-                    .await
-                    .ok()
-            } else {
-                http_client
-                    .as_ref()
-                    .unwrap()
-                    .fetch_resource_with_callbacks(
-                        parsed_url,
-                        resource_request,
-                        callbacks.as_deref(),
-                    )
-                    .await
-                    .ok()
-            }
-        }
-        #[cfg(not(feature = "stealth"))]
-        {
-            http_client
-                .as_ref()
-                .unwrap()
-                .fetch_resource_with_callbacks(parsed_url, resource_request, callbacks.as_deref())
-                .await
-                .ok()
-        }
+        fetcher.fetch(parsed_url, resource_request).await
     } };
-    let response = tokio::select! {
+    let (response, network_event) = tokio::select! {
         response = fetch => response,
-        _ = cancel_rx => None,
+        _ = cancel_rx => (None, None),
     };
+    if let Some(event) = network_event {
+        let mut gs = shared.borrow_mut();
+        if gs.document_generation == document_generation {
+            record_network_completion(&mut gs, event, |_| match &response {
+                Some(response) => CachedNetworkResponseBody::raw(&response.body, response.content_type()),
+                None => CachedNetworkResponseBody::raw(&[], None),
+            });
+        }
+    }
     let bytes = response.and_then(|response| {
         (200..300)
             .contains(&response.status)

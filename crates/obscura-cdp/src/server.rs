@@ -1504,7 +1504,7 @@ async fn cdp_processor(
                 // messages via the `process_with_interception` select loop;
                 // unrelated requests get deferred only briefly and are drained
                 // as soon as the nav settles.
-                let (is_navigation, is_fetch_resolution) = {
+                let (is_navigation, is_fetch_resolution, capture_session) = {
                     let command = serde_json::from_str::<CdpRequest>(&cdp_msg.text).ok();
                     if let Some(command) = command.as_ref() {
                         let removed = match command.method.as_str() {
@@ -1514,8 +1514,9 @@ async fn cdp_processor(
                         };
                         if let Some(session) = removed { release_fetch_session(&session, &cdp_msg.reply_tx, &mut intercepted_paused); }
                         (is_navigate_method(command),
-                            matches!(command.method.as_str(), "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest"))
-                    } else { (false, false) }
+                            matches!(command.method.as_str(), "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest"),
+                            capture_needs_interception_pump(command, &ctx).then(|| command.session_id.clone()))
+                    } else { (false, false, None) }
                 };
 
                 if is_navigation {
@@ -1532,7 +1533,12 @@ async fn cdp_processor(
                             &mut intercepted_paused,
                         );
                     if !fetch_was_resolved {
-                        process_cdp_message_with_pending(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, Some(&mut pending_runtime)).await;
+                        if let Some(session) = capture_session {
+                            process_capture_with_interception(&cdp_msg.text, &session, &mut ctx, &cdp_msg.reply_tx, &mut rx,
+                                &mut intercept_rx, &mut intercepted_paused, &mut deferred, &mut pending_runtime).await;
+                        } else {
+                            process_cdp_message_with_pending(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, Some(&mut pending_runtime)).await;
+                        }
                     }
                 }
             }
@@ -2461,6 +2467,101 @@ async fn process_with_interception(
     }
 }
 
+fn capture_needs_interception_pump(request: &CdpRequest, ctx: &CdpContext) -> bool {
+    #[cfg(feature = "render")]
+    {
+        if !ctx.fetch_intercept.enabled { return false; }
+        matches!(request.method.as_str(), "Page.captureScreenshot" | "Page.startScreencast" | "Page.printToPDF")
+            && ctx.get_session_page(&request.session_id).is_some_and(|page| page.intercept_enabled)
+            && crate::domains::page::capture_resource_deadline_ms().is_some()
+    }
+    #[cfg(not(feature = "render"))]
+    { let _ = (request, ctx); false }
+}
+
+async fn process_capture_with_interception(
+    text: &str,
+    session_id: &Option<String>,
+    ctx: &mut CdpContext,
+    reply_tx: &mpsc::UnboundedSender<String>,
+    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
+    deferred: &mut std::collections::VecDeque<ServerMessage>,
+    pending_runtime: &mut Vec<PendingRuntimeReply>,
+) {
+    let capture_page = session_id.as_ref().and_then(|session| ctx.sessions.get(session));
+    let routes: HashMap<_, _> = ctx.pages.iter().map(|page| {
+        let session = if Some(&page.id) == capture_page { session_id.clone() }
+            else { pending_runtime.iter().find(|pending| pending.evaluation.page_id == page.id)
+                .map(|pending| pending.session_id.clone())
+                .unwrap_or_else(|| ctx.sessions.iter().find(|(_, owner)| **owner == page.id).map(|(session, _)| session.clone())) };
+        let observers = crate::domains::page::network_observer_sessions(ctx, &page.id, &session);
+        (page.id.clone(), (page.frame_id.clone(), session, observers))
+    }).collect();
+    let sessions = ctx.sessions.clone();
+    let mut subscriptions = ctx.fetch_intercept.subscription_snapshot();
+    let mut disabled = HashSet::new();
+    let mut changed_pages = HashSet::new();
+    {
+        // Dispatch owns every Page until completion; only immutable routing
+        // snapshots and oneshots are accessed while it is parked on a resource.
+        let command = process_cdp_message_with_pending(text, ctx, reply_tx, Some(pending_runtime));
+        tokio::pin!(command);
+        loop {
+            let has_intercept_rx = intercept_rx.is_some();
+            tokio::select! {
+                _ = &mut command => break,
+                Some(intercepted) = async {
+                    if let Some(receiver) = intercept_rx.as_mut() { receiver.recv().await }
+                    else { std::future::pending().await }
+                }, if has_intercept_rx => {
+                    let subscribers = subscriptions.subscribers(&intercepted.page_id, &intercepted.url, &intercepted.resource_type);
+                    let route = routes.get(&intercepted.page_id);
+                    emit_routed_intercepted_request(intercepted,
+                        route.map(|(frame, session, _)| (frame.as_str(), session.clone())), None,
+                        route.map_or(&[][..], |(_, _, observers)| observers.as_slice()), subscribers, reply_tx, intercepted_paused);
+                }
+                Some(message) = rx.recv() => {
+                    if let ServerMessage::Cdp(message) = &message {
+                        if handle_fetch_resolution(&message.text, &message.reply_tx, intercepted_paused) { continue; }
+                        if let Ok(request) = serde_json::from_str::<CdpRequest>(&message.text) {
+                            let removed = match request.method.as_str() {
+                                "Fetch.disable" => Some(request.session_id.clone()),
+                                "Target.detachFromTarget" => request.params.get("sessionId").and_then(|id| id.as_str()).map(|id| Some(id.to_string())),
+                                _ => None,
+                            };
+                            if let Some(session) = removed {
+                                subscriptions.remove_session(&session);
+                                release_fetch_session(&session, &message.reply_tx, intercepted_paused);
+                                if let Some(page) = session.as_ref().and_then(|session| sessions.get(session)) { changed_pages.insert(page.clone()); }
+                                disabled.insert(session);
+                                if request.method == "Fetch.disable" {
+                                    let response = crate::types::CdpResponse::success(request.id, json!({}), request.session_id);
+                                    if let Ok(json) = serde_json::to_string(&response) { let _ = message.reply_tx.send(json); }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if deferred.len() < MAX_DEFERRED_MESSAGES { deferred.push_back(message); }
+                    else if let ServerMessage::Cdp(message) = message {
+                        if let Ok(request) = serde_json::from_str::<CdpRequest>(&message.text) {
+                            let response = crate::types::CdpResponse::error(request.id, -32000,
+                                "Server busy: capture in progress, try again later".into(), request.session_id);
+                            if let Ok(json) = serde_json::to_string(&response) { let _ = message.reply_tx.send(json); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for session in disabled { ctx.fetch_intercept.remove_session(&session); }
+    for page_id in changed_pages {
+        if let Some(page) = ctx.pages.iter_mut().find(|page| page.id == page_id) { ctx.fetch_intercept.sync_page(page); }
+    }
+}
+
 async fn process_cdp_message(
     text: &str,
     ctx: &mut CdpContext,
@@ -3084,6 +3185,145 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_subscribers_detach_another_page_during_navigation_preserves_current_guard() {
         assert_fetch_subscriber_removed_during_navigation(true, true).await;
+    }
+
+    #[cfg(feature = "render")]
+    async fn capture_test_reply(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>, id: u64) -> serde_json::Value {
+        loop {
+            let value: serde_json::Value = serde_json::from_str(&tokio::time::timeout(
+                std::time::Duration::from_secs(5), rx.recv()).await.expect("CDP response").unwrap()).unwrap();
+            if value["id"] == id { assert!(value.get("error").is_none(), "{value}"); return value; }
+        }
+    }
+
+    #[cfg(feature = "render")]
+    async fn assert_capture_services_intercepted_resources(method: &str, removal: Option<&str>) {
+        use base64::Engine as _;
+        std::env::set_var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS", "10000");
+        tokio::task::LocalSet::new().run_until(async {
+            let context = obscura_browser::context::BrowserContext::with_storage_and_network(
+                "capture-interception".into(), None, false, None, None, true,
+            );
+            let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let processor = tokio::task::spawn_local(super::cdp_processor(server_rx, std::sync::Arc::new(context),
+                std::sync::Arc::new(tokio::sync::Notify::new()), Default::default()));
+            server_tx.send(super::ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
+            reply_rx.recv().await.unwrap();
+            let send = |value: serde_json::Value| {
+                server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
+                    text: value.to_string(), reply_tx: reply_tx.clone(),
+                })).unwrap();
+            };
+            send(json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
+            let target = capture_test_reply(&mut reply_rx, 1).await["result"]["targetId"].as_str().unwrap().to_string();
+            send(json!({"id": 2, "method": "Target.attachToTarget", "params": {"targetId": target, "flatten": true}}));
+            let driver = capture_test_reply(&mut reply_rx, 2).await["result"]["sessionId"].as_str().unwrap().to_string();
+            send(json!({"id": 3, "method": "Target.attachToTarget", "params": {"targetId": target, "flatten": true}}));
+            let guard = capture_test_reply(&mut reply_rx, 3).await["result"]["sessionId"].as_str().unwrap().to_string();
+            send(json!({"id": 4, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
+            let other = capture_test_reply(&mut reply_rx, 4).await["result"]["targetId"].as_str().unwrap().to_string();
+            send(json!({"id": 5, "method": "Target.attachToTarget", "params": {"targetId": other, "flatten": true}}));
+            let other_session = capture_test_reply(&mut reply_rx, 5).await["result"]["sessionId"].as_str().unwrap().to_string();
+            send(json!({"id": 6, "method": "Page.navigate", "sessionId": driver,
+                "params": {"url": "data:text/html,<body style='margin:0;background:white'></body>"}}));
+            capture_test_reply(&mut reply_rx, 6).await;
+            send(json!({"id": 7, "method": "Emulation.setDeviceMetricsOverride", "sessionId": driver,
+                "params": {"width": 64, "height": 64, "deviceScaleFactor": 1, "mobile": false}}));
+            capture_test_reply(&mut reply_rx, 7).await;
+            for (id, session) in [(8, &driver), (9, &guard)] {
+                send(json!({"id": id, "method": "Fetch.enable", "sessionId": session,
+                    "params": {"patterns": [{"urlPattern": "http://127.0.0.1:9/*"}]}}));
+                capture_test_reply(&mut reply_rx, id).await;
+            }
+            send(json!({"id": 10, "method": "Runtime.evaluate", "sessionId": driver, "params": {"expression":
+                "document.body.innerHTML='<div style=\"width:64px;height:64px;background-image:url(http://127.0.0.1:9/late.svg)\"></div>'"}}));
+            capture_test_reply(&mut reply_rx, 10).await;
+            send(json!({"id": 100, "method": format!("Page.{method}"), "sessionId": driver, "params": {"format": "png"}}));
+            let mut observed_pause = false;
+            let mut resolved = false;
+            let mut first_frame = None;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event: serde_json::Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                    assert_ne!(event["id"], 300, "foreign V8 work must wait until capture responds");
+                    if event["method"] == "Fetch.requestPaused" {
+                        assert_eq!(event["params"]["request"]["url"], "http://127.0.0.1:9/late.svg");
+                        if event["sessionId"] == guard {
+                            if let Some(removal) = removal {
+                                send(json!({"id": 400, "method": removal,
+                                    "sessionId": if removal == "Fetch.disable" { Some(&guard) } else { None },
+                                    "params": {"sessionId": guard}}));
+                                continue;
+                            }
+                        }
+                        let responder = if removal.is_some() { &driver } else { &guard };
+                        assert_eq!(event["sessionId"], *responder);
+                        observed_pause = true;
+                        send(json!({"id": 300, "method": "Runtime.evaluate", "sessionId": other_session,
+                            "params": {"expression": "globalThis.foreignCaptureCommand=true"}}));
+                        send(json!({"id": 200, "method": "Fetch.fulfillRequest", "sessionId": responder, "params": {
+                            "requestId": event["params"]["requestId"], "responseCode": 200,
+                            "responseHeaders": [{"name": "Content-Type", "value": "image/svg+xml"}],
+                            "body": base64::engine::general_purpose::STANDARD.encode(
+                                "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><rect width='64' height='64' fill='red'/></svg>")}}));
+                    }
+                    if event["id"] == 200 { assert!(event.get("error").is_none(), "{event}"); resolved = true; }
+                    if event["method"] == "Page.screencastFrame" { first_frame = event["params"]["data"].as_str().map(str::to_string); }
+                    if event["id"] == 100 {
+                        assert!(observed_pause && resolved, "capture must resolve the guard before responding");
+                        assert!(event.get("error").is_none(), "{event}");
+                        if method == "captureScreenshot" || method == "startScreencast" {
+                            let encoded = if method == "captureScreenshot" { event["result"]["data"].as_str().unwrap().to_string() }
+                                else { first_frame.take().expect("initial screencast frame") };
+                            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+                            assert_eq!(image::load_from_memory(&bytes).unwrap().to_rgb8().get_pixel(20, 20).0,
+                                [255, 0, 0], "the first capture must contain the fulfilled image");
+                        } else {
+                            let bytes = base64::engine::general_purpose::STANDARD.decode(event["result"]["data"].as_str().unwrap()).unwrap();
+                            assert!(bytes.starts_with(b"%PDF"));
+                        }
+                        break;
+                    }
+                }
+            }).await.expect("capture must not wait for the diagnostic resource deadline");
+            capture_test_reply(&mut reply_rx, 300).await;
+            send(json!({"id": 500, "method": "Runtime.evaluate", "sessionId": other_session,
+                "params": {"expression": "globalThis.foreignCaptureCommand === true", "returnByValue": true}}));
+            assert_eq!(capture_test_reply(&mut reply_rx, 500).await["result"]["result"]["value"], true);
+            processor.abort();
+            let _ = processor.await;
+        }).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_screenshot_resolves_guard_before_first_image_capture() {
+        assert_capture_services_intercepted_resources("captureScreenshot", None).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_screencast_resolves_guard_before_first_image_frame() {
+        assert_capture_services_intercepted_resources("startScreencast", None).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_pdf_resolves_guard_before_response() {
+        assert_capture_services_intercepted_resources("printToPDF", None).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_disable_advances_to_the_remaining_guard() {
+        assert_capture_services_intercepted_resources("captureScreenshot", Some("Fetch.disable")).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_detach_advances_to_the_remaining_guard() {
+        assert_capture_services_intercepted_resources("captureScreenshot", Some("Target.detachFromTarget")).await;
     }
 
     #[test]
