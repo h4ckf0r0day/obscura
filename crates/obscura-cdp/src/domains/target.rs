@@ -96,9 +96,14 @@ pub async fn handle(
                     page.push_history(page.url_string());
                     None
                 } else {
-                    page.navigate(url).await.ok().map(|_| {
-                        (page.frame_id.clone(), page.url_string())
-                    })
+                    match page.navigate(url).await {
+                        Ok(()) => Some((page.frame_id.clone(), page.url_string())),
+                        Err(error) if page.navigation_was_blocked() => {
+                            ctx.remove_page(&page_id);
+                            return Err(error.to_string());
+                        }
+                        Err(_) => None,
+                    }
                 }
             } else {
                 None
@@ -345,6 +350,79 @@ pub(crate) fn close_target(ctx: &mut CdpContext, target_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_denials_use_runtime_errors_and_unknown_methods_stay_unknown() {
+        let mut ctx = CdpContext::new();
+        for (method, code) in [("Target.createTarget", -32000), ("Target.notARealMethod", -32601)] {
+            let request = crate::types::CdpRequest {
+                id: 1,
+                method: method.into(),
+                params: json!({"url":"http://127.0.0.1:9/"}),
+                session_id: None,
+            };
+            let response = crate::dispatch::dispatch(&request, &mut ctx).await;
+            assert_eq!(response.id, 1);
+            assert_eq!(response.error.unwrap().code, code);
+            assert!(ctx.pages.is_empty());
+            assert!(ctx.sessions.is_empty());
+            assert!(ctx.pending_events.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_policy_refusals_leave_no_target_or_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut ctx = CdpContext::new();
+        let existing = ctx.create_page();
+        let isolated = ctx.create_browser_context();
+        for context_id in [None, Some(isolated.as_str())] {
+            for host in ["127.0.0.1", "localhost", "[::1]"] {
+                let result = handle("createTarget", &json!({
+                    "url": format!("http://{host}:{port}/marker"),
+                    "browserContextId": context_id,
+                }), &mut ctx, &None).await;
+                let error = result.expect_err("startup navigation must report a policy refusal");
+                assert!(error.contains("not allowed"), "{error}");
+                assert_eq!(ctx.pages.len(), 1);
+                assert!(ctx.get_page(&existing).is_some());
+                assert!(ctx.sessions.is_empty());
+                assert!(ctx.pending_events.is_empty());
+                assert_eq!(ctx.current_loader_ids.len(), 1);
+                assert_eq!(ctx.lifecycle_timestamps.len(), 1);
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(10), listener.accept()).await.is_err(),
+                    "a refused target must not contact the listener");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_navigation_keeps_private_opt_in_and_connection_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 37\r\nConnection: close\r\n\r\n<title>marker</title><p>permitted</p>").await.unwrap();
+        });
+        let context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+            "startup-allowed".into(), None, false, None, None, true,
+        ));
+        let mut ctx = CdpContext::new_with_shared_context(context);
+        let created = handle("createTarget", &json!({"url": format!("http://{address}/")}), &mut ctx, &None)
+            .await.expect("explicit private-network opt-in remains supported");
+        assert_eq!(ctx.get_page(created["targetId"].as_str().unwrap()).unwrap().title, "marker");
+        server.await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let created = handle("createTarget", &json!({"url": format!("http://{address}/")}), &mut ctx, &None)
+            .await.expect("ordinary connection failures still create a target");
+        assert!(ctx.get_page(created["targetId"].as_str().unwrap()).is_some());
+    }
 
     #[tokio::test]
     async fn browser_contexts_are_real_and_do_not_clear_default_cookies() {

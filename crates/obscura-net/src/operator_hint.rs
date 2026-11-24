@@ -8,7 +8,9 @@ const PRIVATE_NETWORK_HINT: &str = "Local/private network access is blocked by t
 /// redirect can lead elsewhere. Metadata and other special-purpose ranges
 /// deliberately receive no opt-out suggestion.
 pub fn private_network_error_hint(mut error: &str) -> Option<&'static str> {
-    while let Some(inner) = error.strip_prefix("Network error: ") {
+    while let Some(inner) = error.strip_prefix("Network error: ")
+        .or_else(|| error.strip_prefix("Request blocked: "))
+    {
         error = inner;
     }
     if let Some(domain) = error
@@ -50,6 +52,8 @@ mod tests {
     fn local_denials_offer_the_existing_operator_opt_in() {
         for message in [
             "Access to localhost domain 'localhost' is not allowed",
+            "Request blocked: Access to localhost domain 'localhost' is not allowed",
+            "Network error: Request blocked: Access to private/internal IP address 127.0.0.1 is not allowed",
             "Network error: Network error: Access to localhost domain 'app.localhost' is not allowed",
             "Access to private/internal IP address 127.0.0.1 is not allowed",
             "Access to private/internal IP address 192.168.1.1 is not allowed",
@@ -68,6 +72,7 @@ mod tests {
     fn metadata_special_ranges_and_unrelated_errors_do_not_get_a_hint() {
         for message in [
             "Access to private/internal IP address 169.254.169.254 is not allowed",
+            "Network error: Request blocked: Access to private/internal IP address 169.254.169.254 is not allowed",
             "Access to private/internal IP address 100.100.100.200 is not allowed",
             "Access to private/internal IPv6 address fd00:ec2::254 is not allowed",
             "Access to private/internal IPv6 address fe80::1 is not allowed",

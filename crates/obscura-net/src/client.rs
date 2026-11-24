@@ -642,12 +642,11 @@ impl Resolve for SsrfGuardResolver {
                 .collect();
             if !allow {
                 if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
-                    return Err(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "SSRF blocked: '{}' resolves to forbidden address {}",
                         host,
                         bad.ip()
-                    )
-                    .into());
+                    )).into());
                 }
             }
             let iter: Addrs = Box::new(addrs.into_iter());
@@ -674,7 +673,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
         match host {
             url::Host::Ipv4(ip) => {
                 if is_forbidden_ip(IpAddr::V4(ip)) {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
                     )));
@@ -682,7 +681,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
             }
             url::Host::Ipv6(ip) => {
                 if is_forbidden_ip(IpAddr::V6(ip)) {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip
                     )));
@@ -700,7 +699,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                     || lower_domain == "127.0.0.1"
                     || lower_domain == "::1"
                 {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to localhost domain '{}' is not allowed",
                         domain
                     )));
@@ -1748,7 +1747,7 @@ impl ObscuraHttpClient {
 
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
+                request_error(&current_url, &e)
             })?;
 
             let status = resp.status();
@@ -1884,6 +1883,19 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     text
+}
+
+// Keep a resolver's policy refusal typed through transport error wrappers.
+pub(crate) fn request_error(url: &Url, error: &(dyn std::error::Error + 'static)) -> ObscuraNetError {
+    let text = format!("{}: {}", url, error_chain(error));
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if matches!(error.downcast_ref::<ObscuraNetError>(), Some(ObscuraNetError::Blocked(_))) {
+            return ObscuraNetError::Blocked(text);
+        }
+        cause = error.source();
+    }
+    ObscuraNetError::Network(text)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2316,6 +2328,39 @@ mod ssrf_tests {
             "ff0e::1",      // global-scope multicast
         ] {
             assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+    }
+
+    #[test]
+    fn private_network_denials_have_a_blocked_error_kind() {
+        for text in ["http://127.0.0.1/", "http://localhost/", "http://[::1]/"] {
+            assert!(matches!(validate_url(&Url::parse(text).unwrap(), false),
+                Err(ObscuraNetError::Blocked(_))), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_dns_policy_refusals_survive_transport_wrapping() {
+        struct Resolver(bool);
+        impl Resolve for Resolver {
+            fn resolve(&self, _: Name) -> reqwest::dns::Resolving {
+                let blocked = self.0;
+                Box::pin(async move {
+                    let error = if blocked {
+                        ObscuraNetError::Blocked("test resolver denied the destination".into())
+                    } else {
+                        ObscuraNetError::Network("SSRF blocked: untrusted error text".into())
+                    };
+                    Err(error.into())
+                })
+            }
+        }
+        for blocked in [true, false] {
+            let client = ObscuraHttpClient::new();
+            client.client.set(reqwest::Client::builder().no_proxy()
+                .dns_resolver(Arc::new(Resolver(blocked))).build().unwrap()).unwrap();
+            let error = client.fetch(&Url::parse("http://policy.example.test/").unwrap()).await.unwrap_err();
+            assert_eq!(matches!(error, ObscuraNetError::Blocked(_)), blocked, "{error}");
         }
     }
 

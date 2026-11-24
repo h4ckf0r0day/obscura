@@ -16,7 +16,7 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
-    cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
+    cors_required, env_allows_private_network, error_chain, request_error, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_origin_header, request_referrer, response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
     validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
@@ -43,12 +43,11 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
                 .collect();
             if !allow {
                 if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
-                    return Err(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "SSRF blocked: '{}' resolves to forbidden address {}",
                         host,
                         bad.ip()
-                    )
-                    .into());
+                    )).into());
                 }
             }
             let iter: wreq::dns::Addrs = Box::new(addrs.into_iter());
@@ -497,7 +496,7 @@ impl StealthHttpClient {
             } else { req.send().await }
 
                 .map_err(|e| {
-                    ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
+                    request_error(&current_url, &e)
                 })?;
 
             let status = resp.status();
@@ -678,7 +677,7 @@ impl StealthHttpClient {
 
         let in_flight = InFlightGuard::new(&self.in_flight);
         let resp = req.send().await.map_err(|e| {
-            ObscuraNetError::Network(format!("{}: {}", url, error_chain(&e)))
+            request_error(url, &e)
         })?;
 
         let status = resp.status();
@@ -734,6 +733,31 @@ mod tests {
     use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
+
+    #[tokio::test]
+    async fn stealth_typed_dns_policy_refusals_survive_transport_wrapping() {
+        struct Resolver(bool);
+        impl Resolve for Resolver {
+            fn resolve(&self, _: Name) -> wreq::dns::Resolving {
+                let blocked = self.0;
+                Box::pin(async move {
+                    let error = if blocked {
+                        ObscuraNetError::Blocked("test resolver denied the destination".into())
+                    } else {
+                        ObscuraNetError::Network("SSRF blocked: untrusted error text".into())
+                    };
+                    Err(error.into())
+                })
+            }
+        }
+        for blocked in [true, false] {
+            let mut client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+            client.client = wreq::Client::builder().no_proxy()
+                .dns_resolver(Arc::new(Resolver(blocked))).build().unwrap();
+            let error = client.fetch(&Url::parse("http://policy.example.test/").unwrap()).await.unwrap_err();
+            assert_eq!(matches!(error, ObscuraNetError::Blocked(_)), blocked, "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn stealth_user_agent_override_has_one_wire_value_for_navigation_and_script_fetch() {
