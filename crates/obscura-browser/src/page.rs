@@ -308,6 +308,7 @@ pub struct Page {
     /// latency does not incorrectly advance newly-created animations.
     document_timeline_origin: std::time::Instant,
     navigation_timing: NavigationTiming,
+    navigation_blocked: bool,
     /// Optional page-scoped ceiling for an end-to-end navigation. Automation
     /// frontends set this from their request timeout so a caller asking for a
     /// 50-second navigation is not silently cut off by the process default.
@@ -1153,6 +1154,7 @@ impl Page {
             content_type: String::new(),
             document_timeline_origin: std::time::Instant::now(),
             navigation_timing: NavigationTiming::default(),
+            navigation_blocked: false,
             navigation_timeout: None,
             navigation_chain_limit: None,
             history: Vec::new(),
@@ -3273,6 +3275,12 @@ impl Page {
         self.sync_js_network_events();
     }
 
+    /// Policy-refusal marker for target startup, before Page interception is enabled.
+    #[doc(hidden)]
+    pub fn navigation_was_blocked(&self) -> bool {
+        self.navigation_blocked
+    }
+
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
         self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load)
             .await
@@ -3314,6 +3322,7 @@ impl Page {
         &mut self, url: &str, wait: crate::lifecycle::WaitUntil, method: &str, body: &str,
         referrer: &str, initiator: Option<&Url>,
     ) -> Result<(), PageError> {
+        self.navigation_blocked = false;
         let timeout = self.navigation_timeout();
         let progress = DocumentProgress::default();
         let outcome = tokio::time::timeout(timeout,
@@ -3871,6 +3880,7 @@ impl Page {
             .map(|response| (response, was_intercepted))
             .map_err(|e| {
                 self.lifecycle = LifecycleState::Failed;
+                self.navigation_blocked = matches!(&e, ObscuraNetError::Blocked(_));
                 PageError::NetworkError(e.to_string())
             })
         }).await;
@@ -4184,6 +4194,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.navigation_blocked = false;
         self.navigation_timing = NavigationTiming::default();
         self.retire_render_resources();
         self.pending_frame_work.clear();
@@ -6972,6 +6983,27 @@ mod tests {
         page.sync_history_updates();
         assert_eq!(page.url_string(), format!("{url}#one"));
         assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_policy_refusal_state_tracks_the_latest_attempt() {
+        use crate::PageError;
+        let mut page = Page::new("navigation-policy-state".into(),
+            std::sync::Arc::new(BrowserContext::new("navigation-policy-context".into())));
+        let denied = "http://127.0.0.1:9/";
+        let error = page.navigate(denied).await.unwrap_err();
+        match error {
+            PageError::NetworkError(_) => {},
+            PageError::InvalidUrl(_) | PageError::ParseError(_) |
+            PageError::TooManyClientNavigations(_) => panic!("policy refusals keep the existing network error variant"),
+        }
+        assert!(page.navigation_was_blocked());
+        page.navigate("data:text/html,<title>permitted</title>").await.unwrap();
+        assert!(!page.navigation_was_blocked());
+        assert!(page.navigate(denied).await.is_err());
+        assert!(page.navigation_was_blocked());
+        page.navigate_blank();
+        assert!(!page.navigation_was_blocked());
     }
 
     #[tokio::test(flavor = "current_thread")]
