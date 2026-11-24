@@ -554,14 +554,15 @@ fn encode_long_full_page_png(
 pub(crate) async fn prepare_capture_resources_if_requested(
     page: &mut obscura_browser::Page,
 ) {
-    let Some(deadline_ms) = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value != 0)
-    else {
-        return;
-    };
-    let _ = page.prepare_screenshot_resources(deadline_ms).await;
+    if let Some(deadline_ms) = capture_resource_deadline_ms() {
+        let _ = page.prepare_screenshot_resources(deadline_ms).await;
+    }
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn capture_resource_deadline_ms() -> Option<u64> {
+    std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS").ok()
+        .and_then(|value| value.parse::<u64>().ok()).filter(|value| *value != 0)
 }
 
 #[cfg(feature = "render")]
@@ -869,19 +870,6 @@ pub(crate) fn schedule_screencast_frame(
     }
 }
 
-/// Whether a request reported after navigation may be paused for the client.
-/// Chrome only pauses requests that match the `Fetch.enable` URL patterns;
-/// omitted patterns mean every request.
-fn fetch_pause_matches(ctx: &CdpContext, url: &str) -> bool {
-    ctx.fetch_intercept.enabled
-        && (ctx.fetch_intercept.patterns.is_empty()
-            || ctx
-                .fetch_intercept
-                .patterns
-                .iter()
-                .any(|pattern| obscura_browser::url_matches_cdp_pattern(pattern, url)))
-}
-
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -945,23 +933,6 @@ pub fn emit_navigation_events(
             session_id: es.clone(),
         });
         }
-        if !net_event.intercepted && fetch_pause_matches(ctx, &net_event.url) {
-            ctx.pending_events.push(CdpEvent {
-                method: "Fetch.requestPaused".into(),
-                params: json!({
-                    "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
-                    "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
-                    "networkId": rid,
-                }),
-                session_id: es.clone(),
-            });
-        }
     }
 
     let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
@@ -993,33 +964,6 @@ pub fn emit_navigation_events(
     }
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
     ctx.pending_events.extend(phase1);
-
-    if ctx.fetch_intercept.enabled {
-        for (i, net_event) in network_events.iter().enumerate() {
-            if Some(i) == nav_idx
-                || net_event.intercepted
-                || !fetch_pause_matches(ctx, &net_event.url)
-            {
-                continue;
-            }
-            let rid = &nav_request_ids[i];
-            ctx.pending_events.push(CdpEvent {
-                method: "Fetch.requestPaused".into(),
-                params: json!({
-                    "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
-                    "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
-                    "networkId": rid,
-                }),
-                session_id: es.clone(),
-            });
-        }
-    }
 
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
@@ -2636,7 +2580,7 @@ mod tests {
     }
 
     #[test]
-    fn post_navigation_fetch_pauses_follow_enable_patterns() {
+    fn completed_requests_never_emit_post_navigation_fetch_pauses() {
         let page_url = "https://example.test/";
         let events = [
             (page_url, "Document"),
@@ -2659,15 +2603,12 @@ mod tests {
             timestamp: 1.0,
         })
         .collect::<Vec<_>>();
-        for (patterns, expected) in [
-            (vec!["*never-matches*"], vec![]),
-            (vec!["*/value/*"], vec!["https://example.test/value/1"]),
-            (vec!["*/value/?"], vec!["https://example.test/value/1"]),
-            (vec![r"*/value/\?"], vec![]),
-            (
-                vec!["*"],
-                vec![page_url, "https://example.test/image.png", "https://example.test/value/1"],
-            ),
+        for patterns in [
+            vec!["*never-matches*"],
+            vec!["*/value/*"],
+            vec!["*/value/?"],
+            vec![r"*/value/\?"],
+            vec!["*"],
         ] {
             let mut ctx = CdpContext::new();
             let page_id = ctx.create_page();
@@ -2685,7 +2626,7 @@ mod tests {
                 .filter(|event| event.method == "Fetch.requestPaused")
                 .map(|event| event.params["request"]["url"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>();
-            assert_eq!(paused, expected, "patterns {patterns:?}");
+            assert!(paused.is_empty(), "completed requests cannot be paused: {patterns:?}");
             // Network reporting is independent of interception patterns.
             for method in ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"] {
                 assert_eq!(
@@ -2729,7 +2670,7 @@ mod tests {
     }
 
     #[test]
-    fn intercepted_document_is_paused_before_frame_commit() {
+    fn completed_document_is_not_falsely_paused_before_frame_commit() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some(format!("{page_id}-session"));
@@ -2768,15 +2709,8 @@ mod tests {
             .iter()
             .map(|event| event.method.as_str())
             .collect::<Vec<_>>();
-        let paused = methods
-            .iter()
-            .position(|method| *method == "Fetch.requestPaused")
-            .unwrap();
-        let committed = methods
-            .iter()
-            .position(|method| *method == "Page.frameNavigated")
-            .unwrap();
-        assert!(paused < committed, "document pause must precede frame commit: {methods:?}");
+        assert!(!methods.contains(&"Fetch.requestPaused"));
+        assert!(methods.contains(&"Page.frameNavigated"));
     }
 
     #[tokio::test]

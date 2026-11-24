@@ -445,10 +445,11 @@ async function __runDynScriptTask(task) {
         // parser script happened to trigger the microtask checkpoint.
         await new Promise(resolve => {
           const execute = () => {
+            const previousNid = globalThis.__currentScriptNid;
             globalThis.__currentScriptNid = task.nid;
             try { _executeClassicScript(body); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
-            finally { globalThis.__currentScriptNid = task.prevNid || 0; }
+            finally { globalThis.__currentScriptNid = previousNid || 0; }
             resolve();
           };
           if (_scheduleAfter(0, execute) === undefined) execute();
@@ -2042,7 +2043,7 @@ function _eventTargetDispatch(target, event, authorDispatch = false) {
   event.eventPhase = 2;
   try {
     // Other EventTargets register their IDL handlers in the listener list.
-    const eventHandler = target === globalThis ? target['on' + event.type] : null;
+    const eventHandler = target === globalThis ? _nativeEventHandler(target, 'on' + event.type) : null;
     if (typeof eventHandler === 'function') {
       try {
         const result = eventHandler.call(target, event);
@@ -2114,9 +2115,9 @@ function _domEventInvokeHandlers(target, event, capture, phase) {
   // listener group. Keep their existing position ahead of listeners installed
   // through addEventListener; changing that ordering here would be an unrelated
   // compatibility change.
-  if (!capture && typeof target._resolveInlineHandler === "function") {
+  if (!capture) {
     const handlerName = "on" + event.type;
-    const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
+    const inlineFn = _nativeEventHandler(target, handlerName);
     if (typeof inlineFn === "function") {
       try {
         if (inlineFn.call(target, event) === false) event.preventDefault();
@@ -2291,7 +2292,6 @@ function __prepareInsertedScript(script) {
       url: fullUrl,
       isModule,
       nid: script._nid,
-      prevNid,
       pageOrigin,
       fireEvent: (type) => _fireResourceEvent(script, type),
     };
@@ -2302,7 +2302,6 @@ function __prepareInsertedScript(script) {
     task.delaysLoad = globalThis.document?.readyState !== 'complete';
     if (task.delaysLoad) __dynLoadDelayingPending++;
     if (parserInserted && !isModule) {
-      task.prevNid = 0;
       if (parserBlocking) __parserBlockingScriptPending++;
       __parserBlockingScriptQueue.push({ task, blocking: parserBlocking });
       __processParserBlockingScriptQueue();
@@ -2336,7 +2335,6 @@ function __prepareInsertedScript(script) {
       url: dataUrl,
       isModule: true,
       nid: script._nid,
-      prevNid,
       pageOrigin: "",
       fireEvent: (type) => _fireResourceEvent(script, type),
       delaysLoad: globalThis.document?.readyState !== 'complete',
@@ -2352,7 +2350,6 @@ function __prepareInsertedScript(script) {
         inlineCode: code,
         isModule: false,
         nid: script._nid,
-        prevNid: 0,
         fireEvent: () => {},
         delaysLoad: false,
       },
@@ -2479,7 +2476,7 @@ function __prepareInsertedSubtree(root) {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe,img[onload],img[onerror]") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
     if (script && !seen.has(script._nid)) {
@@ -2488,6 +2485,8 @@ function __prepareInsertedSubtree(root) {
     }
   }
   for (const script of scripts) {
+    // Constructing an image wrapper starts its content-handler lifecycle.
+    if (script.localName === 'img') continue;
     if (_postConnection) _postConnection.cursor = script;
     if (script.localName === 'iframe') {
       if (script.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
@@ -2547,7 +2546,7 @@ function _registerForeignDocument() { _foreignDocumentCount++; }
 // A Document without a browsing context, backed by its own native tree root.
 function _createDetachedDocument(contentType, xml) {
   const nid = +_dom("create_document_fragment");
-  const DocumentClass = xml ? (globalThis.XMLDocument || Document) : Document;
+  const DocumentClass = xml ? _nativeXMLDocument : Document;
   const doc = new DocumentClass(nid);
   doc._detached = true;
   doc._contentType = contentType;
@@ -3067,7 +3066,7 @@ class Node {
   cloneNode(deep) {
     const t = this.nodeType;
     if (t === 9) {
-      const xml = this instanceof XMLDocument || (this._documentShim && _isXMLDocument(this));
+      const xml = this instanceof _nativeXMLDocument || (this._documentShim && _isXMLDocument(this));
       const clone = _createDetachedDocument(this.contentType, !!xml);
       clone._documentURL = this.URL;
       clone._documentEncoding = this.characterSet;
@@ -4338,7 +4337,7 @@ class Element extends Node {
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
-    _connectInsertedFrames(this, html);
+    _connectInsertedResources(this, html);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -4485,11 +4484,7 @@ class Element extends Node {
       }
     }
     if (n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
-    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
-      _windowOnloadOverrideSet = false;
-      _windowOnloadOverride = null;
-      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
-    }
+    _eventHandlerAttributeChanged(this, n);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, n, null, observedOldValue);
     if (customOldValue !== undefined) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, value, null]);
@@ -4516,6 +4511,7 @@ class Element extends Node {
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttributeNS(ns, localName) : null;
     const customOldValue = _customElementObserves(this, localName) ? this.getAttributeNS(ns, localName) : undefined;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    if (ns === '') _eventHandlerAttributeChanged(this, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
     // Namespace-aware writes can replace an attribute by namespace/local name
@@ -4538,6 +4534,7 @@ class Element extends Node {
       : null;
     const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
     const customOldValue = _customElementObserves(this, n) ? this.getAttribute(n) : null;
+    const handlerWasPresent = n.startsWith('on') && this.hasAttribute(n);
     _dom("remove_attribute", this._nid, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
@@ -4550,11 +4547,7 @@ class Element extends Node {
       _reconcileWindowNamedProperty(previousWindowName);
     }
     if (n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
-    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
-      _windowOnloadOverrideSet = false;
-      _windowOnloadOverride = null;
-      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
-    }
+    if (handlerWasPresent) _eventHandlerAttributeChanged(this, n);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -4577,7 +4570,9 @@ class Element extends Node {
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe' && this.getAttributeNS(ns, n) === null) return;
     const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
     const customOldValue = _customElementObserves(this, n) ? this.getAttributeNS(ns, n) : null;
+    const handlerWasPresent = ns === '' && n.startsWith('on') && this.getAttributeNS(ns, n) !== null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    if (handlerWasPresent) _eventHandlerAttributeChanged(this, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
@@ -4721,7 +4716,7 @@ class Element extends Node {
     const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
     if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
     const src = this.getAttribute && this.getAttribute(name);
-    if (!src) { cache[name] = null; return null; }
+    if (src == null) { cache[name] = null; return null; }
     try {
       cache[name] = new Function('event', src);
     } catch (e) {
@@ -4953,10 +4948,10 @@ class Element extends Node {
   set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
   get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
   set returnValue(v) { this._returnValue = String(v); }
-  get oncancel() { return this._oncancel || null; }
-  set oncancel(f) { this._oncancel = typeof f === 'function' ? f : null; }
-  get onclose() { return this._onclose || null; }
-  set onclose(f) { this._onclose = typeof f === 'function' ? f : null; }
+  get oncancel() { return _eventHandlerGet.call(this, 'oncancel', 'element'); }
+  set oncancel(value) { _eventHandlerSet.call(this, 'oncancel', 'element', value); }
+  get onclose() { return _eventHandlerGet.call(this, 'onclose', 'element'); }
+  set onclose(value) { _eventHandlerSet.call(this, 'onclose', 'element', value); }
   get closedBy() { const v = (this.getAttribute('closedby') || '').toLowerCase(); return (v === 'any' || v === 'closerequest' || v === 'none') ? v : 'auto'; }
   set closedBy(v) { this.setAttribute('closedby', String(v)); }
   show() {
@@ -6602,11 +6597,21 @@ class DOMImplementation {
   get [Symbol.toStringTag]() { return "DOMImplementation"; }
 }
 
-const _documentInstances = new WeakSet();
+const _documentInstances = new WeakMap();
+const _documentRootState = Function.prototype.call.bind(WeakMap.prototype.get);
+const _setDocumentRootState = Function.prototype.call.bind(WeakMap.prototype.set);
+function _documentPart(receiver, name, command) {
+  if (receiver === _document) return _wrapEl(+_dom(command));
+  const member = _documentRealmMember(receiver, name);
+  if (member) return Reflect.apply(member, receiver, []);
+  const root = _documentRootState(_documentInstances, receiver);
+  if (root === undefined) throw new TypeError('Illegal invocation');
+  return _wrapEl(+_dom(command, root.nid, root.element ? 'element' : ''));
+}
 class Document extends Node {
   constructor(nid) {
     super(nid);
-    _documentInstances.add(this);
+    _setDocumentRootState(_documentInstances, this, { nid:typeof nid === 'number' ? nid : -1, element:false });
   }
   get timeline() {
     if (!this._timeline) {
@@ -6618,10 +6623,7 @@ class Document extends Node {
     return Array.from(_waapiAnimations).filter(animation => animation.playState !== 'idle'
       && (animation.playState !== 'finished' || animation.effect?._timing.fill === 'forwards' || animation.effect?._timing.fill === 'both'));
   }
-  get documentElement() {
-    if (this._detached) return _childNodeOfType(this, 1);
-    return _wrapEl(+_dom("document_element"));
-  }
+  get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); }
   get children() {
     const root = this.documentElement;
     return HTMLCollection._from(root ? [root] : []);
@@ -6629,8 +6631,8 @@ class Document extends Node {
   get childElementCount() { return this.documentElement ? 1 : 0; }
   get firstElementChild() { return this.documentElement; }
   get lastElementChild() { return this.documentElement; }
-  get head() { return this.querySelector("head"); }
-  get body() { return this.querySelector("body"); }
+  get head() { return _documentPart(this, 'head', 'document_head'); }
+  get body() { return _documentPart(this, 'body', 'document_body'); }
   get doctype() {
     if (this._detached) return _childNodeOfType(this, 10);
     if (this._doctype !== undefined) return this._doctype;
@@ -6722,7 +6724,7 @@ class Document extends Node {
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
   // backing encoding and reports UTF-8.
   get characterSet() { return this._documentEncoding || ((this._nid === undefined || this._nid === null || this._detached) ? "UTF-8" : _docEncoding()); }
-  get [Symbol.toStringTag]() { return this instanceof XMLDocument ? "XMLDocument" : (_isXMLDocument(this) ? "Document" : "HTMLDocument"); }
+  get [Symbol.toStringTag]() { return this instanceof _nativeXMLDocument ? "XMLDocument" : (_isXMLDocument(this) ? "Document" : "HTMLDocument"); }
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
@@ -7257,7 +7259,7 @@ class Document extends Node {
   queryCommandSupported(commandId) {
     const method = _documentRealmMember(this, 'queryCommandSupported');
     if (method) return Reflect.apply(method, this, arguments);
-    if (!_documentInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (_documentRootState(_documentInstances, this) === undefined) throw new TypeError('Illegal invocation');
     if (arguments.length < 1) throw new TypeError('queryCommandSupported requires 1 argument');
     commandId = `${commandId}`;
     // execCommand currently implements no editing commands. Feature detection
@@ -7310,7 +7312,7 @@ function _insertWrittenNodes(doc, placements) {
 // Preserve the receiver realm's implementations even if a membrane remaps the
 // document's public prototype. The ordinary own-document path makes no op call.
 function _documentRealmMember(receiver, name) {
-  return receiver === globalThis.document ? undefined
+  return receiver === _document ? undefined
     : __obscuraCore.ops.op_document_realm_member(receiver, name, _realmFrameId);
 }
 
@@ -7337,7 +7339,7 @@ class DocumentFragment extends Node {
     } else {
       _dom("set_inner_html", this._nid, html);
     }
-    _connectInsertedFrames(this, html);
+    _connectInsertedResources(this, html);
     _disconnectCustomElements(leavingCustomElements);
     _connectCustomElements(this, false);
   }
@@ -7523,9 +7525,9 @@ class HTMLImageElement extends Element {
     this._imageInitialized = true;
     // Parser images stay lazy until script observes their lifecycle or paint
     // asks for the same cache entry. Inline handlers are observers too.
-    if (!this._imageComplete
+    if ((!this._imageComplete || this._imageCurrentSrc)
         && (this.hasAttribute("onload") || this.hasAttribute("onerror"))) {
-      this._queueImageRequest();
+      this._queueImageRequest(true);
     }
   }
 
@@ -7557,18 +7559,16 @@ class HTMLImageElement extends Element {
     this._queueImageRequest();
     return this._imageNaturalHeight;
   }
-  get onload() { return this._imageOnload || null; }
+  get onload() { return _eventHandlerGet.call(this, 'onload', 'element'); }
   set onload(value) {
-    this._imageOnload = typeof value === "function" ? value : null;
-    if (this._imageOnload) {
+    if (_eventHandlerSet.call(this, 'onload', 'element', value)) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
   }
-  get onerror() { return this._imageOnerror || null; }
+  get onerror() { return _eventHandlerGet.call(this, 'onerror', 'element'); }
   set onerror(value) {
-    this._imageOnerror = typeof value === "function" ? value : null;
-    if (this._imageOnerror) {
+    if (_eventHandlerSet.call(this, 'onerror', 'element', value)) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
@@ -7656,12 +7656,12 @@ class HTMLImageElement extends Element {
     this._imageComplete = !this._imageCurrentSrc;
   }
 
-  _queueImageRequest() {
-    if (this._imageQueued || this._imageComplete) return;
+  _queueImageRequest(reportCachedCompletion = false) {
+    if (this._imageQueued || (this._imageComplete && !reportCachedCompletion)) return;
     this._imageQueued = true;
     const request = this._imageRequest;
     setTimeout(() => {
-      if (request === this._imageRequest && !this._imageComplete) {
+      if (request === this._imageRequest && (!this._imageComplete || reportCachedCompletion)) {
         this._runImageRequest(request);
       } else if (request === this._imageRequest) {
         this._imageQueued = false;
@@ -8173,79 +8173,149 @@ globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
 
+const _eventHandlerValues = new WeakMap();
+// Window lives for the realm; keep its record through snapshot restoration.
+const _windowEventHandlerState = {kind: 'window', values: Object.create(null)};
+const _nativeResolveInlineHandler = Element.prototype._resolveInlineHandler;
+const _nativeElementLocalName = Object.getOwnPropertyDescriptor(Element.prototype, 'localName').get;
+function _eventHandlerState(receiver, kind) {
+  const existing = receiver === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(receiver);
+  if (existing) {
+    if (existing.kind !== kind) throw new TypeError('Illegal invocation');
+    return existing.values;
+  }
+  const valid = kind === 'window' ? receiver === globalThis
+    : kind === 'document' ? _documentRootState(_documentInstances, receiver) !== undefined
+    : receiver && _nodeCacheGet(receiver._nid) === receiver && +_dom('node_type', receiver._nid) === 1;
+  if (!valid) return null;
+  const values = Object.create(null);
+  _eventHandlerValues.set(receiver, {kind, values});
+  return values;
+}
+function _eventHandlerValue(receiver, name, kind, values) {
+  if (values && name in values) return values[name];
+  if (kind === 'window' && name === 'onload') {
+    const body = _windowReflectingBodyElement();
+    return body ? _nativeResolveInlineHandler.call(body, name) : null;
+  }
+  return kind === 'element' ? _nativeResolveInlineHandler.call(receiver, name) : null;
+}
+function _nativeEventHandler(receiver, name) {
+  const state = receiver === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(receiver);
+  const kind = state ? state.kind
+    : typeof receiver._resolveInlineHandler === 'function' ? 'element'
+    : receiver === globalThis ? 'window' : 'document';
+  // Body load handlers belong to Window, not to a load dispatched on Body.
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(receiver)) return null;
+  return _eventHandlerValue(receiver, name, kind, state?.values);
+}
+function _eventHandlerGet(name, kind) {
+  const values = _eventHandlerState(this, kind);
+  if (!values) {
+    const get = this && _documentRealmMember(this, 'getEventHandler');
+    if (get) return get.call(this, name, kind);
+    throw new TypeError('Illegal invocation');
+  }
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(this)) {
+    return _eventHandlerGet.call(globalThis, name, 'window');
+  }
+  return _eventHandlerValue(this, name, kind, values);
+}
+function _eventHandlerSet(name, kind, value) {
+  const values = _eventHandlerState(this, kind);
+  if (!values) {
+    const set = this && _documentRealmMember(this, 'setEventHandler');
+    if (set) return set.call(this, name, kind, value);
+    throw new TypeError('Illegal invocation');
+  }
+  if (kind === 'element' && name === 'onload' && _isWindowReflectingBodyElement(this)) {
+    return _eventHandlerSet.call(globalThis, name, 'window', value);
+  }
+  return values[name] = value !== null && (typeof value === 'object' || typeof value === 'function') ? value : null;
+}
+function _eventHandlerAttributeChanged(element, name) {
+  if (!name.startsWith('on')) return;
+  const state = _eventHandlerValues.get(element);
+  if (state) delete state.values[name];
+  if (element.__inlineHandlerCache) delete element.__inlineHandlerCache[name];
+  if (name === 'onload' && _isWindowReflectingBodyElement(element)) {
+    delete _windowEventHandlerState.values.onload;
+  }
+}
+
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
 // event path through these: jQuery checks `("on" + ev) in window`, and React
 // decides whether the `input` event is supported via `("oninput" in document)`.
 // When that check fails React falls back to a legacy change-detection path that
 // never fires onChange for controlled inputs (issue #324). Initialising these to
-// null on all three targets makes the checks match real browsers. On Document and
-// Element they are non-enumerable so they don't surface in `for..in` over nodes.
-for (const _ev of [
-  "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
-  "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
-  "dragenter","dragleave","dragover","dragstart","drop","durationchange","emptied",
-  "ended","error","focus","focusin","focusout","formdata","gotpointercapture",
-  "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
-  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message",
-  "mousedown","mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup",
-  "offline","online","pagehide","pageshow","paste","pause","play","playing",
-  "pointercancel","pointerdown","pointerenter","pointerleave","pointermove",
-  "pointerout","pointerover","pointerup","popstate","progress","ratechange",
-  "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
-  "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
-  "unload","volumechange","waiting","wheel",
+// null on all three targets makes the checks match real browsers. Accessors
+// also let instrumentation wrap assignments through the original IDL setter.
+const _globalEventHandlerNames = [
+  "abort","animationcancel","animationend","animationiteration","animationstart","auxclick",
+  "beforeinput","beforematch","beforeprint","beforetoggle","beforeunload","beforexrselect","blur",
+  "cancel","canplay","canplaythrough","change","click","close","command",
+  "contentvisibilityautostatechange","contextlost","contextmenu","contextrestored","cuechange",
+  "dblclick","drag","dragend","dragenter","dragleave","dragover","dragstart","drop",
+  "durationchange","emptied","ended","error","focus","focusin","focusout","formdata",
+  "gotpointercapture","hashchange","input","invalid","keydown","keypress","keyup","languagechange",
+  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message","mousedown",
+  "mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup","mousewheel","offline",
+  "online","pagehide","pageshow","paste","pause","play","playing","pointercancel","pointerdown",
+  "pointerenter","pointerleave","pointermove","pointerout","pointerover","pointerrawupdate",
+  "pointerup","popstate","progress","ratechange","rejectionhandled","reset","resize","scroll",
+  "scrollend","scrollsnapchange","scrollsnapchanging","search","securitypolicyviolation","seeked",
+  "seeking","select","selectionchange","selectstart","slotchange","stalled","storage","submit",
+  "suspend","timeupdate","toggle","transitioncancel","transitionend","transitionrun",
+  "transitionstart","unhandledrejection","unload","volumechange","waiting","webkitanimationend",
+  "webkitanimationiteration","webkitanimationstart","webkittransitionend","wheel",
+];
+for (const [_proto, _kind, _names] of [
+  [Element.prototype, 'element', [..._globalEventHandlerNames,
+    "beforecopy","beforecut","beforepaste","copy","cut","fullscreenchange","fullscreenerror",
+    "webkitfullscreenchange","webkitfullscreenerror",
+  ]],
+  [Document.prototype, 'document', [..._globalEventHandlerNames,
+    "beforecopy","beforecut","beforepaste","copy","cut","freeze","fullscreenchange",
+    "fullscreenerror","pointerlockchange","pointerlockerror","prerenderingchange",
+    "readystatechange","resume","visibilitychange","webkitfullscreenchange","webkitfullscreenerror",
+  ]],
+  [globalThis, 'window', [..._globalEventHandlerNames,
+    "afterprint","appinstalled","beforeinstallprompt","devicemotion","deviceorientation",
+    "deviceorientationabsolute","gamepadconnected","gamepaddisconnected","messageerror",
+    "pagereveal","pageswap",
+  ]],
+  [HTMLMediaElement.prototype, 'element', ['encrypted', 'waitingforkey']],
+  [HTMLVideoElement.prototype, 'element', ['enterpictureinpicture', 'leavepictureinpicture']],
 ]) {
-  const _on = "on" + _ev;
-  if (!(_on in globalThis)) globalThis[_on] = null;
-  for (const _proto of [Document.prototype, Element.prototype]) {
-    if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
+  for (const _ev of _names) {
+    const _on = "on" + _ev;
+    if (_kind === 'window' || !(_on in _proto)) {
+      const initial = _kind === 'window' ? _proto[_on] : null;
+      const descriptor = Object.getOwnPropertyDescriptor({
+        get [_on]() {
+          const state = this === globalThis ? _windowEventHandlerState : _eventHandlerValues.get(this);
+          if (_on !== 'onload' && state?.kind === _kind && _on in state.values) return state.values[_on];
+          return _eventHandlerGet.call(this, _on, _kind);
+        },
+        set [_on](value) { _eventHandlerSet.call(this, _on, _kind, value); },
+      }, _on);
+      _markNative(descriptor.get);
+      _markNative(descriptor.set);
+      Object.defineProperty(_proto, _on, descriptor);
+      if (initial != null) _eventHandlerSet.call(_proto, _on, _kind, initial);
     }
   }
 }
 
-let _windowOnloadOverrideSet = false;
-let _windowOnloadOverride = null;
 function _windowReflectingBodyElement() {
   const document = globalThis.document;
   return document && (document.body || document.querySelector('frameset'));
 }
 function _isWindowReflectingBodyElement(element) {
-  return element === _windowReflectingBodyElement();
+  const name = _nativeElementLocalName.call(element);
+  return (name === 'body' || name === 'frameset') && element === _windowReflectingBodyElement();
 }
-Object.defineProperty(globalThis, 'onload', {
-  get() {
-    if (_windowOnloadOverrideSet) return _windowOnloadOverride;
-    const body = _windowReflectingBodyElement();
-    return body && body._resolveInlineHandler
-      ? body._resolveInlineHandler('onload')
-      : null;
-  },
-  set(value) {
-    _windowOnloadOverrideSet = true;
-    _windowOnloadOverride = typeof value === 'function' ? value : null;
-  },
-  configurable: true,
-  enumerable: true,
-});
-Object.defineProperty(Element.prototype, 'onload', {
-  get() {
-    if (_isWindowReflectingBodyElement(this)) {
-      return globalThis.onload;
-    }
-    return this.__onload || null;
-  },
-  set(value) {
-    if (_isWindowReflectingBodyElement(this)) {
-      globalThis.onload = value;
-      return;
-    }
-    this.__onload = typeof value === 'function' ? value : null;
-  },
-  configurable: true,
-  enumerable: false,
-});
 
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
@@ -8940,7 +9010,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
     cleanup();
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
+  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : (parsed.cors ? "cors" : "basic");
   const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
   const responseBody = respType === "opaque"
     ? null
@@ -12838,6 +12908,10 @@ function _xmlWellFormed(src) {
 const _escapeXmlErrorText = (text) =>
   String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+const _parserCreateElementNS = Function.prototype.call.bind(Document.prototype.createElementNS);
+const _parserCreateText = Function.prototype.call.bind(Document.prototype.createTextNode);
+const _parserAppend = Function.prototype.call.bind(Node.prototype.appendChild);
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
@@ -12849,7 +12923,6 @@ globalThis.DOMParser = class DOMParser {
       doc._documentCompatMode = _dom("parse_html_document", doc._nid, html);
       return doc;
     }
-    const root = document.createElement("html");
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
     // error-detection code (doc.querySelector('parsererror')) works, matching
@@ -12867,20 +12940,19 @@ globalThis.DOMParser = class DOMParser {
     const xmlError = isXml ? _checkXmlWellFormed(html) : null;
     const isParserError = isXml && (!_xmlWellFormed(html) || !xmlError.wellFormed);
     if (isParserError) {
-      const detail = (xmlError && xmlError.error) || 'error while parsing XML';
-      try {
-        root.innerHTML =
-          '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>' +
-          _escapeXmlErrorText(detail) +
-          '</div></parsererror>';
-      } catch (e) { /* ignore */ }
-    } else {
-      // innerHTML parses children via html5ever fragment-parsing rules. Most
-      // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
-      // fragment parser strips the outer `<html>` and emits its head+body
-      // children, which is what callers want.
-      try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+      const doc = _createDetachedDocument(mimeType, true);
+      doc._documentURL = parserURL;
+      const report = _parserCreateElementNS(doc, "http://www.mozilla.org/newlayout/xml/parsererror.xml", "parsererror");
+      _parserAppend(report, _parserCreateText(doc, "This page contains the following errors:"));
+      const detail = _parserCreateElementNS(doc, "http://www.w3.org/1999/xhtml", "div");
+      _parserAppend(detail, _parserCreateText(doc, (xmlError && xmlError.error) || 'error while parsing XML'));
+      _parserAppend(report, detail);
+      _parserAppend(doc, report);
+      return doc;
     }
+    // shortcut: valid XML still uses HTML fragments; replace this with a native XML parser.
+    const root = document.createElement("html");
+    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
 
     // Helper: depth-first walk to find an element by predicate.
     const walk = (node, pred) => {
@@ -12902,14 +12974,9 @@ globalThis.DOMParser = class DOMParser {
       nodeType: 9,
       queryCommandSupported: Document.prototype.queryCommandSupported,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
-      get documentElement() {
-        // For XML parsererror docs, return the <parsererror> child, not the
-        // <html> wrapper, matching Chrome's behavior.
-        if (isParserError) return root.firstElementChild;
-        return root;
-      },
-      get body() { return findByTagName("BODY"); },
-      get head() { return findByTagName("HEAD"); },
+      get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); },
+      get body() { return _documentPart(this, 'body', 'document_body'); },
+      get head() { return _documentPart(this, 'head', 'document_head'); },
       get title() {
         const t = findByTagName("TITLE");
         return t ? (t.textContent || "").replace(/[\t\n\f\r ]+/g, " ").trim() : "";
@@ -13005,7 +13072,7 @@ globalThis.DOMParser = class DOMParser {
     // The parsed tree belongs to this document, not the main one.
     _registerForeignDocument();
     _stampNodeDocument(root, docNode);
-    _documentInstances.add(docNode);
+    _setDocumentRootState(_documentInstances, docNode, { nid:root._nid, element:true });
     return docNode;
   }
 };
@@ -14757,6 +14824,26 @@ for (const [name, tags] of Object.entries({
   }
 }
 
+// Ordinary elements must be able to store their own form references.
+{
+  const descriptor = { ...Object.getOwnPropertyDescriptor(Element.prototype, 'form'), enumerable: true };
+  for (const Interface of [HTMLButtonElement, HTMLFieldSetElement, HTMLInputElement,
+      HTMLLabelElement, HTMLLegendElement, HTMLObjectElement, HTMLOutputElement,
+      HTMLSelectElement, HTMLTextAreaElement, HTMLOptionElement]) {
+    Object.defineProperty(Interface.prototype, 'form', descriptor);
+  }
+  delete Element.prototype.form;
+}
+
+// URL members on ordinary elements make detached roots look like shadow hosts.
+for (const name of ['protocol','username','password','host','hostname',
+    'port','pathname','search','hash','origin']) {
+  const descriptor = { ...Object.getOwnPropertyDescriptor(Element.prototype, name), enumerable: true };
+  Object.defineProperty(HTMLAnchorElement.prototype, name, descriptor);
+  Object.defineProperty(HTMLAreaElement.prototype, name, descriptor);
+  delete Element.prototype[name];
+}
+
 HTMLScriptElement.supports = {
   supports(type) {
     if (arguments.length < 1) throw new TypeError("HTMLScriptElement.supports requires a script type");
@@ -15323,6 +15410,7 @@ Object.assign(globalThis.XPathResult, {
 // XMLDocument is a subclass of Document (DOMParser of an XML type and
 // implementation.createDocument produce one). The interface must exist globally.
 if (typeof XMLDocument === "undefined") globalThis.XMLDocument = class XMLDocument extends Document {};
+const _nativeXMLDocument = XMLDocument;
 // ParentNode mixin: Document and DocumentFragment are ParentNodes too, so they
 // share Element's append / prepend / replaceChildren.
 for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
@@ -16257,6 +16345,7 @@ class _IframeDocument {
     this.hidden = false;
 
     this._root = document.createElement('html');
+    _setDocumentRootState(_documentInstances, this, { nid:this._root._nid, element:true });
     this._head = document.createElement('head');
     this._body = document.createElement('body');
     _iframeDocumentRoots.add(this._root);
@@ -16281,9 +16370,9 @@ class _IframeDocument {
     }
   }
 
-  get documentElement() { return this._root; }
-  get head() { return this._head; }
-  get body() { return this._body; }
+  get documentElement() { return _documentPart(this, 'documentElement', 'document_element'); }
+  get head() { return _documentPart(this, 'head', 'document_head'); }
+  get body() { return _documentPart(this, 'body', 'document_body'); }
   get title() { return this._title; }
   set title(v) { this._title = v; }
   get URL() { return this._url; }
@@ -16583,9 +16672,9 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
-function _connectInsertedFrames(root, html) {
-  if (root.isConnected && /<iframe[\s/>]/i.test(html)) {
-    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe')));
+function _connectInsertedResources(root, html) {
+  if (root.isConnected && /<(?:iframe|img)[\s/>]/i.test(html)) {
+    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe,img[onload],img[onerror]')));
   }
 }
 
@@ -16691,6 +16780,9 @@ function _frameWindowFor(frameId) {
       // Not `receiver`: an accessor on a real global must run with the global
       // itself as `this`, not with this proxy.
       return Reflect.get(target, prop);
+    },
+    set(target, prop, value) {
+      return Reflect.set(target, prop, value);
     },
     has(target, prop) {
       return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
@@ -17745,39 +17837,57 @@ const WORKER_GLOBALS = [
 
 globalThis.Worker = class Worker {
   constructor(url) {
+    if (arguments.length === 0) throw new TypeError("Worker requires a script URL");
+    url = `${url}`;
+    // Stored blob URLs are already canonical; avoid reparsing each worker's source.
+    if (!url.startsWith('blob:') || globalThis.__blobStore?.[url] === undefined) {
+      url = _urlResolveOp(url, _documentBase() || 'about:blank');
+      if (!url) throw new TypeError("Failed to construct 'Worker': Invalid URL");
+    }
     this.onmessage = null;
     this.onerror = null;
     this._terminated = false;
     this._listeners = {};
     this._scope = null;
+    this._url = url;
     this._pendingMessages = [];
     const worker = this;
 
-    let resolvedUrl = url;
-    if (typeof url === 'string') {
-      const blob = globalThis.__blobStore?.[url];
-      if (blob) {
-        worker._code = blob;
-        // Auto-start on next tick so caller can set onmessage first.
-        setTimeout(() => worker._autoRun(), 0);
-        return;
-      }
-      // Resolve relative URLs against the current page.
-      if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
-        try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
-      }
-      (async () => {
-        try {
-          const resp = await fetch(resolvedUrl);
-          worker._code = await resp.text();
-          if (!worker._terminated) worker._autoRun();
-        } catch(e) { if (worker.onerror) worker.onerror(e); }
-      })();
+    const blob = globalThis.__blobStore?.[url];
+    if (blob) {
+      worker._code = blob;
+      // Auto-start on next tick so caller can set onmessage first.
+      setTimeout(() => worker._autoRun(), 0);
+      return;
     }
+    (async () => {
+      try {
+        const resp = await fetch(url);
+        worker._url = resp.url || url;
+        worker._code = await resp.text();
+        if (!worker._terminated) worker._autoRun();
+      } catch(e) { if (worker.onerror) worker.onerror(e); }
+    })();
   }
   _makeScope() {
     const worker = this;
+    const workerUrl = worker._url;
+    const URLImpl = globalThis.URL;
+    const fetchImpl = globalThis.fetch;
+    const RequestImpl = globalThis.Request;
+    let workerLocation;
     const scope = {
+      get location() {
+        if (!workerLocation) {
+          const parsed = new URLImpl(workerUrl);
+          workerLocation = {};
+          for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
+            Object.defineProperty(workerLocation, name, {value:parsed[name], enumerable:true});
+          }
+          Object.defineProperty(workerLocation, 'toString', {value:_markNative({toString() { return parsed.href; }}.toString)});
+        }
+        return workerLocation;
+      },
       onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
@@ -17806,11 +17916,32 @@ globalThis.Worker = class Worker {
       clearInterval: globalThis.clearInterval,
       scheduler: globalThis.scheduler,
       Scheduler: globalThis.Scheduler,
-      fetch: globalThis.fetch,
+      // Only URL resolution is worker-local; transport and its security policy stay shared.
+      fetch(input, init = {}) {
+        try {
+          return fetchImpl.call(this, input instanceof RequestImpl ? input : new URLImpl(input, workerUrl).href, init);
+        } catch (error) { return Promise.reject(error); }
+      },
       console: globalThis.console,
       performance: globalThis.performance,
-      location: globalThis.location,
     };
+    _markNative(Object.getOwnPropertyDescriptor(scope, 'location').get);
+    Object.defineProperty(scope, 'Request', {value:class Request extends RequestImpl {
+      constructor(input, init = {}) {
+        super(input instanceof RequestImpl ? input : new URLImpl(input, workerUrl).href, init);
+      }
+      clone() { return Object.setPrototypeOf(super.clone(), Request.prototype); }
+    }, writable:true, configurable:true});
+    Object.defineProperty(scope, 'Worker', {value:class Worker extends globalThis.Worker {
+      constructor(url, ...options) {
+        if (arguments.length === 0) throw new TypeError("Worker requires a script URL");
+        super(new URLImpl(url, workerUrl).href, ...options);
+      }
+    }, writable:true, configurable:true});
+    _markNative(scope.fetch);
+    _markNative(scope.Request);
+    _markNative(scope.Request.prototype.clone);
+    _markNative(scope.Worker);
     scope.self = scope;
     // A worker global carries the ECMAScript builtins and the worker-visible
     // web APIs as properties. Bare identifiers already resolved through the
@@ -19706,7 +19837,7 @@ const _nativeElementClick = Element.prototype.click;
 const _nativeDocumentUrl = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Document.prototype, 'URL').get);
 const _nativeNodeBaseUri = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI').get);
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['documentElement', 'head', 'body', 'URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
@@ -19732,6 +19863,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['windowOrigin', _windowOriginDescriptor.get],
   ['setWindowOrigin', _windowOriginDescriptor.set],
+  ['getEventHandler', _eventHandlerGet],
+  ['setEventHandler', _eventHandlerSet],
 ]));
 
 globalThis.__obscura_init_frames = function() {
@@ -19784,6 +19917,8 @@ globalThis.__obscura_init = (function(skipFrames) {
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);
+  // Materialize only parser images whose HTML handlers observe completion.
+  document.querySelectorAll('img[onload],img[onerror]');
 
   const scr = _fp('screen');
   const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0

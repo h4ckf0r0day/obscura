@@ -337,7 +337,14 @@ impl CdpContext {
 
     pub(crate) fn detach_session(&mut self, session_id: &str) -> Option<String> {
         self.interrupt_routes.lock().unwrap().remove(session_id);
-        self.sessions.remove(session_id)
+        let page_id = self.sessions.remove(session_id);
+        self.fetch_intercept.remove_session(&Some(session_id.to_string()));
+        if let Some(page_id) = &page_id {
+            if let Some(page) = self.pages.iter_mut().find(|page| &page.id == page_id) {
+                self.fetch_intercept.sync_page(page);
+            }
+        }
+        page_id
     }
 
     pub fn get_page(&self, id: &str) -> Option<&Page> {
@@ -394,6 +401,7 @@ impl CdpContext {
             }
         }
         for session_id in &removed_sessions {
+            self.fetch_intercept.remove_session(&Some(session_id.clone()));
             self.runtime_enabled_sessions.remove(session_id);
             self.lifecycle_enabled_sessions.remove(session_id);
         }

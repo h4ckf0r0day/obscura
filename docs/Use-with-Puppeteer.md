@@ -183,6 +183,10 @@ builds also cancel pending image/font loads, including `Image`/`decode()`
 requests, without restarting those URLs on the next render turn. Already-loaded
 resources are preserved. Ordinary JavaScript `fetch()` calls are not canceled.
 
+HTML image `onload` and `onerror` handlers run asynchronously for parser-created
+images and inserted HTML fragments, even when script never reads the image.
+Reading cached image dimensions does not replay completion events.
+
 `Page.close` runs the top-level document's `beforeunload` handlers. A document
 activated through native input can request confirmation, reported through
 `Page.javascriptDialogOpening` with type `beforeunload`. Use
@@ -209,3 +213,9 @@ status, response headers, and body size. Retained bodies remain readable by
 request ID when a page's JavaScript runtime is suspended, subject to
 `OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`.
 Cached imports do not produce another network request.
+
+JavaScript modules can also load from `data:` URLs, including nested and dynamic
+imports. These decode as UTF-8 and require a JavaScript MIME type. Unmapped
+relative imports are rejected; absolute network dependencies retain the page's
+network policy. Decoded sources use `OBSCURA_FETCH_MAX_BODY_BYTES`. Their responses
+remain available through `Network.getResponseBody`.

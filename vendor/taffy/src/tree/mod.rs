@@ -27,7 +27,7 @@ pub use traits::LayoutBlockContainer;
 #[cfg(feature = "taffy_tree")]
 mod taffy_tree;
 #[cfg(feature = "taffy_tree")]
-pub use taffy_tree::{TaffyError, TaffyResult, TaffyTree};
+pub use taffy_tree::{LeafMeasure, TaffyError, TaffyResult, TaffyTree};
 
 #[cfg(feature = "detailed_layout_info")]
 pub use layout::DetailedLayoutInfo;

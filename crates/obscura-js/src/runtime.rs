@@ -2468,9 +2468,7 @@ impl ObscuraJsRuntime {
         }
         // The page transport is the plain client or, when installed, the
         // stealth client; either one on its own is enough (`has_page_transport`).
-        let http_client = state.http_client.clone();
-        #[cfg(feature = "stealth")]
-        let stealth_client = state.stealth_client.clone();
+        let fetcher = crate::ops::RenderResourceFetcher::from_state(&state);
         let initiator = url::Url::parse(&state.url).ok();
         if !crate::ops::has_page_transport(&state) || initiator.is_none() {
             // No transport or no document URL: nothing can be loaded; forget
@@ -2481,7 +2479,6 @@ impl ObscuraJsRuntime {
             return 0;
         }
         let initiator = initiator.expect("checked above");
-        let callbacks = state.callbacks.clone();
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
         let limiter = state.render_resource_limiter.clone();
@@ -2495,10 +2492,7 @@ impl ObscuraJsRuntime {
             use deno_core::futures::StreamExt as _;
             let loads = deno_core::futures::stream::iter(requests.into_iter().map(
                 |(raw, profile, is_font, image_request_generation)| {
-                let http_client = http_client.clone();
-                #[cfg(feature = "stealth")]
-                let stealth_client = stealth_client.clone();
-                let callbacks = callbacks.clone();
+                let fetcher = fetcher.clone();
                 let initiator = initiator.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
@@ -2516,6 +2510,7 @@ impl ObscuraJsRuntime {
                                 image_request_generation,
                                 is_font,
                                 response: None,
+                                network_event: None,
                                 };
                         }
                     };
@@ -2536,44 +2531,14 @@ impl ObscuraJsRuntime {
                         }
                         _ => {}
                     }
-                    #[cfg(feature = "stealth")]
-                    let response = match (stealth_client, http_client) {
-                        (Some(stealth_client), _) => stealth_client
-                                .fetch_resource_with_callbacks(
-                                    &parsed,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                            .await
-                            .ok(),
-                        (None, Some(http_client)) => http_client
-                                .fetch_resource_with_callbacks(
-                                    &parsed,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                            .await
-                            .ok(),
-                        (None, None) => None,
-                    };
-                    #[cfg(not(feature = "stealth"))]
-                    let response = match http_client {
-                        Some(http_client) => http_client
-                                .fetch_resource_with_callbacks(
-                                    &parsed,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                            .await
-                            .ok(),
-                        None => None,
-                    };
+                    let (response, network_event) = fetcher.fetch(&parsed, request).await;
                     crate::ops::RenderResourceLoad {
                         generation,
                         url: raw,
                         profile,
                         image_request_generation,
                         is_font,
+                        network_event: network_event.map(Box::new),
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
                             status: response.status,
@@ -2595,6 +2560,7 @@ impl ObscuraJsRuntime {
                             image_request_generation,
                             is_font: fallback.2,
                             response: None,
+                            network_event: None,
                         })
                     })
                 },
@@ -2685,6 +2651,15 @@ impl ObscuraJsRuntime {
                 load.profile,
                 load.is_font,
             ));
+            let intercepted = load.network_event.is_some();
+            if let Some(event) = load.network_event {
+                crate::ops::record_network_completion(&mut self.state.borrow_mut(), *event, |_| {
+                    match &load.response {
+                        Some(response) => crate::ops::CachedNetworkResponseBody::raw(&response.body, response.headers.get("content-type").map(String::as_str)),
+                        None => crate::ops::CachedNetworkResponseBody::raw(&[], None),
+                    }
+                });
+            }
             let is_font = load.is_font;
             let bytes = match &load.response {
                 Some(response) if (200..300).contains(&response.status) => {
@@ -2698,7 +2673,7 @@ impl ObscuraJsRuntime {
                 Some(profile) => self.seed_shared_render_image_resource_for_request(load.url, profile, bytes, load.image_request_generation),
                 None => self.seed_shared_render_resource(load.url, bytes),
             }
-            if let Some(response) = load.response {
+            if let Some(response) = load.response.filter(|_| !intercepted) {
                 self.state
                     .borrow_mut()
                     .render_resource_events
@@ -4987,6 +4962,57 @@ impl Default for ObscuraJsRuntime {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn custom_elements_can_store_form_references_without_changing_native_control_ownership() {
+        let mut rt = setup_runtime(r#"<html><body>
+            <form id="first"><input id="inside"></form><form id="second"></form>
+            <input id="outside" form="first">
+            <qa-form-owner><form id="widget-form"></form></qa-form-owner>
+        </body></html>"#);
+        let result = rt.evaluate(r#"(function() {
+            let exposed = 0, failed = 0, stored = 0;
+            for (const tag of ['div','span','section','form','img','a','iframe',
+                    'optgroup','datalist','meter','progress','qa-ordinary']) {
+                const element = document.createElement(tag);
+                if ('form' in element) exposed++;
+                try { (function() { 'use strict'; this.form = 42; }).call(element); }
+                catch (error) { failed++; }
+                if (Object.hasOwn(element, 'form') && element.form === 42) stored++;
+            }
+            class FormOwner extends HTMLElement {
+                connectedCallback() {
+                    this.form = this.querySelector('form');
+                    this.setAttribute('data-initialized', 'yes');
+                }
+            }
+            customElements.define('qa-form-owner', FormOwner);
+            const widget = document.querySelector('qa-form-owner');
+            const custom = [widget.getAttribute('data-initialized') === 'yes',
+                Object.hasOwn(widget, 'form'), widget.form === document.getElementById('widget-form')];
+            const inside = document.getElementById('inside');
+            const outside = document.getElementById('outside');
+            const owners = [inside.form.id, outside.form.id];
+            document.getElementById('second').appendChild(inside);
+            outside.setAttribute('form', 'second');
+            owners.push(inside.form.id, outside.form.id);
+            let readonly = false;
+            try { (function() { 'use strict'; inside.form = null; })(); }
+            catch (error) { readonly = error.name === 'TypeError'; }
+            const interfaces = [HTMLButtonElement, HTMLFieldSetElement, HTMLInputElement,
+                HTMLLabelElement, HTMLLegendElement, HTMLObjectElement, HTMLOutputElement,
+                HTMLSelectElement, HTMLTextAreaElement, HTMLOptionElement];
+            const descriptors = interfaces.filter(Interface => {
+                const d = Object.getOwnPropertyDescriptor(Interface.prototype, 'form');
+                return d && typeof d.get === 'function' && d.set === undefined && d.enumerable;
+            }).length;
+            return [[exposed, failed, stored], custom, owners, readonly, descriptors];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [0, 0, 12], [true, true, true],
+            ["first", "first", "second", "second"], true, 10
+        ]));
+    }
+
+    #[test]
     fn form_ownership_tracks_explicit_ids_and_tree_order() {
         let mut rt = setup_runtime("<form id='f'><input id='a'><input id='b' form='g'><input id='empty' form=''></form><form id='g'></form><input id='c' form='f'><div id='block'></div>");
         assert_eq!(rt.evaluate(r#"(() => {
@@ -6372,6 +6398,7 @@ mod tests {
                 profile: None,
                 image_request_generation: None,
                 is_font: false,
+                network_event: None,
                 response: Some(crate::ops::RenderResourceResponse {
                     url: url.clone(),
                     status: 200,
@@ -7456,6 +7483,151 @@ mod tests {
                 0,
             ])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_request_and_fetch_keep_their_original_page_bindings() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-original-page-bindings", r#"
+            globalThis.__workerBindings = [];
+            const originalFetch = globalThis.fetch, OriginalRequest = globalThis.Request, OriginalURL = globalThis.URL;
+            globalThis.fetch = async () => ({text:async () => 'original'});
+            const source = `postMessage('ready'); onmessage = async event => {
+                if (event.data === 'fetch') postMessage({fetch:await fetch('https://example.com/value.txt').then(r => r.text())});
+                else {
+                    try { postMessage({protocol:location.protocol,request:new Request('https://example.com/value.txt').url}); }
+                    catch (error) { postMessage({request:error.name}); }
+                }
+            };`;
+            const url = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                if (event.data === 'ready') {
+                    globalThis.fetch = async () => ({text:async () => 'replacement'});
+                    worker.postMessage('fetch');
+                } else if ('fetch' in event.data) {
+                    __workerBindings.push(event.data.fetch);
+                    globalThis.Request = null; globalThis.URL = null; worker.postMessage('request');
+                } else {
+                    __workerBindings.push(event.data.request);
+                    __workerBindings.push(event.data.protocol);
+                    globalThis.fetch = originalFetch; globalThis.Request = OriginalRequest; globalThis.URL = OriginalURL;
+                    worker.terminate(); URL.revokeObjectURL(url);
+                }
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__workerBindings").unwrap(),
+            serde_json::json!(["original", "https://example.com/value.txt", "blob:"]));
+    }
+
+    #[test]
+    fn worker_url_coercion_precedes_document_base_lookup() {
+        let mut rt = setup_runtime("<html><head><base href='https://example.com/before/'></head><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            let requested;
+            const originalFetch = globalThis.fetch;
+            globalThis.fetch = async url => { requested = url; return {text:async () => ''}; };
+            const worker = new Worker({toString() {
+                document.querySelector('base').setAttribute('href', 'https://example.com/after/');
+                return 'entry.js';
+            }});
+            worker.terminate(); globalThis.fetch = originalFetch;
+            return requested;
+        })()"#).unwrap(), serde_json::json!("https://example.com/after/entry.js"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_urls_use_the_entry_script_without_mutating_the_document() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0u8; 4096];
+                let length = stream.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..length]);
+                let path = request.lines().next().unwrap().split_ascii_whitespace().nth(1).unwrap();
+                let (status, headers, body) = match path {
+                    "/redirect.js" => ("302 Found", "Location: /workers/entry.js\r\n", ""),
+                    "/workers/entry.js" => ("200 OK", "", r#"onmessage = async () => {
+                        const request = new Request('value.txt');
+                        const cloned = request.clone();
+                        const values = await Promise.all([
+                            fetch('value.txt').then(r => r.text()), fetch(request).then(r => r.text())
+                        ]);
+                        const childPath = await new Promise(resolve => {
+                            const child = new Worker('child.js');
+                            child.onmessage = e => { resolve(e.data); child.terminate(); };
+                            child.onerror = () => { resolve('child-error'); child.terminate(); };
+                        });
+                        const changed = Reflect.set(location, 'hash', '#worker-change');
+                        const stableLocation = location === self.location;
+                        const locationReadonly = !Reflect.set(self, 'location', null);
+                        const metadata = [Request, Worker, Request.prototype.clone, fetch, location.toString]
+                            .map(fn => [fn.name, fn.length, Function.prototype.toString.call(fn),
+                                Object.prototype.toString.call(fn), Object.prototype.hasOwnProperty.call(fn, 'prototype')]);
+                        postMessage([location.pathname, new URL(request.url, location.href).pathname,
+                            values, childPath, changed, location.hash, cloned instanceof Request,
+                            Object.prototype.propertyIsEnumerable.call(self, 'Request'),
+                            Object.prototype.propertyIsEnumerable.call(self, 'Worker'), metadata,
+                            stableLocation, locationReadonly]);
+                    };"#),
+                    "/workers/child.js" => ("200 OK", "", "postMessage(location.pathname);"),
+                    "/workers/value.txt" => ("200 OK", "", "worker-value"),
+                    _ => ("200 OK", "", "document-value"),
+                };
+                let response = format!("HTTP/1.1 {status}\r\n{headers}Content-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let url = format!("http://{address}/pages/document.html");
+        let mut rt = ObscuraJsRuntime::with_base_url(&url);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&url);
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        rt.run_page_init();
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const worker = new Worker('/redirect.js');
+            const value = await new Promise(resolve => {
+                worker.onmessage = e => resolve(e.data); worker.postMessage(null);
+            });
+            worker.terminate();
+            const source = `onmessage = async () => {
+                let fetchError, requestError;
+                try { await fetch('value.txt'); } catch (e) { fetchError = e.name; }
+                try { new Request('value.txt'); } catch (e) { requestError = e.name; }
+                postMessage([location.href.startsWith('blob:'), fetchError, requestError]);
+            };`;
+            const blob = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
+            const blobWorker = new Worker(blob);
+            const blobValue = await new Promise(resolve => {
+                blobWorker.onmessage = e => resolve(e.data); blobWorker.postMessage(null);
+            });
+            blobWorker.terminate();
+            const normalizedWorker = new Worker('BLOB:' + blob.slice(5));
+            const normalizedValue = await new Promise(resolve => {
+                normalizedWorker.onmessage = e => resolve(e.data); normalizedWorker.postMessage(null);
+            });
+            normalizedWorker.terminate(); URL.revokeObjectURL(blob);
+            return [value, blobValue, normalizedValue, location.pathname, location.hash,
+                await fetch('/pages/value.txt').then(r => r.text())];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([
+            ["/workers/entry.js", "/workers/value.txt", ["worker-value", "worker-value"],
+             "/workers/child.js", false, "", true, false, false, [
+                 ["Request", 1, "function Request() { [native code] }", "[object Function]", true],
+                 ["Worker", 1, "function Worker() { [native code] }", "[object Function]", true],
+                 ["clone", 0, "function clone() { [native code] }", "[object Function]", false],
+                 ["fetch", 1, "function fetch() { [native code] }", "[object Function]", false],
+                 ["toString", 0, "function toString() { [native code] }", "[object Function]", false]
+             ], true, true],
+            [true, "TypeError", "TypeError"], [true, "TypeError", "TypeError"],
+            "/pages/document.html", "", "document-value"
+        ]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11626,6 +11798,60 @@ mod tests {
                 "origin"
             ])
         );
+    }
+
+    #[test]
+    fn hyperlink_url_members_do_not_make_detached_elements_look_like_shadow_hosts() {
+        let mut rt = setup_runtime(r#"<html><body>
+            <a id="a" href="https://u:p@example.test:8443/path?x=1#h"></a>
+            <area id="area" href="https://u:p@example.test:8443/path?x=1#h">
+        </body></html>"#);
+        let result = rt.evaluate(r#"(function() {
+            const members = ['protocol','username','password','host','hostname',
+                'port','pathname','search','hash','origin'];
+            const exposed = ['div','button','input'].map(tag => {
+                const element = document.createElement(tag);
+                return members.filter(name => name in element);
+            });
+            const connected = element => {
+                try {
+                    const host = element.getRootNode().host;
+                    return !!((host?.ownerDocument.contains(host))
+                        || element.ownerDocument.contains(element));
+                } catch (error) { return error.name; }
+            };
+            const button = document.createElement('button');
+            const wrapper = document.createElement('div');
+            const input = document.createElement('input');
+            wrapper.appendChild(input);
+            const roots = [connected(button), connected(input)];
+            document.body.appendChild(button);
+            roots.push(connected(button));
+            const host = document.createElement('div');
+            document.body.appendChild(host);
+            const shadow = host.attachShadow({mode:'open'});
+            const child = document.createElement('button');
+            shadow.appendChild(child);
+            roots.push(connected(child));
+            const urls = ['a','area'].map(id => {
+                const link = document.getElementById(id);
+                const before = members.map(name => link[name]);
+                link.host = 'other.example:8080';
+                return [before, link.href];
+            });
+            return [exposed, roots, urls];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[], [], []], [false, false, true, true],
+            [
+                [["https:", "u", "p", "example.test:8443", "example.test", "8443",
+                    "/path", "?x=1", "#h", "https://example.test:8443"],
+                    "https://u:p@other.example:8080/path?x=1#h"],
+                [["https:", "u", "p", "example.test:8443", "example.test", "8443",
+                    "/path", "?x=1", "#h", "https://example.test:8443"],
+                    "https://u:p@other.example:8080/path?x=1#h"]
+            ]
+        ]));
     }
 
     #[cfg(feature = "render")]
@@ -20059,6 +20285,94 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_content_handlers_run_without_reading_image_properties() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let loader_requests = requests.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img src="ready.png" onload="document.body.dataset.loaded='yes'">
+               <img src="missing.png" onerror="document.body.dataset.fallback=String(this instanceof HTMLImageElement);this.onerror=null;this.src='ready.png'">
+               <img src="unobserved.png">"#,
+            move |url: &str| {
+                loader_requests.lock().unwrap().push(url.to_string());
+                url.ends_with("ready.png").then(|| png.clone())
+            },
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[document.body.dataset.loaded, document.body.dataset.fallback]").unwrap(),
+            serde_json::json!(["yes", "true"]),
+            "HTML content handlers must observe completion before script reads the image",
+        );
+        assert_eq!(
+            rt.evaluate("Array.from(document.images).slice(0,2).map(image => [image.complete,image.naturalWidth,image.naturalHeight])").unwrap(),
+            serde_json::json!([[true, 2, 3], [true, 2, 3]]),
+        );
+        let mut requests = requests.lock().unwrap().clone();
+        requests.sort();
+        assert_eq!(requests, vec![
+            "http://example.com/page/missing.png",
+            "http://example.com/page/ready.png",
+        ], "unobserved images stay lazy and the fallback reuses retained bytes");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn fragment_image_content_handlers_observe_cached_completion() {
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            "<div id='host'></div><img src='ready.png'>",
+            move |url: &str| url.ends_with("ready.png").then(|| png.clone()),
+        );
+        {
+            let mut state = rt.state.borrow_mut();
+            assert!(ensure_prepared_render(&mut state).is_some());
+        }
+        rt.execute_script("insert-image-handlers", r#"
+            document.getElementById('host').innerHTML = `<img src="ready.png" onload="document.body.dataset.cached='loaded'">
+                <img src="missing.png" onerror="document.body.dataset.failed='yes';this.onerror=null;this.src='ready.png'">`;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[document.body.dataset.cached,document.body.dataset.failed]").unwrap(),
+            serde_json::json!(["loaded", "yes"]),
+        );
+        assert_eq!(
+            rt.evaluate("Array.from(document.getElementById('host').children).map(image => [image.complete,image.naturalWidth,image.naturalHeight])").unwrap(),
+            serde_json::json!([[true, 2, 3], [true, 2, 3]]),
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_content_handler_completion_is_not_replayed_by_late_observers() {
+        let mut rt = parser_image_runtime(
+            r#"<img src="missing.png" onerror="document.body.dataset.errors=(Number(document.body.dataset.errors)||0)+1">"#,
+            move |_url: &str| None,
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("Number(document.body.dataset.errors)").unwrap().as_f64(),
+            Some(1.0));
+        rt.execute_script("late-image-observers", r#"
+            const failed = document.querySelector('img');
+            failed.onerror = () => { document.body.dataset.errors = Number(document.body.dataset.errors)+1; };
+            failed.onload = () => { document.body.dataset.loaded = 'unexpected'; };
+            for (let index = 0; index < 5; index++) {
+                void failed.complete;
+                void failed.naturalWidth;
+                void failed.currentSrc;
+            }
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt.evaluate("[Number(document.body.dataset.errors),document.body.hasAttribute('data-loaded'),failed.complete,failed.naturalWidth]").unwrap();
+        assert_eq!(result[0].as_f64(), Some(1.0));
+        assert_eq!(result[1], serde_json::json!(false));
+        assert_eq!(result[2], serde_json::json!(true));
+        assert_eq!(result[3].as_f64(), Some(0.0));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn parser_image_failure_completes_and_rejects_decode() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = calls.clone();
@@ -22423,6 +22737,283 @@ mod tests {
     }
 
     #[test]
+    fn global_event_handler_accessors_support_wrapped_assignments() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const results = [];
+            for (const name of ['onclick', 'oninput', 'onchange']) {
+                const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, name);
+                if (typeof descriptor.set !== 'function') return ['missing setter', name];
+                Object.defineProperty(HTMLElement.prototype, name, {set(value) {
+                    descriptor.set.call(this, typeof value === 'function' ? function(event) {
+                        return value.call(this, event);
+                    } : value);
+                }});
+                const element = document.createElement('button');
+                let calls = 0;
+                element[name] = function(event) { if (this === element && event.currentTarget === element) calls++; return false; };
+                const dispatched = element.dispatchEvent(new Event(name.slice(2), {cancelable:true}));
+                results.push([typeof descriptor.get, descriptor.enumerable, descriptor.configurable,
+                    calls, dispatched, Object.hasOwn(element, name)]);
+            }
+            for (const [target, prototype] of [[document, Document.prototype], [window, window]]) {
+                const descriptor = Object.getOwnPropertyDescriptor(prototype, 'onclick');
+                let calls = 0;
+                target.onclick = function(event) { if (this === target && event.currentTarget === target) calls++; };
+                target.dispatchEvent(new Event('click'));
+                results.push([typeof descriptor.get, typeof descriptor.set, calls]);
+            }
+            return results;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            ["function",true,true,1,false,false], ["function",true,true,1,false,false],
+            ["function",true,true,1,false,false], ["function","function",1], ["function","function",1],
+        ]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_convert_values_and_preserve_attribute_precedence() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const conversions = [];
+            for (const target of [document.createElement('button'), document, window]) {
+                for (const value of [undefined, true, 7, 'source', Symbol('source'), {}, {handleEvent() {}}, function() {}]) {
+                    target.onclick = value;
+                    conversions.push(target.onclick === ((typeof value === 'object' || typeof value === 'function') ? value : null));
+                }
+                target.onclick = null;
+            }
+            const empty = document.createElement('button'); empty.setAttribute('onclick', '');
+            const emptyRead = typeof empty.onclick;
+            const element = document.createElement('button'); globalThis.handlerOrder = [];
+            element.setAttribute('onclick', "handlerOrder.push('attribute')");
+            const attributeRead = typeof element.onclick;
+            element.click(); element.onclick = () => handlerOrder.push('idl'); element.click();
+            element.onclick = null; element.click();
+            element.setAttribute('onclick', "handlerOrder.push('updated')"); element.click();
+            element.removeAttribute('onclick'); element.click();
+            element.onclick = () => handlerOrder.push('retained');
+            element.removeAttribute('onclick'); element.click();
+            element.setAttributeNS(null, 'onclick', "handlerOrder.push('ns')"); element.click();
+            element.removeAttributeNS(null, 'onclick'); element.click();
+            return [conversions.every(Boolean), attributeRead, handlerOrder, element.onclick === null, emptyRead];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            true,"function",["attribute","idl","updated","retained","ns"],true,"function",
+        ]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_use_the_receiver_realm_and_check_brands() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'onclick');
+            if (typeof descriptor.get !== 'function') return ['missing getter'];
+            const invalid = [document, {}, Object.create(HTMLElement.prototype), document.createTextNode('x')];
+            const brands = invalid.map(target => { try { descriptor.get.call(target); return false; }
+                catch (error) { return error instanceof TypeError; } });
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const child = frame.contentWindow; const element = child.document.createElement('button');
+            child.document.body.appendChild(element);
+            let calls = 0; const fn = function() { if (this === element) calls++; };
+            descriptor.set.call(element, fn); element.click();
+            const before = descriptor.get.call(element) === fn;
+            child.eval('globalThis.childClickDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "onclick")');
+            const parent = document.createElement('button');
+            child.childClickDescriptor.set.call(parent, fn);
+            const borrowed = parent.onclick === fn;
+            Object.setPrototypeOf(parent, null);
+            return [brands, calls, before, borrowed, descriptor.get.call(parent) === fn];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([[true,true,true,true],1,true,true,true]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_preserve_image_error_content_handlers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            globalThis.imageHandlerCalls = [];
+            const image = document.createElement('img');
+            image.setAttribute('onerror', "imageHandlerCalls.push('attribute')");
+            image.dispatchEvent(new Event('error'));
+            image.onerror = () => imageHandlerCalls.push('idl');
+            image.dispatchEvent(new Event('error'));
+            image.onerror = null;
+            image.dispatchEvent(new Event('error'));
+            return imageHandlerCalls;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["attribute","idl"]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_preserve_dialog_content_handlers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            globalThis.dialogHandlerCalls = [];
+            const dialog = document.createElement('dialog'); document.body.appendChild(dialog);
+            dialog.setAttribute('oncancel', "dialogHandlerCalls.push('cancel'); event.preventDefault()");
+            dialog.setAttribute('onclose', "dialogHandlerCalls.push('close')");
+            dialog.show(); dialog.requestClose();
+            const retained = dialog.open;
+            dialog.dispatchEvent(new Event('close'));
+            return [retained, dialogHandlerCalls];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,["cancel","close"]]));
+    }
+
+    #[test]
+    fn specialized_event_handlers_share_attribute_and_idl_precedence() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const result = [];
+            for (const [tag, type] of [['div','load'],['img','load'],['dialog','cancel'],['dialog','close'],['body','load']]) {
+                const target = tag === 'body' ? document.body : document.createElement(tag);
+                globalThis.specializedHandlerCalls = [];
+                const name = 'on'+type;
+                target.setAttribute(name, "specializedHandlerCalls.push('attribute')");
+                target.dispatchEvent(new Event(type));
+                target[name] = () => specializedHandlerCalls.push('idl');
+                target.dispatchEvent(new Event(type));
+                target[name] = null;
+                target.dispatchEvent(new Event(type));
+                target.setAttribute(name, "specializedHandlerCalls.push('updated')");
+                target.dispatchEvent(new Event(type));
+                result.push([tag,type,specializedHandlerCalls.slice()]);
+            }
+            return result;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            ["div","load",["attribute","idl","updated"]],
+            ["img","load",["attribute","idl","updated"]],
+            ["dialog","cancel",["attribute","idl","updated"]],
+            ["dialog","close",["attribute","idl","updated"]],
+            ["body","load",[]],
+        ]));
+    }
+
+    #[test]
+    fn standard_event_handler_accessors_deliver_and_cancel() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const rows=[];
+            for(const type of ['beforeinput','beforetoggle','auxclick','animationstart','animationend','animationiteration','transitionrun','transitionstart','transitionend','transitioncancel']) {
+                for(const target of [document.createElement('input'), document, window]) {
+                    let calls=0;
+                    target['on'+type]=e=>{calls++; e.preventDefault()};
+                    const dispatched=target.dispatchEvent(new Event(type,{cancelable:true}));
+                    target['on'+type]=null;
+                    rows.push([calls,dispatched]);
+                }
+            }
+            return rows;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::Value::Array(vec![serde_json::json!([1,false]); 30]));
+    }
+
+    #[test]
+    fn inherited_event_handler_accessors_preserve_delivery() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const result=[];
+            for(const [tag,type] of [['div','fullscreenchange'],['div','fullscreenerror'],['div','beforecopy'],['audio','encrypted'],['audio','waitingforkey'],['video','enterpictureinpicture'],['video','leavepictureinpicture']]) {
+                const target=document.createElement(tag);
+                let calls=0;
+                const handler=e=>{calls++;e.preventDefault()};
+                target['on'+type]=handler;
+                const dispatched=target.dispatchEvent(new Event(type,{cancelable:true}));
+                result.push([calls,dispatched,target['on'+type]===handler]);
+            }
+            return result;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::Value::Array(vec![serde_json::json!([1,false,true]); 7]));
+    }
+
+    #[test]
+    fn window_event_handler_state_survives_snapshot_restore() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const defaults = [typeof window.onerror, typeof window.onunhandledrejection];
+            let calls = 0;
+            const handler = event => { calls++; event.preventDefault(); };
+            window.onbeforeinput = handler;
+            const dispatched = window.dispatchEvent(new Event('beforeinput', {cancelable:true}));
+            return [defaults, calls, dispatched, window.onbeforeinput === handler];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([["function","function"],1,false,true]));
+    }
+
+    #[test]
+    fn event_handler_accessors_preserve_target_specific_surfaces() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const restricted = ['onfullscreenchange','onfullscreenerror','onwebkitfullscreenchange',
+                'onwebkitfullscreenerror','onbeforecopy','onbeforecut','onbeforepaste'];
+            return [restricted.every(name => name in document.createElement('div') && name in document && !(name in window)),
+                'onencrypted' in document.createElement('audio'), 'onencrypted' in document.createElement('div'),
+                'onenterpictureinpicture' in document.createElement('video'), 'onenterpictureinpicture' in document.createElement('audio')];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,true,false,true,false]));
+    }
+
+    #[test]
+    fn cached_load_handlers_follow_a_replacement_body() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const replacement = document.createElement('body');
+            replacement.onload = () => {};
+            const handler = () => {};
+            window.onload = handler;
+            document.documentElement.replaceChild(replacement, document.body);
+            return [replacement.onload === handler, window.onload === handler, document.body === replacement];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,true,true]));
+    }
+
+    #[test]
+    fn native_event_delivery_ignores_public_handler_getters() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            globalThis.nativeHandlerCalls = [];
+            let reads = 0;
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'onclick');
+            Object.defineProperty(HTMLElement.prototype, 'onclick', {
+                configurable: true,
+                get() { reads++; return () => nativeHandlerCalls.push('getter'); },
+                set: descriptor.set,
+            });
+            const button = document.createElement('button');
+            document.body.appendChild(button);
+            button.setAttribute('onclick', "nativeHandlerCalls.push('attribute')");
+            button.click();
+            button.onclick = () => nativeHandlerCalls.push('idl'); button.click();
+            button.onclick = null; button.click();
+            return [reads, nativeHandlerCalls];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([0,["attribute","idl"]]));
+    }
+
+    #[test]
+    fn global_event_handler_accessors_ignore_unsupported_document_and_window_properties() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            let custom = 0, clicks = 0, reads = 0;
+            document.onownedunsupported = () => custom++;
+            window.onownedunsupported = () => custom++;
+            for (const target of [document, window]) {
+                Object.defineProperty(target, 'onownedgetter', {get() { reads++; return () => custom++; }});
+            }
+            document.onclick = () => clicks++;
+            window.onclick = () => clicks++;
+            const button = document.createElement('button'); document.body.appendChild(button);
+            button.dispatchEvent(new Event('ownedunsupported', {bubbles:true}));
+            button.dispatchEvent(new Event('ownedgetter', {bubbles:true}));
+            button.click();
+            return {custom, clicks, reads};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({"custom":0,"clicks":2,"reads":0}));
+    }
+
+    #[test]
     fn test_matches_and_closest() {
         let mut rt = setup_runtime(
             r#"<div class="outer"><div class="inner"><span id="target">Hi</span></div></div>"#,
@@ -23054,6 +23645,24 @@ mod tests {
             .evaluate("document.querySelector('p').textContent")
             .unwrap();
         assert_eq!(p.as_str().unwrap(), "Para");
+    }
+
+    #[test]
+    fn url_blob_origins_follow_inner_scheme_rules() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let origins = rt.evaluate(r#"[
+            'blob:https://example.test:8443/id',
+            'blob:http://example.test/id',
+            'blob:blob:https://example.test/id',
+            'blob:ws://example.test/id',
+            'blob:wss://example.test/id',
+            'blob:ftp://example.test/id',
+            'blob:file:///tmp/id',
+        ].map(value => new URL(value).origin)"#).unwrap();
+        assert_eq!(origins, serde_json::json!([
+            "https://example.test:8443", "http://example.test",
+            "null", "null", "null", "null", "null"
+        ]));
     }
 
     #[test]
@@ -24190,6 +24799,67 @@ mod tests {
     }
 
 
+    async fn assert_network_cors_response_type(stealth: bool) {
+        let (mut rt, target, _requests) = cors_preflight_runtime();
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(
+                obscura_net::StealthHttpClient::with_proxy(
+                    std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+                ),
+            ));
+        }
+        let result = rt.call_function_on_for_cdp(&format!(r#"async () => {{
+            const response = await fetch({target:?}, {{headers: {{'Content-Type':'application/json'}}}});
+            const copy = response.clone();
+            return [response.type, copy.type, response.status, await response.text(), await copy.text()];
+        }}"#), None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(["cors", "cors", 200, "ok", "ok"])),
+            "stealth={stealth}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_cors_response_type_is_preserved_by_clone() {
+        assert_network_cors_response_type(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cors_response_type_is_preserved_by_clone() {
+        assert_network_cors_response_type(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fulfilled_cors_response_type_distinguishes_same_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        let fetch = rt.call_function_on_for_cdp(r#"async () => {
+            const results = [];
+            for (const url of ['http://example.com/resource', 'https://cross.example/resource']) {
+                const response = await fetch(url);
+                results.push([response.type, response.clone().type, await response.text()]);
+            }
+            return results;
+        }"#, None, &[], true, true);
+        let fulfill = async {
+            for _ in 0..2 {
+                let request = rx.recv().await.expect("intercepted fetch");
+                request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                    status: 200,
+                    headers: [("access-control-allow-origin".to_string(), "*".to_string())].into(),
+                    body: "fulfilled".into(), body_base64: String::new(),
+                }).unwrap();
+            }
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3),
+            async { tokio::join!(fetch, fulfill) }).await.expect("fulfilled responses");
+        assert_eq!(result.unwrap().value, Some(serde_json::json!([
+            ["basic", "basic", "fulfilled"], ["cors", "cors", "fulfilled"]
+        ])));
+    }
+
     #[test]
     fn request_headers_ignore_forbidden_names_and_remain_guarded() {
         let mut rt = setup_runtime("<body></body>");
@@ -24239,6 +24909,60 @@ mod tests {
             assert!(request.starts_with("GET /resource "), "{api}: {request}");
             assert!(!request.contains("attacker.invalid"), "{api}: forbidden Host reached the wire");
         }
+    }
+
+    async fn check_preflight_user_agent(stealth: bool) {
+        for configured in 0..if stealth { 3 } else { 2 } {
+            let (mut rt, target, requests) = cors_preflight_runtime();
+            let client = rt.state.borrow().http_client.as_ref().unwrap().clone();
+            if configured > 0 {
+                client.set_user_agent("ConfiguredBrowser/1.0").await;
+            }
+            #[cfg(feature = "stealth")]
+            if stealth {
+                let client = obscura_net::StealthHttpClient::with_proxy(
+                    client.cookie_jar.clone(), None, true,
+                ).with_user_agent((configured > 0).then(|| "ConfiguredBrowser/1.0".to_string()));
+                if configured == 2 {
+                    client.extra_headers.write().await.insert("User-Agent".into(), "HeaderBrowser/2.0".into());
+                }
+                rt.set_stealth_client(std::sync::Arc::new(client));
+            }
+            let result = rt.call_function_on_for_cdp(&format!(r#"async () => {{
+                const response = await fetch({target:?}, {{
+                    headers: {{'Content-Type': 'application/json'}}
+                }});
+                return response.text();
+            }}"#), None, &[], true, true).await.unwrap();
+            assert_eq!(result.value, Some(serde_json::json!("ok")));
+            let preflight = requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            let request = requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            let agents = |wire: &str| wire.lines().filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| value.trim().to_string()).collect::<Vec<_>>();
+            let actual_agent = agents(&request);
+            assert_eq!(actual_agent.len(), 1, "stealth={stealth}: {request}");
+            if configured > 0 {
+                assert_eq!(actual_agent, [if configured == 2 { "HeaderBrowser/2.0" } else { "ConfiguredBrowser/1.0" }]);
+            } else {
+                assert!(actual_agent[0].contains("Chrome/"), "{request}");
+            }
+            assert_eq!(agents(&preflight), actual_agent, "stealth={stealth}: {preflight}");
+            let preflight = preflight.to_ascii_lowercase();
+            assert!(preflight.contains("access-control-request-headers: content-type\r\n"));
+            assert!(!preflight.contains("\r\ncookie:") && !preflight.contains("\r\nauthorization:"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cors_preflight_uses_the_browser_user_agent() {
+        check_preflight_user_agent(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cors_preflight_uses_the_browser_user_agent() {
+        check_preflight_user_agent(true).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

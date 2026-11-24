@@ -1693,6 +1693,22 @@ impl ShapeLine {
         layout_lines: &mut Vec<LayoutLine>,
         match_mono_width: Option<f32>,
     ) {
+        self.layout_to_buffer_with_line_widths(scratch, font_size, width_opt, wrap, align,
+            layout_lines, match_mono_width, |_| width_opt);
+    }
+
+    /// Layout one shaped paragraph without changing its bidi or shaping context.
+    pub fn layout_to_buffer_with_line_widths(
+        &self,
+        scratch: &mut ShapeBuffer,
+        font_size: f32,
+        width_opt: Option<f32>,
+        wrap: Wrap,
+        align: Option<Align>,
+        layout_lines: &mut Vec<LayoutLine>,
+        match_mono_width: Option<f32>,
+        line_width_for: impl Fn(usize) -> Option<f32>,
+    ) {
         // For each visual line a list of  (span index,  and range of words in that span)
         // Note that a BiDi visual line could have multiple spans or parts of them
         // let mut vl_range_of_spans = Vec::with_capacity(1);
@@ -1772,11 +1788,11 @@ impl ShapeLine {
                         // relayouts with that width as the `line_width` will produce the same
                         // wrapping results.
                         if current_visual_line.w + (word_range_width + word_width)
-                            <= width_opt.unwrap_or(f32::INFINITY)
+                            <= line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY)
                             // Include one blank word over the width limit since it won't be
                             // counted in the final width
                             || (word.blank
-                                && (current_visual_line.w + word_range_width) <= width_opt.unwrap_or(f32::INFINITY))
+                                && (current_visual_line.w + word_range_width) <= line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY))
                         {
                             // fits
                             if word.blank {
@@ -1790,7 +1806,7 @@ impl ShapeLine {
                                 || (matches!(
                                     wrap,
                                     Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
-                                ) && word_width > width_opt.unwrap_or(f32::INFINITY));
+                                ) && word_width > line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY));
                             let break_indices = word.break_indices(wrap, emergency);
                             if !break_indices.is_empty() {
                             // Commit the current line so that the word starts on the next line.
@@ -1800,7 +1816,7 @@ impl ShapeLine {
                                     wrap,
                                     Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
                                 )
-                                && word_width > width_opt.unwrap_or(f32::INFINITY)
+                                && word_width > line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY)
                             {
                                 add_to_visual_line(
                                     &mut current_visual_line,
@@ -1832,7 +1848,7 @@ impl ShapeLine {
                                     .map(|glyph| glyph.width(font_size))
                                     .sum::<f32>();
                                 if current_visual_line.w + (word_range_width + chunk_width)
-                                    <= width_opt.unwrap_or(f32::INFINITY)
+                                    <= line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY)
                                     || (current_visual_line.ranges.is_empty()
                                         && word_range_width == 0.)
                                 {
@@ -1918,11 +1934,11 @@ impl ShapeLine {
                     for (i, word) in span.words.iter().enumerate() {
                         let word_width = word.width(font_size);
                         if current_visual_line.w + (word_range_width + word_width)
-                            <= width_opt.unwrap_or(f32::INFINITY)
+                            <= line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY)
                             // Include one blank word over the width limit since it won't be
                             // counted in the final width.
                             || (word.blank
-                                && (current_visual_line.w + word_range_width) <= width_opt.unwrap_or(f32::INFINITY))
+                                && (current_visual_line.w + word_range_width) <= line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY))
                         {
                             // fits
                             if word.blank {
@@ -1936,7 +1952,7 @@ impl ShapeLine {
                                 || (matches!(
                                     wrap,
                                     Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
-                                ) && word_width > width_opt.unwrap_or(f32::INFINITY));
+                                ) && word_width > line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY));
                             let break_indices = word.break_indices(wrap, emergency);
                             if !break_indices.is_empty() {
                             // Commit the current line so that the word starts on the next line.
@@ -1946,7 +1962,7 @@ impl ShapeLine {
                                     wrap,
                                     Wrap::WordOrGlyph | Wrap::WordOrGlyphMinContent
                                 )
-                                && word_width > width_opt.unwrap_or(f32::INFINITY)
+                                && word_width > line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY)
                             {
                                 add_to_visual_line(
                                     &mut current_visual_line,
@@ -1978,7 +1994,7 @@ impl ShapeLine {
                                     .map(|glyph| glyph.width(font_size))
                                     .sum::<f32>();
                                 if current_visual_line.w + (word_range_width + chunk_width)
-                                    <= width_opt.unwrap_or(f32::INFINITY)
+                                    <= line_width_for(visual_lines.len()).unwrap_or(f32::INFINITY)
                                     || (current_visual_line.ranges.is_empty()
                                         && word_range_width == 0.)
                                 {
@@ -2086,10 +2102,10 @@ impl ShapeLine {
             }
         };
 
-        let start_x = if self.rtl { line_width } else { 0.0 };
-
         let number_of_visual_lines = visual_lines.len();
         for (index, visual_line) in visual_lines.iter().enumerate() {
+            let line_width = line_width_for(index).unwrap_or(line_width);
+            let start_x = if self.rtl { line_width } else { 0.0 };
             if visual_line.ranges.is_empty() {
                 continue;
             }
@@ -2232,6 +2248,7 @@ impl ShapeLine {
             }
 
             layout_lines.push(LayoutLine {
+                top_offset: 0.0,
                 w: if align != Align::Justified {
                     visual_line.w
                 } else if self.rtl {
@@ -2249,6 +2266,7 @@ impl ShapeLine {
         // This is used to create a visual line for empty lines (e.g. lines with only a <CR>)
         if layout_lines.is_empty() {
             layout_lines.push(LayoutLine {
+                top_offset: 0.0,
                 w: 0.0,
                 max_ascent: 0.0,
                 max_descent: 0.0,

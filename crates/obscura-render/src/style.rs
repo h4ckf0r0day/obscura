@@ -4285,22 +4285,38 @@ pub(crate) fn build_line_map(pairs: Vec<(String, i16)>) -> std::collections::Has
     m
 }
 
-/// Split a track list on whitespace while keeping `func(a, b)` groups and
-/// `[line-name lists]` intact.
+/// Separate track sizes and line-name lists, even without intervening whitespace,
+/// while keeping function arguments and bracket contents intact.
 fn tokenize_tracks(value: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i32;
     let mut in_bracket = false;
+    let mut escaped = false;
     for c in value.chars() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
         match c {
+            '\\' => {
+                escaped = true;
+                cur.push(c);
+            }
             '[' => {
+                if depth == 0 && !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
                 in_bracket = true;
                 cur.push(c);
             }
             ']' => {
                 in_bracket = false;
                 cur.push(c);
+                if depth == 0 {
+                    out.push(std::mem::take(&mut cur));
+                }
             }
             '(' => {
                 depth += 1;
@@ -4913,17 +4929,20 @@ fn grid_placement_declaration_is_valid(value: &str, shorthand: bool) -> bool {
 /// `taffy::Line` now; a value that names a grid line (`content-start /
 /// content-end`, or the `grid-column: content` area shorthand) is kept raw and
 /// resolved against the parent's line-name map in `dom::resolve_grid_areas`.
-/// Whichever representation is set, the other is cleared so a later cascade
-/// rule of the opposite kind fully overrides it.
+/// Numeric values clear the raw placement. Named forms retain numeric/span
+/// edges as a fallback while the parent cannot resolve their line names.
 fn set_grid_placement(style: &mut LayoutStyle, value: &str, is_col: bool) {
     if grid_line_has_name(value) {
         let raw = Some(value.trim().to_string());
+        let line = parse_grid_line(value).filter(|line| {
+            line.start != taffy::GridPlacement::Auto || line.end != taffy::GridPlacement::Auto
+        });
         if is_col {
             style.grid_column_raw = raw;
-            style.grid_column = None;
+            style.grid_column = line;
         } else {
             style.grid_row_raw = raw;
-            style.grid_row = None;
+            style.grid_row = line;
         }
     } else {
         let line = parse_grid_line(value);
@@ -4943,37 +4962,39 @@ fn set_grid_placement(style: &mut LayoutStyle, value: &str, is_col: bool) {
 /// on selected children; dropping these longhands traps every item in one
 /// auto-placed track.
 fn set_grid_placement_side(style: &mut LayoutStyle, value: &str, is_col: bool, is_start: bool) {
-    if grid_line_has_name(value) {
-        let raw_slot = if is_col {
-            &mut style.grid_column_raw
-        } else {
-            &mut style.grid_row_raw
+    let named = grid_line_has_name(value);
+    let raw = if is_col { style.grid_column_raw.as_deref() } else { style.grid_row_raw.as_deref() };
+    if named || raw.is_some() {
+        let serialize = |placement: &taffy::GridPlacement| match placement {
+            taffy::GridPlacement::Auto => "auto".to_string(),
+            taffy::GridPlacement::Span(span) => format!("span {span}"),
+            taffy::GridPlacement::Line(line) => line.as_i16().to_string(),
+            taffy::GridPlacement::NamedLine(name, count) => format!("{name} {count}"),
+            taffy::GridPlacement::NamedSpan(name, count) => format!("span {name} {count}"),
         };
-        let (mut start, mut end) = match raw_slot.as_deref() {
+        let (mut start, mut end) = match raw {
             Some(raw) if raw.contains('/') => {
                 let (start, end) = raw.split_once('/').unwrap();
                 (start.trim().to_string(), end.trim().to_string())
             }
-            // A single named grid-area shorthand contributes its `-start`
-            // and `-end` lines. Preserve both logical sides when a later
-            // longhand overrides only one of them (`grid-column:content`
-            // followed by `grid-column-end:extended-full-end`, as on MDN).
-            // Resolution can still fall back to an exact named line when no
-            // area-generated name exists.
+            // A single area name contributes both edges until one is overridden.
             Some(raw) => (raw.trim().to_string(), raw.trim().to_string()),
-            None => ("auto".to_string(), "auto".to_string()),
+            None => {
+                let line = if is_col { style.grid_column.as_ref() } else { style.grid_row.as_ref() };
+                match line {
+                    Some(line) => (serialize(&line.start), serialize(&line.end)),
+                    None => ("auto".to_string(), "auto".to_string()),
+                }
+            }
         };
+        let value = if named { value.trim().to_string() } else { serialize(&parse_grid_placement(value)) };
         if is_start {
-            start = value.trim().to_string();
+            start = value;
         } else {
-            end = value.trim().to_string();
+            end = value;
         }
-        *raw_slot = Some(format!("{start} / {end}"));
-        if is_col {
-            style.grid_column = None;
-        } else {
-            style.grid_row = None;
-        }
+        // Convert back to native placement once neither side needs named-line resolution.
+        set_grid_placement(style, &format!("{start} / {end}"), is_col);
         return;
     }
 
@@ -10208,6 +10229,14 @@ mod tests {
         let shorthand = compute_style("div", Some("display:grid;grid:auto-flow/repeat(3,1fr)"));
         assert_eq!(shorthand.grid_auto_flow, Some(taffy::GridAutoFlow::Row));
         assert_eq!(shorthand.grid_template_columns.len(), 3);
+    }
+
+    #[test]
+    fn grid_track_tokens_preserve_escaped_brackets_in_line_names() {
+        assert_eq!(tokenize_tracks(r"[a\]b] 10px [c]"), [r"[a\]b]", "10px", "[c]"]);
+        assert_eq!(tokenize_tracks(r"[a\\]10px[c]"), [r"[a\\]", "10px", "[c]"]);
+        assert_eq!(tokenize_tracks("[a]repeat(2,[b]10px[c])[d]"),
+            ["[a]", "repeat(2,[b]10px[c])", "[d]"]);
     }
 
     #[test]

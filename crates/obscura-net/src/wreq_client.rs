@@ -316,6 +316,15 @@ impl StealthHttpClient {
         self
     }
 
+    /// Browser-generated requests use the same identity as navigation.
+    pub async fn user_agent(&self) -> String {
+        self.extra_headers.read().await.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, value)| value.as_str())
+            .or(self.user_agent.as_deref())
+            .unwrap_or(STEALTH_USER_AGENT).to_string()
+    }
+
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_callbacks(url, None).await
     }
@@ -336,6 +345,15 @@ impl StealthHttpClient {
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
         self.fetch_with_profile(url, request, callbacks).await
+    }
+
+    /// Continue an intercepted subresource with request-local overrides.
+    pub async fn fetch_resource_request_with_callbacks(
+        &self, url: &Url, request: ResourceRequest, method: &str,
+        body: Option<Vec<u8>>, headers: Option<HashMap<String, String>>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request(url, request, callbacks, method, body, headers).await
     }
 
     async fn fetch_with_profile(

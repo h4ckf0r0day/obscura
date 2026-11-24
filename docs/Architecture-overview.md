@@ -300,6 +300,10 @@ message handlers and lexical state. Bare `onmessage` assignments target the
 worker scope, and messages posted before the source loads are queued until
 initialization finishes. Terminating a worker discards pending messages.
 
+Worker `location` is read-only and identifies the final entry script URL.
+Relative `fetch()`, `Request` and nested `Worker` URLs resolve against that URL;
+relative resource URLs from a blob worker are rejected.
+
 Workers remain emulated within the page runtime, not separate V8 isolates or
 OS threads. This is not a complete WorkerGlobalScope implementation.
 

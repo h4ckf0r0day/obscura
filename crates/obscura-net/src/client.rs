@@ -1298,6 +1298,17 @@ impl ObscuraHttpClient {
             .await
     }
 
+    /// Continue an intercepted subresource with request-local overrides.
+    pub async fn fetch_resource_request_with_callbacks(
+        &self, url: &Url, request: ResourceRequest, method: &str,
+        body: Option<Vec<u8>>, headers: Option<HashMap<String, String>>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
+    }
+
     async fn resource_cache_key(
         &self,
         method: &Method,
