@@ -330,11 +330,11 @@ jobs:
           set +e
           OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-base" \
             python3 obscura-benchmark/obstacle-course/run.py \
-              --json --runs 3 --warmup 1 > "$results_root/obstacle-base.json"
+              --json --runs 3 --warmup 0 > "$results_root/obstacle-base.json"
           base_status=$?
           OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-pr" \
             python3 obscura-benchmark/obstacle-course/run.py \
-              --json --runs 3 --warmup 1 > "$results_root/obstacle-pr.json"
+              --json --runs 3 --warmup 0 > "$results_root/obstacle-pr.json"
           pr_status=$?
           set -e
           printf 'Obstacle commands exited base=%s candidate=%s\n' "$base_status" "$pr_status"
