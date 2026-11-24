@@ -5373,8 +5373,8 @@ impl Page {
         Ok(self.process_pending_navigation_outcome().await? != PendingNavigationOutcome::None)
     }
 
-    /// Reject a document-driven cross-scheme jump to `file://` and restore
-    /// the virtual URL that the location setter changed before queuing it.
+    /// Reject a document-driven cross-scheme jump to `file://`. Location never
+    /// previewed the target, so the document keeps its URL as it is.
     pub fn reject_page_initiated_file_navigation(&mut self, target: &str) -> bool {
         let current_url = self.url_string();
         if !cross_scheme_to_file(&current_url, target) {
@@ -5385,15 +5385,6 @@ impl Page {
             current_url,
             target,
         );
-        if let Some(js) = self.js.as_mut() {
-            let _ = js.execute_script(
-                "<blocked-navigation>",
-                &format!(
-                    "globalThis.__virtualUrl = {};",
-                    serde_json::to_string(&current_url).unwrap_or_else(|_| "null".into())
-                ),
-            );
-        }
         true
     }
 
@@ -6983,6 +6974,20 @@ mod tests {
         page.sync_history_updates();
         assert_eq!(page.url_string(), format!("{url}#one"));
         assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+    }
+
+    // #1628: location used to report a script navigation's target at once and
+    // keep it when that navigation failed, while the old document stayed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_script_navigation_leaves_location_on_the_current_document() {
+        let url = "data:text/html,<title>current</title>";
+        let mut page = page_without_chain_limit("failed-location-navigation");
+        page.navigate(url).await.unwrap();
+        assert_eq!(page.evaluate("(() => { location.href = 'https://nonexistent-host.invalid/next'; return location.href; })()"),
+            serde_json::json!(url), "location keeps the current URL until a navigation commits");
+        assert!(page.process_pending_navigation().await.is_err());
+        assert_eq!(page.evaluate("[location.href, location.origin === new URL(document.URL).origin, document.URL, document.title]"),
+            serde_json::json!([url, true, url, "current"]));
     }
 
     #[tokio::test(flavor = "current_thread")]
