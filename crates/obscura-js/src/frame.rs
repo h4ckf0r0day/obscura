@@ -289,7 +289,7 @@ impl FrameRealm {
     /// Runs `source` in the frame's realm. Ops called from it find the frame's
     /// document by looking up the realm they were called from.
     fn run(&self, parent: &mut ObscuraJsRuntime, source: &str) -> Result<String, String> {
-        parent.eval_in_realm(&self.context, source)
+        parent.eval_in_realm(&self.context, source, true)
     }
 
     /// Runs a script inside the frame, reporting a script error as `Err`.
@@ -298,7 +298,7 @@ impl FrameRealm {
         parent: &mut ObscuraJsRuntime,
         source: &str,
     ) -> Result<(), String> {
-        self.run(parent, source).map(|_| ())
+        parent.eval_in_realm(&self.context, source, false).map(|_| ())
     }
 
     /// Evaluates an expression inside the frame and decodes it as JSON.
@@ -331,6 +331,9 @@ impl FrameRealm {
             Ok(scripts) => scripts,
             Err(error) => return vec![error],
         };
+        let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) else {
+            return vec!["could not run frame scripts: missing realm".to_string()];
+        };
 
         let mut problems = Vec::new();
         for (index, script) in scripts.iter().enumerate() {
@@ -356,7 +359,16 @@ impl FrameRealm {
             if source.trim().is_empty() {
                 continue;
             }
-            if let Err(error) = self.execute_script(parent, &source) {
+            let (previous, generation) = {
+                let mut state = state.borrow_mut();
+                (state.current_script.replace(script.node), state.document_generation)
+            };
+            let result = self.execute_script(parent, &source);
+            {
+                let mut state = state.borrow_mut();
+                if state.document_generation == generation { state.current_script = previous; }
+            }
+            if let Err(error) = result {
                 problems.push(format!("frame script {name} failed: {error}"));
             }
         }
@@ -406,6 +418,7 @@ impl FrameRealm {
             if dom.parser_script_already_started(id) { return None; }
             let text = dom.text_content(id);
             dom.with_node(id, |node| DocumentScript {
+                node: id,
                 src: node.get_attribute("src").unwrap_or("").to_string(),
                 type_attribute: node.get_attribute("type").unwrap_or("").to_lowercase(),
                 text,
@@ -415,6 +428,7 @@ impl FrameRealm {
 }
 
 struct DocumentScript {
+    node: obscura_dom::NodeId,
     src: String,
     type_attribute: String,
     text: String,
@@ -997,6 +1011,64 @@ mod tests {
             assert_eq!(frame.evaluate(&mut parent, "window.runs||0").unwrap(),
                 serde_json::json!(if complete { 1 } else { 0 }));
         }
+    }
+
+    #[test]
+    fn frame_void_scripts_do_not_coerce_their_completion_value() {
+        let mut parent = page("https://parent.example/", "<body></body>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/", "<body></body>").unwrap();
+        frame.execute_script(&mut parent, r#"
+            globalThis.completionCoerced = false;
+            ({ toString() { completionCoerced = true; throw new Error('unused completion'); } });
+        "#).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, "completionCoerced").unwrap(), serde_json::json!(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_classic_current_script_tracks_identity_and_clears_after_errors() {
+        let mut parent = page("https://parent.example/", "<script id='parent'></script><body></body>");
+        parent.evaluate("globalThis.__currentScriptNid=document.getElementById('parent')._nid").unwrap();
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame/page", r#"
+            <body>
+            <script id="first">
+                window.seen = [];
+                window.record = function (id) {
+                    const script = document.currentScript;
+                    const get = Object.getOwnPropertyDescriptor(Document.prototype, 'currentScript').get;
+                    seen.push([id, script.id, script === document.getElementById(id),
+                        get.call(document) === script,
+                        document.implementation.createHTMLDocument('').currentScript === null]);
+                };
+                record('first');
+            </script>
+            <script id="external" src="bundle.js"></script>
+            <script id="failure">record('failure'); throw new Error('frame failure');</script>
+            <script id="last">
+                record('last');
+                Promise.resolve().then(() => { window.afterMicrotask = document.currentScript === null; });
+            </script>
+            </body>
+        "#).unwrap();
+        let problems = frame.run_document_scripts(&mut parent, |url| {
+            assert_eq!(url, "https://parent.example/frame/bundle.js");
+            Some(r#"
+                record('external');
+                var classicGlobal = 41;
+                function declaredGlobally() { return classicGlobal + 1; }
+                document.write('<span id="written">written</span>');
+            "#.into())
+        });
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("frame failure"), "{problems:?}");
+        parent.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(frame.evaluate(&mut parent, "seen").unwrap(), serde_json::json!([
+            ["first", "first", true, true, true], ["external", "external", true, true, true],
+            ["failure", "failure", true, true, true], ["last", "last", true, true, true]
+        ]));
+        assert_eq!(frame.evaluate(&mut parent,
+            "[document.currentScript === null, afterMicrotask, declaredGlobally(), document.querySelector('#external + #written') !== null]"
+        ).unwrap(), serde_json::json!([true, true, 42, true]));
+        assert_eq!(parent.evaluate("document.currentScript.id").unwrap(), serde_json::json!("parent"));
     }
 
     /// The capability the frame realm exists for: scripts that arrived with the
