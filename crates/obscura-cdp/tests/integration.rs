@@ -25,6 +25,7 @@ integration_tests!(
     accessibility_names,
     backspace_surrogate,
     binding_called_session,
+    browser_close_reply,
     call_function_on_object_id_arg,
     cdp_click_submit_parity,
     cdp_ws_origin_policy,
