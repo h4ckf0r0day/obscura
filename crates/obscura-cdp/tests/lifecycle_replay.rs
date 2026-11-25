@@ -21,12 +21,19 @@ fn replay(ctx: &CdpContext, session: &str, frame: &Value) -> Vec<Value> {
     }).collect()
 }
 
+fn live_phases(ctx: &CdpContext) -> Vec<Value> {
+    ctx.pending_events.iter()
+        .filter(|event| event.method == "Page.lifecycleEvent" && event.params["name"] != "init")
+        .map(|event| event.params.clone()).collect()
+}
+
 #[tokio::test]
 async fn late_lifecycle_subscription_replays_only_to_the_attached_session() {
     let mut ctx = CdpContext::new();
     let page = ctx.create_page();
     ctx.sessions.insert("managed".into(), page.clone());
     call(&mut ctx, "Page.enable", json!({}), "managed").await;
+    let initial_events = live_phases(&ctx);
     ctx.sessions.insert("attached".into(), page);
     let tree = call(&mut ctx, "Page.getFrameTree", json!({}), "attached").await;
     ctx.pending_events.clear();
@@ -34,6 +41,8 @@ async fn late_lifecycle_subscription_replays_only_to_the_attached_session() {
     let first = replay(&ctx, "attached", &tree["frameTree"]["frame"]);
     let names: Vec<_> = first.iter().map(|event| event["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["commit", "DOMContentLoaded", "load", "networkAlmostIdle", "networkIdle"]);
+
+    assert_eq!(initial_events, first);
 
     // Chrome replays on each enable, retaining the document's original timings.
     for enabled in [true, false, true] {
@@ -55,18 +64,15 @@ async fn lifecycle_replay_tracks_the_latest_navigation_and_original_timestamps()
     for url in ["data:text/html,<p>first</p>", "data:text/html,<p>second</p>"] {
         ctx.pending_events.clear();
         call(&mut ctx, "Page.navigate", json!({"url":url}), "driver").await;
-        let emitted: Vec<_> = ctx.pending_events.iter()
-            .filter(|event| event.method == "Page.lifecycleEvent" && event.params["name"] != "init")
-            .map(|event| event.params.clone()).collect();
+        let emitted = live_phases(&ctx);
+        let names: Vec<_> = emitted.iter().map(|event| event["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["commit", "DOMContentLoaded", "load", "networkAlmostIdle", "networkIdle"]);
         let tree = call(&mut ctx, "Page.getFrameTree", json!({}), "observer").await;
         assert_ne!(tree["frameTree"]["frame"]["loaderId"], initial["frameTree"]["frame"]["loaderId"]);
         ctx.pending_events.clear();
         call(&mut ctx, "Page.setLifecycleEventsEnabled", json!({"enabled":true}), "observer").await;
         let events = replay(&ctx, "observer", &tree["frameTree"]["frame"]);
-        assert!(!events.is_empty());
-        for event in emitted {
-            assert!(events.contains(&event), "missing original lifecycle event: {event}");
-        }
+        assert_eq!(emitted, events);
     }
 }
 
