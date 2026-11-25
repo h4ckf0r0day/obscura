@@ -2626,6 +2626,19 @@ impl PreparedRender {
         Some(rect)
     }
 
+    /// Map immutable document-space points into the current viewport without
+    /// flattening rotated or skewed boxes into an axis-aligned rectangle.
+    pub fn viewport_transform_with_scroll(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState,
+    ) -> Option<crate::Affine2> {
+        self.layout.rects.get(&id)?;
+        let movement = scroll.movement_for(id);
+        Some(crate::Affine2::translate(movement.0, movement.1)
+            .then(self.layout.transforms.get(&id).copied().unwrap_or_default()))
+    }
+
     /// Every CSS border-box fragment in the current root viewport. Ordinary
     /// inlines can have one fragment per line; all other boxes expose their
     /// single border box. Keeping this separate from the bounding union is
