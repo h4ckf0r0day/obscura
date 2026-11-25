@@ -6194,6 +6194,7 @@ fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
     let mut current_decls = String::new();
     let mut block_depth = 0;
     let mut in_comment = false;
+    let mut quote: Option<char> = None;
     let mut chars = css.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -6201,6 +6202,45 @@ fn parse_stylesheet_for_viewport_preserving_containers_in_layer(
             if c == '*' && chars.peek() == Some(&'/') {
                 chars.next();
                 in_comment = false;
+            }
+            continue;
+        }
+        // Strings and escapes are copied through verbatim: a brace, quote or
+        // comment opener inside `content: "{"` or `.a\{` is not structure.
+        // A newline ends an unterminated string, as in the CSS tokenizer.
+        if quote.is_some() || c == '\\' || c == '"' || c == '\'' {
+            let buffer = if block_depth > 0 {
+                &mut current_decls
+            } else {
+                &mut current_selector
+            };
+            buffer.push(c);
+            if c == '\\' {
+                if let Some(mut escaped) = chars.next() {
+                    buffer.push(escaped);
+                    if escaped.is_ascii_hexdigit() {
+                        for _ in 0..5 {
+                            match chars.next_if(|c| c.is_ascii_hexdigit()) {
+                                Some(hex) => buffer.push(hex),
+                                None => break,
+                            }
+                        }
+                        // Hex escapes consume one optional CSS whitespace character.
+                        if let Some(space) = chars.next_if(|c| matches!(*c, ' ' | '\t' | '\n' | '\r' | '\u{c}')) {
+                            buffer.push(space);
+                            escaped = space;
+                        }
+                    }
+                    // CSS treats CRLF as one newline, including in a string continuation.
+                    if escaped == '\r' && chars.peek() == Some(&'\n') {
+                        buffer.push('\n');
+                        chars.next();
+                    }
+                }
+            } else if quote.is_none() {
+                quote = Some(c);
+            } else if Some(c) == quote || matches!(c, '\n' | '\r' | '\u{c}') {
+                quote = None;
             }
             continue;
         }
@@ -6971,7 +7011,16 @@ fn enclosing_parenthesized(condition: &str) -> Option<&str> {
     }
     let mut depth = 0i32;
     let mut quote = None;
+    let mut escaped = false;
     for (index, character) in condition.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
         if let Some(active) = quote {
             if character == active {
                 quote = None;
@@ -7285,6 +7334,27 @@ fn combine_selectors(parent: &str, child: &str) -> String {
 /// selector), emit `(sel, own-declarations)`, and recurse into each nested rule
 /// with the combined selector. Without this, Tailwind v4 / modern-framework CSS
 /// (which nests almost everything) loses the nested utility rules entirely.
+/// Whether `text` has a `{` outside strings and escapes, such as the opener
+/// of an unterminated nested block, as opposed to `content: "{"`.
+fn has_unquoted_open_brace(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if c == '{' {
+            return true;
+        }
+    }
+    false
+}
+
 fn denest(
     sel: &str,
     body: &str,
@@ -7315,6 +7385,11 @@ fn denest(
             i += 1;
             continue;
         }
+        // An escaped character (`"\""`, `.a\{`) is never a delimiter.
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
         if let Some(q) = quote {
             if c == q {
                 quote = None;
@@ -7339,6 +7414,10 @@ fn denest(
                 let (mut q2, mut cm2) = (None::<char>, false);
                 while j < n && depth > 0 {
                     let cj = chars[j];
+                    if !cm2 && cj == '\\' {
+                        j = (j + 2).min(n);
+                        continue;
+                    }
                     if cm2 {
                         if cj == '*' && chars.get(j + 1) == Some(&'/') {
                             cm2 = false;
@@ -7480,7 +7559,7 @@ fn denest(
     }
     let tail: String = chars[seg..].iter().collect();
     let tail = tail.trim();
-    if !tail.is_empty() && !tail.contains('{') {
+    if !tail.is_empty() && !has_unquoted_open_brace(tail) {
         own.push_str(tail);
         own.push(';');
     }
@@ -7677,8 +7756,17 @@ fn split_media_query_list(query: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     let mut start = 0usize;
     for (idx, c) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
         match c {
             _ if quote == Some(c) => quote = None,
             '\'' | '"' if quote.is_none() => quote = Some(c),
@@ -9382,6 +9470,85 @@ mod tests {
             Some(ContainerQueryExpr::Not(_))
         ));
         assert_eq!(parse_stylesheet(css).len(), 1);
+    }
+
+    #[test]
+    fn braces_and_quotes_in_strings_and_escapes_are_not_structure() {
+        // Icon-font sheets ship `.fa-bracket-curly{--fa:"{"}`; a brace in a
+        // string must not open a block that swallows the rest of the sheet.
+        let css = r#".a{--fa:"{";--fa--fa:"{{"}.b{content:'}'}
+            .c{content:"\"{"}.d\{{color:red}
+            @media screen{.e{content:"{"}.f{color:blue}}
+            .g{content:"/*"}.h{color:green}
+            .i{&:hover{content:"}"}}.j{color:black}"#;
+        let rules = parse_stylesheet(css);
+        let selectors: Vec<&str> = rules.iter().map(|(sel, _)| sel.as_str()).collect();
+        for expected in [".a", ".b", ".c", ".d\\{", ".e", ".f", ".g", ".h", ".i:hover", ".j"] {
+            assert!(selectors.contains(&expected), "{expected} missing from {selectors:?}");
+        }
+        let decls = |sel: &str| {
+            rules.iter().find(|(s, _)| s == sel).map(|(_, d)| d.as_str()).unwrap_or_default()
+        };
+        assert!(decls(".a").contains(r#"--fa--fa:"{{""#), "{}", decls(".a"));
+        assert!(decls(".c").contains(r#"content:"\"{""#), "{}", decls(".c"));
+        assert!(decls(".f").contains("color:blue"));
+        assert!(decls(".h").contains("color:green"));
+        assert!(decls(".j").contains("color:black"));
+    }
+
+    #[test]
+    fn stylesheet_scanner_keeps_rules_after_malformed_nested_escape() {
+        let rules = parse_stylesheet(".a{.b{content:\"\n} \\ }.after{color:blue}");
+        assert!(rules.iter().any(|(sel, decls)| sel == ".after" && decls == "color:blue;"));
+    }
+
+    #[test]
+    fn stylesheet_scanner_keeps_css_string_line_continuations() {
+        for newline in ["\n", "\r", "\u{c}", "\r\n"] {
+            let css = format!(".a{{content:\"a\\{newline}b\";color:red}}.after{{color:blue}}");
+            let rules = parse_stylesheet(&css);
+            assert_eq!(rules.len(), 2, "newline {newline:?}: {rules:?}");
+            assert_eq!(rules[0].0, ".a");
+            assert!(rules[0].1.contains("color:red;"));
+            assert_eq!(rules[1], (".after".to_string(), "color:blue;".to_string()));
+        }
+    }
+
+    #[test]
+    fn stylesheet_scanner_recovers_bad_strings_at_css_newlines() {
+        for newline in ["\n", "\r", "\u{c}", "\r\n"] {
+            let css = format!(".a{{content:\"bad{newline}}}.after{{color:blue}}");
+            let rules = parse_stylesheet(&css);
+            assert!(rules.iter().any(|(sel, decls)| sel == ".after" && decls == "color:blue;"),
+                "newline {newline:?}: {rules:?}");
+        }
+    }
+
+    #[test]
+    fn stylesheet_scanner_keeps_hex_escape_newline_terminators() {
+        for escape in ["\\4", "\\41", "\\000041"] {
+            for newline in ["\n", "\r", "\u{c}", "\r\n"] {
+                let css = format!(".a{{content:\"a{escape}{newline}b\";color:red}}.after{{color:blue}}");
+                let rules = parse_stylesheet(&css);
+                assert_eq!(rules.len(), 2, "escape {escape:?}, newline {newline:?}: {rules:?}");
+                assert_eq!(rules[0].1, format!("content:\"a{escape}{newline}b\";color:red;"));
+                assert_eq!(rules[1], (".after".to_string(), "color:blue;".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_quotes_do_not_end_strings_in_declarations_and_preludes() {
+        let parts: Vec<&str> = crate::style::split_declarations(r#"content:"\"";color:red"#)
+            .into_iter()
+            .map(str::trim)
+            .collect();
+        assert_eq!(parts, [r#"content:"\"""#, "color:red"]);
+        assert_eq!(
+            split_media_query_list(r#"screen and (x:"\",y"), print"#),
+            [r#"screen and (x:"\",y")"#, "print"]
+        );
+        assert_eq!(enclosing_parenthesized(r#"(content:"\")")"#), Some(r#"content:"\")""#));
     }
 
     #[test]

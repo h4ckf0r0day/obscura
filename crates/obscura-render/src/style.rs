@@ -485,8 +485,17 @@ pub(crate) fn split_declarations(css: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut in_quote: Option<char> = None;
+    let mut escaped = false;
     let mut start = 0;
     for (i, c) in css.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
         if let Some(q) = in_quote {
             if c == q {
                 in_quote = None;
