@@ -5643,9 +5643,7 @@ fn paint_laid_dom_scrolled(
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
-                let is_bold = crate::style::used_font_weight(style) >= 600;
-                let mw = measure_text(&marker, fsize, is_bold, style.font_family.as_deref());
-                let mx = rect.x + style.padding.left - mw - 6.0;
+                let mx = rect.x + style.padding.left - 6.0;
                 let my = rect.y + style.border.top + style.padding.top;
                 laid.text_engine.paint_direct_text(
                     &mut pixmap,
@@ -5655,7 +5653,7 @@ fn paint_laid_dom_scrolled(
                     color,
                     fsize,
                     Some(style),
-                    is_bold,
+                    true,
                     clip,
                     element_clip_mask,
                     raster_scale,
@@ -5683,7 +5681,6 @@ fn paint_laid_dom_scrolled(
         } else if let Some(runs) = laid.text_runs.get(&nid) {
             let color = style.color.unwrap_or([0, 0, 0, 255]);
             let fsize = style.font_size.unwrap_or(16.0);
-            let is_bold = crate::style::used_font_weight(style) >= 600;
             for (word_rect, word) in runs {
                 laid.text_engine.paint_direct_text(
                     &mut pixmap,
@@ -5693,7 +5690,7 @@ fn paint_laid_dom_scrolled(
                     color,
                     fsize,
                     Some(style),
-                    is_bold,
+                    false,
                     clip,
                     element_clip_mask,
                     raster_scale,
@@ -5718,7 +5715,7 @@ fn paint_laid_dom_scrolled(
                     style.color.unwrap_or([0, 0, 0, 255]),
                     fsize,
                     Some(style),
-                    crate::style::used_font_weight(style) >= 600,
+                    false,
                     Some(visible_rect),
                     element_clip_mask,
                     raster_scale,
@@ -5915,7 +5912,7 @@ fn paint_laid_dom_scrolled(
                                 color,
                                 fsize,
                                 Some(style),
-                                crate::style::used_font_weight(style) >= 600,
+                                false,
                                 Some(text_clip),
                                 element_clip_mask,
                                 raster_scale,
@@ -5945,7 +5942,7 @@ fn paint_laid_dom_scrolled(
                                 color,
                                 fsize,
                                 Some(style),
-                                crate::style::used_font_weight(style) >= 600,
+                                false,
                                 Some(text_clip),
                                 element_clip_mask,
                                 raster_scale,
@@ -7881,8 +7878,6 @@ fn paint_text_node(
     let color =
         clip_text_fill_color(style).unwrap_or_else(|| style.color.unwrap_or([0, 0, 0, 255]));
     let fsize = style.font_size.unwrap_or(16.0);
-    let is_bold = crate::style::used_font_weight(style) >= 600;
-
     for (rect, word) in runs {
         laid.text_engine.paint_direct_text(
             pixmap,
@@ -7892,7 +7887,7 @@ fn paint_text_node(
             color,
             fsize,
             Some(style),
-            is_bold,
+            false,
             clip,
             clip_mask.as_ref(),
             raster_scale,
@@ -20705,7 +20700,7 @@ mod tests {
         assert!(!at_end.has_active_css_animations());
     }
 
-    fn synthetic_hanzi_ttf(family_name: &str) -> Vec<u8> {
+    fn synthetic_square_ttf(family_name: &str, codepoints: &[u16]) -> Vec<u8> {
         let mut tables: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
         let push_u16 = |buf: &mut Vec<u8>, v: u16| buf.extend_from_slice(&v.to_be_bytes());
         let push_i16 = |buf: &mut Vec<u8>, v: i16| buf.extend_from_slice(&v.to_be_bytes());
@@ -20717,15 +20712,17 @@ mod tests {
         os2[4..6].copy_from_slice(&400u16.to_be_bytes()); // usWeightClass
         os2[6..8].copy_from_slice(&5u16.to_be_bytes());   // usWidthClass
         os2[62..64].copy_from_slice(&0x0040u16.to_be_bytes()); // fsSelection: REGULAR
-        os2[64..66].copy_from_slice(&0x4E2Du16.to_be_bytes()); // usFirstCharIndex
-        os2[66..68].copy_from_slice(&0x4E2Du16.to_be_bytes()); // usLastCharIndex
+        os2[64..66].copy_from_slice(&codepoints[0].to_be_bytes()); // usFirstCharIndex
+        os2[66..68].copy_from_slice(&codepoints[codepoints.len() - 1].to_be_bytes()); // usLastCharIndex
         os2[68..70].copy_from_slice(&850i16.to_be_bytes());    // sTypoAscender
         os2[70..72].copy_from_slice(&(-150i16).to_be_bytes()); // sTypoDescender
         os2[74..76].copy_from_slice(&850u16.to_be_bytes());    // usWinAscent
         os2[76..78].copy_from_slice(&150u16.to_be_bytes());    // usWinDescent
         tables.push((b"OS/2", os2));
 
-        // cmap (format 4 mapping U+4E2D -> glyph 1)
+        // Each codepoint maps to the same square, with a one-em advance.
+        let segments = codepoints.len() as u16 + 1;
+        let search_range = 2 * (1u16 << segments.ilog2());
         let mut cmap = Vec::new();
         push_u16(&mut cmap, 0); // version
         push_u16(&mut cmap, 1); // numTables
@@ -20733,21 +20730,24 @@ mod tests {
         push_u16(&mut cmap, 1); // encodingID (Unicode BMP)
         push_u32(&mut cmap, 12); // subtable offset
         push_u16(&mut cmap, 4); // format
-        push_u16(&mut cmap, 32); // length
+        push_u16(&mut cmap, 16 + 8 * segments); // length
         push_u16(&mut cmap, 0); // language
-        push_u16(&mut cmap, 4); // segCountX2 (2 segments)
-        push_u16(&mut cmap, 4); // searchRange
-        push_u16(&mut cmap, 1); // entrySelector
-        push_u16(&mut cmap, 0); // rangeShift
-        push_u16(&mut cmap, 0x4E2D); // endCode[0]
-        push_u16(&mut cmap, 0xFFFF); // endCode[1]
-        push_u16(&mut cmap, 0);      // reservedPad
-        push_u16(&mut cmap, 0x4E2D); // startCode[0]
-        push_u16(&mut cmap, 0xFFFF); // startCode[1]
-        push_i16(&mut cmap, 1 - 0x4E2Di32 as i16); // idDelta[0]
-        push_i16(&mut cmap, 1);      // idDelta[1]
-        push_u16(&mut cmap, 0);      // idRangeOffset[0]
-        push_u16(&mut cmap, 0);      // idRangeOffset[1]
+        push_u16(&mut cmap, 2 * segments); // segCountX2
+        push_u16(&mut cmap, search_range);
+        push_u16(&mut cmap, segments.ilog2() as u16);
+        push_u16(&mut cmap, 2 * segments - search_range);
+        for codepoint in codepoints.iter().copied().chain(std::iter::once(0xFFFF)) {
+            push_u16(&mut cmap, codepoint); // endCode
+        }
+        push_u16(&mut cmap, 0); // reservedPad
+        for codepoint in codepoints.iter().copied().chain(std::iter::once(0xFFFF)) {
+            push_u16(&mut cmap, codepoint); // startCode
+        }
+        for codepoint in codepoints {
+            push_i16(&mut cmap, (1i32 - i32::from(*codepoint)) as i16);
+        }
+        push_i16(&mut cmap, 1); // sentinel idDelta
+        for _ in 0..segments { push_u16(&mut cmap, 0); } // idRangeOffset
         tables.push((b"cmap", cmap));
 
         // glyf: glyph 0 empty (.notdef), glyph 1 solid clockwise square [100..900]
@@ -20870,8 +20870,52 @@ mod tests {
     }
 
     #[test]
+    fn list_markers_keep_loaded_font_advances_in_the_gutter() {
+        let font = synthetic_square_ttf("WideMarkers", &[46, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 8226]);
+        let tree = parse_html(r#"<!doctype html><style>
+            @font-face { font-family: WideMarkers; src: url(https://assets.test/markers.ttf) }
+            body { margin:0; background:white }
+            ol,ul { margin:0; padding:0 0 0 100px }
+            li { height:32px; padding-left:8px; color:blue; font:20px/32px WideMarkers,monospace }
+            span { color:red }
+            #spaced { letter-spacing:3px }
+            #bold { font-weight:700 }
+            </style><ol><li id=one><span>content</span></li></ol>
+            <ol start=12><li id=two><span>content</span></li></ol>
+            <ol><li id=spaced><span>content</span></li><li id=bold><span>content</span></li></ol>
+            <ul><li id=bullet><span>content</span></li></ul>"#);
+        let mut resources = RenderResourceCache::with_loader(move |url: &str|
+            (url == "https://assets.test/markers.ttf").then(|| font.clone()));
+        let mut prepared = prepare_dom(&tree, (360.0, 200.0), None, &mut resources).unwrap();
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let pixmap = paint_prepared_region_with_scroll(&tree, &mut prepared, &mut resources,
+            &scroll, CaptureRegion::new(0.0, 0.0, 360.0, 200.0, 1.0)).unwrap();
+        for id in ["one", "two", "spaced", "bold", "bullet"] {
+            let li = tree.get_element_by_id(id).unwrap();
+            let span = tree.children(li)[0];
+            let text_left = prepared.document_rect(span).unwrap().x;
+            let rect = prepared.document_rect(li).unwrap();
+            let mut blue_pixels = 0;
+            let mut rightmost = 0;
+            for y in rect.y as u32..(rect.y + rect.height) as u32 {
+                for x in 0..pixmap.width() {
+                    let p = pixmap.pixel(x, y).unwrap();
+                    if p.blue() > 150 && p.red() < 120 && p.green() < 120 {
+                        blue_pixels += 1;
+                        rightmost = rightmost.max(x);
+                    }
+                }
+            }
+            // One-em square glyphs distinguish loaded marker ink from fallback.
+            assert!(blue_pixels > 180, "{id}: loaded marker did not paint: {blue_pixels}");
+            assert!((rightmost as f32) < text_left,
+                "{id}: marker overlaps content: rightmost={rightmost}, text_left={text_left}");
+        }
+    }
+
+    #[test]
     fn native_controls_use_loaded_font_fallback_for_non_latin_glyphs() {
-        let hanzi_font = synthetic_hanzi_ttf("FixtureHanzi");
+        let hanzi_font = synthetic_square_ttf("FixtureHanzi", &[0x4E2D]);
         let parsed_face = cosmic_text::ttf_parser::Face::parse(&hanzi_font, 0)
             .expect("synthetic hanzi font must parse");
         let glyph_id = parsed_face.glyph_index('中').expect("U+4E2D glyph index");

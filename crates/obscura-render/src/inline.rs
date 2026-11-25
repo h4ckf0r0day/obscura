@@ -1468,7 +1468,7 @@ impl TextEngine {
         color: [u8; 4],
         font_size: f32,
         style: Option<&LayoutStyle>,
-        is_bold: bool,
+        align_right: bool,
         clip: Option<Rect>,
         clip_mask: Option<&tiny_skia::Mask>,
         raster_scale: f32,
@@ -1493,7 +1493,7 @@ impl TextEngine {
         }
         let weight = style
             .map(crate::style::used_font_weight)
-            .unwrap_or(if is_bold { 700 } else { 400 });
+            .unwrap_or(400);
         let italic = style.and_then(|s| s.font_style_italic).unwrap_or(false);
         let family_stack = style.and_then(|s| s.font_family.as_deref());
         let font = resolve_loaded_font(family_stack, weight, italic, &self.loaded_families);
@@ -1527,7 +1527,7 @@ impl TextEngine {
             word_break: crate::WordBreak::Normal,
         };
         let metrics = Metrics::new(font_size.max(1.0), box_height);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        let mut buffer = Buffer::new_empty(metrics);
         buffer.set_wrap(&mut self.font_system, Wrap::None);
         let variation_sets: Vec<Arc<FontVariations>> = variations.into_iter().collect();
         let variation_index = usize::from(!variation_sets.is_empty());
@@ -1551,7 +1551,6 @@ impl TextEngine {
                 (c.y + c.height) * raster_scale,
             )
         });
-        let ox = x * raster_scale;
         let oy = y * raster_scale;
         let pw = pixmap.width() as i32;
         let ph = pixmap.height() as i32;
@@ -1565,6 +1564,7 @@ impl TextEngine {
         } = self;
 
         for run in buffer.layout_runs() {
+            let ox = (if align_right { x - run.line_w } else { x }) * raster_scale;
             for glyph in run.glyphs {
                 let physical = glyph.physical((0.0, 0.0), raster_scale);
                 let glyph_color = glyph.color_opt.unwrap_or(default);
