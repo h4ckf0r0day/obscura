@@ -19192,6 +19192,46 @@ mod tests {
     }
 
     #[test]
+    fn inline_content_contributes_to_element_scroll_metrics() {
+        let tree = parse_html(r#"<style>body{margin:0;font:14px sans-serif}
+            #a,#b,#c{width:100px;white-space:nowrap}#a,#b{overflow:hidden}
+            #a{text-overflow:ellipsis}#v{height:40px;overflow:auto}
+            #h{width:200px;overflow:auto}#h>div{width:500px;height:20px}</style>
+            <div id="a">This text is far too long to fit</div>
+            <div id="b">This text is far too long to fit</div>
+            <div id="c">This text is far too long to fit</div>
+            <div id="v">1<br>2<br>3<br>4<br>5<br>6</div>
+            <div id="h"><div></div></div>
+            <div id="outer" style="width:120px;overflow:auto"><div id="inner"
+                style="width:100px;white-space:nowrap;overflow:hidden">This text is far too long to fit</div></div>"#);
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let prepared = prepare_dom(&tree, (800.0, 600.0), None, &mut resources).unwrap();
+        let state = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        for name in ["a", "b", "c", "v", "h", "inner"] {
+            let id = tree.get_element_by_id(name).unwrap();
+            let metrics = prepared.element_scroll_metrics(id, &state).unwrap();
+            if name == "v" {
+                assert!(metrics.content_size.1 > metrics.client_size.1, "{name}: {metrics:?}");
+            } else {
+                assert!(metrics.content_size.0 > metrics.client_size.0, "{name}: {metrics:?}");
+            }
+        }
+        let outer = tree.get_element_by_id("outer").unwrap();
+        let metrics = prepared.element_scroll_metrics(outer, &state).unwrap();
+        assert_eq!(metrics.content_size.0, 120.0, "inner clipped text must not enlarge outer scroll area");
+        let a = tree.get_element_by_id("a").unwrap();
+        let b = tree.get_element_by_id("b").unwrap();
+        assert_eq!(prepared.element_scroll_metrics(a, &state).unwrap().content_size,
+            prepared.element_scroll_metrics(b, &state).unwrap().content_size,
+            "ellipsis must retain natural text overflow");
+        let scrolled = prepared.resolve_scroll_state(&tree, (0.0, 0.0),
+            &HashMap::from([(a, (9999.0, 0.0))]));
+        let metrics = prepared.element_scroll_metrics(a, &scrolled).unwrap();
+        assert!(metrics.offset.0 > 0.0);
+        assert_eq!(metrics.offset.0, metrics.max_offset.0);
+    }
+
+    #[test]
     fn resolved_nested_scroll_keeps_owner_and_clip_stationary_while_pixels_move() {
         let tree = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
