@@ -163,10 +163,11 @@ struct CachedRasterPaint {
 // of its URL. Pending cohorts also cover elements sharing one transport load.
 #[derive(Default)]
 struct HtmlImageRequests {
-    // Request key, failure state, arena allocation identity, attempt generation.
-    nodes: HashMap<NodeId, (Arc<str>, bool, u64, Option<u64>)>,
+    // Request key, failure state, arena identity, generation, successful metadata.
+    nodes: HashMap<NodeId, (Arc<str>, bool, u64, Option<u64>, Option<crate::ReplacedIntrinsic>)>,
     cohorts: HashMap<Arc<str>, HtmlImageCohort>,
     next_generation: u64,
+    successful_keys: usize,
 }
 
 #[derive(Default)]
@@ -175,14 +176,19 @@ struct HtmlImageCohort {
     // attempt may finish. Every indexed member also occupies one bounded node record.
     attempts: HashMap<u64, HashSet<NodeId>>,
     count: usize,
+    successful: usize,
     pending: Option<u64>,
     started: bool,
 }
 
 impl HtmlImageRequests {
     fn forget(&mut self, node: NodeId) {
-        let Some((key, _, _, generation)) = self.nodes.remove(&node) else { return; };
+        let Some((key, _, _, generation, intrinsic)) = self.nodes.remove(&node) else { return; };
         let empty = self.cohorts.get_mut(key.as_ref()).is_some_and(|cohort| {
+            if intrinsic.is_some() {
+                cohort.successful -= 1;
+                if cohort.successful == 0 { self.successful_keys -= 1; }
+            }
             if let Some(generation) = generation {
                 let empty = cohort.attempts.get_mut(&generation).is_some_and(|members| {
                     members.remove(&node);
@@ -202,10 +208,18 @@ impl HtmlImageRequests {
     }
 
     fn observe(&mut self, node: NodeId, key: &str, failed: bool, allocation: u64) {
-        if let Some((old, state, identity, _)) = self.nodes.get_mut(&node) {
+        if let Some((old, state, identity, _, intrinsic)) = self.nodes.get_mut(&node) {
             if old.as_ref() == key && *identity == allocation {
                 if *state == failed { return; }
-                if failed { *state = true; return; }
+                if failed {
+                    *state = true;
+                    if intrinsic.take().is_some() {
+                        let cohort = self.cohorts.get_mut(old.as_ref()).expect("tracked image cohort");
+                        cohort.successful -= 1;
+                        if cohort.successful == 0 { self.successful_keys -= 1; }
+                    }
+                    return;
+                }
             }
         }
         self.forget(node);
@@ -225,37 +239,67 @@ impl HtmlImageRequests {
             cohort.attempts.entry(generation).or_default().insert(node);
             Some(generation)
         };
-        self.nodes.insert(node, (key, failed, allocation, generation));
+        self.nodes.insert(node, (key, failed, allocation, generation, None));
     }
 
-    fn complete(&mut self, key: &str, expected: Option<u64>, failed: bool) {
+    fn complete(&mut self, key: &str, expected: Option<u64>, intrinsic: Option<crate::ReplacedIntrinsic>) {
         let Some(generation) = expected else { return; };
         let Some(cohort) = self.cohorts.get_mut(key) else { return; };
         let Some(mut members) = cohort.attempts.remove(&generation) else { return; };
+        let had_success = cohort.successful != 0;
         for node in &members {
-            if failed {
-                if let Some((_, state, _, _)) = self.nodes.get_mut(node) { *state = true; }
-            } else if self.nodes.remove(node).is_some() {
-                cohort.count -= 1;
+            if let Some((_, failed, _, attempt, metadata)) = self.nodes.get_mut(node) {
+                match (metadata.is_some(), intrinsic.is_some()) {
+                    (false, true) => cohort.successful += 1,
+                    (true, false) => cohort.successful -= 1,
+                    _ => {}
+                }
+                *failed = intrinsic.is_none();
+                *metadata = intrinsic;
+                if intrinsic.is_some() { *attempt = None; }
             }
         }
+        match (had_success, cohort.successful != 0) {
+            (false, true) => self.successful_keys += 1,
+            (true, false) => self.successful_keys -= 1,
+            _ => {}
+        }
         if cohort.pending == Some(generation) { cohort.pending = None; cohort.started = false; }
-        if failed {
-            // Keep only this attempt's members, not historical table capacity.
+        // A late success may recover this failed attempt, but a late failure
+        // must not revoke a completed success or its retained dimensions.
+        if intrinsic.is_none() {
             members.shrink_to_fit();
             cohort.attempts.insert(generation, members);
         }
         if cohort.attempts.len() < cohort.attempts.capacity() / 4 { cohort.attempts.shrink_to_fit(); }
-        if cohort.count == 0 { self.cohorts.remove(key); }
     }
 
-    fn observe_success(&mut self, node: NodeId) {
-        // Bytes from another consumer may become visible while this attempt's
-        // own transport is still running. Keep its completion membership.
-        let active = self.nodes.get(&node).is_some_and(|(key, _, _, generation)| {
-            self.cohorts.get(key.as_ref()).is_some_and(|cohort| cohort.started && cohort.pending == *generation)
+    fn observe_success(&mut self, node: NodeId, key: &str, allocation: u64, intrinsic: crate::ReplacedIntrinsic) {
+        // Shared bytes may arrive before this attempt's transport finishes.
+        let active = self.nodes.get(&node).is_some_and(|(old, _, identity, generation, _)| {
+            old.as_ref() == key && *identity == allocation && self.cohorts.get(key)
+                .is_some_and(|cohort| cohort.started && cohort.pending == *generation)
         });
-        if !active { self.forget(node); }
+        if active {
+            if let Some((_, _, _, _, metadata)) = self.nodes.get_mut(&node) {
+                if metadata.is_none() {
+                    let cohort = self.cohorts.get_mut(key).expect("active image cohort");
+                    if cohort.successful == 0 { self.successful_keys += 1; }
+                    cohort.successful += 1;
+                }
+                *metadata = Some(intrinsic);
+            }
+            return;
+        }
+        self.forget(node);
+        if self.nodes.len() >= MAX_HTML_IMAGE_REQUESTS { return; }
+        let key = self.cohorts.get_key_value(key)
+            .map(|(key, _)| Arc::clone(key)).unwrap_or_else(|| Arc::from(key));
+        let cohort = self.cohorts.entry(Arc::clone(&key)).or_default();
+        cohort.count += 1;
+        if cohort.successful == 0 { self.successful_keys += 1; }
+        cohort.successful += 1;
+        self.nodes.insert(node, (key, false, allocation, None, Some(intrinsic)));
     }
 
     fn begin(&mut self, key: &str) -> Option<u64> {
@@ -361,11 +405,19 @@ impl RenderResourceCache {
         self.sync_loading_enabled
     }
 
-    /// Retain failed HTML image attempts for this document. Generic resource
-    /// failures keep their normal retry window.
+    /// Retain HTML image outcomes for this document. Successful selected URLs
+    /// each allow one additional byte-cache entry within the same byte limit.
+    /// Forgetting requests contracts that allowance at the next insertion.
+    /// Generic resource failures keep their normal retry window.
     pub fn set_document_scoped(&mut self, enabled: bool) {
         self.document_scoped = enabled;
-        if !enabled { *self.html_image_requests.get_mut() = HtmlImageRequests::default(); }
+        if !enabled {
+            *self.html_image_requests.get_mut() = HtmlImageRequests::default();
+            while self.entries.len() > self.max_entries {
+                let Some(oldest) = self.order.pop_front() else { break; };
+                self.remove_entry(&oldest);
+            }
+        }
     }
 
     pub fn forget_html_image_request(&self, node: NodeId) {
@@ -382,35 +434,41 @@ impl RenderResourceCache {
         }
     }
 
-    fn failed_html_image(&self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile) -> bool {
-        if !self.document_scoped { return false; }
+    fn known_html_image(&self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile) -> Option<Option<crate::ReplacedIntrinsic>> {
+        if !self.document_scoped { return None; }
         let mut requests = self.html_image_requests.borrow_mut();
-        let Some((key, failed, allocation, _)) = requests.nodes.get(&node) else { return false; };
-        if tree.node_allocation_generation(node) != Some(*allocation) {
+        let (key, failed, allocation, _, intrinsic) = requests.nodes.get(&node)?;
+        if tree.node_allocation_generation(node) != Some(*allocation)
+            || key.as_ref() != image_resource_key(url, profile) {
             requests.forget(node);
-            return false;
+            return None;
         }
-        *failed && key.as_ref() == image_resource_key(url, profile)
+        if *failed { Some(None) } else { intrinsic.map(Some) }
     }
 
-    fn observe_html_image(&self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile, outcome: Option<bool>) {
+    fn failed_html_image(&self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile) -> bool {
+        self.known_html_image(tree, node, url, profile) == Some(None)
+    }
+
+    fn observe_html_image(&self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile, outcome: Option<Option<crate::ReplacedIntrinsic>>) {
         if !self.document_scoped { return; }
         let mut requests = self.html_image_requests.borrow_mut();
         if url.starts_with("data:") {
             requests.forget(node);
             return;
         }
-        if outcome == Some(true) {
-            requests.observe_success(node);
-        } else {
-            if let Some(allocation) = tree.node_allocation_generation(node) {
-                requests.observe(node, &image_resource_key(url, profile), outcome == Some(false), allocation);
+        if let Some(allocation) = tree.node_allocation_generation(node) {
+            let key = image_resource_key(url, profile);
+            if let Some(Some(intrinsic)) = outcome {
+                requests.observe_success(node, &key, allocation, intrinsic);
+            } else {
+                requests.observe(node, &key, outcome == Some(None), allocation);
             }
         }
     }
 
     fn html_image_intrinsic(&mut self, tree: &DomTree, node: NodeId, url: &str, profile: ImageRequestProfile) -> Option<crate::ReplacedIntrinsic> {
-        if self.failed_html_image(tree, node, url, profile) { return None; }
+        if let Some(intrinsic) = self.known_html_image(tree, node, url, profile) { return intrinsic; }
         if self.document_scoped && !url.starts_with("data:") {
             // Keep the ordinary image loader's scheme/resolution gate before
             // consulting retained bytes or registering a transport attempt.
@@ -420,7 +478,7 @@ impl RenderResourceCache {
             let key = image_resource_key(url, profile);
             if let Some(entry @ CachedResource::Bytes { .. }) = self.entries.get(&key) {
                 let intrinsic = entry.image_intrinsic();
-                self.observe_html_image(tree, node, url, profile, Some(intrinsic.is_some()));
+                self.observe_html_image(tree, node, url, profile, Some(intrinsic));
                 return intrinsic;
             }
             self.observe_html_image(tree, node, url, profile, None);
@@ -430,11 +488,11 @@ impl RenderResourceCache {
             }
         }
         let intrinsic = self.profiled_image_intrinsic(url, profile);
-        let outcome = if intrinsic.is_some() { Some(true) } else {
+        let outcome = if intrinsic.is_some() { Some(intrinsic) } else {
             let key = image_resource_key(url, profile);
             match self.entries.get(&key) {
-                Some(CachedResource::Bytes { .. } | CachedResource::Missing(_)) => Some(false),
-                _ => self.stopped.contains(&key).then_some(false),
+                Some(CachedResource::Bytes { .. } | CachedResource::Missing(_)) => Some(None),
+                _ => self.stopped.contains(&key).then_some(None),
             }
         };
         self.observe_html_image(tree, node, url, profile, outcome);
@@ -537,7 +595,7 @@ impl RenderResourceCache {
         if generation.is_none() { self.seed_shared(key, bytes); return; }
         let intrinsic = generation.map(|_| image_intrinsic_metadata(&bytes));
         if let Some(intrinsic) = intrinsic {
-            self.html_image_requests.get_mut().complete(&key, generation, intrinsic.is_none());
+            self.html_image_requests.get_mut().complete(&key, generation, intrinsic);
         }
         self.seed_shared(key.clone(), bytes);
         if let (Some(intrinsic), Some(CachedResource::Bytes { intrinsic: cached, .. })) = (intrinsic, self.entries.get(&key)) {
@@ -552,7 +610,7 @@ impl RenderResourceCache {
 
     pub fn seed_image_missing_for_request(&mut self, url: String, profile: ImageRequestProfile, generation: Option<u64>) {
         let key = image_resource_key(&url, profile);
-        self.html_image_requests.get_mut().complete(&key, generation, true);
+        self.html_image_requests.get_mut().complete(&key, generation, None);
         self.seed_missing(key);
     }
 
@@ -583,7 +641,7 @@ impl RenderResourceCache {
         if self.has_cached_bytes(&key) { return; }
         self.remove(&key);
         let generation = self.html_image_requests.get_mut().generation(&key);
-        self.html_image_requests.get_mut().complete(&key, generation, true);
+        self.html_image_requests.get_mut().complete(&key, generation, None);
         self.stopped.insert(key);
     }
 
@@ -704,8 +762,10 @@ impl RenderResourceCache {
         let (src, density) = resolve_img_url(tree, id, viewport)?;
         let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
         let profile = image_request_profile(tree, id);
-        if self.failed_html_image(tree, id, &resolved_url, profile) {
-            return Some((resolved_url, density, true, None));
+        if let Some(intrinsic) = self.known_html_image(tree, id, &resolved_url, profile) {
+            let dimensions = intrinsic.and_then(crate::ReplacedIntrinsic::natural_size)
+                .map(|(width, height)| (width / density, height / density));
+            return Some((resolved_url, density, true, dimensions));
         }
         let mut metadata = self.cached_profiled_image_metadata(&resolved_url, None, profile);
         let can_track = self.document_scoped && {
@@ -716,7 +776,10 @@ impl RenderResourceCache {
             && matches!(self.entries.get(&image_resource_key(&resolved_url, profile)), Some(CachedResource::Missing(_))) {
             metadata = None;
         }
-        self.observe_html_image(tree, id, &resolved_url, profile, metadata.as_ref().map(Option::is_some));
+        let outcome = metadata.as_ref().map(|dimensions| dimensions.as_ref().and_then(|_| {
+            self.entries.get(&image_resource_key(&resolved_url, profile)).and_then(CachedResource::image_intrinsic)
+        }));
+        self.observe_html_image(tree, id, &resolved_url, profile, outcome);
         match metadata {
             None => Some((resolved_url, density, false, None)),
             Some(dimensions) => Some((
@@ -845,7 +908,7 @@ impl RenderResourceCache {
                 let generation = self.html_image_requests.get_mut().generation(&key);
                 let intrinsic = generation.map(|_| image_intrinsic_metadata(&bytes));
                 if let Some(intrinsic) = intrinsic {
-                    self.html_image_requests.get_mut().complete(&key, generation, intrinsic.is_none());
+                    self.html_image_requests.get_mut().complete(&key, generation, intrinsic);
                 }
                 self.insert_bytes(key.clone(), Arc::clone(&bytes));
                 if let (Some(intrinsic), Some(CachedResource::Bytes { intrinsic: cached, .. })) = (intrinsic, self.entries.get(&key)) {
@@ -855,18 +918,23 @@ impl RenderResourceCache {
             }
             None => {
                 let generation = self.html_image_requests.get_mut().generation(&key);
-                self.html_image_requests.get_mut().complete(&key, generation, true);
+                self.html_image_requests.get_mut().complete(&key, generation, None);
                 self.insert_missing(key);
                 None
             }
         }
     }
 
+    fn entry_limit(&self) -> usize {
+        if self.max_entries == 0 { return 0; }
+        self.max_entries.saturating_add(self.html_image_requests.borrow().successful_keys)
+    }
+
     fn insert_bytes(&mut self, url: String, bytes: Arc<[u8]>) {
         if self.max_entries == 0 || bytes.len() > self.max_bytes {
             return;
         }
-        while self.entries.len() >= self.max_entries
+        while self.entries.len() >= self.entry_limit()
             || self.retained_bytes.saturating_add(bytes.len()) > self.max_bytes
         {
             let Some(oldest) = self.order.pop_front() else {
@@ -887,7 +955,7 @@ impl RenderResourceCache {
         if self.max_entries == 0 {
             return;
         }
-        while self.entries.len() >= self.max_entries {
+        while self.entries.len() >= self.entry_limit() {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
@@ -12792,6 +12860,156 @@ mod tests {
     }
 
     #[test]
+    fn loaded_html_image_metadata_survives_byte_cache_eviction() {
+        let tree = parse_html(r#"<body style="margin:0"><img id="first" src="first.svg" style="display:block"><img id="second" src="second.svg" style="display:none">"#);
+        let first = tree.get_element_by_id("first").unwrap();
+        let second = tree.get_element_by_id("second").unwrap();
+        let base = "https://assets.test/";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let mut cache = RenderResourceCache::with_loader_and_limits(|_: &str| None, 1, 160);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        for (node, url, width) in [(first, "https://assets.test/first.svg", 23), (second, "https://assets.test/second.svg", 31)] {
+            assert!(!cache.cached_image_element_metadata(&tree, node, (80.0, 60.0), Some(base)).unwrap().2);
+            let generation = cache.begin_html_image_request(url, profile);
+            cache.seed_image_shared_for_request(url.into(), profile,
+                Arc::from(format!("<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='17'><rect width='{width}' height='17' fill='red'/></svg>").into_bytes()), generation);
+        }
+        assert_eq!(cache.retained_entry_count(), 1);
+        assert_eq!(cache.cached_image_metadata("first.svg", Some(base)), None,
+            "pixel bytes must remain evictable");
+        assert_eq!(cache.cached_image_element_metadata(&tree, first, (80.0, 60.0), Some(base)),
+            Some(("https://assets.test/first.svg".into(), 1.0, true, Some((23.0, 17.0)))),
+            "a completed image must not become pending when its bytes are evicted");
+        cache.take_sync_misses();
+        assert_eq!(cache.html_image_intrinsic(&tree, first, "https://assets.test/first.svg", profile).unwrap().natural_size(), Some((23.0, 17.0)));
+        assert!(cache.take_sync_misses().is_empty(), "intrinsic layout must not refetch completed images");
+        let mut prepared = prepare_dom(&tree, (80.0, 60.0), Some(base), &mut cache).unwrap();
+        paint_prepared(&tree, &mut prepared, &mut cache, (0.0, 0.0)).unwrap();
+        assert!(cache.take_sync_misses().iter().any(|(url, _, _)| url == "https://assets.test/first.svg"),
+            "paint must still request evicted visible bytes");
+        cache.seed_image_shared_for_request("https://assets.test/first.svg".into(), profile,
+            Arc::from(br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"><rect width="23" height="17" fill="red"/></svg>"#.as_slice()), None);
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut cache, (0.0, 0.0)).unwrap();
+        let pixel = pixmap.pixel(3, 3).unwrap();
+        assert!(pixel.red() > 240 && pixel.green() < 20 && pixel.blue() < 20,
+            "reloaded bytes must paint: {pixel:?}");
+        assert_eq!(cache.cached_image_element_metadata(&tree, second, (80.0, 60.0), Some(base)).unwrap().3, Some((31.0, 17.0)));
+
+    }
+
+    #[test]
+    fn successful_html_image_attempt_ignores_late_transport_failure() {
+        let tree = parse_html(r#"<img id="image" src="image.svg">"#);
+        let node = tree.get_element_by_id("image").unwrap();
+        let url = "https://assets.test/image.svg";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let mut cache = RenderResourceCache::with_loader(|_: &str| None);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        cache.html_image_intrinsic(&tree, node, url, profile);
+        let generation = cache.begin_html_image_request(url, profile);
+        cache.seed_image_shared_for_request(url.into(), profile,
+            Arc::from(br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"/>"#.as_slice()), generation);
+        cache.seed_image_missing_for_request(url.into(), profile, generation);
+        assert_eq!(cache.html_image_intrinsic(&tree, node, url, profile).unwrap().natural_size(), Some((23.0, 17.0)),
+            "a late failure cannot revoke a successfully completed attempt");
+        cache.seed_image_missing_for_request(url.into(), profile, None);
+        assert_eq!(cache.cached_image_element_metadata(&tree, node, (80.0, 60.0), Some("https://assets.test/")).unwrap().3,
+            Some((23.0, 17.0)), "a failed pixel-cache refill cannot change the original load result");
+    }
+
+    #[test]
+    fn loaded_html_image_selection_changes_discard_old_metadata() {
+        let tree = parse_html(r#"<img id="image" src="first.svg">"#);
+        let node = tree.get_element_by_id("image").unwrap();
+        let viewport = (80.0, 60.0);
+        let base = Some("https://assets.test/");
+        let mut cache = RenderResourceCache::with_loader_and_limits(|_: &str| None, 0, 0);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        for (src, cors, profile, width) in [
+            ("first.svg", None, ImageRequestProfile::NoCorsInclude, 23),
+            ("second.svg", None, ImageRequestProfile::NoCorsInclude, 31),
+            ("second.svg", Some("anonymous"), ImageRequestProfile::CorsSameOrigin, 46),
+        ] {
+            tree.with_node_mut(node, |node| {
+                node.set_attribute("src", src.into());
+                if let Some(cors) = cors { node.set_attribute("crossorigin", cors.into()); }
+            });
+            assert!(!cache.cached_image_element_metadata(&tree, node, viewport, base).unwrap().2,
+                "new source/profile must not reuse an old completed request");
+            let url = format!("https://assets.test/{src}");
+            let generation = cache.begin_html_image_request(&url, profile);
+            cache.seed_image_shared_for_request(url, profile,
+                Arc::from(format!("<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='18'/>").into_bytes()), generation);
+            assert_eq!(cache.cached_image_element_metadata(&tree, node, viewport, base).unwrap().3, Some((width as f32, 18.0)));
+            assert_eq!(cache.retained_entry_count(), 0);
+        }
+        tree.with_node_mut(node, |node| node.set_attribute("srcset", "second.svg 2x".into()));
+        assert_eq!(cache.cached_image_element_metadata(&tree, node, viewport, base).unwrap().3, Some((23.0, 9.0)),
+            "density correction must use retained raw metadata");
+        cache.retry_html_image_request(node, "https://assets.test/second.svg", ImageRequestProfile::CorsSameOrigin);
+        assert!(!cache.cached_image_element_metadata(&tree, node, viewport, base).unwrap().2,
+            "explicit retries must forget a completed request even without retained bytes");
+    }
+
+    #[test]
+    fn image_entry_allowance_is_shared_and_released_with_requests() {
+        let tree = parse_html(r#"<img id="a" src="shared.svg"><img id="b" src="shared.svg"><img id="c" src="other.svg">"#);
+        let a = tree.get_element_by_id("a").unwrap();
+        let b = tree.get_element_by_id("b").unwrap();
+        let c = tree.get_element_by_id("c").unwrap();
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let mut cache = RenderResourceCache::with_loader_and_limits(|_: &str| None, 1, 4096);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        for (node, url) in [(a, "https://assets.test/shared.svg"), (b, "https://assets.test/shared.svg"), (c, "https://assets.test/other.svg")] {
+            cache.html_image_intrinsic(&tree, node, url, profile);
+        }
+        for url in ["https://assets.test/shared.svg", "https://assets.test/other.svg"] {
+            cache.seed_image(url.into(), profile, br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"/>"#.to_vec());
+        }
+        for url in ["https://assets.test/one.css", "https://assets.test/two.css"] {
+            cache.seed(url.into(), b"body{}".to_vec());
+        }
+        assert_eq!(cache.retained_entry_count(), 3, "shared elements allow only one entry per selected URL");
+        cache.forget_html_image_request(a);
+        cache.seed("https://assets.test/three.css".into(), b"body{}".to_vec());
+        assert_eq!(cache.retained_entry_count(), 3, "another element still owns the shared selection");
+        cache.forget_html_image_request(b);
+        cache.seed("https://assets.test/four.css".into(), b"body{}".to_vec());
+        assert_eq!(cache.retained_entry_count(), 2);
+        cache.html_image_intrinsic(&tree, a, "https://assets.test/shared.svg", profile);
+        cache.seed_image("https://assets.test/shared.svg".into(), profile,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"/>"#.to_vec());
+        cache.seed("https://assets.test/five.css".into(), b"body{}".to_vec());
+        assert_eq!(cache.retained_entry_count(), 3);
+        cache.set_document_scoped(false);
+        assert_eq!(cache.retained_entry_count(), 1, "disabling document scope restores the ordinary count limit immediately");
+        assert!(cache.retained_byte_len() <= 4096);
+    }
+
+    #[test]
+    fn failed_in_flight_image_releases_its_shared_byte_allowance() {
+        let tree = parse_html(r#"<img id="image" src="shared.svg">"#);
+        let node = tree.get_element_by_id("image").unwrap();
+        let url = "https://assets.test/shared.svg";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let mut cache = RenderResourceCache::with_loader_and_limits(|_: &str| None, 1, 4096);
+        cache.set_document_scoped(true);
+        cache.set_sync_loading_enabled(false);
+        cache.html_image_intrinsic(&tree, node, url, profile);
+        let generation = cache.begin_html_image_request(url, profile);
+        cache.seed(url.into(), br#"<svg xmlns="http://www.w3.org/2000/svg" width="23" height="17"/>"#.to_vec());
+        assert_eq!(cache.cached_image_element_metadata(&tree, node, (80.0, 60.0), Some("https://assets.test/")).unwrap().3, Some((23.0, 17.0)));
+        cache.seed_image_missing_for_request(url.into(), profile, generation);
+        cache.seed("https://assets.test/next.css".into(), b"body{}".to_vec());
+        assert_eq!(cache.retained_entry_count(), 1, "failed transport must release the temporary shared-byte allowance");
+        assert!(cache.failed_html_image(&tree, node, url, profile));
+    }
+
+    #[test]
     fn html_image_failure_belongs_to_the_attempt_not_the_url() {
         let tree = parse_html(r#"<img id="old" src="retry.svg"><img id="new" src="retry.svg">"#);
         let old = tree.get_element_by_id("old").unwrap();
@@ -12814,6 +13032,8 @@ mod tests {
             "another consumer's success must not revive the failed image");
         cache.retry_html_image_request(old, url, profile);
         assert_eq!(cache.html_image_intrinsic(&tree, old, url, profile).unwrap().natural_size(), Some((23.0, 17.0)));
+        cache.forget_html_image_request(old);
+        cache.forget_html_image_request(new);
         assert!(cache.html_image_requests.borrow().nodes.is_empty());
         assert!(cache.html_image_requests.borrow().cohorts.is_empty());
     }
@@ -12896,12 +13116,13 @@ mod tests {
         assert!(Arc::ptr_eq(&requests.nodes[&a].0, &requests.nodes[&b].0));
         requests.observe(a, "new-profile", false, 0);
         let generation = requests.generation("old");
-        requests.complete("old", generation, true);
+        requests.complete("old", generation, None);
         assert!(!requests.nodes[&a].1);
         assert!(requests.nodes[&b].1);
         let generation = requests.generation("new-profile");
-        requests.complete("new-profile", generation, false);
-        assert!(!requests.nodes.contains_key(&a));
+        requests.complete("new-profile", generation, Some(crate::ReplacedIntrinsic::from_dimensions(23.0, 17.0)));
+        assert_eq!(requests.nodes[&a].4.unwrap().natural_size(), Some((23.0, 17.0)));
+        requests.forget(a);
         requests.forget(b);
         assert!(requests.cohorts.is_empty());
     }
@@ -12946,14 +13167,16 @@ mod tests {
         let node = NodeId::new(1);
         requests.observe(node, "url", false, 0);
         let old_generation = requests.generation("url");
-        requests.complete("url", old_generation, true);
+        requests.complete("url", old_generation, None);
         requests.forget(node);
         requests.observe(node, "url", false, 0);
         let new_generation = requests.generation("url");
         assert_ne!(old_generation, new_generation);
-        requests.complete("url", old_generation, true);
+        requests.complete("url", old_generation, None);
         assert!(!requests.nodes[&node].1);
-        requests.complete("url", new_generation, false);
+        requests.complete("url", new_generation, Some(crate::ReplacedIntrinsic::from_dimensions(23.0, 17.0)));
+        assert_eq!(requests.nodes[&node].4.unwrap().natural_size(), Some((23.0, 17.0)));
+        requests.forget(node);
         assert!(requests.nodes.is_empty());
         assert!(requests.cohorts.is_empty());
     }
