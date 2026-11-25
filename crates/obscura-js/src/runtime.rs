@@ -6992,6 +6992,63 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn legacy_caret_ranges_rescope_open_and_closed_shadow_content() {
+        let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}#context{position:fixed;left:0;top:0}#host{display:block;width:200px;height:24px}</style><div id='context'><i></i><div id='host'></div></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const context = document.getElementById('context');
+            let host = document.getElementById('host');
+            const result = [];
+            for (const mode of ['open', 'closed']) {
+                if (mode === 'closed') {
+                    const replacement = document.createElement('div'); replacement.id = 'host';
+                    host.replaceWith(replacement); host = replacement;
+                }
+                const root = host.attachShadow({mode});
+                for (const html of [
+                    '<span style="position:relative;z-index:2;display:inline-block">ABCD</span>',
+                    '<input value="ABCD" style="position:relative;z-index:2;border:0;padding:0;font:20px/24px monospace;width:200px;height:24px">',
+                ]) {
+                    root.innerHTML = html;
+                    const range = document.caretRangeFromPoint(1,12);
+                    const position = document.caretPositionFromPoint(1,12);
+                    const allowed = document.caretPositionFromPoint(1,12,{shadowRoots:[root]});
+                    result.push(range.startContainer === context && range.startOffset === 1 && range.collapsed,
+                        position.offsetNode === context && position.offset === 1,
+                        allowed.offsetNode.getRootNode() === root);
+                }
+            }
+            return result;
+        })()"#).unwrap(), serde_json::json!([
+            true, true, true, true, true, true, true, true, true, true, true, true
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn legacy_caret_ranges_rescope_nested_roots_without_hiding_slotted_text() {
+        let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}#context{position:fixed;left:0;top:0}#host{display:block;width:200px;height:24px}</style><div id='context'><div id='host'></div></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const context = document.getElementById('context'), host = document.getElementById('host');
+            const outer = host.attachShadow({mode:'open'});
+            outer.innerHTML = '<i></i><div id=nested style="position:relative;z-index:1;width:200px;height:24px"></div>';
+            const inner = outer.getElementById('nested').attachShadow({mode:'closed'});
+            inner.innerHTML = '<span style="position:relative;z-index:2;display:inline-block">ABCD</span>';
+            const range = document.caretRangeFromPoint(1,12);
+            const position = document.caretPositionFromPoint(1,12,{shadowRoots:[outer]});
+            const allowed = document.caretPositionFromPoint(1,12,{shadowRoots:[inner]});
+            const result = [range.startContainer === context && range.startOffset === 0 && range.collapsed,
+                position.offsetNode === outer && position.offset === 1,
+                allowed.offsetNode === inner.querySelector('span').firstChild];
+            outer.innerHTML = '<slot></slot>';
+            host.innerHTML = '<span style="position:relative;z-index:2;display:inline-block">LIGHT</span>';
+            const light = document.caretRangeFromPoint(1,12);
+            result.push(light.startContainer === host.firstChild.firstChild && light.collapsed);
+            return result;
+        })()"#).unwrap(), serde_json::json!([true, true, true, true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn document_carets_keep_receiver_realm_and_current_geometry() {
         let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}#parent{display:inline-block}</style><span id='parent'>ABCD</span>");
         assert_eq!(rt.evaluate(r#"(() => {
