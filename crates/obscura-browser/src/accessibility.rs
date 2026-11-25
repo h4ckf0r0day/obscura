@@ -153,6 +153,9 @@ fn map_role(data: &NodeData) -> &'static str {
                     "table" => "table",
                     "row" => "row",
                     "cell" | "gridcell" => "cell",
+                    "columnheader" => "columnheader",
+                    "rowheader" => "rowheader",
+                    "option" => "option",
                     "img" => "image",
                     "dialog" => "dialog",
                     "alert" => "alert",
@@ -214,6 +217,8 @@ fn map_role(data: &NodeData) -> &'static str {
                 "table" => "table",
                 "tr" => "row",
                 "td" | "th" => "cell",
+                "option" => "option",
+                "optgroup" => "group",
                 "nav" => "navigation",
                 "header" => "banner",
                 "main" => "main",
@@ -241,6 +246,47 @@ fn map_role(data: &NodeData) -> &'static str {
     }
 }
 
+/// The role of a node in its tree. `map_role` sees one node, and a `th` is a
+/// column or a row header depending on its row (HTML-AAM).
+fn tree_role(dom: &DomTree, node: &obscura_dom::Node) -> &'static str {
+    if tag(node) != "th" || node.get_attribute("role").is_some() {
+        return map_role(&node.data);
+    }
+    match node.get_attribute("scope").map(str::to_ascii_lowercase).as_deref() {
+        Some("row" | "rowgroup") => return "rowheader",
+        Some("col" | "colgroup") => return "columnheader",
+        _ => {}
+    }
+    let Some(row) = node.parent else { return "columnheader" };
+    let in_thead = dom.with_node(row, |row| row.parent).flatten()
+        .and_then(|group| dom.get_node(group))
+        .is_some_and(|group| tag(&group) == "thead");
+    let beside_data_cell = dom.children(row).into_iter()
+        .any(|cell| dom.get_node(cell).is_some_and(|cell| tag(&cell) == "td"));
+    if !in_thead && beside_data_cell { "rowheader" } else { "columnheader" }
+}
+
+fn option_value(dom: &DomTree, option: NodeId) -> String {
+    dom.get_node(option)
+        .and_then(|node| node.get_attribute("value").map(str::to_owned))
+        .unwrap_or_else(|| flat_string(&dom.text_content(option)))
+}
+
+/// The options a select shows as chosen. A single select follows its live
+/// value, then the `selected` attribute, then its first option.
+fn selected_options(dom: &DomTree, select: &obscura_dom::Node) -> Vec<NodeId> {
+    let options = dom.select_options(select.id).unwrap_or_default();
+    let marked = |id: &NodeId| dom.get_node(*id).is_some_and(|option| option.get_attribute("selected").is_some());
+    if select.get_attribute("multiple").is_some() {
+        return options.into_iter().filter(marked).collect();
+    }
+    let live = dom.form_control_state(select.id).and_then(|state| state.value)
+        .and_then(|value| options.iter().copied().find(|id| option_value(dom, *id) == value));
+    live.or_else(|| options.iter().copied().find(marked))
+        .or_else(|| options.first().copied())
+        .into_iter().collect()
+}
+
 #[derive(Clone, Copy, Default)]
 struct Visibility {
     subtree_hidden: bool,
@@ -252,6 +298,7 @@ pub struct AccessibilityContext {
     visibility: HashMap<NodeId, Visibility>,
     elements_by_id: HashMap<String, NodeId>,
     labels: HashMap<NodeId, Vec<NodeId>>,
+    selected_options: HashSet<NodeId>,
 }
 
 impl AccessibilityContext {
@@ -265,12 +312,12 @@ impl AccessibilityContext {
     pub fn describe_node(&self, dom: &DomTree, id: NodeId) -> Option<Value> {
         if self.is_hidden(id) { return None; }
         let node = dom.get_node(id)?;
-        let role = map_role(&node.data);
+        let role = tree_role(dom, &node);
         if role.is_empty() { return None; }
         let mut result = json!({"backendDOMNodeId":id.raw(),"role":ax_value_role(role)});
         if let Some(name) = compute_name(dom, &node, self) { result["name"] = ax_value_string(&name); }
         if let Some(value) = compute_value(dom, &node) { result["value"] = ax_value_string(&value); }
-        let properties = compute_properties(dom, &node);
+        let properties = compute_properties(dom, &node, self);
         if !properties.is_empty() { result["properties"] = json!(properties); }
         Some(result)
     }
@@ -280,6 +327,7 @@ impl AccessibilityContext {
             visibility: HashMap::new(),
             elements_by_id: HashMap::new(),
             labels: HashMap::new(),
+            selected_options: HashSet::new(),
         };
         for id in ids {
             let Some(node) = dom.get_node(*id) else {
@@ -300,10 +348,16 @@ impl AccessibilityContext {
                     "head" | "script" | "style" | "template" | "noscript"
                 )
                 || (tag(&node) == "input" && input_type(&node) == "hidden");
+            // A closed select renders none of its options, but they stay in
+            // the AX tree: they are what the control offers.
+            let unrendered_option = matches!(tag(&node), "option" | "optgroup");
+            if tag(&node) == "select" {
+                context.selected_options.extend(selected_options(dom, &node));
+            }
             context.visibility.insert(
                 *id,
                 Visibility {
-                    subtree_hidden: parent.subtree_hidden || hidden || style.display_none,
+                    subtree_hidden: parent.subtree_hidden || hidden || (style.display_none && !unrendered_option),
                     visibility_hidden: style.visibility_hidden.unwrap_or(parent.visibility_hidden),
                 },
             );
@@ -541,6 +595,9 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node, context: &Accessibility
             | "menuitem"
             | "tab"
             | "cell"
+            | "columnheader"
+            | "rowheader"
+            | "option"
             | "row"
             | "LabelText"
             | "StaticText"
@@ -625,7 +682,7 @@ fn is_content_editing_host(dom: &DomTree, node: &obscura_dom::Node) -> bool {
 }
 
 /// Compute accessibility properties for a node.
-fn compute_properties(dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
+fn compute_properties(dom: &DomTree, node: &obscura_dom::Node, context: &AccessibilityContext) -> Vec<Value> {
     if let NodeData::Element { name, attrs, .. } = &node.data {
         let tag = name.local.as_ref();
         let mut props = Vec::new();
@@ -679,6 +736,17 @@ fn compute_properties(dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         for (property, attribute) in [("expanded", "aria-expanded"), ("selected", "aria-selected"), ("pressed", "aria-pressed")] {
             if let Some(value) = node.get_attribute(attribute).filter(|value| matches!(*value, "true" | "false")) {
                 props.push(json!({"name":property,"value":ax_value_boolean(value == "true")}));
+            } else if node.get_attribute("role").is_none() {
+                // Native state: an option reports whether it is chosen, and a
+                // drop-down select is a collapsed combobox.
+                let native = match (property, tag) {
+                    ("selected", "option") => Some(context.selected_options.contains(&node.id)),
+                    ("expanded", "select") if map_role(&node.data) == "combobox" => Some(false),
+                    _ => None,
+                };
+                if let Some(value) = native {
+                    props.push(json!({"name":property,"value":ax_value_boolean(value)}));
+                }
             }
         }
 
@@ -729,6 +797,82 @@ mod tests {
         let mixed = ax_node_for(&nodes, checkbox)["properties"].as_array().unwrap().iter()
             .find(|property| property["name"] == "checked").unwrap();
         assert_eq!(mixed["value"]["value"], json!("mixed"));
+    }
+
+    fn role_of(nodes: &[Value], dom: &DomTree, id: &str) -> String {
+        ax_node_for(nodes, dom.get_element_by_id(id).unwrap())["role"]["value"].as_str().unwrap().to_string()
+    }
+
+    fn property_of(nodes: &[Value], dom: &DomTree, id: &str, name: &str) -> Option<Value> {
+        ax_node_for(nodes, dom.get_element_by_id(id).unwrap())["properties"].as_array()?
+            .iter().find(|property| property["name"] == name).map(|property| property["value"]["value"].clone())
+    }
+
+    #[test]
+    fn select_options_are_exposed_with_their_selected_state() {
+        let dom = parse_html(concat!(
+            "<select id=single aria-label=Status><option id=a>Scheduled</option><option id=b value=done>Completed</option></select>",
+            "<select id=marked><option id=c>One</option><option id=d selected>Two</option></select>",
+            "<select id=multi multiple><option id=e selected>A</option><option id=f>B</option><option id=g selected>C</option></select>",
+            "<select id=grouped><optgroup id=group label=Fruit><option id=h>Apple</option></optgroup></select>",
+        ));
+        // The renderer reports the options of a closed select as display: none.
+        let mut styles = HashMap::new();
+        for id in ["a", "b", "c", "d", "h"] {
+            styles.insert(dom.get_element_by_id(id).unwrap(), AccessibilityStyle { display_none: true, visibility_hidden: None });
+        }
+        let nodes = build_ax_nodes_with_styles(&dom, &styles);
+        let single = ax_node_for(&nodes, dom.get_element_by_id("single").unwrap());
+        assert_eq!(single["role"]["value"], "combobox");
+        assert_eq!(single["childIds"].as_array().map(Vec::len), Some(2), "options are children of their select");
+        assert_eq!(property_of(&nodes, &dom, "single", "expanded"), Some(json!(false)));
+        assert_eq!(property_of(&nodes, &dom, "multi", "expanded"), None, "a list box does not collapse");
+        for (id, name, selected) in [
+            ("a", "Scheduled", true), ("b", "Completed", false),
+            ("c", "One", false), ("d", "Two", true),
+            ("e", "A", true), ("f", "B", false), ("g", "C", true),
+            ("h", "Apple", true),
+        ] {
+            assert_eq!(role_of(&nodes, &dom, id), "option", "#{id}");
+            assert_eq!(ax_node_for(&nodes, dom.get_element_by_id(id).unwrap())["name"]["value"], name, "#{id}");
+            assert_eq!(property_of(&nodes, &dom, id, "selected"), Some(json!(selected)), "#{id}");
+        }
+        assert_eq!(role_of(&nodes, &dom, "group"), "group");
+
+        // A script that picks another option moves the selection with it.
+        dom.update_form_control_state(dom.get_element_by_id("single").unwrap(), |state| state.value = Some("done".into()));
+        let nodes = build_ax_nodes_with_styles(&dom, &styles);
+        assert_eq!(property_of(&nodes, &dom, "a", "selected"), Some(json!(false)));
+        assert_eq!(property_of(&nodes, &dom, "b", "selected"), Some(json!(true)));
+
+        // An author-hidden option and a hidden select stay out of the tree.
+        let dom = parse_html("<select id=s><option id=shown>Shown</option><option id=gone hidden>Gone</option></select><select hidden><option id=inner>Inner</option></select>");
+        let nodes = build_ax_nodes(&dom);
+        for id in ["gone", "inner"] {
+            let backend = dom.get_element_by_id(id).unwrap().raw();
+            assert!(nodes.iter().all(|node| node["backendDOMNodeId"] != backend), "#{id}");
+        }
+        assert_eq!(property_of(&nodes, &dom, "shown", "selected"), Some(json!(true)));
+    }
+
+    #[test]
+    fn header_cells_are_column_or_row_headers() {
+        let dom = parse_html(concat!(
+            "<table><thead><tr><th id=head>Patient</th><th id=date>Date</th></tr></thead>",
+            "<tbody><tr><th id=row>Alice</th><td id=cell>2026-11-09</td></tr>",
+            "<tr><th id=scoped scope=col>Total</th><td>1</td></tr>",
+            "<tr><th id=explicit role=cell>Plain</th><td>2</td></tr></tbody></table>",
+            "<table><tr><th id=bare>Name</th><th id=rowscope scope=row>Age</th></tr><tr><td>Bob</td><td>3</td></tr></table>",
+        ));
+        let nodes = build_ax_nodes(&dom);
+        for (id, role) in [
+            ("head", "columnheader"), ("date", "columnheader"), ("row", "rowheader"), ("cell", "cell"),
+            ("scoped", "columnheader"), ("explicit", "cell"), ("bare", "columnheader"), ("rowscope", "rowheader"),
+        ] {
+            assert_eq!(role_of(&nodes, &dom, id), role, "#{id}");
+        }
+        assert_name(&dom, "head", Some("Patient"));
+        assert_name(&dom, "row", Some("Alice"));
     }
 
     #[test]
