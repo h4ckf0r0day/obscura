@@ -247,9 +247,12 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
         elapsed_ms = (time.perf_counter() - started) * 1000
         if process.returncode != 0:
             raise RuntimeError(f"{binary} exited with status {process.returncode}")
+        if not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
+            raise RuntimeError(f"{binary} produced an invalid latency measurement")
         cpu_seconds = usage.ru_utime + usage.ru_stime
         rss_kib = usage.ru_maxrss
-        if not math.isfinite(cpu_seconds) or usage.ru_utime < 0 or usage.ru_stime < 0 or rss_kib <= 0:
+        if (not math.isfinite(cpu_seconds) or usage.ru_utime < 0 or usage.ru_stime < 0
+                or not math.isfinite(rss_kib) or rss_kib <= 0):
             raise RuntimeError(f"{binary} produced an invalid CPU/RSS measurement")
         try:
             result = json.loads(stdout_path.read_text(encoding="utf-8"))
@@ -267,6 +270,31 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
 
 def median(values: list[float | int]) -> float:
     return float(statistics.median(values))
+
+
+def paired_comparison(base: list[float | int], candidate: list[float | int],
+                      ratio_limit: float, delta_limit: float) -> dict[str, object]:
+    if not base or len(base) != len(candidate):
+        raise RuntimeError("invalid paired sample counts")
+    # Both lists retain round order even when the execution order alternates.
+    ratios = [changed / original if original else (math.inf if changed else 1.0)
+              for original, changed in zip(base, candidate)]
+    deltas = [changed - original for original, changed in zip(base, candidate)]
+    ratio, delta = median(ratios), median(deltas)
+    exceeding = sum(r > ratio_limit and d > delta_limit for r, d in zip(ratios, deltas))
+    return {
+        # Zero CPU baselines have no finite positive ratio; retain their deltas.
+        "ratios": [value if math.isfinite(value) else None for value in ratios],
+        "deltas": deltas,
+        "median_ratio": ratio if math.isfinite(ratio) else None,
+        "median_delta": delta,
+        "exceeding_pairs": exceeding,
+        "regression": ratio > ratio_limit and delta > delta_limit and exceeding > len(base) / 2,
+    }
+
+
+def percent_change(ratio: float | None) -> str:
+    return f"{(ratio - 1) * 100:+.1f}%" if ratio is not None else "n/a"
 
 
 def add_summary(markdown: str) -> None:
@@ -314,12 +342,18 @@ def main() -> None:
         server.shutdown()
         server.server_close()
 
-    report: dict[str, object] = {"rounds": ROUNDS, "scenarios": {}}
+    report: dict[str, object] = {
+        "rounds": ROUNDS,
+        "comparison_method": "median paired ratios and deltas; majority exceeding both limits",
+        "scenarios": {},
+    }
     lines = [
         "## Performance smoke comparison\n\n",
-        "Fails above 10% and 10 ms for latency, 10% and 20 ms for CPU, or 15% and 8 MiB for RSS.\n\n",
-        "| Scenario | Base latency | PR latency | Change | Base CPU | PR CPU | Base RSS | PR RSS | Change |\n",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "Compares adjacent base/PR pairs. Fails when the median paired change exceeds "
+        "10% and 10 ms for latency, 10% and 20 ms for CPU, or 15% and 8 MiB for RSS, "
+        "with a majority of the same pairs exceeding both limits. Arm medians are shown for context.\n\n",
+        "| Scenario | Base latency | PR latency | Paired change | Base CPU | PR CPU | Paired change | Base RSS | PR RSS | Paired change |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     ]
     failures = []
     for scenario in SCENARIOS:
@@ -331,6 +365,15 @@ def main() -> None:
         rss_ratio = pr_rss / base_rss
         base_cpu = median(samples[scenario]["base"]["cpu_seconds"])
         pr_cpu = median(samples[scenario]["candidate"]["cpu_seconds"])
+        paired = {
+            metric: paired_comparison(samples[scenario]["base"][metric],
+                                      samples[scenario]["candidate"][metric], ratio, delta)
+            for metric, ratio, delta in (
+                ("latency_ms", LATENCY_FAILURE_RATIO, LATENCY_FAILURE_DELTA_MS),
+                ("cpu_seconds", CPU_FAILURE_RATIO, CPU_FAILURE_DELTA_SECONDS + 1e-9),
+                ("rss_kib", RSS_FAILURE_RATIO, RSS_FAILURE_DELTA_KIB),
+            )
+        }
         report["scenarios"][scenario] = {
             "base_cpu_seconds": base_cpu,
             "candidate_cpu_seconds": pr_cpu,
@@ -341,23 +384,20 @@ def main() -> None:
             "candidate_rss_kib": pr_rss,
             "rss_ratio": rss_ratio,
             "samples": samples[scenario],
+            "paired": paired,
         }
         lines.append(
             f"| {scenario} | {base_latency:.1f} ms | {pr_latency:.1f} ms | "
-            f"{(latency_ratio - 1) * 100:+.1f}% | {base_cpu:.4f} s | {pr_cpu:.4f} s | {base_rss / 1024:.1f} MiB | "
-            f"{pr_rss / 1024:.1f} MiB | {(rss_ratio - 1) * 100:+.1f}% |\n"
+            f"{percent_change(paired['latency_ms']['median_ratio'])} | {base_cpu:.4f} s | {pr_cpu:.4f} s | "
+            f"{percent_change(paired['cpu_seconds']['median_ratio'])} | {base_rss / 1024:.1f} MiB | "
+            f"{pr_rss / 1024:.1f} MiB | {percent_change(paired['rss_kib']['median_ratio'])} |\n"
         )
-        latency_delta = pr_latency - base_latency
-        rss_delta = pr_rss - base_rss
-        if (
-            latency_ratio > LATENCY_FAILURE_RATIO
-            and latency_delta > LATENCY_FAILURE_DELTA_MS
-        ):
-            failures.append(f"{scenario} latency is {latency_ratio:.2f}x the base")
-        if pr_cpu > base_cpu * CPU_FAILURE_RATIO and pr_cpu - base_cpu > CPU_FAILURE_DELTA_SECONDS + 1e-9:
-            failures.append(f"{scenario} CPU increased from {base_cpu:.4f} s to {pr_cpu:.4f} s")
-        if rss_ratio > RSS_FAILURE_RATIO and rss_delta > RSS_FAILURE_DELTA_KIB:
-            failures.append(f"{scenario} RSS is {rss_ratio:.2f}x the base")
+        if paired["latency_ms"]["regression"]:
+            failures.append(f"{scenario} latency median paired ratio is {paired['latency_ms']['median_ratio']:.2f}x the base")
+        if paired["cpu_seconds"]["regression"]:
+            failures.append(f"{scenario} CPU median paired increase is {paired['cpu_seconds']['median_delta']:.4f} s")
+        if paired["rss_kib"]["regression"]:
+            failures.append(f"{scenario} RSS median paired ratio is {paired['rss_kib']['median_ratio']:.2f}x the base")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
