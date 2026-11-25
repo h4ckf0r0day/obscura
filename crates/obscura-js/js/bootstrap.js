@@ -19759,10 +19759,10 @@ const _installCaretGeometry = (function _installCaretGeometry() {
     _markNative(descriptor.value || descriptor.get);
   }
   _markNative(CaretPosition);
-  function nativeCaret(receiver, x, y) {
+  function nativeCaret(receiver, x, y, rescopeShadow = false) {
     if (receiver !== globalThis.document && !(receiver instanceof Document)) throw new TypeError('Illegal invocation');
     if (receiver._nid !== globalThis.document?._nid) return null;
-    const raw = __obscuraCore.ops.op_layout_caret(x, y, _realmFrameId);
+    const raw = __obscuraCore.ops.op_layout_caret(x, y, _realmFrameId, rescopeShadow);
     if (!raw) return null;
     const [nid, offset] = JSON.parse(raw);
     const node = _wrap(nid);
@@ -19772,7 +19772,8 @@ const _installCaretGeometry = (function _installCaretGeometry() {
     const method = _documentRealmMember(this, 'caretRangeFromPoint');
     if (method) return Reflect.apply(method, this, [x, y]);
     // The legacy Chromium extension takes optional signed integer coordinates.
-    const state = nativeCaret(this, +x | 0, +y | 0);
+    // Rescope before wrapping native hits, including closed shadow descendants.
+    const state = nativeCaret(this, +x | 0, +y | 0, true);
     if (!state) return null;
     const range = new Range();
     // Widget value offsets are not DOM Range boundaries. The legacy API
