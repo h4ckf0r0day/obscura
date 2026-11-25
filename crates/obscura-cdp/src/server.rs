@@ -2658,7 +2658,7 @@ fn fast_path_response(
     text: &str,
     routes: &crate::dispatch::InterruptRoutes,
     owner: std::thread::ThreadId,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
     if req.method == "Runtime.terminateExecution" {
@@ -2675,10 +2675,11 @@ fn fast_path_response(
             _ => crate::types::CdpResponse::error(req.id, -32601,
                 "Unknown Runtime method: terminateExecution".into(), req.session_id),
         };
-        return serde_json::to_string(&response).ok();
+        return serde_json::to_string(&response).ok().map(|response| (response, false));
     }
 
     let result = match req.method.as_str() {
+        "Browser.close" => Some(json!({})),
         "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
         "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
@@ -2707,7 +2708,7 @@ fn fast_path_response(
 
     if let Some(value) = result {
         let resp = crate::types::CdpResponse::success(req.id, value, req.session_id);
-        serde_json::to_string(&resp).ok()
+        serde_json::to_string(&resp).ok().map(|response| (response, req.method == "Browser.close"))
     } else {
         None
     }
@@ -2743,6 +2744,11 @@ async fn handle_connection_ws(
 
     let send_task = tokio::task::spawn_local(async move {
         while let Some(msg) = reply_rx.recv().await {
+            // An empty internal message closes the writer after queued replies flush.
+            if msg.is_empty() {
+                let _ = ws_sender.close().await;
+                break;
+            }
             if msg.contains("\"__init\"") {
                 continue;
             }
@@ -2763,18 +2769,13 @@ async fn handle_connection_ws(
 
         match msg {
             Message::Text(text) => {
-                if text.contains("\"Browser.close\"") {
-                    if let Ok(req) = serde_json::from_str::<CdpRequest>(&text) {
-                        let resp = crate::types::CdpResponse::success(req.id, json!({}), None);
-                        if let Ok(json) = serde_json::to_string(&resp) {
-                            let _ = reply_tx.send(json);
-                        }
-                    }
-                    break;
-                }
-
-                if let Some(resp) = fast_path_response(&text, &interrupt_routes, connection_thread) {
+                if let Some((resp, close)) = fast_path_response(&text, &interrupt_routes, connection_thread) {
                     let _ = reply_tx.send(resp);
+                    if close {
+                        let _ = reply_tx.send(String::new());
+                        let _ = send_task.await;
+                        return Ok(());
+                    }
                 } else {
                     let _ = msg_tx.send(ServerMessage::Cdp(CdpMessage {
                         text: text.to_string(),
