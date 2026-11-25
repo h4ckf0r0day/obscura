@@ -5571,6 +5571,21 @@ class Element extends Node {
       opts[i]._selected = (i === v);
     }
   }
+  get selectedOptions() {
+    const opts = this.options;
+    const result = [];
+    let hasExplicit = false;
+    for (let i = 0; i < opts.length; i++) {
+      if (opts[i].selected || opts[i].hasAttribute('selected')) {
+        result.push(opts[i]);
+        hasExplicit = true;
+      }
+    }
+    if (!hasExplicit && opts.length && !this.hasAttribute('multiple')) {
+      result.push(opts[0]);
+    }
+    return HTMLCollection._from(result);
+  }
   // Per the HTML spec, the submit() METHOD submits the form WITHOUT firing a
   // cancelable `submit` event: a page's submit listener cannot veto it. Only
   // requestSubmit() and user-initiated submits fire the cancelable event.

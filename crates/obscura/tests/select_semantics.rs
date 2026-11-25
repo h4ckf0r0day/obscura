@@ -99,3 +99,56 @@ async fn select_without_explicit_selection_defaults_to_first_option() {
     assert_eq!(probes["index"], 0);
     assert_eq!(probes["value"], "a");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn selected_options_returns_html_collection() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server();
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+
+    let probes = page.evaluate(
+        r#"(function () {
+            var single = document.getElementById('single');
+            var multi = document.getElementById('multi');
+            var empty = document.getElementById('empty');
+
+            // Single select with no explicit selected attr implicitly selects first
+            var so = single.selectedOptions;
+            var implicitLen = so.length;
+            var implicitVal = so.length ? so[0].value : null;
+
+            // After programmatic assignment, selectedOptions reflects new state
+            single.value = 'b';
+            var afterSet = single.selectedOptions;
+            var afterSetLen = afterSet.length;
+            var afterSetVal = afterSet.length ? afterSet[0].value : null;
+
+            // Multiple select with no explicit selection returns empty
+            var multiSo = multi.selectedOptions;
+            var multiLen = multiSo.length;
+
+            // Empty select returns empty
+            var emptySo = empty.selectedOptions;
+            var emptyLen = emptySo.length;
+
+            return {
+                implicit_len: implicitLen,
+                implicit_val: implicitVal,
+                after_set_len: afterSetLen,
+                after_set_val: afterSetVal,
+                multi_len: multiLen,
+                empty_len: emptyLen,
+            };
+        })()"#,
+    );
+
+    assert_eq!(probes["implicit_len"], 1);
+    assert_eq!(probes["implicit_val"], "a");
+    assert_eq!(probes["after_set_len"], 1);
+    assert_eq!(probes["after_set_val"], "b");
+    assert_eq!(probes["multi_len"], 0);
+    assert_eq!(probes["empty_len"], 0);
+}
