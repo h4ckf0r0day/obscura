@@ -1421,6 +1421,17 @@ impl TextEngine {
         ascent + descent
     }
 
+    pub(crate) fn font_box_height_for_size(&self, style: &LayoutStyle, font_size: f32) -> f32 {
+        let font = resolve_loaded_font(
+            style.font_family.as_deref(),
+            crate::style::used_font_weight(style),
+            style.font_style_italic.unwrap_or(false),
+            &self.loaded_families,
+        );
+        let (ascent, descent) = fitted_font_box_metrics(font_size, font.metrics);
+        ascent + descent
+    }
+
     pub(crate) fn inline_font_box_metrics(&self, style: &LayoutStyle) -> (f32, f32) {
         let font = resolve_loaded_font(
             style.font_family.as_deref(),
@@ -1442,6 +1453,146 @@ impl TextEngine {
             &self.loaded_families,
         );
         used_line_height_for_font(style, &font)
+    }
+
+    /// Shape and paint a single standalone string (such as a form control value,
+    /// placeholder, `<select>` label, or `<img alt>` fallback) through the
+    /// configured font database so `--font-dir` and webfont fallback apply.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_direct_text(
+        &mut self,
+        pixmap: &mut tiny_skia::Pixmap,
+        text: &str,
+        x: f32,
+        y: f32,
+        color: [u8; 4],
+        font_size: f32,
+        style: Option<&LayoutStyle>,
+        align_right: bool,
+        clip: Option<Rect>,
+        clip_mask: Option<&tiny_skia::Mask>,
+        raster_scale: f32,
+    ) {
+        if text.is_empty()
+            || color[3] == 0
+            || !font_size.is_finite()
+            || font_size <= 0.0
+            || clip.is_some_and(|c| c.width <= 0.0 || c.height <= 0.0)
+        {
+            return;
+        }
+        // Match the earlier single-line native paint behavior where control
+        // characters never introduce extra vertical lines inside a control.
+        let shaped_text: std::borrow::Cow<'_, str> = if text.chars().any(char::is_control) {
+            std::borrow::Cow::Owned(text.chars().filter(|c| !c.is_control()).collect())
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        if shaped_text.is_empty() {
+            return;
+        }
+        let weight = style
+            .map(crate::style::used_font_weight)
+            .unwrap_or(400);
+        let italic = style.and_then(|s| s.font_style_italic).unwrap_or(false);
+        let family_stack = style.and_then(|s| s.font_family.as_deref());
+        let font = resolve_loaded_font(family_stack, weight, italic, &self.loaded_families);
+        let (ascent, descent) = fitted_font_box_metrics(font_size, font.metrics);
+        let box_height = (ascent + descent).max(1.0);
+        let variations = style.and_then(|s| resolved_font_variations(s, &font));
+        let span_attrs = SpanAttrs {
+            font_size,
+            line_height: box_height,
+            letter_spacing: style.and_then(|s| s.letter_spacing).unwrap_or(0.0),
+            word_spacing: style.and_then(|s| s.word_spacing).unwrap_or(0.0),
+            letter_spacing_non_normal: style
+                .and_then(|s| s.letter_spacing_non_normal)
+                .unwrap_or(false),
+            weight,
+            optical_sizing: style
+                .and_then(|s| s.font_optical_sizing)
+                .unwrap_or_default(),
+            font_id: font.font_id,
+            variations: variations.clone(),
+            italic,
+            synthetic_italic: font.synthetic_italic,
+            underline: false,
+            overline: false,
+            line_through: false,
+            color,
+            family: font.family,
+            clip_fill: None,
+            white_space: crate::WhiteSpace::Pre,
+            overflow_wrap: crate::OverflowWrap::Normal,
+            word_break: crate::WordBreak::Normal,
+        };
+        let metrics = Metrics::new(font_size.max(1.0), box_height);
+        let mut buffer = Buffer::new_empty(metrics);
+        buffer.set_wrap(&mut self.font_system, Wrap::None);
+        let variation_sets: Vec<Arc<FontVariations>> = variations.into_iter().collect();
+        let variation_index = usize::from(!variation_sets.is_empty());
+        let attrs = span_attrs.to_attrs(variation_index);
+        let defaults = Attrs::new().family(Family::Name(FAMILY));
+        buffer.set_rich_text(
+            &mut self.font_system,
+            [(shaped_text.as_ref(), attrs)],
+            &defaults,
+            Shaping::Advanced,
+            None,
+        );
+        buffer.set_size(&mut self.font_system, None, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+
+        let clip_bounds = clip.map(|c| {
+            (
+                c.x * raster_scale,
+                c.y * raster_scale,
+                (c.x + c.width) * raster_scale,
+                (c.y + c.height) * raster_scale,
+            )
+        });
+        let oy = y * raster_scale;
+        let pw = pixmap.width() as i32;
+        let ph = pixmap.height() as i32;
+        let default = Color::rgba(color[0], color[1], color[2], color[3]);
+        let pixels = pixmap.pixels_mut();
+        let TextEngine {
+            font_system,
+            swash,
+            variable_swash,
+            ..
+        } = self;
+
+        for run in buffer.layout_runs() {
+            let ox = (if align_right { x - run.line_w } else { x }) * raster_scale;
+            for glyph in run.glyphs {
+                let physical = glyph.physical((0.0, 0.0), raster_scale);
+                let glyph_color = glyph.color_opt.unwrap_or(default);
+                let line_y = run.line_y;
+                paint_swash_glyph(
+                    font_system,
+                    swash,
+                    variable_swash,
+                    glyph,
+                    physical,
+                    &variation_sets,
+                    glyph_color,
+                    ox,
+                    oy,
+                    line_y,
+                    raster_scale,
+                    clip_bounds,
+                    clip_mask,
+                    pw,
+                    ph,
+                    pixels,
+                    |gx, gy, color| {
+                        let _ = (gx, gy);
+                        (color.r(), color.g(), color.b())
+                    },
+                );
+            }
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
@@ -4054,111 +4205,45 @@ impl TextEngine {
                 if print_economy && fill_index.is_some() {
                     continue;
                 }
-                let mut draw_pixel = |x, y, color: Color| {
-                    // cosmic-text's mask rasterizer replaces the authored
-                    // alpha with glyph coverage (see its `blend base alpha?`
-                    // TODO). Reapply the span alpha here so transparent and
-                    // translucent CSS text do not become opaque at paint.
-                    let a = color.a() as u32 * glyph_color.a() as u32 / 255;
-                    if a == 0 {
-                        return;
-                    }
-                    let gx = physical.x + x;
-                    let gy = (run.line_y * raster_scale) as i32 + physical.y + y;
-                    let (mut r, mut g, mut b) = fill_index
-                        .and_then(|index| {
-                            let fill = clip_fills.get(index)?;
-                            let (x0, y0, x1, y1) = fill_bounds.get(index).copied().flatten()?;
-                            let sampled = sample_gradient(
-                                fill,
-                                (gx as f32 + 0.5) / raster_scale - x0,
-                                (gy as f32 + 0.5) / raster_scale - y0,
-                                x1 - x0,
-                                y1 - y0,
-                            );
-                            Some((sampled[0], sampled[1], sampled[2]))
-                        })
-                        .unwrap_or_else(|| (color.r(), color.g(), color.b()));
-                    if print_economy {
-                        let adjusted = crate::paint::print_economy_color([r, g, b, 255]);
-                        (r, g, b) = (adjusted[0], adjusted[1], adjusted[2]);
-                    }
-                    let px = ox as i32 + gx;
-                    let py = oy as i32 + gy;
-                    if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
-                        if (px as f32) < cx0
-                            || (px as f32) >= cx1
-                            || (py as f32) < cy0
-                            || (py as f32) >= cy1
-                        {
-                            return;
+                paint_swash_glyph(
+                    font_system,
+                    swash,
+                    variable_swash,
+                    glyph,
+                    physical,
+                    &item.variation_sets,
+                    glyph_color,
+                    ox,
+                    oy,
+                    run.line_y,
+                    raster_scale,
+                    clip_bounds,
+                    clip_mask,
+                    pw,
+                    ph,
+                    pixels,
+                    |gx, gy, color| {
+                        let (mut r, mut g, mut b) = fill_index
+                            .and_then(|index| {
+                                let fill = clip_fills.get(index)?;
+                                let (x0, y0, x1, y1) = fill_bounds.get(index).copied().flatten()?;
+                                let sampled = sample_gradient(
+                                    fill,
+                                    (gx as f32 + 0.5) / raster_scale - x0,
+                                    (gy as f32 + 0.5) / raster_scale - y0,
+                                    x1 - x0,
+                                    y1 - y0,
+                                );
+                                Some((sampled[0], sampled[1], sampled[2]))
+                            })
+                            .unwrap_or_else(|| (color.r(), color.g(), color.b()));
+                        if print_economy {
+                            let adjusted = crate::paint::print_economy_color([r, g, b, 255]);
+                            (r, g, b) = (adjusted[0], adjusted[1], adjusted[2]);
                         }
-                    }
-                    if px < 0 || px >= pw || py < 0 || py >= ph {
-                        return;
-                    }
-                    let idx = (py * pw + px) as usize;
-                    let mask_alpha = clip_mask
-                        .and_then(|mask| mask.data().get(idx))
-                        .copied()
-                        .unwrap_or(255) as u32;
-                    let a = a * mask_alpha / 255;
-                    if a == 0 {
-                        return;
-                    }
-                    let dst = pixels[idx];
-                    let sa = a;
-                    let sr = (r as u32 * sa) / 255;
-                    let sg = (g as u32 * sa) / 255;
-                    let sb = (b as u32 * sa) / 255;
-                    let inv = 255 - sa;
-                    let out_a = sa + (dst.alpha() as u32 * inv / 255);
-                    if out_a == 0 {
-                        return;
-                    }
-                    let out_r = sr + (dst.red() as u32 * inv / 255);
-                    let out_g = sg + (dst.green() as u32 * inv / 255);
-                    let out_b = sb + (dst.blue() as u32 * inv / 255);
-                    pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
-                        out_r as u8,
-                        out_g as u8,
-                        out_b as u8,
-                        out_a as u8,
-                    )
-                    .unwrap_or(dst);
-                };
-                let explicit_variations = metadata_variation(glyph.metadata)
-                    .and_then(|index| item.variation_sets.get(index))
-                    .map(Arc::clone);
-                let effective_variations = glyph
-                    .font_is_variable
-                    .then(|| {
-                        variable_swash.effective_variations(
-                            font_system,
-                            physical.cache_key.font_id,
-                            glyph.font_weight_axis_opt,
-                            glyph.font_optical_size_opt,
-                            glyph.font_italic_axis,
-                            explicit_variations,
-                        )
-                    })
-                    .flatten();
-                if let Some(variations) = effective_variations {
-                    variable_swash.with_pixels(
-                        font_system,
-                        physical.cache_key,
-                        variations,
-                        glyph_color,
-                        &mut draw_pixel,
-                    );
-                } else {
-                    swash.with_pixels(
-                        font_system,
-                        physical.cache_key,
-                        glyph_color,
-                        &mut draw_pixel,
-                    );
-                }
+                        (r, g, b)
+                    },
+                );
             }
         }
 
@@ -4247,6 +4332,114 @@ impl TextEngine {
                 }
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_swash_glyph<F>(
+    font_system: &mut FontSystem,
+    swash: &mut SwashCache,
+    variable_swash: &mut VariableSwashCache,
+    glyph: &cosmic_text::LayoutGlyph,
+    physical: cosmic_text::PhysicalGlyph,
+    variation_sets: &[Arc<FontVariations>],
+    glyph_color: Color,
+    ox: f32,
+    oy: f32,
+    line_y: f32,
+    raster_scale: f32,
+    clip_bounds: Option<(f32, f32, f32, f32)>,
+    clip_mask: Option<&tiny_skia::Mask>,
+    pw: i32,
+    ph: i32,
+    pixels: &mut [tiny_skia::PremultipliedColorU8],
+    mut resolve_rgb: F,
+) where
+    F: FnMut(i32, i32, Color) -> (u8, u8, u8),
+{
+    let mut draw_pixel = |x, y, color: Color| {
+        // cosmic-text's mask rasterizer replaces the authored alpha with glyph
+        // coverage (see its `blend base alpha?` TODO). Reapply span alpha here
+        // so transparent and translucent CSS text do not become opaque at paint.
+        let a = color.a() as u32 * glyph_color.a() as u32 / 255;
+        if a == 0 {
+            return;
+        }
+        let gx = physical.x + x;
+        let gy = (line_y * raster_scale) as i32 + physical.y + y;
+        let (r, g, b) = resolve_rgb(gx, gy, color);
+        let px = ox as i32 + gx;
+        let py = oy as i32 + gy;
+        if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
+            if (px as f32) < cx0 || (px as f32) >= cx1 || (py as f32) < cy0 || (py as f32) >= cy1
+            {
+                return;
+            }
+        }
+        if px < 0 || px >= pw || py < 0 || py >= ph {
+            return;
+        }
+        let idx = (py * pw + px) as usize;
+        let mask_alpha = clip_mask
+            .and_then(|mask| mask.data().get(idx))
+            .copied()
+            .unwrap_or(255) as u32;
+        let a = a * mask_alpha / 255;
+        if a == 0 {
+            return;
+        }
+        let dst = pixels[idx];
+        let sa = a;
+        let sr = (r as u32 * sa) / 255;
+        let sg = (g as u32 * sa) / 255;
+        let sb = (b as u32 * sa) / 255;
+        let inv = 255 - sa;
+        let out_a = sa + (dst.alpha() as u32 * inv / 255);
+        if out_a == 0 {
+            return;
+        }
+        let out_r = sr + (dst.red() as u32 * inv / 255);
+        let out_g = sg + (dst.green() as u32 * inv / 255);
+        let out_b = sb + (dst.blue() as u32 * inv / 255);
+        pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
+            out_r as u8,
+            out_g as u8,
+            out_b as u8,
+            out_a as u8,
+        )
+        .unwrap_or(dst);
+    };
+    let explicit_variations = metadata_variation(glyph.metadata)
+        .and_then(|index| variation_sets.get(index))
+        .map(Arc::clone);
+    let effective_variations = glyph
+        .font_is_variable
+        .then(|| {
+            variable_swash.effective_variations(
+                font_system,
+                physical.cache_key.font_id,
+                glyph.font_weight_axis_opt,
+                glyph.font_optical_size_opt,
+                glyph.font_italic_axis,
+                explicit_variations,
+            )
+        })
+        .flatten();
+    if let Some(variations) = effective_variations {
+        variable_swash.with_pixels(
+            font_system,
+            physical.cache_key,
+            variations,
+            glyph_color,
+            &mut draw_pixel,
+        );
+    } else {
+        swash.with_pixels(
+            font_system,
+            physical.cache_key,
+            glyph_color,
+            &mut draw_pixel,
+        );
     }
 }
 
