@@ -1576,6 +1576,21 @@ impl RealmStates {
         Some(false)
     }
 
+    #[cfg(feature = "render")]
+    pub(crate) fn frame_owner(&self, frame_id: u32) -> Option<(SharedState, NodeId)> {
+        let frame = self.frame_timers.get(&frame_id)?;
+        if frame.cancel.is_canceled() { return None; }
+        let (parent, node, generation) = frame.owner.as_ref()?;
+        let parent = parent.upgrade()?;
+        {
+            let state = parent.try_borrow().ok()?;
+            if state.document_generation != *generation
+                || !state.dom.as_ref().is_some_and(|dom| dom.is_connected(*node))
+            { return None; }
+        }
+        Some((parent, *node))
+    }
+
     pub(crate) fn cancel_inactive_frame_timers(&self) {
         for (id, timers) in &self.frame_timers {
             if self.frame_timers_active(*id) == Some(false) { timers.cancel.cancel(); }
@@ -9629,7 +9644,7 @@ pub(crate) fn ensure_resolved_scroll(state: &mut ObscuraState) -> Option<()> {
 }
 
 #[cfg(feature = "render")]
-fn ensure_resolved_scroll_for_geometry(state: &mut ObscuraState) -> Option<()> {
+pub(crate) fn ensure_resolved_scroll_for_geometry(state: &mut ObscuraState) -> Option<()> {
     ensure_resolved_scroll_for_consumer(state, true)
 }
 

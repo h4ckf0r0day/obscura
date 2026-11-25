@@ -137,6 +137,24 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     Err("nodeId, backendNodeId, or objectId required".to_string())
 }
 
+#[cfg(feature = "render")]
+fn remote_geometry(page: &mut Page, params: &Value) -> Result<Option<(Vec<Value>, f64, f64)>, String> {
+    if params["nodeId"].as_u64().is_some() || params["backendNodeId"].as_u64().is_some() {
+        return Ok(None);
+    }
+    let Some(object_id) = params["objectId"].as_str() else { return Ok(None); };
+    let (quad, width, height) = page.js.as_mut().ok_or("No JS runtime")?
+        .remote_dom_node_quad(object_id)?;
+    Ok(Some((quad.into_iter().map(coord_value).collect(), width, height)))
+}
+
+fn box_model(quad: Vec<Value>, width: f64, height: f64) -> Value {
+    json!({"model": {
+        "content": quad.clone(), "padding": quad.clone(), "border": quad.clone(), "margin": quad,
+        "width": coord_value(width), "height": coord_value(height),
+    }})
+}
+
 async fn run_file_input_command(page: &mut Page, function: &str, object_id: Option<&str>,
     specs: Value, validate_only: bool) -> Result<(), String> {
     let specs = serde_json::to_string(&specs).map_err(|error| error.to_string())?;
@@ -563,6 +581,10 @@ pub async fn handle(
         }
         "getBoxModel" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            #[cfg(feature = "render")]
+            if let Some((quad, width, height)) = remote_geometry(page, params)? {
+                return Ok(box_model(quad, width, height));
+            }
             let node_id = match resolve_node_id(page, params) {
                 Ok(nid) => nid,
                 Err(_) => return Ok(json!(null)),
@@ -589,18 +611,14 @@ pub async fn handle(
             } else {
                 (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
             };
-            Ok(json!({
-                "model": {
-                    "content": quad.clone(),
-                    "padding": quad.clone(),
-                    "border": quad.clone(),
-                    "margin": quad,
-                    "width": coord_value(w), "height": coord_value(h),
-                }
-            }))
+            Ok(box_model(quad, w, h))
         }
         "getContentQuads" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            #[cfg(feature = "render")]
+            if let Some((quad, _, _)) = remote_geometry(page, params)? {
+                return Ok(json!({"quads": [quad]}));
+            }
             let node_id = match resolve_node_id(page, params) {
                 Ok(nid) => nid,
                 Err(_) => return Ok(json!(null)),

@@ -4479,6 +4479,66 @@ impl ObscuraJsRuntime {
         Ok(inspect(dom, node_id, frame_id, &url, &base))
     }
 
+    /// Border quad of a genuine remote node in the top-level viewport, with
+    /// untransformed layout dimensions. Frame owners are resolved natively.
+    #[cfg(feature = "render")]
+    pub fn remote_dom_node_quad(&mut self, object_id: &str)
+        -> Result<([f64; 8], f64, f64), String>
+    {
+        use obscura_render::{Affine2, Rect};
+        use crate::ops::{ensure_resolved_scroll_for_geometry, sample_live_document_animations};
+        let (mut frame_id, node) = self.with_remote_dom_node(object_id,
+            |_, node, frame_id, _, _| (frame_id, node))?;
+        let realms = self.realm_states();
+        let state = if frame_id == 0 { self.state.clone() }
+            else { realms.borrow().by_frame_id(frame_id).ok_or("Remote document unavailable")? };
+        let (mut points, width, height) = {
+            let mut state = state.borrow_mut();
+            if frame_id != 0 { begin_animation_task(&mut state); }
+            sample_live_document_animations(&mut state);
+            ensure_resolved_scroll_for_geometry(&mut state).ok_or("Could not compute node geometry")?;
+            let prepared = state.prepared_render.as_ref().ok_or("No prepared geometry")?;
+            let (_, scroll) = state.resolved_scroll.as_ref().ok_or("No scroll geometry")?;
+            let rect = *prepared.layout().rects.get(&node).ok_or("Node has no layout box")?;
+            let transform = prepared.viewport_transform_with_scroll(node, scroll)
+                .ok_or("Node has no viewport geometry")?;
+            let Rect { x, y, width, height } = rect;
+            ([transform.map_point(x, y), transform.map_point(x + width, y),
+                transform.map_point(x + width, y + height), transform.map_point(x, y + height)],
+                width, height)
+        };
+        let limit = realms.borrow().live_count();
+        for _ in 0..=limit {
+            if frame_id == 0 {
+                let mut quad = [0.0; 8];
+                for (index, (x, y)) in points.into_iter().enumerate() {
+                    if !x.is_finite() || !y.is_finite() { return Err("Non-finite node geometry".into()); }
+                    quad[index * 2] = f64::from(x);
+                    quad[index * 2 + 1] = f64::from(y);
+                }
+                return Ok((quad, f64::from(width), f64::from(height)));
+            }
+            let (owner, owner_node) = realms.borrow().frame_owner(frame_id)
+                .ok_or("Remote node belongs to a detached frame")?;
+            let mut owner = owner.borrow_mut();
+            frame_id = owner.frame_id;
+            if frame_id != 0 { begin_animation_task(&mut owner); }
+            sample_live_document_animations(&mut owner);
+            ensure_resolved_scroll_for_geometry(&mut owner).ok_or("Frame owner has no geometry")?;
+            let prepared = owner.prepared_render.as_ref().ok_or("No frame owner geometry")?;
+            let (_, scroll) = owner.resolved_scroll.as_ref().ok_or("No frame scroll geometry")?;
+            let layout = prepared.layout();
+            let rect = layout.rects.get(&owner_node).ok_or("Frame owner has no layout box")?;
+            let style = layout.styles.get(&owner_node).ok_or("Frame owner has no style")?;
+            let transform = prepared.viewport_transform_with_scroll(owner_node, scroll)
+                .ok_or("Frame owner has no viewport geometry")?
+                .then(Affine2::translate(rect.x + style.border.left + style.padding.left,
+                    rect.y + style.border.top + style.padding.top));
+            for point in &mut points { *point = transform.map_point(point.0, point.1); }
+        }
+        Err("Invalid frame owner chain".into())
+    }
+
     #[cfg(feature = "render")]
     pub fn accessibility_styles(&self) -> HashMap<NodeId, AccessibilityStyle> {
         let mut state = self.state.borrow_mut();

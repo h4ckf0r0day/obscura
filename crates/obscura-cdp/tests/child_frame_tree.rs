@@ -20,7 +20,13 @@ async fn serve() -> String {
                 let mut buf = [0u8; 2048];
                 let read = socket.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..read]).to_string();
-                let body = if request.starts_with("GET /child.html ") {
+                let body = if request.starts_with("GET /geometry.html ") {
+                    r#"<!doctype html><style>html,body{margin:0;height:2000px}#collision{width:4px;height:4px}iframe{position:absolute;left:140px;top:90px;width:400px;height:240px;border:7px solid black;padding:5px;transform-origin:0 0}</style><div id="collision"></div><iframe src="/geometry-child.html"></iframe>"#
+                } else if request.starts_with("GET /geometry-child.html ") {
+                    r#"<!doctype html><style>html,body{margin:0;height:900px}button{position:absolute;left:30px;top:40px;width:110px;height:30px;border:0;padding:0}</style><button id="target">target</button>"#
+                } else if request.starts_with("GET /geometry-grandchild.html ") {
+                    r#"<!doctype html><style>html,body{margin:0;height:500px}button{position:absolute;left:15px;top:20px;width:70px;height:25px;border:0;padding:0}</style><button id="deep">deep</button>"#
+                } else if request.starts_with("GET /child.html ") {
                     "<html><body><h2>Child heading</h2><iframe src=\"/grandchild.html\"></iframe></body></html>"
                 } else if request.starts_with("GET /grandchild.html ") {
                     "<html><body><p>deep</p></body></html>"
@@ -739,4 +745,143 @@ async fn isolated_worlds_are_owned_by_their_exact_frame() {
     assert_eq!(recreated.len(), 1, "only the main-frame world should persist");
     assert_eq!(recreated[0].params["context"]["auxData"]["frameId"], main_id);
 
+}
+
+
+#[cfg(feature = "render")]
+#[tokio::test(flavor = "current_thread")]
+async fn remote_frame_geometry_keeps_its_document_and_ancestor_transforms() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url":format!("{url}geometry.html")}), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression":"1"}), &session).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let frame_id = tree["frameTree"]["childFrames"][0]["frame"]["id"].clone();
+    let context = ctx.pending_events.iter().find(|event|
+        event.method == "Runtime.executionContextCreated"
+            && event.params["context"]["auxData"]["frameId"] == frame_id
+            && event.params["context"]["auxData"]["isDefault"] == true
+    ).unwrap().params["context"]["id"].clone();
+    let direct = cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression":"globalThis.target = document.getElementById('target')", "contextId":context,
+    }), &session).await;
+    let borrowed = cdp(&mut ctx, 6, "Runtime.evaluate", json!({
+        "expression":"document.querySelector('iframe').contentDocument.getElementById('target')",
+    }), &session).await;
+    let expected = json!([182,142,292,142,292,172,182,172]);
+    for handle in [&direct, &borrowed] {
+        let quads = cdp(&mut ctx, 7, "DOM.getContentQuads", json!({"objectId":handle["result"]["objectId"]}), &session).await;
+        assert_eq!(quads["quads"], json!([expected]), "{quads}");
+        let model = cdp(&mut ctx, 8, "DOM.getBoxModel", json!({"objectId":handle["result"]["objectId"]}), &session).await;
+        assert_eq!(model["model"]["width"], 110);
+        assert_eq!(model["model"]["height"], 30);
+        assert_eq!(model["model"]["border"], expected);
+    }
+    cdp(&mut ctx, 9, "Runtime.evaluate", json!({
+        "expression":"target.getBoundingClientRect = () => { throw new Error('author getter'); }; scrollTo(0,5)",
+        "contextId":context,
+    }), &session).await;
+    cdp(&mut ctx, 10, "Runtime.evaluate", json!({
+        "expression":"scrollTo(0,50); document.querySelector('iframe').style.transform='scale(1.5)'",
+    }), &session).await;
+    let quads = cdp(&mut ctx, 11, "DOM.getContentQuads", json!({"objectId":direct["result"]["objectId"]}), &session).await;
+    assert_eq!(quads["quads"], json!([[203,110.5,368,110.5,368,155.5,203,155.5]]));
+    cdp(&mut ctx, 12, "Runtime.evaluate", json!({
+        "expression":"document.querySelector('iframe').style.transform='rotate(17deg) skewX(11deg)'",
+    }), &session).await;
+    let quads = cdp(&mut ctx, 13, "DOM.getContentQuads", json!({"objectId":direct["result"]["objectId"]}), &session).await;
+    assert_frame_quad(&quads, [175.15625,99.890625,280.359375,132.0625,277.15625,162.453125,171.96875,130.296875]);
+    cdp(&mut ctx, 14, "Runtime.evaluate", json!({
+        "expression":"var nested=document.createElement('iframe'); nested.src='/geometry-grandchild.html'; nested.style.cssText='position:absolute;left:60px;top:120px;width:180px;height:110px;border:3px solid black;padding:2px;transform-origin:0 0;transform:rotate(-9deg) scale(.8)'; document.body.append(nested)",
+        "contextId":context,
+    }), &session).await;
+    ctx.get_session_page_mut(&Some(session.clone())).unwrap().settle(1_000).await;
+    let tree = cdp(&mut ctx, 15, "Page.getFrameTree", json!({}), &session).await;
+    let grandchild = &tree["frameTree"]["childFrames"][0]["childFrames"][0]["frame"]["id"];
+    let grand_context = ctx.pending_events.iter().find(|event|
+        event.method == "Runtime.executionContextCreated"
+            && event.params["context"]["auxData"]["frameId"] == *grandchild
+            && event.params["context"]["auxData"]["isDefault"] == true
+    ).unwrap().params["context"]["id"].clone();
+    let deep = cdp(&mut ctx, 16, "Runtime.evaluate", json!({
+        "expression":"scrollTo(0,7); document.getElementById('deep')", "contextId":grand_context,
+    }), &session).await;
+    let quads = cdp(&mut ctx, 17, "DOM.getContentQuads", json!({"objectId":deep["result"]["objectId"]}), &session).await;
+    assert_frame_quad(&quads, [211.359375,206.875,265.171875,214.15625,266.0625,235.109375,212.234375,227.796875]);
+    let model = cdp(&mut ctx, 18, "DOM.getBoxModel", json!({"objectId":deep["result"]["objectId"]}), &session).await;
+    assert_eq!(model["model"]["width"], 70);
+    assert_eq!(model["model"]["height"], 25);
+    cdp(&mut ctx, 19, "Runtime.evaluate", json!({"expression":"document.querySelector('iframe').remove()"}), &session).await;
+    let detached = dispatch(&CdpRequest {
+        id:13, method:"DOM.getContentQuads".into(),
+        params:json!({"objectId":direct["result"]["objectId"]}), session_id:Some(session),
+    }, &mut ctx).await;
+    assert!(detached.error.is_some(), "detached handle must not resolve into the parent document");
+}
+
+
+#[cfg(feature = "render")]
+fn assert_frame_quad(result: &Value, expected: [f64; 8]) {
+    let quad = result["quads"][0].as_array().unwrap();
+    assert_eq!(quad.len(), 8);
+    for (coordinate, expected) in quad.iter().zip(expected) {
+        // Chromium rounds transformed frame coordinates to CSS subpixels.
+        assert!((coordinate.as_f64().unwrap() - expected).abs() < 1.0 / 16.0,
+            "{result}, expected {expected}");
+    }
+}
+
+#[cfg(feature = "render")]
+#[tokio::test(flavor = "current_thread")]
+async fn foreign_frame_remote_geometry_does_not_use_parent_node_ids() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let foreign = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url":format!("{url}geometry.html")}), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression":format!(
+        "document.querySelector('iframe').src={}", serde_json::to_string(&format!("{foreign}geometry-child.html")).unwrap(),
+    )}), &session).await;
+    ctx.get_session_page_mut(&Some(session.clone())).unwrap().settle(1_000).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let child = &tree["frameTree"]["childFrames"][0]["frame"];
+    assert_eq!(child["url"], format!("{foreign}geometry-child.html"));
+    let context = ctx.pending_events.iter().find(|event|
+        event.method == "Runtime.executionContextCreated"
+            && event.params["context"]["auxData"]["frameId"] == child["id"]
+            && event.params["context"]["auxData"]["isDefault"] == true
+    ).unwrap().params["context"]["id"].clone();
+    let target = cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression":"document.getElementById('target')", "contextId":context,
+    }), &session).await;
+    let quads = cdp(&mut ctx, 6, "DOM.getContentQuads", json!({"objectId":target["result"]["objectId"]}), &session).await;
+    assert_eq!(quads["quads"], json!([[182,142,292,142,292,172,182,172]]));
+}
+
+
+#[cfg(feature = "render")]
+#[tokio::test(flavor = "current_thread")]
+async fn remote_frame_geometry_resamples_animations_between_requests() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":format!("{url}geometry.html")}), &session).await;
+    let target = cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":r#"(() => {
+        const d = document.querySelector('iframe').contentDocument;
+        const style = d.createElement('style');
+        style.textContent = '@keyframes travel{from{transform:translateX(0px)}to{transform:translateX(1000000px)}} #target{animation:travel 1000000ms linear}';
+        d.head.appendChild(style);
+        return d.getElementById('target');
+    })()"#}), &session).await;
+    let first = cdp(&mut ctx, 3, "DOM.getContentQuads", json!({"objectId":target["result"]["objectId"]}), &session).await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let later = cdp(&mut ctx, 4, "DOM.getContentQuads", json!({"objectId":target["result"]["objectId"]}), &session).await;
+    assert!(later["quads"][0][0].as_f64().unwrap() > first["quads"][0][0].as_f64().unwrap() + 20.0,
+        "child timeline did not advance: first {first}, later {later}");
 }
