@@ -197,6 +197,34 @@ impl BufferLine {
         self.reset_layout();
     }
 
+    /// Release spare capacity held by the cached shape and layout.
+    pub fn shrink_to_fit(&mut self) {
+        self.text.shrink_to_fit();
+        match &mut self.shape_opt {
+            Cached::Empty => {}
+            Cached::Unused(shape) | Cached::Used(shape) => shape.shrink_to_fit(),
+        }
+        match &mut self.layout_opt {
+            Cached::Empty => {}
+            Cached::Unused(layout) | Cached::Used(layout) => {
+                layout.shrink_to_fit();
+                for line in layout.iter_mut() {
+                    line.glyphs.shrink_to_fit();
+                }
+            }
+        }
+    }
+
+    /// Drop the shaped glyph cache while keeping a valid layout. The line is
+    /// reshaped on demand if it must be laid out again.
+    pub fn release_shape(&mut self) {
+        if self.layout_opt.is_used() {
+            if let Some(shape) = self.shape_opt.get_mut() {
+                shape.release();
+            }
+        }
+    }
+
     /// Reset only layout cache
     pub fn reset_layout(&mut self) {
         self.layout_opt.set_unused();
@@ -205,6 +233,9 @@ impl BufferLine {
     /// Shape line, will cache results
     #[allow(clippy::missing_panics_doc)]
     pub fn shape(&mut self, font_system: &mut FontSystem, tab_width: u16) -> &ShapeLine {
+        if self.shape_opt.get().is_some_and(ShapeLine::is_released) {
+            self.shape_opt.set_unused();
+        }
         if self.shape_opt.is_unused() {
             let mut line = self
                 .shape_opt
