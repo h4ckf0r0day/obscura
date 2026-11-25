@@ -1386,6 +1386,20 @@ impl DomTree {
         result
     }
 
+    /// Find an immediate child without allocating a child-list snapshot.
+    pub fn find_child(&self, parent: NodeId, mut matches: impl FnMut(&Node) -> bool) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let mut child = inner.nodes.get(parent.index())?.as_ref()?.first_child;
+        // Keep the same corrupt-sibling backstop as children().
+        for _ in 0..inner.nodes.len() {
+            let id = child?;
+            let node = inner.nodes.get(id.index())?.as_ref()?;
+            if matches(node) { return Some(id); }
+            child = node.next_sibling;
+        }
+        None
+    }
+
     pub fn children(&self, node_id: NodeId) -> Vec<NodeId> {
         let inner = self.inner.borrow();
         let mut result = Vec::new();
@@ -2450,6 +2464,36 @@ mod tests {
         assert_eq!(sheet.cssom_rules.unwrap()[0].as_ref(), ".own { width: 3px }");
         assert_eq!(sheet.sources.len(), 2);
         assert!(!sheet.origin_clean);
+    }
+
+    #[test]
+    fn find_child_stops_at_the_first_matching_immediate_child() {
+        let tree = DomTree::new();
+        let parent = element(&tree, "div");
+        let text = tree.new_node(NodeData::Text { contents: "before".into() });
+        let first = element(&tree, "span");
+        let last = element(&tree, "b");
+        let nested = element(&tree, "i");
+        for child in [text, first, last] { tree.append_child(parent, child); }
+        tree.append_child(first, nested);
+        let mut visited = 0;
+        assert_eq!(tree.find_child(parent, |node| { visited += 1; node.is_element() }), Some(first));
+        assert_eq!(visited, 2, "matching reads must not walk later siblings or descendants");
+        assert_eq!(tree.find_child(parent, |node| node.as_element().is_some_and(|name| name.local.as_ref() == "i")), None);
+        tree.detach(first);
+        assert_eq!(tree.find_child(parent, Node::is_element), Some(last));
+        assert_eq!(tree.find_child(NodeId::new(u32::MAX), |_| true), None);
+    }
+
+    #[test]
+    fn find_child_bounds_a_corrupted_sibling_cycle() {
+        let tree = DomTree::new();
+        let child = element(&tree, "div");
+        tree.append_child(tree.document(), child);
+        tree.with_node_mut(child, |node| node.next_sibling = Some(child));
+        let mut visited = 0;
+        assert_eq!(tree.find_child(tree.document(), |_| { visited += 1; false }), None);
+        assert_eq!(visited, tree.node_slot_count());
     }
 
     #[test]

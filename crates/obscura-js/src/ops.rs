@@ -3110,8 +3110,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 if arg2 == "element" {
                     return dom.borrow_node(root).and_then(|node| node.as_element().map(|_| root));
                 }
-                dom.children(root).into_iter().find(|&child|
-                    dom.borrow_node(child).is_some_and(|node| node.as_element().is_some()))
+                dom.find_child(root, |node| node.as_element().is_some())
             });
             let found = element.and_then(|element| {
                 if cmd == "document_element" { return Some(element); }
@@ -3120,13 +3119,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 if name.ns.as_ref() != "http://www.w3.org/1999/xhtml" || name.local.as_ref() != "html" {
                     return None;
                 }
-                dom.children(element).into_iter().find(|&child| {
-                    dom.borrow_node(child).is_some_and(|node| node.as_element().is_some_and(|name| {
-                        name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
-                            && if cmd == "document_head" { name.local.as_ref() == "head" }
-                               else { matches!(name.local.as_ref(), "body" | "frameset") }
-                    }))
-                })
+                dom.find_child(element, |node| node.as_element().is_some_and(|name| {
+                    name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                        && if cmd == "document_head" { name.local.as_ref() == "head" }
+                           else { matches!(name.local.as_ref(), "body" | "frameset") }
+                }))
             });
             found.map_or_else(|| "-1".into(), |node| node.index().to_string())
         }
