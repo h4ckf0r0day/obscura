@@ -2,16 +2,22 @@ use std::net::{IpAddr, Ipv6Addr};
 
 const PRIVATE_NETWORK_HINT: &str = "Local/private network access is blocked by the SSRF guard. For your own local services, start Obscura with --allow-private-network or set OBSCURA_ALLOW_PRIVATE_NETWORK=1.";
 
-/// Hint for an operator-facing error, not a policy change. CLI and stdio MCP
-/// opt into presenting it; remote transports should keep the original error.
+/// Hint for an operator-facing error, not a policy change. CLI, MCP and CDP
+/// can present it without changing the server's network permissions.
 /// Inspect the actual denied host, not the initial navigation URL, since a
 /// redirect can lead elsewhere. Metadata and other special-purpose ranges
 /// deliberately receive no opt-out suggestion.
 pub fn private_network_error_hint(mut error: &str) -> Option<&'static str> {
-    while let Some(inner) = error.strip_prefix("Network error: ")
-        .or_else(|| error.strip_prefix("Request blocked: "))
-    {
-        error = inner;
+    let mut blocked = false;
+    loop {
+        if let Some(inner) = error.strip_prefix("Network error: ") {
+            error = inner;
+        } else if let Some(inner) = error.strip_prefix("Request blocked: ") {
+            blocked = true;
+            error = inner;
+        } else {
+            break;
+        }
     }
     if let Some(domain) = error
         .strip_prefix("Access to localhost domain '")
@@ -21,12 +27,20 @@ pub fn private_network_error_hint(mut error: &str) -> Option<&'static str> {
         return (domain == "localhost" || domain.ends_with(".localhost"))
             .then_some(PRIVATE_NETWORK_HINT);
     }
-    let address = error
+    let address = if let Some(address) = error
         .strip_prefix("Access to private/internal IP address ")
-        .or_else(|| error.strip_prefix("Access to private/internal IPv6 address "))?
-        .strip_suffix(" is not allowed")?
-        .parse::<IpAddr>()
-        .ok()?;
+        .or_else(|| error.strip_prefix("Access to private/internal IPv6 address "))
+    {
+        address.strip_suffix(" is not allowed")?
+    } else if blocked {
+        // Resolver refusals retain the full transport error chain. Parse the
+        // final denied address, never the original URL's host.
+        let (_, refusal) = error.rsplit_once("SSRF blocked: '")?;
+        let (_, address) = refusal.rsplit_once("' resolves to forbidden address ")?;
+        address
+    } else {
+        return None;
+    }.parse::<IpAddr>().ok()?;
     let local = match address {
         IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
         IpAddr::V6(ip) => {
@@ -61,6 +75,8 @@ mod tests {
             "Access to private/internal IPv6 address ::1 is not allowed",
             "Access to private/internal IPv6 address fd12::1 is not allowed",
             "Access to private/internal IPv6 address ::ffff:127.0.0.1 is not allowed",
+            "Request blocked: http://app.example.test/: error sending request: dns error: SSRF blocked: 'app.example.test' resolves to forbidden address 127.0.0.1",
+            "Request blocked: http://app.example.test/: SSRF blocked: 'app.example.test' resolves to forbidden address fd12::1",
         ] {
             let hint = private_network_error_hint(message).expect(message);
             assert!(hint.contains("--allow-private-network"));
@@ -81,6 +97,11 @@ mod tests {
             "Access to private/internal IP address 0.0.0.0 is not allowed",
             "Access to localhost domain 'example.com' is not allowed",
             "Network error: certificate verify failed",
+            "Request blocked: http://app.example.test/: SSRF blocked: 'app.example.test' resolves to forbidden address 169.254.169.254",
+            "Request blocked: http://app.example.test/: SSRF blocked: 'app.example.test' resolves to forbidden address fd00:ec2::254",
+            "Request blocked: http://app.example.test/: SSRF blocked: 'app.example.test' resolves to forbidden address 100.100.100.200",
+            "Network error: SSRF blocked: 'app.example.test' resolves to forbidden address 127.0.0.1",
+            "Request blocked: unrelated error mentioning resolves to forbidden address 127.0.0.1",
             "Access to private/internal IP address invalid is not allowed",
         ] {
             assert_eq!(private_network_error_hint(message), None, "{message}");

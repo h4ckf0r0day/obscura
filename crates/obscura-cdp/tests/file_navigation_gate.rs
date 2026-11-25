@@ -103,3 +103,32 @@ async fn cdp_cannot_reach_local_files_without_allow_file_access() {
         .await;
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_navigation_denials_offer_operator_opt_in() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "0");
+    let port = pick_port().await;
+    tokio::task::LocalSet::new().run_until(async {
+        tokio::task::spawn_local(async move {
+            let _ = obscura_cdp::server::start(port).await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{port}/devtools/browser")).await.unwrap();
+        let (_, session) = call(&mut ws, 1, "Target.createTarget", json!({"url":"about:blank"}), None).await;
+        let session = session.unwrap();
+        for (id, url) in [(2, "http://localhost:8911/"), (3, "http://127.0.0.1:8911/")] {
+            let (reply, _) = call(&mut ws, id, "Page.navigate", json!({"url":url}), Some(&session)).await;
+            assert_eq!(reply["error"]["code"], -32000, "{reply}");
+            let message = reply["error"]["message"].as_str().unwrap();
+            assert!(message.contains("--allow-private-network"), "{reply}");
+            assert!(message.contains("OBSCURA_ALLOW_PRIVATE_NETWORK=1"), "{reply}");
+        }
+        let (reply, _) = call(&mut ws, 4, "Target.createTarget", json!({"url":"http://localhost:8911/"}), None).await;
+        assert!(reply["error"]["message"].as_str().unwrap().contains("--allow-private-network"), "{reply}");
+        let (reply, _) = call(&mut ws, 5, "Page.navigate", json!({"url":"http://169.254.169.254/"}), Some(&session)).await;
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(!message.contains("--allow-private-network"), "{reply}");
+        let (reply, _) = call(&mut ws, 6, "Page.navigate", json!({"url":"data:text/html,<p>still works</p>"}), Some(&session)).await;
+        assert!(reply.get("result").is_some(), "{reply}");
+    }).await;
+}

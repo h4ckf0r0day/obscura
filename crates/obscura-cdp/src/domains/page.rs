@@ -1305,6 +1305,15 @@ pub fn parse_wait_until(params: &Value) -> WaitUntil {
         .unwrap_or(WaitUntil::DomContentLoaded)
 }
 
+pub(crate) fn navigation_error_message(message: String, blocked: bool) -> String {
+    if blocked {
+        if let Some(hint) = obscura_net::private_network_error_hint(&message) {
+            return format!("{message} {hint}");
+        }
+    }
+    message
+}
+
 async fn do_navigate(
     url: &str,
     params: &Value,
@@ -1353,11 +1362,11 @@ async fn do_navigate(
         let result = if nav_method == "POST" && !nav_body.is_empty() {
             page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| navigation_error_message(e.to_string(), page.navigation_was_blocked()))
         } else {
             page.navigate_with_wait(url, wait_until)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| navigation_error_message(e.to_string(), page.navigation_was_blocked()))
         };
         let committed = page.with_dom(|dom| previous_document.as_ref().is_none_or(|previous|
             !std::sync::Arc::ptr_eq(previous, &dom.form_cache_generation_handle()))).unwrap_or(false);

@@ -2215,7 +2215,8 @@ async fn process_with_interception(
                 } else {
                     page.navigate_with_wait(&url_owned, wait_until).await
                 }
-            } => (result.map_err(|e| e.to_string()), false),
+            } => (result.map_err(|e| crate::domains::page::navigation_error_message(
+                e.to_string(), page.navigation_was_blocked())), false),
             _ = cancel_rx => (Err("net::ERR_ABORTED".into()), true),
         };
         drop(_v8_guard);

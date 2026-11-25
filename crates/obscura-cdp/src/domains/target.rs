@@ -100,7 +100,7 @@ pub async fn handle(
                         Ok(()) => Some((page.frame_id.clone(), page.url_string())),
                         Err(error) if page.navigation_was_blocked() => {
                             ctx.remove_page(&page_id);
-                            return Err(error.to_string());
+                            return Err(crate::domains::page::navigation_error_message(error.to_string(), true));
                         }
                         Err(_) => None,
                     }
