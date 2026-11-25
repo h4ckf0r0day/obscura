@@ -670,7 +670,7 @@ impl ObscuraJsRuntime {
         }
         for (context, notices) in deliveries {
             let script = format!("globalThis.__obscura_poll_indexeddb({});", serde_json::json!(notices));
-            if let Err(error) = self.eval_in_realm(&context, &script) {
+            if let Err(error) = self.eval_in_realm(&context, &script, true) {
                 tracing::warn!("IndexedDB notification failed: {error}");
             }
         }
@@ -1018,12 +1018,13 @@ impl ObscuraJsRuntime {
         copied > 0
     }
 
-    /// Runs `source` inside `realm` and returns its value as a string. Errors
-    /// come back as `Err(message)`.
+    /// Runs `source` inside `realm`, optionally stringifying its completion.
+    /// Errors come back as `Err(message)`.
     pub(crate) fn eval_in_realm(
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
         source: &str,
+        stringify_result: bool,
     ) -> Result<String, String> {
         use deno_core::v8;
 
@@ -1040,7 +1041,8 @@ impl ObscuraJsRuntime {
             None => return Err(exception_text(tc_scope)),
         };
         match script.run(tc_scope) {
-            Some(value) => Ok(value.to_rust_string_lossy(tc_scope)),
+            Some(value) if stringify_result => Ok(value.to_rust_string_lossy(tc_scope)),
+            Some(_) => Ok(String::new()),
             None => Err(exception_text(tc_scope)),
         }
     }
@@ -1764,7 +1766,7 @@ impl ObscuraJsRuntime {
         let script = "globalThis.__obscura_update_media_preferences();";
         let _ = self.execute_runtime_script("<media-preferences>", script.into());
         for (context, _) in realms {
-            let _ = self.eval_in_realm(&context, script);
+            let _ = self.eval_in_realm(&context, script, true);
         }
     }
 

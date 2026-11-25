@@ -6760,10 +6760,11 @@ class Document extends Node {
     return get ? Reflect.apply(get, this, []) : (globalThis.__documentReadyState__ || 'complete');
   }
   get currentScript() {
-    // Next.js / Turbopack chunk loader reads document.currentScript.src to
-    // derive its base path. page.rs sets __currentScriptNid before each
-    // <script> body runs and clears it after, mirroring real Chrome.
-    const nid = globalThis.__currentScriptNid;
+    if (this !== _document) {
+      const get = _documentRealmMember(this, 'currentScript');
+      return get ? Reflect.apply(get, this, []) : null;
+    }
+    const nid = globalThis.__currentScriptNid || +_dom('document_current_script');
     return nid ? _wrapEl(+nid) : null;
   }
   get hidden() { return false; }
@@ -7272,7 +7273,7 @@ class Document extends Node {
 // Shared by write and the final EOF flush. A nonnegative parent is a real node,
 // including document node 0; -1 denotes the running script's insertion point.
 function _insertWrittenNodes(doc, placements) {
-  var scriptNid = globalThis.__currentScriptNid || 0;
+  var scriptNid = globalThis.__currentScriptNid || +_dom('document_current_script') || 0;
   var after = null;
   if (scriptNid) {
     var anchorNid = doc._writeAnchorScript === scriptNid && doc._writeAnchorNid
@@ -19838,7 +19839,7 @@ const _nativeElementClick = Element.prototype.click;
 const _nativeDocumentUrl = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Document.prototype, 'URL').get);
 const _nativeNodeBaseUri = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI').get);
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['documentElement', 'head', 'body', 'URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['documentElement', 'head', 'body', 'currentScript', 'URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),

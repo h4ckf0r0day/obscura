@@ -477,6 +477,7 @@ fn form_cache_observer(
 
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
+    pub(crate) current_script: Option<NodeId>,
     form_cache_buffer: Option<FormCacheBuffer>,
     pub url: String,
     /// Initial about:blank and srcdoc documents retain their creator's base and origin.
@@ -752,6 +753,7 @@ pub struct PendingFrameMessage {
 
 impl ObscuraState {
     pub(crate) fn replace_dom(&mut self, dom: DomTree) {
+        self.current_script = None;
         if let Some(cache) = self.form_cache_buffer.as_mut() {
             let generation = dom.form_cache_generation_handle();
             generation.store(cache.generation.load(AtomicOrdering::Relaxed).wrapping_add(1), AtomicOrdering::Relaxed);
@@ -767,6 +769,7 @@ impl ObscuraState {
 
     pub(crate) fn take_dom(&mut self) -> Option<DomTree> {
         let dom = self.dom.take()?;
+        self.current_script = None;
         if let Some(cache) = self.form_cache_buffer.as_mut() {
             let mut publisher = cache.publisher.lock().expect("form cache backing storage poisoned");
             publisher.generation = std::sync::Weak::new();
@@ -813,6 +816,7 @@ impl ObscuraState {
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
             dom: None,
+            current_script: None,
             form_cache_buffer: None,
             url: "about:blank".to_string(),
             about_base_url: None,
@@ -3102,6 +3106,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "document_content_type" => {
             serde_json::to_string(&gs.content_type).unwrap_or("\"text/html\"".into())
         }
+        "document_current_script" => gs.current_script.map_or_else(|| "0".into(), |node| node.index().to_string()),
         "document_element" | "document_head" | "document_body" => {
             let root = if arg1.is_empty() { Some(dom.document()) }
                 else { arg1.parse::<u32>().ok().map(NodeId::new) };
