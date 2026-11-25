@@ -6,6 +6,7 @@ pub mod markdown;
 pub mod module_loader;
 pub mod ops;
 pub mod runtime;
+mod svg_geometry;
 pub mod v8_flags;
 mod write_stream;
 
