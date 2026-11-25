@@ -4448,6 +4448,7 @@ impl Page {
         }
         let mut loaded = 0;
         self.spawn_pending_render_resources();
+        let had_pending = self.has_pending_render_resources();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
         let Some(notify) = self.js.as_ref().map(|js| js.render_resource_notify()) else {
             return loaded;
@@ -4462,7 +4463,9 @@ impl Page {
             notified.as_mut().enable();
             loaded += self.drain_render_resource_results();
             if !self.has_pending_render_resources() {
-                break;
+                if !had_pending || tokio::time::Instant::now() >= deadline { break; }
+                self.spawn_pending_render_resources();
+                if !self.has_pending_render_resources() { break; }
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 loaded += self.drain_render_resource_results();
@@ -10785,6 +10788,46 @@ mod tests {
             loadable.len() + rejected.len(),
             super::MAX_STYLESHEET_RESOURCES
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_resource_warmup_continues_after_a_full_batch() {
+        let (address, seen_rx) = spawn_delayed_svg_server(0, 8);
+        let page_url = format!("http://{address}/page");
+        let mut page = page_with_transport_and_image("warmup-progress", &page_url, &format!("http://{address}/0.svg"));
+        let mut html = String::from("<body>");
+        for index in 0..129 {
+            html.push_str(&format!("<img src='http://{address}/{index}.svg'>"));
+        }
+        page.js.as_mut().unwrap().set_dom(parse_html(&html));
+        assert_eq!(page.prepare_screenshot_resources(3_000).await, 129,
+            "finishing a bounded batch must schedule the remaining document resources");
+        assert_eq!(seen_rx.try_iter().count(), 129);
+        assert!(page.js.as_ref().unwrap().pending_render_image_urls().is_empty());
+        assert!(!page.has_pending_render_resources());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_resource_warmup_restores_evicted_viewport_images_before_capture() {
+        let (address, _seen_rx) = spawn_delayed_svg_server(0, 8);
+        let page_url = format!("http://{address}/page");
+        let mut page = page_with_transport_and_image("warmup-visible", &page_url, &format!("http://{address}/0.svg"));
+        let mut html = String::from(r#"<body style="margin:0;display:grid;grid-template-columns:repeat(10,6px)">"#);
+        for index in 0..640 {
+            html.push_str(&format!("<img width='6' height='6' src='http://{address}/{index}.svg'>"));
+        }
+        page.js.as_mut().unwrap().set_dom(parse_html(&html));
+        assert!(page.prepare_screenshot_resources(3_000).await >= 640);
+        assert!(page.js.as_ref().unwrap().pending_render_image_urls().is_empty());
+        let png = page.screenshot(page.viewport).unwrap();
+        let bitmap = image::load_from_memory(&png).unwrap().to_rgb8();
+        for (x, y) in [(3, 3), (57, 3), (3, 75), (57, 75)] {
+            let pixel = bitmap.get_pixel(x, y);
+            assert!(pixel[0] > 240 && pixel[1] < 20 && pixel[2] < 20,
+                "the first capture must retain prepared visible pixels at ({x},{y}): {pixel:?}");
+        }
     }
 
     #[cfg(feature = "render")]
