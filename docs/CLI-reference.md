@@ -1,7 +1,8 @@
 ## `obscura`
 
-`--verbose`, `--proxy`, `--stealth`, `--obey-robots`, `--user-agent`, and
-`--allow-private-network` work before or after a subcommand. `--obey-robots`
+`--verbose`, `--proxy`, `--stealth`, `--obey-robots`, `--user-agent`,
+`--allow-private-network`, and `--ignore-certificate-errors` work before or
+after a subcommand. `--obey-robots`
 applies to `fetch` and `scrape`. Pass `--port` after `serve` or `mcp`; the
 top-level port selects CDP when no subcommand is given.
 
@@ -19,6 +20,7 @@ subcommand.
     --user-agent <UA>        Override the User-Agent
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --ignore-certificate-errors  Skip TLS certificate verification
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
 -h, --help                   Help
 -V, --version                Version
@@ -95,6 +97,7 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --ignore-certificate-errors  Skip TLS certificate verification
     --quiet                  Suppress logs unless overridden by --verbose or RUST_LOG
 -v, --verbose                Enable debug logging
 ```
@@ -117,11 +120,12 @@ Run a JS expression across many URLs in parallel.
     --proxy <URL>            HTTP or SOCKS5 proxy
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --ignore-certificate-errors  Skip TLS certificate verification
 -q, --quiet                  Suppress logs unless overridden by --verbose or RUST_LOG
 -v, --verbose                Enable debug logging
 ```
 
-`--stealth`, `--proxy`, and `--allow-private-network` are global flags: they work before or after any subcommand, so each worker in a `scrape` run inherits stealth too.
+`--stealth`, `--proxy`, `--allow-private-network`, and `--ignore-certificate-errors` are global flags: they work before or after any subcommand, so each worker in a `scrape` run inherits stealth too.
 
 Read URLs from stdin with `-`:
 
@@ -144,6 +148,7 @@ Run obscura as an MCP server.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --ignore-certificate-errors  Skip TLS certificate verification
 -v, --verbose                Enable debug logging
 ```
 
