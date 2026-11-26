@@ -1361,7 +1361,14 @@ async fn run_fetch(
         if let Some(ref expr) = eval {
             // Bound the eval by the same budget as navigation so a runaway
             // expression (infinite loop, never-settling sync work) cannot hang.
-            let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
+            let result = if !dump_specified && selector.is_none() && screenshot.is_none() {
+                // The value is printed: await a returned Promise first, so an
+                // async expression prints its result instead of `{}` (#693;
+                // #697 fixed only the worker path).
+                evaluate_cli_value(&mut page, expr, timeout_secs).await
+            } else {
+                page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs))
+            };
 
             // A bare --eval (no --selector, --dump, or --screenshot) returns the
             // eval value directly, so synchronous expressions
@@ -1577,6 +1584,35 @@ async fn run_fetch(
     context.save_storage();
 
     Ok(())
+}
+
+/// The printed value of a bare `fetch --eval`, with a returned Promise
+/// awaited. The whole evaluation, including the await, shares --timeout.
+async fn evaluate_cli_value(page: &mut obscura_browser::Page, expr: &str, timeout_secs: u64) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    // Wrap exactly as a plain --eval is wrapped (statements, trailing `;`,
+    // errors to null), but keep the raw result so a Promise can be awaited.
+    let wrapped = obscura_js::runtime::ObscuraJsRuntime::wrap_expression(expr);
+    let value = page.evaluate_with_timeout(
+        &format!("(globalThis.__obscuraCliEval = {wrapped}) instanceof Promise"),
+        Duration::from_secs(timeout_secs),
+    );
+    if value != serde_json::Value::Bool(true) {
+        // Not a Promise (or the expression failed): unchanged behavior.
+        return if value == serde_json::Value::Bool(false) {
+            page.evaluate("(() => { const v = globalThis.__obscuraCliEval; delete globalThis.__obscuraCliEval; return v; })()")
+        } else {
+            value
+        };
+    }
+    let remaining = Duration::from_secs(timeout_secs).saturating_sub(started.elapsed());
+    match page.evaluate_for_cdp_with_timeout(
+        "(() => { const v = globalThis.__obscuraCliEval; delete globalThis.__obscuraCliEval; return v; })()",
+        true, true, remaining.as_millis() as u64,
+    ).await {
+        Ok(info) if !info.thrown => info.value.unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
+    }
 }
 
 async fn fetch_original_response(
