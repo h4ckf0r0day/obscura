@@ -362,13 +362,14 @@ pub async fn handle(
             // drive them. Attach THIS connection's own pages, reusing the
             // managed session where one exists.
             //
-            // Remote pages are deliberately NOT auto-attached: their live
+            // Remote pages are NOT auto-attached by default: their live
             // `Page` lives on the owner's thread (thread-per-connection #430),
-            // so a phantom session would fail the first time the client tried
-            // to initialize the Page (Page.getFrameTree etc.). They remain
-            // visible via Target.getTargets and /json/list and stay attachable
-            // through an explicit attachToTarget (metadata-only, as documented
-            // there).
+            // so announcing them changes which client drives that page. They
+            // remain visible via Target.getTargets and /json/list and stay
+            // attachable through an explicit attachToTarget, which routes
+            // commands to the owner. A client that explicitly opted in (see
+            // `reconnect_opt_in`) also receives retained targets whose owner
+            // disconnected; active clients' pages stay hidden either way.
             //
             // A SESSION-scoped call (parent session set) auto-attaches only
             // child targets of that session's page. Obscura has none (one
@@ -409,6 +410,44 @@ pub async fn handle(
                         ));
                     }
                 }
+                if ctx.reconnect_opt_in {
+                    // The client asked, at WebSocket handshake time, to resume
+                    // pages retained by disconnected clients. Announce only
+                    // those: a target owned by a still-connected client is
+                    // never in the retained set, and a target this connection
+                    // already attached is skipped so repeated or nested
+                    // setAutoAttach calls stay idempotent.
+                    ctx.sync_registry();
+                    for target in ctx.registry.retained() {
+                        if ctx.get_page(&target.target_id).is_some()
+                            || ctx
+                                .sessions
+                                .values()
+                                .any(|page_id| page_id == &target.target_id)
+                        {
+                            continue;
+                        }
+                        let session_id = ctx.next_target_session(&target.target_id);
+                        ctx.sessions
+                            .insert(session_id.clone(), target.target_id.clone());
+                        ctx.pending_events.push(CdpEvent::new(
+                            "Target.attachedToTarget",
+                            json!({
+                                "sessionId": session_id,
+                                "targetInfo": {
+                                    "targetId": target.target_id,
+                                    "type": "page",
+                                    "title": target.title,
+                                    "url": target.url,
+                                    "attached": true,
+                                    "canAccessOpener": false,
+                                    "browserContextId": target.browser_context_id,
+                                },
+                                "waitingForDebugger": false,
+                            }),
+                        ));
+                    }
+                }
             }
             Ok(json!({}))
         }
@@ -416,14 +455,7 @@ pub async fn handle(
         // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                let page_id = ctx.sessions.get(session_id).cloned();
-                ctx.sessions.remove(session_id);
-                ctx.runtime_enabled_sessions.remove(session_id);
-                if let Some(page_id) = page_id {
-                    ctx.refresh_runtime_event_collection(&page_id);
-                }
-                #[cfg(feature = "render")]
-                ctx.screencasts.remove(session_id);
+                ctx.release_session(session_id);
             }
             Ok(json!({}))
         }
@@ -1145,6 +1177,149 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Target method"));
+    }
+
+    /// A reconnecting client that did not opt in must keep the existing CDP
+    /// default: retained pages stay discoverable but are not auto-attached.
+    /// Opting in via the WebSocket handshake announces only retained targets,
+    /// and repeated setAutoAttach calls must not emit duplicates.
+    #[tokio::test]
+    async fn reconnect_opt_in_attaches_only_retained_targets_once() {
+        let registry = crate::registry::TargetRegistry::default();
+        let mut owner = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+        let mut reconnecting = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+
+        let page_id = owner.create_page();
+        owner.sync_registry();
+        registry.mark_retained(&[page_id.clone()]);
+
+        // Default (no opt-in): retained target stays hidden from auto-attach.
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": true, "flatten": true }),
+            &mut reconnecting,
+            &None,
+        )
+        .await
+        .expect("setAutoAttach should succeed");
+        assert!(
+            reconnecting.pending_events.is_empty(),
+            "retained targets must not be auto-attached without opt-in, got: {:?}",
+            reconnecting.pending_events
+        );
+
+        // Opted-in: the retained target is announced through the normal
+        // browser-level attach lifecycle and gets a session route.
+        reconnecting.reconnect_opt_in = true;
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": true, "flatten": true }),
+            &mut reconnecting,
+            &None,
+        )
+        .await
+        .expect("opted-in setAutoAttach should succeed");
+        let attached: Vec<_> = reconnecting
+            .pending_events
+            .iter()
+            .filter(|e| {
+                e.method == "Target.attachedToTarget"
+                    && e.params["targetInfo"]["targetId"] == page_id
+            })
+            .collect();
+        assert_eq!(attached.len(), 1, "retained target must be announced once");
+        let session_id = attached[0].params["sessionId"].as_str().unwrap();
+        assert_eq!(
+            reconnecting.sessions.get(session_id).map(String::as_str),
+            Some(page_id.as_str()),
+            "reconnecting client must hold a route to the retained page"
+        );
+        assert_eq!(attached[0].params["targetInfo"]["attached"], true);
+        assert_eq!(attached[0].params["targetInfo"]["type"], "page");
+
+        // Repeated setAutoAttach is idempotent: Playwright throws on a
+        // duplicate target, so no second attachedToTarget for the same id.
+        reconnecting.pending_events.clear();
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": true, "flatten": true }),
+            &mut reconnecting,
+            &None,
+        )
+        .await
+        .expect("second opted-in setAutoAttach should succeed");
+        assert!(
+            reconnecting.pending_events.iter().all(|e| {
+                e.method != "Target.attachedToTarget"
+                    || e.params["targetInfo"]["targetId"] != page_id
+            }),
+            "repeated setAutoAttach must not duplicate an attachment, got: {:?}",
+            reconnecting.pending_events
+        );
+    }
+
+    /// Active clients' pages are never retained, so even an opted-in reconnect
+    /// must not announce them. A retained target closed remotely must not be
+    /// attached after close.
+    #[tokio::test]
+    async fn reconnect_opt_in_skips_live_and_closed_targets() {
+        let registry = crate::registry::TargetRegistry::default();
+        let mut owner = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+        let mut reconnecting = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+        reconnecting.reconnect_opt_in = true;
+
+        let live_page = owner.create_page();
+        owner.sync_registry();
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": true, "flatten": true }),
+            &mut reconnecting,
+            &None,
+        )
+        .await
+        .expect("setAutoAttach should succeed");
+        assert!(
+            reconnecting.pending_events.iter().all(|e| {
+                e.method != "Target.attachedToTarget"
+                    || e.params["targetInfo"]["targetId"] != live_page
+            }),
+            "a live remote page must not be auto-attached, got: {:?}",
+            reconnecting.pending_events
+        );
+
+        let closed_page = owner.create_page();
+        owner.sync_registry();
+        registry.mark_retained(&[closed_page.clone()]);
+        registry.mark_closed(&[closed_page.clone()]);
+        reconnecting.pending_events.clear();
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": true, "flatten": true }),
+            &mut reconnecting,
+            &None,
+        )
+        .await
+        .expect("setAutoAttach should succeed");
+        assert!(
+            reconnecting.pending_events.iter().all(|e| {
+                e.method != "Target.attachedToTarget"
+                    || e.params["targetInfo"]["targetId"] != closed_page
+            }),
+            "a closed retained target must not be attached, got: {:?}",
+            reconnecting.pending_events
+        );
     }
 
     /// Regression for #122 item 5: every TargetInfo payload must carry the

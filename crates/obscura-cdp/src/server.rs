@@ -58,6 +58,13 @@ struct CdpMessage {
     reply_tx: mpsc::UnboundedSender<String>,
 }
 
+/// A WebSocket stream accepted by the control-plane thread, plus the
+/// per-connection options parsed from its HTTP upgrade request.
+struct WsHandoff {
+    stream: std::net::TcpStream,
+    reconnect_opt_in: bool,
+}
+
 enum ServerMessage {
     Cdp(CdpMessage),
     NewConnection {
@@ -73,8 +80,13 @@ enum ServerMessage {
     RemoteExec {
         text: String,
         page_id: String,
+        /// Identifies the forwarding connection. The owner uses it together
+        /// with the caller's session id to mint a stable, caller-specific
+        /// owner-side session instead of reusing one of its own sessions.
+        forwarder_id: u64,
         reply_tx: mpsc::UnboundedSender<String>,
     },
+    ReleaseRemoteSession(String),
     /// The client's WebSocket closed. Pages created by this connection are
     /// NOT torn down: they stay alive on this thread (thread-per-connection
     /// #430) and remain visible in the global registry and drivable from
@@ -225,7 +237,7 @@ pub async fn start_with_serve_options_and_limit(
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
 
-    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
+    let (ws_tx, mut ws_rx) = mpsc::channel::<WsHandoff>(MAX_PENDING_WS_HANDOFFS);
 
     // Process-wide page target registry (issue #544). Every connection shares
     // this one so Target.getTargets on any WebSocket and /json/list on the
@@ -420,10 +432,11 @@ pub async fn start_with_serve_options_and_limit(
             stream = ws_rx.recv() => stream,
             _ = shutdown_notify.notified() => None,
         };
-        let stream = match stream {
-            Some(s) => s,
+        let handoff = match stream {
+            Some(h) => h,
             None => break,
         };
+        let stream = handoff.stream;
         // Nagle off + nonblocking on the std socket before it moves to the
         // connection thread. CDP exchanges many small (~100-byte) frames during
         // newPage()/navigate; with Nagle on, each small write waits on an ACK or
@@ -454,6 +467,7 @@ pub async fn start_with_serve_options_and_limit(
         }
         run_connection(
             stream,
+            handoff.reconnect_opt_in,
             shared_ctx.clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
@@ -544,6 +558,7 @@ fn cap_malloc_arenas() {
 /// plumbing is needed.
 fn run_connection(
     std_stream: std::net::TcpStream,
+    reconnect_opt_in: bool,
     context_template: Arc<obscura_browser::BrowserContext>,
     persistence_context: Arc<obscura_browser::BrowserContext>,
     persistence_lock: Arc<std::sync::Mutex<()>>,
@@ -610,6 +625,7 @@ fn run_connection(
                     target_registry,
                     msg_tx.clone(),
                     remote_owners,
+                    reconnect_opt_in,
                 ));
             if let Err(e) = handle_connection_ws(tokio_stream, msg_tx.clone()).await {
                 error!("WebSocket connection error: {}", e);
@@ -785,6 +801,22 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
     PeekStatus::Head(String::from_utf8_lossy(head).into_owned())
 }
 
+/// Explicit per-connection opt-in for resuming pages retained by disconnected
+/// CDP clients. It travels as an HTTP header on the WebSocket upgrade, which
+/// `connectOverCDP` forwards from its `headers` option. The header is consumed
+/// here and never logged.
+const RECONNECT_OPT_IN_HEADER: &str = "x-obscura-reconnect";
+
+fn reconnect_opt_in_from_head(head: &str) -> bool {
+    head.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case(RECONNECT_OPT_IN_HEADER)
+            && matches!(value.trim(), "1" | "true")
+    })
+}
+
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
 ///
 /// The connection's request head has already been peeked by the accept loop
@@ -795,7 +827,7 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
 fn accept_dispatch(
     stream: std::net::TcpStream,
     port: u16,
-    ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    ws_tx: &mpsc::Sender<WsHandoff>,
     head: &str,
     target_registry: &TargetRegistry,
 ) -> anyhow::Result<()> {
@@ -826,7 +858,10 @@ fn accept_dispatch(
     // dropped `stream` closes itself; the client will see ECONNRESET and
     // can retry.
     ws_tx
-        .try_send(stream)
+        .try_send(WsHandoff {
+            stream,
+            reconnect_opt_in: reconnect_opt_in_from_head(head),
+        })
         .map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
@@ -910,8 +945,10 @@ async fn cdp_processor(
     target_registry: TargetRegistry,
     my_msg_tx: mpsc::UnboundedSender<ServerMessage>,
     remote_owners: RemoteOwners,
+    reconnect_opt_in: bool,
 ) {
     let mut ctx = CdpContext::new_with_shared_context_and_registry(default_context, target_registry);
+    ctx.reconnect_opt_in = reconnect_opt_in;
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
@@ -1069,6 +1106,13 @@ async fn cdp_processor(
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 connection_reply_tx = Some(reply_tx.clone());
+                if ctx.reconnect_opt_in {
+                    // A connection that resumes existing pages starts without an
+                    // implicit page of its own. Otherwise each reconnect would
+                    // leave a fresh blank target and processor behind.
+                    let _ = reply_tx.send(json!({"__init": true}).to_string());
+                    continue;
+                }
                 // Issue #543: a browser-level client that connects and immediately
                 // calls Target.getTargets must see the existing page targets (the
                 // CDP spec makes targets globally visible). Without this, a fresh
@@ -1125,12 +1169,14 @@ async fn cdp_processor(
             ServerMessage::RemoteExec {
                 text,
                 page_id,
+                forwarder_id,
                 reply_tx,
             } => {
                 handle_remote_exec(
                     &mut ctx,
                     &text,
                     &page_id,
+                    forwarder_id,
                     &reply_tx,
                     &mut rx,
                     &mut intercept_rx,
@@ -1138,6 +1184,9 @@ async fn cdp_processor(
                     &mut deferred,
                 )
                 .await;
+            }
+            ServerMessage::ReleaseRemoteSession(session_id) => {
+                ctx.release_session(&session_id);
             }
             ServerMessage::ConnectionClosed => {
                 // The client socket is gone, but the pages this connection
@@ -1155,6 +1204,14 @@ async fn cdp_processor(
                 ctx.pending_events.clear();
                 #[cfg(feature = "render")]
                 ctx.screencasts.clear();
+                // The live pages stay on this thread, but their client is
+                // gone. Mark them retained so a reconnecting client that
+                // explicitly opted in can auto-attach them through the normal
+                // Playwright/Puppeteer lifecycle. Active clients' pages are
+                // never marked here.
+                let retained: Vec<String> =
+                    ctx.pages.iter().map(|page| page.id.clone()).collect();
+                ctx.registry.mark_retained(&retained);
             }
         }
 
@@ -1211,6 +1268,19 @@ fn forward_remote_cdp(
         return false;
     };
 
+    if req.method == "Target.detachFromTarget" {
+        if let Some(session_id) = req.params.get("sessionId").and_then(|v| v.as_str()) {
+            if let Some(page_id) = ctx.sessions.get(session_id).filter(|id| ctx.get_page(id).is_none()) {
+                if let Some(owner) = remote_owners.lock().unwrap_or_else(|e| e.into_inner()).get(page_id) {
+                    let _ = owner.send(ServerMessage::ReleaseRemoteSession(
+                        forwarded_session_id(page_id, ctx.connection_id, session_id),
+                    ));
+                }
+            }
+        }
+        return false; // The caller must also drop its local session.
+    }
+
     // Browser-level `Target.closeTarget` (no sessionId) is browser-global: it
     // may name a target owned by another connection. Route it to the owner so
     // the live `Page` is torn down for real — its isolate lives on the owner's
@@ -1240,6 +1310,7 @@ fn forward_remote_cdp(
         let forwarded = ServerMessage::RemoteExec {
             text: cdp_msg.text.clone(),
             page_id: target_id.to_string(),
+            forwarder_id: ctx.connection_id,
             reply_tx: cdp_msg.reply_tx.clone(),
         };
         if owner_tx.send(forwarded).is_err() {
@@ -1300,6 +1371,7 @@ fn forward_remote_cdp(
     let forwarded = ServerMessage::RemoteExec {
         text: cdp_msg.text.clone(),
         page_id: page_id.clone(),
+        forwarder_id: ctx.connection_id,
         reply_tx: cdp_msg.reply_tx.clone(),
     };
     if owner_tx.send(forwarded).is_err() {
@@ -1325,10 +1397,15 @@ fn forward_remote_cdp(
 /// message is rewritten back to the caller's session id so the client can
 /// correlate the reply with its session. The page's V8 isolate is never
 /// shared: all execution happens on this (the owning) connection's thread.
+fn forwarded_session_id(page_id: &str, forwarder_id: u64, session_id: &str) -> String {
+    format!("{page_id}-forwarded-{forwarder_id}-{session_id}")
+}
+
 async fn handle_remote_exec(
     ctx: &mut CdpContext,
     text: &str,
     page_id: &str,
+    forwarder_id: u64,
     caller_reply_tx: &mpsc::UnboundedSender<String>,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
@@ -1341,20 +1418,37 @@ async fn handle_remote_exec(
     let Ok(mut req) = serde_json::from_str::<CdpRequest>(text) else {
         return;
     };
+    ctx.reap_forwarded_sessions();
     let caller_session = req.session_id.clone();
-    // This connection's own session for the page. Pages created here (init or
-    // createTarget) already carry a managed `{page_id}-session`; mint one for
-    // anything else rather than leaving the caller's session unresolved.
-    let owner_session = ctx
-        .sessions
-        .iter()
-        .find(|(_, pid)| pid.as_str() == page_id)
-        .map(|(sid, _)| sid.clone())
-        .unwrap_or_else(|| {
-            let sid = ctx.next_target_session(page_id);
-            ctx.sessions.insert(sid.clone(), page_id.to_string());
+    // Give every forwarding connection its own owner-side session. Reusing
+    // this connection's existing session for the page collides with the
+    // caller's id in the common case (both are named `{page_id}-session`) and
+    // makes Runtime.enable look like a repeat enable, so the owner suppresses
+    // the executionContextCreated burst the caller needs to initialize the
+    // page. The id is derived from the forwarder and the caller's session, so
+    // repeated commands from one caller keep one stable session while two
+    // reconnects stay isolated. Non-session forwards (browser-level close)
+    // keep the previous find-or-mint behaviour.
+    let owner_session = match caller_session.as_deref() {
+        Some(caller) => {
+            let sid = forwarded_session_id(page_id, forwarder_id, caller);
+            ctx.sessions
+                .entry(sid.clone())
+                .or_insert_with(|| page_id.to_string());
+            ctx.forwarded_sessions.insert(sid.clone(), caller_reply_tx.downgrade());
             sid
-        });
+        }
+        None => ctx
+            .sessions
+            .iter()
+            .find(|(_, pid)| pid.as_str() == page_id)
+            .map(|(sid, _)| sid.clone())
+            .unwrap_or_else(|| {
+                let sid = ctx.next_target_session(page_id);
+                ctx.sessions.insert(sid.clone(), page_id.to_string());
+                sid
+            }),
+    };
     req.session_id = Some(owner_session.clone());
     let rewritten = serde_json::to_string(&req).unwrap_or_else(|_| text.to_string());
 
@@ -1861,6 +1955,7 @@ async fn process_with_interception(
                     ServerMessage::RemoteExec {
                         text,
                         page_id,
+                        forwarder_id,
                         reply_tx,
                     } => {
                         // Same V8 hazard as a session command: executing a
@@ -1892,9 +1987,13 @@ async fn process_with_interception(
                             deferred.push_back(ServerMessage::RemoteExec {
                                 text,
                                 page_id,
+                                forwarder_id,
                                 reply_tx,
                             });
                         }
+                    }
+                    ServerMessage::ReleaseRemoteSession(session_id) => {
+                        ctx.release_session(&session_id);
                     }
                     ServerMessage::ConnectionClosed => {
                         // No V8 involved: this only flips the processor's
@@ -2245,6 +2344,7 @@ mod tests {
                     crate::registry::TargetRegistry::default(),
                     my_msg_tx,
                     std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
                 ));
 
                 server_tx
@@ -2378,6 +2478,7 @@ mod tests {
                     crate::registry::TargetRegistry::default(),
                     my_msg_tx,
                     std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
                 ));
 
                 server_tx
@@ -2454,6 +2555,7 @@ mod tests {
                     crate::registry::TargetRegistry::default(),
                     my_msg_tx,
                     std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
                 ));
 
                 server_tx
@@ -2534,6 +2636,7 @@ mod tests {
                     crate::registry::TargetRegistry::default(),
                     my_msg_tx,
                     std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
                 ));
 
                 server_tx
@@ -2624,6 +2727,7 @@ mod tests {
                     registry.clone(),
                     owner_tx.clone(),
                     remote_owners.clone(),
+                    false,
                 ));
                 owner_tx
                     .send(super::ServerMessage::NewConnection {
@@ -2650,6 +2754,7 @@ mod tests {
                     registry,
                     caller_tx.clone(),
                     remote_owners,
+                    false,
                 ));
                 caller_tx
                     .send(super::ServerMessage::NewConnection {
@@ -2785,6 +2890,7 @@ mod tests {
                     crate::registry::TargetRegistry::default(),
                     my_msg_tx,
                     std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
                 ));
 
                 server_tx
@@ -3122,6 +3228,7 @@ mod tests {
                     registry.clone(),
                     server_tx.clone(),
                     remote_owners.clone(),
+                    false,
                 ));
 
                 // The connection opens and its init page is registered.
@@ -3256,6 +3363,7 @@ mod tests {
                     registry.clone(),
                     owner_tx.clone(),
                     remote_owners.clone(),
+                    false,
                 ));
                 owner_tx
                     .send(super::ServerMessage::NewConnection {
@@ -3282,6 +3390,7 @@ mod tests {
                     registry.clone(),
                     caller_tx.clone(),
                     remote_owners.clone(),
+                    false,
                 ));
                 caller_tx
                     .send(super::ServerMessage::NewConnection {

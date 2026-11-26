@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
@@ -49,6 +50,8 @@ pub(crate) struct ExecutionContextRecord {
     pub is_default: bool,
 }
 
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
@@ -79,6 +82,22 @@ pub struct CdpContext {
     /// globally-unique page ids: per-connection counters used to collide on
     /// "page-1" across connections, which broke any shared target view.
     pub registry: TargetRegistry,
+    /// Set when the WebSocket handshake carries the explicit retained-target
+    /// opt-in. Browser-level `Target.setAutoAttach` then also announces pages
+    /// whose owning connection has disconnected, so Playwright's
+    /// connectOverCDP surfaces them on the ordinary attach lifecycle. Default
+    /// is false: active clients' pages and retained pages stay hidden from
+    /// clients that did not opt in.
+    pub reconnect_opt_in: bool,
+    /// Identifies the connection that owns this context. Forwarded commands
+    /// use it to derive a distinct owner-side session per calling
+    /// connection, even when two connections use the same client-side
+    /// session id (for example two reconnects both attaching
+    /// `page-1-session-1`). Reusing the owner's already-enabled session would
+    /// suppress the one-time `Runtime.executionContextCreated` burst the
+    /// caller needs to initialize the page.
+    pub(crate) connection_id: u64,
+    pub(crate) forwarded_sessions: HashMap<String, tokio::sync::mpsc::WeakUnboundedSender<String>>,
     browser_context_counter: u32,
     target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
@@ -202,6 +221,9 @@ impl CdpContext {
             default_context,
             browser_contexts: HashMap::new(),
             registry,
+            reconnect_opt_in: false,
+            connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+            forwarded_sessions: HashMap::new(),
             browser_context_counter: 0,
             target_session_counter: 0,
             preload_scripts: Vec::new(),
@@ -390,6 +412,30 @@ impl CdpContext {
         }
     }
 
+    pub(crate) fn release_session(&mut self, session_id: &str) {
+        self.forwarded_sessions.remove(session_id);
+        self.runtime_enabled_sessions.remove(session_id);
+        self.binding_sessions.retain(|_, sessions| {
+            sessions.retain(|id| id != session_id);
+            !sessions.is_empty()
+        });
+        #[cfg(feature = "render")]
+        self.screencasts.remove(session_id);
+        if let Some(page_id) = self.sessions.remove(session_id) {
+            self.refresh_runtime_event_collection(&page_id);
+        }
+    }
+
+    pub(crate) fn reap_forwarded_sessions(&mut self) {
+        let expired: Vec<_> = self.forwarded_sessions.iter()
+            .filter(|(_, sender)| sender.upgrade().is_none_or(|sender| sender.is_closed()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.release_session(&id);
+        }
+    }
+
     pub fn remove_page(&mut self, id: &str) {
         let removed_sessions: Vec<String> = self
             .sessions
@@ -409,6 +455,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
+            self.forwarded_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {

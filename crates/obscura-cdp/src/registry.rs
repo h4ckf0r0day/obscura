@@ -33,6 +33,12 @@ struct RegistryState {
     /// skipped by `upsert`; the entry is cleared once the owner really drops
     /// the page (`remove_page` or connection `Drop`).
     closed: HashSet<String>,
+    /// Target ids whose owning connection's WebSocket is gone. The live `Page`
+    /// stays on the owner's thread, so an opted-in reconnecting client can
+    /// still drive it through normal CDP routing. Retained targets are never
+    /// auto-attached unless the new connection explicitly opts in; active
+    /// clients' pages are never in this set.
+    retained: HashSet<String>,
     /// Globally-unique page id counter. Each connection used to mint its own
     /// `page-N` ids from a per-context counter, so every connection's first
     /// page collided on "page-1" in any shared view. The registry hands out
@@ -100,6 +106,7 @@ impl TargetRegistry {
         state.targets.retain(|t| !target_ids.contains(&t.target_id));
         for id in target_ids {
             state.closed.remove(id);
+            state.retained.remove(id);
         }
     }
 
@@ -120,6 +127,7 @@ impl TargetRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         state.targets.retain(|t| !target_ids.contains(&t.target_id));
+        state.retained.retain(|id| !target_ids.contains(id));
         for id in target_ids {
             if !state.closed.insert(id.clone()) {
                 continue;
@@ -147,6 +155,52 @@ impl TargetRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .closed
+            .contains(target_id)
+    }
+
+    /// Remember that a target's owning connection disconnected. The target
+    /// remains live and drivable, but only a connection that explicitly opts
+    /// in may auto-attach it. Unknown or closed ids are ignored.
+    pub fn mark_retained(&self, target_ids: &[String]) {
+        if target_ids.is_empty() {
+            return;
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for id in target_ids {
+            if state.closed.contains(id) {
+                continue;
+            }
+            if state.targets.iter().any(|t| t.target_id == *id) {
+                state.retained.insert(id.clone());
+            }
+        }
+    }
+
+    /// Snapshot of every retained (owner disconnected) live target, in
+    /// creation order. Used only by opted-in `Target.setAutoAttach`.
+    pub fn retained(&self) -> Vec<TargetInfo> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state
+            .targets
+            .iter()
+            .filter(|t| state.retained.contains(&t.target_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a target is retained by a disconnected owner.
+    #[cfg(test)]
+    pub fn is_retained(&self, target_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retained
             .contains(target_id)
     }
 
@@ -287,4 +341,46 @@ mod tests {
         registry.mark_closed(&["page-fresh".to_string()]);
         assert!(registry.is_closed("page-fresh"));
     }
+    /// Retained marks are scoped to live targets and clear as soon as the
+    /// target is closed or really removed, so an opted-in reconnect can never
+    /// attach a dead target or unknowingly attach an active client's page.
+    #[test]
+    fn retained_targets_are_live_and_clear_on_close_or_remove() {
+        let registry = TargetRegistry::default();
+        let live = "page-1".to_string();
+        let other = "page-2".to_string();
+        registry.upsert(TargetInfo {
+            target_id: live.clone(),
+            title: String::new(),
+            url: "about:blank".into(),
+            browser_context_id: "default".into(),
+        });
+        registry.upsert(TargetInfo {
+            target_id: other.clone(),
+            title: String::new(),
+            url: "https://example.com/".into(),
+            browser_context_id: "default".into(),
+        });
+
+        // Unknown ids are ignored: retention only describes registered pages.
+        registry.mark_retained(&["page-unknown".to_string(), live.clone()]);
+        assert!(registry.is_retained(&live));
+        assert!(!registry.is_retained(&other));
+        assert!(!registry.is_retained("page-unknown"));
+        assert_eq!(registry.retained().len(), 1);
+        assert_eq!(registry.retained()[0].target_id, live);
+
+        // Closing a retained target clears retention with the tombstone.
+        registry.mark_closed(&[live.clone()]);
+        assert!(!registry.is_retained(&live));
+        assert!(registry.retained().is_empty());
+
+        // Retention also clears when the owner really drops the page.
+        registry.mark_retained(&[other.clone()]);
+        assert!(registry.is_retained(&other));
+        registry.remove_pages(&[other.clone()]);
+        assert!(!registry.is_retained(&other));
+        assert!(registry.retained().is_empty());
+    }
+
 }
