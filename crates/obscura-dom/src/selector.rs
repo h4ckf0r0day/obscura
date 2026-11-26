@@ -707,24 +707,27 @@ impl DomTree {
         root: NodeId,
         selector: &str,
     ) -> Result<Option<NodeId>, String> {
-        // Fast path: a bare "#id" selector resolves through the id index in O(1)
-        // instead of scanning every descendant. The index holds the first element
-        // in tree order per id, which is exactly what the full scan would return.
+        // Fast path: a bare "#id" selector resolves through the id index
+        // instead of scanning every descendant. The index lists every element
+        // with the id, so the first of them below `root` in tree order is
+        // exactly what the full scan would return, and none means no match.
         // In quirks mode `#id` matches ASCII-case-insensitively, but the id
         // index is keyed on the exact-case id, so skip the fast path and let the
         // selector engine (below) do the case-insensitive match.
         if !self.is_quirks() {
             if let Some(id) = simple_id_selector(selector) {
-                match self.get_element_by_id(id) {
-                    // querySelector matches strict descendants of root only, so the
-                    // indexed element must have root among its ancestors.
-                    Some(nid) if self.ancestors(nid).contains(&root) => return Ok(Some(nid)),
-                    // Index miss or stale entry (detached node) — fall through to full scan.
-                    // The id_index is best-effort: it only registers nodes at creation time
-                    // and does not update on reparent, so it can point to a detached clone
-                    // while the live node (with the same id) is elsewhere in the tree.
-                    _ => {}
+                let mut first: Option<NodeId> = None;
+                // querySelector matches strict descendants of root only.
+                for nid in self.elements_with_id(id) {
+                    if !self.ancestors(nid).contains(&root) {
+                        continue;
+                    }
+                    first = Some(match first {
+                        Some(current) if self.precedes_in_tree_order(current, nid) => current,
+                        _ => nid,
+                    });
                 }
+                return Ok(first);
             }
         }
         let selector_list = parse_selector(selector)?;

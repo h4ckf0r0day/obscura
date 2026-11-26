@@ -13599,6 +13599,46 @@ mod tests {
     }
 
     #[test]
+    fn get_element_by_id_tracks_moves_renames_and_duplicate_order() {
+        let mut rt = setup_runtime(r#"<div id="list"><p id="a"></p></div>"#);
+        let result = rt
+            .evaluate(
+                r##"(() => {
+                const list = document.getElementById("list");
+                const a = document.getElementById("a");
+                list.remove();
+                const detached = document.getElementById("a") === null
+                    && document.querySelector("#a") === null;
+                document.body.appendChild(list);
+                const reinserted = document.getElementById("a") === a;
+                const dup = document.createElement("span");
+                dup.id = "a";
+                list.insertBefore(dup, a);
+                const firstInTreeOrder = document.getElementById("a") === dup
+                    && document.querySelector("#a") === dup;
+                dup.setAttribute("id", "b");
+                const renamed = document.getElementById("a") === a
+                    && document.getElementById("b") === dup;
+                dup.removeAttribute("id");
+                const cleared = document.getElementById("b") === null;
+                const host = document.createElement("div");
+                document.body.appendChild(host);
+                host.attachShadow({ mode: "open" }).innerHTML = '<i id="shadowed"></i>';
+                const shadowHidden = document.getElementById("shadowed") === null;
+                return { detached, reinserted, firstInTreeOrder, renamed, cleared, shadowHidden };
+            })()"##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "detached": true, "reinserted": true, "firstInTreeOrder": true,
+                "renamed": true, "cleared": true, "shadowHidden": true,
+            })
+        );
+    }
+
+    #[test]
     fn attributes_named_node_map_is_live() {
         let mut rt = setup_runtime(r#"<div id="test" class="card" data-state="ready"></div>"#);
         let result = rt
