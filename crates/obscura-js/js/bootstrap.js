@@ -6798,6 +6798,12 @@ class Document extends Node {
   evaluate(expression, contextNode, namespaceResolver, type, result) {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
   }
+  createExpression(expression, resolver) {
+    return new XPathExpression(expression, resolver);
+  }
+  createNSResolver(nodeResolver) {
+    return null;
+  }
   createElement(t) {
     const localName = String(t).toLowerCase();
     const nid = +_dom("create_element", localName);
@@ -15394,6 +15400,29 @@ globalThis.DOMStringMap = DOMStringMap;
 globalThis.Animation = Animation;
 globalThis.KeyframeEffect = KeyframeEffect;
 globalThis.DocumentTimeline = DocumentTimeline;
+// I have nothing but my burger and I want nothing more
+class XPathExpression {
+  #expr;
+  #resolver;
+  constructor(expr, resolver) {
+    this.#expr = expr;
+    this.#resolver = resolver;
+  }
+  evaluate(contextNode, type, result) {
+    return _makeXPathResult(type, _xpathFindNodes(this.#expr, contextNode));
+  }
+}
+class XPathEvaluator {
+  createExpression(expression, resolver) {
+    return new XPathExpression(expression, resolver);
+  }
+  createNSResolver(nodeResolver) {
+    return null;
+  }
+  evaluate(expression, contextNode, resolver, type, result) {
+    return _makeXPathResult(type, _xpathFindNodes(expression, contextNode));
+  }
+}
 globalThis.XPathResult = globalThis.XPathResult || class XPathResult {};
 Object.assign(globalThis.XPathResult, {
   ANY_TYPE: 0,
@@ -15407,6 +15436,8 @@ Object.assign(globalThis.XPathResult, {
   ANY_UNORDERED_NODE_TYPE: 8,
   FIRST_ORDERED_NODE_TYPE: 9,
 });
+globalThis.XPathExpression = XPathExpression;
+globalThis.XPathEvaluator = XPathEvaluator;
 // XMLDocument is a subclass of Document (DOMParser of an XML type and
 // implementation.createDocument produce one). The interface must exist globally.
 if (typeof XMLDocument === "undefined") globalThis.XMLDocument = class XMLDocument extends Document {};
