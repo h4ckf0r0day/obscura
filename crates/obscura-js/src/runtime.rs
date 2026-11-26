@@ -19825,6 +19825,35 @@ mod tests {
         assert_eq!(exposed, serde_json::json!("function:function:9"));
     }
 
+    #[test]
+    fn xpath_evaluator_and_expression_are_defined() {
+        let mut rt = setup_runtime("<p class='x'>A</p><p class='x'>B</p>");
+
+        let types = rt
+            .evaluate("`${typeof XPathEvaluator}:${typeof XPathExpression}:${typeof document.createExpression}`")
+            .unwrap();
+        assert_eq!(types, serde_json::json!("function:function:function"));
+
+        let via_evaluator = rt
+            .evaluate(r#"(() => {
+                const ev = new XPathEvaluator();
+                const expr = ev.createExpression('//p');
+                const result = expr.evaluate(document, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE);
+                return result.snapshotLength;
+            })()"#)
+            .unwrap();
+        assert_eq!(via_evaluator, serde_json::json!(2));
+
+        let via_doc = rt
+            .evaluate(r#"(() => {
+                const expr = document.createExpression('//p');
+                const result = expr.evaluate(document, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE);
+                return result.snapshotLength;
+            })()"#)
+            .unwrap();
+        assert_eq!(via_doc, serde_json::json!(2));
+    }
+
     /// Regression for #105: `document.forms` / `images` / `links` must be
     /// live, not hardcoded `[]`. jQuery 1.x's submit-event setup iterates
     /// `document.forms` and crashes when it's empty for pages that have forms.
