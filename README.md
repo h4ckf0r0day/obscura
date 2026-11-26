@@ -498,6 +498,21 @@ Fetch and render a single page.
 | `--quiet` | off | Suppress banner |
 | `--proxy` | — | Inherited global HTTP/SOCKS5 proxy URL |
 
+### `obscura fetch --file <path>`
+
+Check a list of URLs with raw HTTP requests. Supply one URL per line, or use
+`--file -` to read from stdin. Blank lines and lines starting with `#` are
+skipped. Batch mode defaults to `--dump original` and accepts only that format.
+
+```bash
+obscura fetch --file urls.txt --concurrency 4 --output results.ndjson
+```
+
+A single URL with `--dump original` writes the response body. Batch mode writes
+one JSON status record per URL in input order, to stdout or the `--output` file.
+HTTP responses include the status code and body size in bytes. Request errors
+include an `error` message. Use `scrape` for rendered batch output.
+
 ### `obscura scrape <URL...>`
 
 Scrape multiple URLs in parallel with worker processes.
