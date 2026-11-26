@@ -25,12 +25,12 @@ function _idbDispatch(target, type, init = {}) {
   const event = globalThis.__obscura_markTrusted(new IDBVersionChangeEvent(type, {
     bubbles: type === 'error' || type === 'abort', cancelable: type === 'error', ...init,
   }));
-  event.target = target;
+  _eventSet(event, "target", target);
   event._dispatching = true;
   let threw = false, current = target;
   while (current) {
-    event.currentTarget = current;
-    event.eventPhase = current === target ? 2 : 3;
+    _eventSet(event, "currentTarget", current);
+    _eventSet(event, "eventPhase", current === target ? 2 : 3);
     const listeners = (_eventTargetListeners.get(current)?.get(type) || []).slice();
     const invoke = callback => {
       try {
@@ -48,7 +48,7 @@ function _idbDispatch(target, type, init = {}) {
     const slot = _idbSlot(current);
     current = slot.transaction || slot.db || null;
   }
-  event.currentTarget = null; event.eventPhase = 0;
+  _eventSet(event, "currentTarget", null); _eventSet(event, "eventPhase", 0);
   event._dispatching = false;
   return { canceled:event.defaultPrevented, threw };
 }
