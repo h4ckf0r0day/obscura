@@ -97,8 +97,12 @@ Use raw CDP for `Page.captureScreenshot`, `Page.startScreencast`, and
 page activity; this is not fixed-frame-rate desktop capture.
 
 PDF output supports paper dimensions, margins, landscape, scale, backgrounds,
-and page ranges. It does not currently provide selectable text, tagged PDF,
-outlines, headers/footers, or complete CSS paged-media behavior.
+page ranges, and header/footer templates (`displayHeaderFooter` with
+`headerTemplate` and `footerTemplate`). Templates are drawn in the top and
+bottom margins of every page, so reserve margin space for them. The `date`,
+`title`, `url`, `pageNumber`, and `totalPages` classes are filled in; templates
+run no script and fetch nothing. It does not currently provide selectable text,
+tagged PDF, outlines, or complete CSS paged-media behavior.
 
 ## Drive MCP
 
