@@ -1976,7 +1976,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
                 // instead of menus, footers, and cookie banners.
                 if matches!(
                     tag,
-                    "script" | "style" | "nav" | "header" | "footer" | "aside"
+                    "script" | "style" | "noscript" | "nav" | "header" | "footer" | "aside"
                 ) {
                     continue;
                 }
@@ -3070,6 +3070,21 @@ mod tests {
                 "boilerplate '{boilerplate}' leaked through: {text}"
             );
         }
+    }
+
+    #[test]
+    fn skips_noscript_fallback_content() {
+        let text = body_text(
+            r#"<html><body>
+                <p>Visible text.</p>
+                <noscript><p>Enable JavaScript.</p></noscript>
+            </body></html>"#,
+        );
+        assert!(text.contains("Visible text."), "main content kept: {text}");
+        assert!(
+            !text.contains("Enable JavaScript."),
+            "noscript fallback leaked through: {text}"
+        );
     }
 
     #[test]
