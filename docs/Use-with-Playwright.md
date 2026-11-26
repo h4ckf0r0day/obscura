@@ -147,6 +147,30 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 await browser.close();  // closes the CDP connection, leaves obscura serve running
 ```
 
+## Reconnect to retained pages
+
+`obscura serve` keeps a disconnected client's pages alive. They remain visible
+in `Target.getTargets` and `/json/list`, but they are not auto-attached to a new
+connection by default, because their Page and V8 isolate stay on the original
+client's thread and a different client should not take them over implicitly.
+On a trusted endpoint dedicated to one automation run, opt in on the reconnect
+handshake:
+
+```js
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9222', {
+  headers: { 'x-obscura-reconnect': '1' },
+});
+const page = browser.contexts()
+  .flatMap(context => context.pages())
+  .find(tab => tab.url() === 'https://example.com');
+```
+
+The header opts in to every retained page on the endpoint. Only pages whose
+owning connection has disconnected are announced, and commands are forwarded
+to that owner thread. The reconnecting connection starts without an implicit
+blank page. It can still create pages explicitly. Without the header, the
+default connection behavior applies.
+
 ## Current limits
 
 - Playwright `page.video()` and tracing artifacts that require desktop capture
