@@ -1,5 +1,6 @@
 pub mod cdp_watchdog;
-#[cfg(obscura_runtime_bootstrap)]
+// Compiled in every configuration: frame.rs and ops.rs read the CHILD_REALMS_*
+// constants from native builds too. Only `source()` is runtime-bootstrap only.
 mod bootstrap;
 pub mod frame;
 mod import_map;
