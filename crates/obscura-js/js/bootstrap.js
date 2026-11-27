@@ -6677,6 +6677,17 @@ class Document extends Node {
     return get ? Reflect.apply(get, this, []) : (_domParse("document_url") ?? "");
   }
   get documentURI() { return this.URL; }
+  // Reflects `dir` on the html element only, limited to known values.
+  get dir() {
+    const root = this.documentElement;
+    return root && root.localName === "html" && root.namespaceURI === "http://www.w3.org/1999/xhtml"
+      ? root.dir : "";
+  }
+  set dir(v) {
+    const value = String(v);
+    const root = this.documentElement;
+    if (root && root.localName === "html" && root.namespaceURI === "http://www.w3.org/1999/xhtml") root.dir = value;
+  }
   get domain() {
     return this === globalThis.document
       ? (typeof this._effectiveDomain === "string" ? this._effectiveDomain : _documentUrlHost())

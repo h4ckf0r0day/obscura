@@ -2214,6 +2214,17 @@ impl PreparedRender {
         let style = self.layout.styles.get(&id)?;
         let rect = self.layout.rects.get(&id);
         let mut out = non_geometric_computed_style(style);
+        // Layout has already inherited direction and applied the `dir`
+        // attribute. The non-geometric fast path does neither, so this stays
+        // out of that snapshot.
+        out.insert(
+            "direction",
+            match style.direction {
+                Some(taffy::Direction::Rtl) => "rtl",
+                _ => "ltr",
+            }
+            .to_string(),
+        );
         out.insert(
             "vertical-align",
             match style.vertical_align {
@@ -18446,6 +18457,38 @@ mod tests {
         assert_eq!(computed("right")["clear"], "both");
         assert_eq!(computed("plain")["float"], "none");
         assert_eq!(computed("plain")["clear"], "none");
+    }
+
+    #[test]
+    fn computed_style_exposes_inherited_direction() {
+        let tree = parse_html(
+            r#"<html dir="RTL"><style>#css{direction:ltr}</style>
+               <p id="p">x <span id="span">y</span></p>
+               <div id="ltr" dir="ltr"><b id="nested">z</b></div>
+               <div id="bogus" dir="sideways">b</div>
+               <div id="css" dir="rtl">c</div></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        assert_eq!(computed("p")["direction"], "rtl");
+        assert_eq!(computed("span")["direction"], "rtl");
+        assert_eq!(computed("ltr")["direction"], "ltr");
+        assert_eq!(computed("nested")["direction"], "ltr");
+        assert_eq!(computed("bogus")["direction"], "rtl");
+        assert_eq!(computed("css")["direction"], "ltr");
+
+        let tree = parse_html(r#"<p id="plain">x</p>"#);
+        let prepared = prepare_dom(&tree, (320.0, 200.0), None, &mut RenderResourceCache::default())
+            .expect("prepared render");
+        let plain = tree.get_element_by_id("plain").unwrap();
+        assert_eq!(prepared.computed_style(plain).expect("computed style")["direction"], "ltr");
     }
 
     /// `vertical-align`, `text-transform`, `list-style-type`, `border-collapse`
