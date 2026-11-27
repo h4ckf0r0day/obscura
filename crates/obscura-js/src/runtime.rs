@@ -1416,6 +1416,7 @@ impl ObscuraJsRuntime {
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
+            gs.canvas_text_engine = None;
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
@@ -1439,6 +1440,7 @@ impl ObscuraJsRuntime {
                 // present. Keep already-fetched absolute bytes, but rebuild
                 // candidate selection/layout against the new base.
                 state.prepared_render = None;
+                state.canvas_text_engine = None;
                 state.pending_style_mutations.clear();
                 state.resolved_scroll = None;
             }
@@ -4363,6 +4365,7 @@ impl ObscuraJsRuntime {
             state.render_resource_rx = rx;
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
+            state.canvas_text_engine = None;
             state.element_scroll_offsets.clear();
             state.resolved_scroll = None;
         }
@@ -19370,6 +19373,92 @@ mod tests {
             padded_content.red() > 220 && padded_content.green() < 40 && padded_content.blue() < 40,
             "canvas bitmap must start at the CSS content-box origin"
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn canvas_2d_measure_text_uses_rendered_fonts_and_loaded_font_faces() {
+        let mono_font = include_bytes!("../../obscura-render/assets/liberation-mono.ttf").to_vec();
+        let mut rt = parser_image_runtime(
+            "<html><body><canvas width='300' height='60'></canvas></body></html>",
+            move |url: &str| (url == "http://example.com/mono.ttf").then(|| mono_font.clone()),
+        );
+        rt.set_url("http://example.com/index.html");
+
+        let baseline = rt
+            .evaluate(
+                r#"(() => {
+                    const ctx = document.querySelector('canvas').getContext('2d');
+                    const w10 = ctx.measureText('WWWW').width;
+                    const i10 = ctx.measureText('iiii').width;
+                    const a = ctx.measureText('a').width;
+                    const aSpace = ctx.measureText('a ').width;
+                    ctx.font = '20px sans-serif';
+                    const w20 = ctx.measureText('WWWW').width;
+                    ctx.font = '20px Arial';
+                    const arialNarrow = ctx.measureText('iiiiiiii').width;
+                    ctx.font = '20px CanvasDynamic, Arial';
+                    const beforeFont = ctx.measureText('iiiiiiii').width;
+                    return { w10, i10, a, aSpace, w20, arialNarrow, beforeFont };
+                })()"#,
+            )
+            .unwrap();
+
+        let w10 = baseline["w10"].as_f64().unwrap();
+        let i10 = baseline["i10"].as_f64().unwrap();
+        let a = baseline["a"].as_f64().unwrap();
+        let a_space = baseline["aSpace"].as_f64().unwrap();
+        let w20 = baseline["w20"].as_f64().unwrap();
+        let arial_narrow = baseline["arialNarrow"].as_f64().unwrap();
+        let before_font = baseline["beforeFont"].as_f64().unwrap();
+
+        assert!(w10 > i10 * 1.5, "proportional glyphs expected: w10={w10}, i10={i10}");
+        assert!(a_space > a + 0.5, "trailing space expected: a={a}, aSpace={a_space}");
+        assert!((w20 - w10 * 2.0).abs() < w10 * 0.2, "20px scaling: w10={w10}, w20={w20}");
+        assert!(
+            (before_font - arial_narrow).abs() < 0.01,
+            "CanvasDynamic fallback should equal Arial: before={before_font}, arial={arial_narrow}, w10={w10}, i10={i10}, w20={w20}"
+        );
+
+        let register = rt
+            .evaluate(
+                r#"(() => {
+                    const face = new FontFace("CanvasDynamic", "url('http://example.com/mono.ttf')");
+                    document.fonts.add(face);
+                    const ctx = document.querySelector('canvas').getContext('2d');
+                    ctx.font = '20px CanvasDynamic, Arial';
+                    return ctx.measureText('iiiiiiii').width;
+                })()"#,
+            )
+            .unwrap();
+        let after_font = register.as_f64().unwrap();
+        assert!(
+            after_font > before_font * 1.5,
+            "loaded FontFace must invalidate cached canvas text engine: before={before_font}, after={after_font}"
+        );
+    }
+
+    #[cfg(not(feature = "render"))]
+    #[test]
+    fn canvas_2d_measure_text_fallback_scales_without_render() {
+        let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
+        let res = rt
+            .evaluate(
+                r#"(() => {
+                    const ctx = document.querySelector('canvas').getContext('2d');
+                    const d10 = ctx.measureText('abcd').width;
+                    const s = ctx.measureText('  ').width;
+                    ctx.font = '20px sans-serif';
+                    const d20 = ctx.measureText('abcd').width;
+                    return [d10, s, d20];
+                })()"#,
+            )
+            .unwrap();
+        let arr = res.as_array().unwrap();
+        let d10 = arr[0].as_f64().unwrap();
+        let s = arr[1].as_f64().unwrap();
+        let d20 = arr[2].as_f64().unwrap();
+        assert!(d10 > 0.0 && s > 0.0 && (d20 - d10 * 2.0).abs() < 0.01);
     }
 
     #[test]

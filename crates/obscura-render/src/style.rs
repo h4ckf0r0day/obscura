@@ -7409,6 +7409,31 @@ fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
     style.font_family = Some(tokens[family_index..].join(" ").to_ascii_lowercase());
 }
 
+#[cfg(feature = "paint")]
+pub(crate) fn parse_canvas_font_style(css_font: &str) -> LayoutStyle {
+    let mut style = LayoutStyle::default();
+    apply_font_shorthand(&mut style, "10px sans-serif");
+    apply_font_shorthand(&mut style, css_font);
+    if style.font_size.is_none() {
+        let base = 10.0;
+        let resolved = match style.font_size_raw {
+            Some(crate::Dimension::Px(px)) => px,
+            Some(crate::Dimension::Em(value)) | Some(crate::Dimension::Percent(value)) => {
+                base * value
+            }
+            Some(crate::Dimension::Rem(value)) => 16.0 * value,
+            Some(crate::Dimension::Ex(value)) => base * value * 0.528_320_3,
+            _ => base,
+        };
+        style.font_size = Some(if resolved.is_finite() {
+            resolved.max(0.0)
+        } else {
+            base
+        });
+    }
+    style
+}
+
 /// Normalize a specified CSS font weight while preserving relative keywords
 /// until the top-down inheritance pass can see the parent's computed weight.
 fn specified_font_weight(value: &str) -> Option<String> {

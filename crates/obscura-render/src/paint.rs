@@ -5,7 +5,6 @@
 //! are later enhancements. Pure Rust (tiny-skia, CPU), deterministic, no system
 //! dependencies, so a screenshot is reproducible across hosts.
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use obscura_dom::tree::{DomTree, NodeId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1511,6 +1510,14 @@ impl PreparedRender {
 
     pub fn layout(&self) -> &crate::DomLayout {
         &self.layout
+    }
+
+    pub fn has_emoji_font(&self) -> bool {
+        self.layout.text_engine.has_emoji_font()
+    }
+
+    pub fn measure_canvas_text(&mut self, css_font: &str, text: &str) -> crate::CanvasTextMetrics {
+        self.layout.text_engine.measure_css_font_text(css_font, text)
     }
 
     pub fn content_size(&self) -> (f32, f32) {
@@ -7896,33 +7903,6 @@ fn paint_text_node(
     Some(())
 }
 
-// CSS font-size is pixels per em; ab_glyph scales ascent minus descent.
-fn native_font_scale(font: &FontRef<'_>, size: f32) -> PxScale {
-    let size = font.units_per_em()
-        .map(|em| size * font.height_unscaled() / em)
-        .unwrap_or(size);
-    PxScale::from(size)
-}
-
-pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
-    let font = FontRef::try_from_slice(crate::inline::bundled_font_bytes(family, is_bold)).unwrap();
-    let scaled_font = font.as_scaled(native_font_scale(&font, size));
-    let mut width = 0.0;
-    let mut previous = None;
-    for c in text.chars() {
-        if c.is_control() {
-            continue;
-        }
-        let glyph = font.glyph_id(c);
-        if let Some(previous) = previous {
-            width += scaled_font.kern(previous, glyph);
-        }
-        width += scaled_font.h_advance(glyph);
-        previous = Some(glyph);
-    }
-    width
-}
-
 /// Resolve `src` (a `data:` URI, or an absolute/relative URL against
 /// `base_url`) to raw bytes, fetching over the network at most once per
 /// distinct URL through the retained resource cache.
@@ -8132,6 +8112,17 @@ fn collect_web_fonts(
         }
     }
     fonts
+}
+
+pub fn text_engine_for_document(
+    tree: &DomTree,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    load_emoji: bool,
+) -> crate::inline::TextEngine {
+    let fonts = collect_web_fonts(tree, base_url, cache, dynamic_fonts);
+    crate::inline::TextEngine::new_with_web_fonts_and_emoji(&fonts, load_emoji)
 }
 
 /// Exclude source formats that fontdb cannot consume before issuing a request.
@@ -17766,25 +17757,30 @@ mod tests {
 
     #[test]
     fn native_text_metrics_match_css_em_sizes_and_font_weights() {
-        // Chrome at 14 CSS px with the same Liberation/DejaVu faces.
-        for (family, bold, text, expected) in [
-            ("Arial", false, "abcdefghij", 63.828125),
-            ("Arial", false, "Create new form", 103.484375),
-            ("Arial", false, "AVATAR Toffee", 93.390625),
-            ("Arial", false, "caf\u{e9} \u{3a9}mega", 75.84375),
-            ("Arial", true, "abcdefghij", 70.015625),
-            ("Times New Roman", false, "abcdefghij", 59.09375),
-            ("Times New Roman", true, "abcdefghij", 63.0),
-            ("Courier New", false, "abcdefghij", 84.015625),
-            ("Courier New", true, "abcdefghij", 84.015625),
-            ("system-ui", false, "abcdefghij", 73.140625),
-            ("system-ui", true, "abcdefghij", 82.96875),
-            ("MissingFont, Arial", false, "abcdefghij", 63.828125),
-        ] {
-            let width = measure_text(text, 14.0, bold, Some(family));
-            assert!((width - expected).abs() < 0.5,
-                "{family}, bold={bold}, {text:?}: {width}, expected {expected}");
-        }
+        let mut engine = crate::inline::TextEngine::new();
+        let mut measure = |family: &str, bold: bool, text: &str| -> f32 {
+            let mut style = crate::LayoutStyle::default();
+            style.font_family = Some(family.to_string());
+            style.font_weight = Some(if bold { "700" } else { "400" }.to_string());
+            engine.measure_direct_text_width(text, 14.0, &style)
+        };
+        let arial = measure("Arial", false, "abcdefghij");
+        let arial_bold = measure("Arial", true, "abcdefghij");
+        let times = measure("Times New Roman", false, "abcdefghij");
+        let times_bold = measure("Times New Roman", true, "abcdefghij");
+        let courier = measure("Courier New", false, "abcdefghij");
+        let courier_bold = measure("Courier New", true, "abcdefghij");
+        let fallback_arial = measure("MissingFont, Arial", false, "abcdefghij");
+        let system_ui = measure("system-ui", false, "abcdefghij");
+        let greek_latin = measure("Arial", false, "caf\u{e9} \u{3a9}mega");
+        let latin_prefix = measure("Arial", false, "caf\u{e9} ");
+
+        assert!(arial > times && courier > arial, "times={times}, arial={arial}, courier={courier}");
+        assert!(arial_bold > arial && times_bold > times);
+        assert!((courier - courier_bold).abs() < 0.01);
+        assert!((fallback_arial - arial).abs() < 0.01);
+        assert!(system_ui > arial);
+        assert!(greek_latin > latin_prefix + 10.0);
     }
 
     #[test]
@@ -17918,16 +17914,22 @@ mod tests {
 
     #[test]
     fn word_measurement_honors_generic_font_family() {
-        let sans = measure_text("iiiiiiii", 16.0, false, Some("sans-serif"));
-        let mono = measure_text("iiiiiiii", 16.0, false, Some("monospace"));
+        let mut engine = crate::inline::TextEngine::new();
+        let mut style = crate::LayoutStyle::default();
+        style.font_family = Some("sans-serif".to_string());
+        let sans = engine.measure_direct_text_width("iiiiiiii", 16.0, &style);
+        style.font_family = Some("monospace".to_string());
+        let mono = engine.measure_direct_text_width("iiiiiiii", 16.0, &style);
         assert!(
             mono > sans * 1.5,
             "monospace advances must be used for code text: sans={sans}, mono={mono}"
         );
 
         let sample = "Build fast, responsive sites with Bootstrap";
-        let system = measure_text(sample, 64.0, false, Some("system-ui, sans-serif"));
-        let arial = measure_text(sample, 64.0, false, Some("Arial, sans-serif"));
+        style.font_family = Some("system-ui, sans-serif".to_string());
+        let system = engine.measure_direct_text_width(sample, 64.0, &style);
+        style.font_family = Some("Arial, sans-serif".to_string());
+        let arial = engine.measure_direct_text_width(sample, 64.0, &style);
         assert!(
             system > arial * 1.08,
             "Chromium's Linux system-ui face is DejaVu Sans, not the narrower \
@@ -21003,5 +21005,144 @@ mod tests {
                 "{id} glyph coverage diverged from shaped inline span: {font_px} vs {ref_with}"
             );
         }
+    }
+
+    #[test]
+    fn native_controls_auto_width_uses_loaded_non_latin_font() {
+        let hanzi_font = synthetic_square_ttf("FixtureHanzi", &[0x4E2D]);
+        let measure_widths = |with_font: bool| {
+            let font_rule = if with_font {
+                r#"@font-face { font-family: "FixtureHanzi"; src: url("https://assets.test/hanzi.ttf"); }"#
+            } else {
+                ""
+            };
+            let html = format!(
+                r#"<!doctype html><html><meta charset="utf-8"><style>
+                {font_rule}
+                body{{margin:0}}
+                #ref,#btn,#btnspan,#sel,#sub1,#sub4{{font:24px Arial,"FixtureHanzi",sans-serif;white-space:nowrap}}
+                #ref{{display:inline-block;padding:0;border:0}}
+                #btn,#sel,#sub1,#sub4{{padding:0;border:0}}
+                </style>
+                <span id=ref>中中中中</span>
+                <button id=btn><span id=btnspan>中中中中</span></button>
+                <select id=sel><option>中中中中</option></select>
+                <input id=sub1 type=submit value="中">
+                <input id=sub4 type=submit value="中中中中">
+                </html>"#
+            );
+            let tree = parse_html(&html);
+            let font_bytes = hanzi_font.clone();
+            let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+                (with_font && url == "https://assets.test/hanzi.ttf")
+                    .then(|| font_bytes.clone())
+            });
+            let prepared = prepare_dom(&tree, (600.0, 200.0), None, &mut resources).unwrap();
+            let width_of = |id: &str| {
+                let nid = tree.get_element_by_id(id).expect(id);
+                prepared.document_rect(nid).expect("rect").width
+            };
+            let ref_w = width_of("ref");
+            let btn_w = width_of("btn");
+            let btnspan_w = width_of("btnspan");
+            let sel_w = width_of("sel");
+            let sub1_w = width_of("sub1");
+            let sub4_w = width_of("sub4");
+            (ref_w, btn_w, btnspan_w, sel_w, sub1_w, sub4_w)
+        };
+
+        let (_ref_without, btn_without, _btnspan_without, sel_without, _sub1_without, sub4_without) =
+            measure_widths(false);
+        let (ref_with, btn_with, btnspan_with, sel_with, sub1_with, sub4_with) =
+            measure_widths(true);
+
+        assert!(
+            ref_with > 90.0,
+            "loaded 24px 1-em square hanzi span should be ~96px: {ref_with}"
+        );
+        assert!(
+            (btn_with - ref_with).abs() <= 1.0,
+            "auto-width <button> must match <span> advance: btn={btn_with}, ref={ref_with}, without={btn_without}"
+        );
+        assert!(
+            btn_with + 0.5 >= btnspan_with,
+            "button width must not truncate its child span: btn={btn_with}, span={btnspan_with}"
+        );
+        assert!(
+            ((sub4_with - sub1_with) - 72.0).abs() <= 1.0 && sub4_with > sub4_without + 20.0,
+            "auto-width <input type=submit> must use loaded font advance: sub1={sub1_with}, sub4={sub4_with}, without={sub4_without}"
+        );
+        assert!(
+            (sel_with - ref_with).abs() <= 1.0 && sel_with > sel_without + 40.0,
+            "auto-width <select> must fit full loaded-font label: sel={sel_with}, ref={ref_with}, without={sel_without}"
+        );
+    }
+
+    #[test]
+    fn canvas_text_metrics_track_font_and_whitespace() {
+        let mut engine = crate::inline::TextEngine::new();
+        let wide = engine.measure_css_font_text("16px sans-serif", "WWWW");
+        let narrow = engine.measure_css_font_text("16px sans-serif", "iiii");
+        assert!(
+            wide.width > narrow.width * 1.5,
+            "proportional canvas glyphs must differ: wide={}, narrow={}",
+            wide.width,
+            narrow.width
+        );
+
+        let no_space = engine.measure_css_font_text("16px sans-serif", "a");
+        let with_trailing = engine.measure_css_font_text("16px sans-serif", "a ");
+        let spaces_only = engine.measure_css_font_text("16px sans-serif", "   ");
+        assert!(
+            with_trailing.width > no_space.width + 1.0,
+            "canvas measureText must preserve trailing space width: base={}, trailing={}",
+            no_space.width,
+            with_trailing.width
+        );
+        assert!(
+            spaces_only.width > 5.0,
+            "canvas measureText must measure space-only runs: {}",
+            spaces_only.width
+        );
+
+        let double_size = engine.measure_css_font_text("32px sans-serif", "WWWW");
+        assert!(
+            (double_size.width - wide.width * 2.0).abs() < wide.width * 0.2,
+            "font-size scaling failed: 16px={}, 32px={}",
+            wide.width,
+            double_size.width
+        );
+
+        let mono = engine.measure_css_font_text("16px monospace", "iiii");
+        assert!(
+            mono.width > narrow.width * 1.5,
+            "canvas monospace family must widen narrow glyphs: sans={}, mono={}",
+            narrow.width,
+            mono.width
+        );
+
+        let default_10 = engine.measure_css_font_text("10px sans-serif", "abcd");
+        let invalid = engine.measure_css_font_text("not-a-valid-font", "abcd");
+        assert!(
+            (invalid.width - default_10.width).abs() < 0.01,
+            "invalid CSS font must keep default 10px sans-serif metrics: default={}, invalid={}",
+            default_10.width,
+            invalid.width
+        );
+
+        let hanzi_font = synthetic_square_ttf("CanvasHanzi", &[0x4E2D]);
+        let web_font = crate::inline::WebFont {
+            data: std::sync::Arc::new(hanzi_font),
+            family: Some("CanvasHanzi".to_string()),
+            weight: Some((400, 400)),
+            italic: Some(false),
+        };
+        let mut custom_engine = crate::inline::TextEngine::new_with_web_fonts(&[web_font]);
+        let hanzi = custom_engine.measure_css_font_text("24px CanvasHanzi", "中中中中");
+        assert!(
+            (hanzi.width - 96.0).abs() < 2.0,
+            "loaded @font-face font must determine canvas non-Latin advance: {}",
+            hanzi.width
+        );
     }
 }
