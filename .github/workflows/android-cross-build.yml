@@ -274,9 +274,20 @@ jobs:
             install -m 0644 "$libcxx" artifacts/libc++_shared.so
           fi
 
+          # Ready-to-drop layout for an Android app that runs obscura as a child
+          # process: executables must ship as lib*.so so the installer extracts
+          # them into nativeLibraryDir (the only exec-able path on Android 10+
+          # with targetSdk >= 29). Copy artifacts/jniLibs into app/src/main/jniLibs.
+          mkdir -p artifacts/jniLibs/arm64-v8a
+          install -m 0755 "$binary" artifacts/jniLibs/arm64-v8a/libobscura.so
+          if [ "$needs_libcxx" = true ]; then
+            install -m 0644 artifacts/libc++_shared.so \
+              artifacts/jniLibs/arm64-v8a/libc++_shared.so
+          fi
+
           (
             cd artifacts
-            sha256sum obscura obscura-worker build.log > SHA256SUMS
+            sha256sum obscura obscura-worker build.log jniLibs/arm64-v8a/*.so > SHA256SUMS
           )
 
       - name: Upload Android binaries
