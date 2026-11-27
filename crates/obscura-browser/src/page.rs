@@ -2363,10 +2363,6 @@ impl Page {
             .collect()
     }
 
-    async fn execute_scripts(&mut self) {
-        self.execute_scripts_with_module_budget(None).await;
-    }
-
     /// Drive a selected script queue until it empties or the shared parser
     /// deadline expires. The caller chooses the queue so parser blockers and
     /// load-delaying dynamic scripts keep their distinct lifecycle semantics.
@@ -2444,7 +2440,7 @@ impl Page {
         .await
     }
 
-    async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
+    async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>, navigation_deadline: Option<tokio::time::Instant>) {
         let scripts_started = std::time::Instant::now();
         tracing::info!(
             "execute_scripts called, js runtime exists: {}",
@@ -2467,6 +2463,17 @@ impl Page {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30_000);
+        // When the navigation has an overall deadline, cap the script budget to
+        // the remaining time so `--timeout N` bounds script execution too (#1696).
+        let script_deadline_ms = match navigation_deadline {
+            Some(nav_deadline) => {
+                let remaining_ms = nav_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis() as u64;
+                script_deadline_ms.min(remaining_ms)
+            }
+            None => script_deadline_ms,
+        };
         let script_deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
 
@@ -4028,7 +4035,7 @@ impl Page {
         // listeners never registered, frameworks never bootstrapped,
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.execute_scripts().await;
+        self.execute_scripts_with_module_budget(None, Some(deadline)).await;
         // The document's own scripts are the common source of storage writes,
         // so the profile is flushed once they have run, not before.
         self.context.save_local_storage();
@@ -9436,7 +9443,7 @@ mod tests {
                 </script>
             </head><body></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(None).await;
+        page.execute_scripts_with_module_budget(None, None).await;
         let ran = page.js.as_mut().unwrap().evaluate("globalThis.__ran").unwrap();
         assert_eq!(ran, serde_json::json!(["classic", "dynamic", "module"]));
     }
@@ -9448,7 +9455,7 @@ mod tests {
             "http://127.0.0.1:9",
             r#"<html><body><div id=w><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg></div></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(None).await;
+        page.execute_scripts_with_module_budget(None, None).await;
         let result = page.js.as_mut().unwrap().evaluate(r#"(() => {
             const attr = document.querySelector('svg').attributes[0];
             return [attr.name, attr.localName, attr.prefix, attr.namespaceURI,
@@ -9521,7 +9528,7 @@ mod tests {
                 globalThis.__shared_deadline_completed = true;
             </script></head><body></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(Some(350)).await;
+        page.execute_scripts_with_module_budget(Some(350), None).await;
 
         assert_eq!(
             request_rx
@@ -9587,7 +9594,7 @@ mod tests {
                 </script>
             </head><body></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(Some(300)).await;
+        page.execute_scripts_with_module_budget(Some(300), None).await;
 
         assert_eq!(
             page.js
