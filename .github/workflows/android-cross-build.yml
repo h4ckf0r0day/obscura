@@ -1,0 +1,308 @@
+name: obscura-android-cross-build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      ANDROID_API: "29"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CHROMIUM_BINDGEN_STRIP_HOST_X64_FLAGS_FOR_ANDROID: "1"
+      LIBCLANG_PATH: "/usr/lib/llvm-19/lib"
+      V8_FROM_SOURCE: "1"
+    steps:
+      - name: Checkout Obscura
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install host build tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ca-certificates curl git libglib2.0-dev ninja-build perl \
+            pkg-config python3 unzip zip
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+
+          # apt.llvm.org may install the versioned shared library without
+          # the unversioned libclang.so symlink expected by bindgen.
+          libclang_so="$(find /usr/lib/llvm-19 /usr/lib/x86_64-linux-gnu \
+            \( -name 'libclang.so.*' -o -name 'libclang-[0-9]*.so.*' \) \
+            -print -quit)"
+          test -n "$libclang_so"
+          sudo ln -sfn "$libclang_so" /usr/lib/llvm-19/lib/libclang.so
+          test -e /usr/lib/llvm-19/lib/libclang.so
+          /usr/lib/llvm-19/bin/clang --version
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          token: ${{ github.token }}
+
+      - name: Install Android NDK r26c
+        run: |
+          set -euxo pipefail
+          ndk_zip="$RUNNER_TEMP/android-ndk-r26c-linux.zip"
+          curl -fL --retry 3 --retry-delay 2 \
+            https://dl.google.com/android/repository/android-ndk-r26c-linux.zip \
+            -o "$ndk_zip"
+          unzip -q "$ndk_zip" -d "$RUNNER_TEMP"
+          rm -f "$ndk_zip"
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r26c" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$RUNNER_TEMP/android-ndk-r26c" >> "$GITHUB_ENV"
+          test -x "$RUNNER_TEMP/android-ndk-r26c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+
+      - name: Install Rust target
+        run: |
+          set -euxo pipefail
+          rustup set profile minimal
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-linux-android
+          rustc --version
+          cargo --version
+
+      - name: Check out rusty_v8 with complete Android build sources
+        run: |
+          set -euxo pipefail
+          rusty_v8_dir="$RUNNER_TEMP/rusty_v8"
+          crate_dir="$RUNNER_TEMP/v8-crate"
+          crate="$RUNNER_TEMP/v8-150.4.0.crate"
+
+          # The crates.io package omits files needed by a source build (for
+          # example Chromium's Android test-runner data, ICU data and libc++
+          # implementation). Use the pinned git checkout and restore every
+          # submodule at the revision selected by rusty_v8 v150.4.0.
+          git clone --depth=1 --branch v150.4.0 --no-recurse-submodules \
+            https://github.com/denoland/rusty_v8.git "$rusty_v8_dir"
+          test "$(git -C "$rusty_v8_dir" rev-parse HEAD)" = \
+            "5c15a6995c9bb4bacd3e341b59fff32c909c80bf"
+          git -C "$rusty_v8_dir" submodule update --init --depth=1 --recursive
+          submodule_status="$(git -C "$rusty_v8_dir" submodule status --recursive)"
+          printf '%s\n' "$submodule_status"
+          if printf '%s\n' "$submodule_status" | grep -Eq '^[-+U]'; then
+            echo "A rusty_v8 submodule is missing or is not at its pinned revision" >&2
+            exit 1
+          fi
+
+          # A git checkout does not include rusty_v8's generated host binding.
+          # Copy the matching published binding while retaining the complete
+          # git sources for the Android unit.
+          curl -fL --retry 3 --retry-delay 2 \
+            https://crates.io/api/v1/crates/v8/150.4.0/download \
+            -o "$crate"
+          tar -xzf "$crate" -C "$RUNNER_TEMP"
+          rm -f "$crate"
+          mv "$RUNNER_TEMP/v8-150.4.0" "$crate_dir"
+          binding="$crate_dir/gen/src_binding_simdutf_release_x86_64-unknown-linux-gnu.rs"
+          test -s "$binding"
+          install -m 0644 "$binding" "$rusty_v8_dir/gen/"
+          rm -rf "$crate_dir"
+
+          test -f "$rusty_v8_dir/build.rs"
+          test -f "$rusty_v8_dir/gen/src_binding_simdutf_release_x86_64-unknown-linux-gnu.rs"
+          test -f "$rusty_v8_dir/v8/BUILD.gn"
+          test -f "$rusty_v8_dir/v8/src/api/api.cc"
+          test -f "$rusty_v8_dir/v8/tools/gen-v8-gn.py"
+          test -f "$rusty_v8_dir/build/rust/gni_impl/filter_clang_args.py"
+          test -f "$rusty_v8_dir/build/android/pylib/results/presentation/test_results_presentation.pydeps"
+          test -f "$rusty_v8_dir/third_party/icu/common/icudtl.dat"
+          test -f "$rusty_v8_dir/third_party/libc++/src/src/vector.cpp"
+          test -f "$rusty_v8_dir/tools/clang/scripts/update.py"
+
+      - name: Install the host amd64 sysroot
+        run: |
+          set -euxo pipefail
+          # Chromium's Android cross build still compiles host tools (for
+          # example the snapshot generator) with the Linux x86_64 toolchain.
+          python3 \
+            "$RUNNER_TEMP/rusty_v8/build/linux/sysroot_scripts/install-sysroot.py" \
+            --arch=amd64
+          test -d \
+            "$RUNNER_TEMP/rusty_v8/build/linux/debian_bullseye_amd64-sysroot"
+
+      - name: Prepare the V8 source build for Android
+        run: |
+          set -euxo pipefail
+          python3 scripts/ci/patch-rusty-v8.py \
+            "$RUNNER_TEMP/rusty_v8/build.rs" \
+            "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni" \
+            "$RUNNER_TEMP/rusty_v8/build/rust/gni_impl/filter_clang_args.py" \
+            "$RUNNER_TEMP/rusty_v8/v8/src/codegen/arm64/cpu-arm64.cc"
+          grep -n -A5 -B2 'build V8 from source only for Android' \
+            "$RUNNER_TEMP/rusty_v8/build.rs"
+          grep -n -A3 -B2 'declare Android NDK version' \
+            "$RUNNER_TEMP/rusty_v8/build/config/android/config.gni"
+          grep -n -A8 -B2 'CHROMIUM_BINDGEN_STRIP_HOST_X64_FLAGS_FOR_ANDROID' \
+            "$RUNNER_TEMP/rusty_v8/build/rust/gni_impl/filter_clang_args.py"
+          grep -n -A5 -B2 \
+            'defined(V8_OS_LINUX) && !defined(V8_OS_ANDROID)' \
+            "$RUNNER_TEMP/rusty_v8/v8/src/codegen/arm64/cpu-arm64.cc"
+
+      - name: Link the NDK into rusty_v8
+        run: |
+          set -euxo pipefail
+          rusty_v8_dir="$RUNNER_TEMP/rusty_v8"
+          rm -rf "$rusty_v8_dir/third_party/android_ndk"
+          ln -s "$ANDROID_NDK_HOME" "$rusty_v8_dir/third_party/android_ndk"
+          mkdir -p "$rusty_v8_dir/third_party/android_toolchain"
+          rm -rf "$rusty_v8_dir/third_party/android_toolchain/ndk"
+          ln -s ../android_ndk "$rusty_v8_dir/third_party/android_toolchain/ndk"
+          test -x "$rusty_v8_dir/third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++"
+
+      - name: Prepare deno_core for Android
+        run: |
+          set -euxo pipefail
+          deno_core_dir="$RUNNER_TEMP/deno_core-0.412.0"
+          deno_core_crate="$RUNNER_TEMP/deno_core-0.412.0.crate"
+
+          curl -fL --retry 3 --retry-delay 2 \
+            https://crates.io/api/v1/crates/deno_core/0.412.0/download \
+            -o "$deno_core_crate"
+          echo "580cb2e0d797d75ff3dfc4a8f2b14aa7470f0fa31654a09a83d4cbb42b5eb9b4  $deno_core_crate" \
+            | sha256sum -c -
+          mkdir -p "$deno_core_dir"
+          tar -xzf "$deno_core_crate" -C "$deno_core_dir" --strip-components=1
+          rm -f "$deno_core_crate"
+
+          python3 scripts/ci/patch-deno-core-android.py \
+            "$deno_core_dir/uv_compat/tty.rs"
+          grep -n -A5 -B2 "Bionic's __errno" \
+            "$deno_core_dir/uv_compat/tty.rs"
+          grep -n -A7 -B2 'target_os = "android"' \
+            "$deno_core_dir/uv_compat/tty.rs"
+
+      - name: Resolve the patched V8 and deno_core dependencies
+        run: |
+          set -euxo pipefail
+          v8_patch="patch.crates-io.v8.path=\"$RUNNER_TEMP/rusty_v8\""
+          deno_core_patch="patch.crates-io.deno_core.path=\"$RUNNER_TEMP/deno_core-0.412.0\""
+          cargo metadata --format-version 1 \
+            --config "$v8_patch" --config "$deno_core_patch" \
+            > "$RUNNER_TEMP/obscura-metadata.json"
+          grep -Fq "$RUNNER_TEMP/rusty_v8" "$RUNNER_TEMP/obscura-metadata.json"
+          grep -Fq "$RUNNER_TEMP/deno_core-0.412.0" "$RUNNER_TEMP/obscura-metadata.json"
+          cargo fetch --config "$v8_patch" --config "$deno_core_patch"
+
+      - name: Build obscura-cli for arm64 Bionic
+        run: |
+          set -euxo pipefail
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$toolchain/aarch64-linux-android${ANDROID_API}-clang"
+          export CC_aarch64_linux_android="$toolchain/aarch64-linux-android${ANDROID_API}-clang"
+          export CXX_aarch64_linux_android="$toolchain/aarch64-linux-android${ANDROID_API}-clang++"
+          export AR_aarch64_linux_android="$toolchain/llvm-ar"
+          export RANLIB_aarch64_linux_android="$toolchain/llvm-ranlib"
+
+          # Bindgen must parse V8's headers against Bionic, never the Ubuntu
+          # glibc headers. The underscore form is bindgen's target-specific
+          # variable name for aarch64-linux-android.
+          export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$sysroot --target=aarch64-linux-android${ANDROID_API}"
+
+          # rusty_v8 downloads Chromium Clang for the V8 build. Do not set
+          # CLANG_BASE_PATH: Ubuntu's Clang is only used by libclang 19 here.
+          unset CLANG_BASE_PATH
+          export EXTRA_GN_ARGS="android_ndk_api_level=${ANDROID_API}"
+          export PRINT_GN_ARGS=1
+
+          v8_patch="patch.crates-io.v8.path=\"$RUNNER_TEMP/rusty_v8\""
+          deno_core_patch="patch.crates-io.deno_core.path=\"$RUNNER_TEMP/deno_core-0.412.0\""
+          set -o pipefail
+          cargo build --release --target aarch64-linux-android \
+            -p obscura-cli --config "$v8_patch" --config "$deno_core_patch" \
+            2>&1 | tee build.log
+
+      - name: Verify the Android ELF
+        run: |
+          set -euxo pipefail
+          binary="target/aarch64-linux-android/release/obscura"
+          worker="target/aarch64-linux-android/release/obscura-worker"
+          python3 scripts/ci/verify-android-elf.py "$binary" "$worker"
+
+      - name: Stage Android artifacts
+        run: |
+          set -euxo pipefail
+          sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          binary="target/aarch64-linux-android/release/obscura"
+          worker="target/aarch64-linux-android/release/obscura-worker"
+          rm -rf artifacts
+          mkdir -p artifacts
+          install -m 0755 "$binary" "$worker" artifacts/
+          cp build.log artifacts/build.log
+
+          {
+            readelf -hW "$binary"
+            readelf -lW "$binary"
+            readelf -dW "$binary"
+          } > artifacts/obscura.elf.txt
+          {
+            readelf -hW "$worker"
+            readelf -lW "$worker"
+            readelf -dW "$worker"
+          } > artifacts/obscura-worker.elf.txt
+
+          needs_libcxx=false
+          for elf in "$binary" "$worker"; do
+            if readelf -dW "$elf" \
+              | grep -Fq 'Shared library: [libc++_shared.so]'; then
+              needs_libcxx=true
+            fi
+          done
+          if [ "$needs_libcxx" = true ]; then
+            libcxx="$sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+            test -f "$libcxx"
+            install -m 0644 "$libcxx" artifacts/libc++_shared.so
+          fi
+
+          # Ready-to-drop layout for an Android app that runs obscura as a child
+          # process: executables must ship as lib*.so so the installer extracts
+          # them into nativeLibraryDir (the only exec-able path on Android 10+
+          # with targetSdk >= 29). Copy artifacts/jniLibs into app/src/main/jniLibs.
+          mkdir -p artifacts/jniLibs/arm64-v8a
+          install -m 0755 "$binary" artifacts/jniLibs/arm64-v8a/libobscura.so
+          if [ "$needs_libcxx" = true ]; then
+            install -m 0644 artifacts/libc++_shared.so \
+              artifacts/jniLibs/arm64-v8a/libc++_shared.so
+          fi
+
+          (
+            cd artifacts
+            sha256sum obscura obscura-worker build.log jniLibs/arm64-v8a/*.so > SHA256SUMS
+          )
+
+      - name: Upload Android binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: obscura-android-arm64
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: obscura-android-build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 14
