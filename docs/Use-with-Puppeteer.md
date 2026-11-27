@@ -1,3 +1,5 @@
+Examples use Node.js ES modules. Save scripts with a `.mjs` extension.
+
 ## Setup
 
 ```bash
@@ -8,7 +10,7 @@ npm install puppeteer-core
 ## Connect
 
 ```js
-const puppeteer = require('puppeteer-core');
+import puppeteer from 'puppeteer-core';
 
 const browser = await puppeteer.connect({
   browserWSEndpoint: 'ws://127.0.0.1:9222',
@@ -26,7 +28,7 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle0', timeout: 60000 });
 ```
 
-Default `waitUntil` is `domcontentloaded`. Other values: `load`, `networkidle2`, `networkidle0`.
+Default `waitUntil` is `load`. Other values: `domcontentloaded`, `networkidle2`, `networkidle0`.
 
 ## Evaluate
 
@@ -46,7 +48,7 @@ const items = await page.evaluate(() => {
 ```js
 await page.click('#login-button');
 await page.type('#username', 'alice');
-await page.fill('#password', 'secret');  // alias of .type for compat
+await page.type('#password', 'secret');
 
 await page.waitForSelector('#dashboard');
 await page.waitForFunction(() => window.appReady === true);
@@ -85,6 +87,11 @@ page.on('request', req => {
 
 See [Intercept and modify requests](Intercept-and-modify-requests.md).
 
+Scripted fetch/XHR requests in stealth mode report Network events and retained
+response bodies using the same request IDs as the normal transport. The existing
+`OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`
+settings still control retention; disabling retention does not disable events.
+
 ## Expose a Node callback
 
 ```js
@@ -109,7 +116,8 @@ await Promise.all([
 ]);
 ```
 
-Pages share one V8 isolate. Concurrent JS execution serializes through a lock. CPU-bound JS on one page blocks the others.
+Pages on one CDP connection serialize JavaScript work. Separate CDP connections
+run on separate threads and can execute in parallel.
 
 ## Screenshots, scrolling, and PDF
 
@@ -162,9 +170,52 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 await browser.disconnect();  // leaves obscura serve running
 ```
 
+## Page lifecycle
+
+`Page.setLifecycleEventsEnabled` replays completed lifecycle phases for the
+current main-frame document to the requesting session, with their original
+timestamps and loader ID. This lets a client attach after the initial page load
+without waiting for a load event that has already happened.
+
+`Page.stopLoading` cancels an in-flight document or parser-resource request,
+clears queued document navigation, and leaves the target usable. Rendering
+builds also cancel pending image/font loads, including `Image`/`decode()`
+requests, without restarting those URLs on the next render turn. Already-loaded
+resources are preserved. Ordinary JavaScript `fetch()` calls are not canceled.
+
+HTML image `onload` and `onerror` handlers run asynchronously for parser-created
+images and inserted HTML fragments, even when script never reads the image.
+Reading cached image dimensions does not replay completion events.
+
+`Page.close` runs the top-level document's `beforeunload` handlers. A document
+activated through native input can request confirmation, reported through
+`Page.javascriptDialogOpening` with type `beforeunload`. Use
+`Page.handleJavaScriptDialog` to accept or dismiss it. `Target.closeTarget`
+remains a force-close path. Other dialog types and child-frame unload hooks
+are not implemented by this change.
+
 ## Current limits
 
 - Some device emulation, service-worker, native media, long-tail CSS, and
   compositor behavior remains incomplete relative to Chromium.
-- Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
+- CPU-bound JavaScript can delay other pages on the same CDP connection.
 - PDF text is not selectable/searchable and tagged PDF is not yet available.
+
+Network events are shared by sessions attached to the same target. An additional
+CDP session can observe navigation and later fetch/XHR traffic without issuing a
+second navigation. Request IDs and loader IDs match the driving session, so
+`Network.getResponseBody` uses the same ID. Fetch interception control and the
+navigation lifecycle keep their existing owner; sessions on other targets do
+not receive this traffic.
+
+ES-module roots, dependencies, and dynamic imports report their actual HTTP
+status, response headers, and body size. Retained bodies remain readable by
+request ID when a page's JavaScript runtime is suspended, subject to
+`OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`.
+Cached imports do not produce another network request.
+
+JavaScript modules can also load from `data:` URLs, including nested and dynamic
+imports. These decode as UTF-8 and require a JavaScript MIME type. Unmapped
+relative imports are rejected; absolute network dependencies retain the page's
+network policy. Decoded sources use `OBSCURA_FETCH_MAX_BODY_BYTES`. Their responses
+remain available through `Network.getResponseBody`.

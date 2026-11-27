@@ -75,7 +75,10 @@ impl Segment {
     /// Whether the segment can fit the passed floated box (in the horizontal axis)
     fn fits_float_width(&self, floated_box: Size<f32>, direction: FloatDirection, bfc_width: f32) -> bool {
         let slot = direction as usize;
-        self.insets[slot] == 0.0 || (bfc_width - floated_box.width - self.inset_sum()) >= 0.0
+        // Percentage sizes can meet at a band edge with a small f32 rounding error.
+        // Keep the allowance below a layout subpixel even at large coordinates.
+        let tolerance = (bfc_width.abs() * f32::EPSILON).min(1.0 / 1024.0);
+        self.insets[slot] == 0.0 || (bfc_width - floated_box.width - self.inset_sum()) >= -tolerance
     }
 
     /// The total space taken up by both insets
@@ -93,16 +96,14 @@ impl Segment {
 struct FloatFitter {
     /// The overall width of the Block Formatting Context
     bfc_width: f32,
-    /// The total height of the set of segments currently being considered
-    slot_height: f64,
     /// The union of the insets of the set of segments currently being considered
     insets: [f32; 2],
 }
 
 impl FloatFitter {
     /// Create a new `FloatFitter`
-    fn new(bfc_width: f32, slot_height: f32, insets: [f32; 2]) -> Self {
-        Self { bfc_width, slot_height: slot_height as f64, insets }
+    fn new(bfc_width: f32, insets: [f32; 2]) -> Self {
+        Self { bfc_width, insets }
     }
 
     // Horizontal fitting
@@ -116,20 +117,10 @@ impl FloatFitter {
     /// Given the currently accounted for insets, check whether there is an x position
     /// such that the box fits horizontally
     fn fits_horiontally(&self, width: f32) -> bool {
-        self.insets == [0.0, 0.0] || self.bfc_width - self.insets[0] - self.insets[1] - width >= 0.0
+        let tolerance = (self.bfc_width.abs() * f32::EPSILON).min(1.0 / 1024.0);
+        self.insets == [0.0, 0.0] || self.bfc_width - self.insets[0] - self.insets[1] - width >= -tolerance
     }
 
-    // Vertical fitting
-
-    /// Add the height of another segment.
-    fn add_height(&mut self, height: f32) {
-        self.slot_height += height as f64;
-    }
-
-    /// Given the currently accounted for height, check whether the box fits vertically
-    fn fits_vertically(&mut self, height: f32) -> bool {
-        self.slot_height >= height as f64
-    }
 }
 
 /// A context for placing floated boxes
@@ -307,8 +298,8 @@ impl FloatContext {
             }
 
             start_y = start_y.max(start_segment.y.start);
-            let available_height = start_segment.y.end - start_y;
-            let mut fitter = FloatFitter::new(self.available_width, available_height, containing_block_insets);
+            let float_end = start_y + floated_box.height;
+            let mut fitter = FloatFitter::new(self.available_width, containing_block_insets);
             fitter.union_insets(start_segment.insets);
 
             // Pinning the start segment, loop over segments starting with the start segment
@@ -341,10 +332,8 @@ impl FloatContext {
                 //
                 // If it does not (yet) fit vertically then continue the inner loop to add another
                 // segment to the range of segments we are placing the float in
-                if end_idx != start_idx {
-                    fitter.add_height(end_segment.y.end - end_segment.y.start);
-                }
-                if !fitter.fits_vertically(floated_box.height) {
+                // Compare endpoints directly: summing rounded segment heights can miss an exact boundary.
+                if float_end > end_segment.y.end {
                     end_idx += 1;
                     continue;
                 }
@@ -404,8 +393,9 @@ impl FloatContext {
         let end_idx = match end {
             None => {
                 let last_y_end = self.segments.last().map(|seg| seg.y.end).unwrap_or(0.0);
-                if min_y > last_y_end {
-                    self.segments.push(Segment { y: last_y_end..min_y, insets: [0.0, 0.0] });
+                let end_y = start_y + floated_box.height;
+                if end_y > last_y_end {
+                    self.segments.push(Segment { y: last_y_end..end_y, insets: [0.0, 0.0] });
                 }
                 self.segments.len() - 1
             }
@@ -480,7 +470,7 @@ impl FloatContext {
                     x: inset_left,
                     y: segment.y.start.max(min_y),
                     width: self.available_width - inset_left - inset_right,
-                    height: f32::INFINITY,
+                    height: segment.y.end - segment.y.start.max(min_y),
                 }
             }
             None => ContentSlot {

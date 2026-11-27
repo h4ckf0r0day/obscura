@@ -60,26 +60,57 @@ impl FrameRealm {
         url: &str,
         html: &str,
     ) -> Option<Self> {
+        let realms = parent.realm_states();
+        let existing = realms.borrow().context(frame_id);
+        if let Some(context) = existing {
+            let state = realms.borrow().by_frame_id(frame_id)?;
+            let origin = state.borrow().inherited_origin.clone().unwrap_or_else(|| origin_of(url));
+            return Some(Self {
+                context,
+                realms,
+                frame_id,
+                parent_frame_id,
+                url: url.to_string(),
+                origin,
+            });
+        }
+        if realms.borrow().live_count() >= crate::ops::max_live_frames() {
+            return None;
+        }
         let context = parent.create_realm_context()?;
         if !parent.share_ops_with_realm(&context) {
             return None;
         }
         parent.copy_identity_to_realm(&context);
+        // A snapshot-created realm has null deno_core per-context state slots, so
+        // a promise rejection or dynamic import() in the frame would segfault in
+        // deno_core's global callbacks (#850, #841). Alias the main realm's state.
+        parent.share_deno_context_state_with_realm(&context);
 
         // Only a same-origin frame is reachable from the page. Cross-origin
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let origin = origin_of(url);
+        let (scripting_enabled, sandbox_opaque_origin) = realms.borrow().by_frame_id(parent_frame_id)
+            .map(|creator| {
+                let creator = creator.borrow();
+                (creator.scripting_enabled, creator.sandbox_opaque_origin)
+            }).unwrap_or((true, false));
+        let origin = if sandbox_opaque_origin { "null".to_string() } else { origin_of(url) };
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
             parent.share_security_token_with_realm(&context);
         }
 
         let mut state = ObscuraState::new();
+        state.navigation_timing.record("domLoading");
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.frame_id = frame_id;
+        state.parent_frame_id = parent_frame_id;
+        state.scripting_enabled = scripting_enabled;
+        state.sandbox_opaque_origin = sandbox_opaque_origin;
+        if sandbox_opaque_origin { state.inherited_origin = Some("null".to_string()); }
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
@@ -100,16 +131,14 @@ impl FrameRealm {
         // Both ids before init, not after: init is what installs `parent` and
         // `top`, and a document that runs even one script believing it is
         // top-level has already taken the wrong branch.
-        realm
-            .run(
-                parent,
-                &format!(
-                    "globalThis.__obscura_frameId = {frame_id};\
-                     globalThis.__obscura_parentFrameId = {parent_frame_id};\
-                     globalThis.__obscura_init();"
-                ),
-            )
-            .ok()?;
+        let watchdog = parent.arm_watchdog(std::time::Duration::from_secs(5));
+        let initialized = realm.run(parent, &format!(
+            "globalThis.__obscura_frameId = {frame_id};\
+             globalThis.__obscura_parentFrameId = {parent_frame_id};\
+             globalThis.__obscura_init();"
+        ));
+        parent.disarm_watchdog(watchdog);
+        initialized.ok()?;
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
@@ -126,20 +155,40 @@ impl FrameRealm {
     /// can talk to its parent perfectly and still never build its interface,
     /// which looks like a rendering problem and is a lifecycle one.
     pub fn dispatch_load_events(&self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
+        let state = self.realms.borrow().by_frame_id(self.frame_id)
+            .ok_or_else(|| "Frame no longer exists".to_string())?;
+        {
+            let mut state = state.borrow_mut();
+            state.navigation_timing.record("domInteractive");
+            state.navigation_timing.record("domContentLoadedEventStart");
+        }
         self.execute_script(
             parent,
             "globalThis.__documentReadyState__ = 'interactive';\
              try { document.dispatchEvent(new Event('DOMContentLoaded', \
                  { bubbles: false, cancelable: false })); } catch (_) {}\
              try { window.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
-             globalThis.__documentReadyState__ = 'complete';\
+                 { bubbles: false, cancelable: false })); } catch (_) {}",
+        )?;
+        {
+            let mut state = state.borrow_mut();
+            state.navigation_timing.record("domContentLoadedEventEnd");
+            state.navigation_timing.record("domComplete");
+            state.navigation_timing.record("loadEventStart");
+        }
+        let result = self.execute_script(
+            parent,
+            "globalThis.__documentReadyState__ = 'complete';\
              try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
              try { const loadEvent = new Event('load', \
                  { bubbles: false, cancelable: false }); \
                  if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
                  try { window.dispatchEvent(loadEvent); } catch (_) {} } catch (_) {}",
-        )
+        );
+        if result.is_ok() {
+            state.borrow_mut().navigation_timing.record("loadEventEnd");
+        }
+        result
     }
 
     /// Delivers a `postMessage` that another realm sent to this one.
@@ -160,6 +209,22 @@ impl FrameRealm {
                 encode_json_argument(target_origin),
             ),
         )
+    }
+
+    /// Delivers a queued message without losing a retired sender's Window identity.
+    pub fn deliver_queued_message(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        message: &crate::ops::PendingFrameMessage,
+    ) -> Result<(), String> {
+        self.execute_script(parent, &format!(
+            "globalThis.__obscura_deliverMessage({}, {}, {}, {}, {});",
+            encode_json_argument(&message.data_json),
+            encode_json_argument(&message.origin),
+            message.source_frame_id,
+            encode_json_argument(&message.target_origin),
+            message.source_context_id.map_or(-1i64, i64::from),
+        ))
     }
 
     pub fn frame_id(&self) -> u32 {
@@ -183,6 +248,12 @@ impl FrameRealm {
         } else {
             150.0
         };
+        #[cfg(feature = "render")]
+        {
+            let state = self.realms.borrow().by_frame_id(self.frame_id)
+                .ok_or_else(|| "could not resize frame: missing realm".to_string())?;
+            state.borrow_mut().set_viewport(width, height);
+        }
         self.execute_script(
             parent,
             &format!(
@@ -256,7 +327,7 @@ impl FrameRealm {
         parent: &mut ObscuraJsRuntime,
         load_external: impl Fn(&str) -> Option<String>,
     ) -> Vec<String> {
-        let scripts = match self.list_scripts(parent) {
+        let scripts = match self.list_scripts() {
             Ok(scripts) => scripts,
             Err(error) => return vec![error],
         };
@@ -296,8 +367,8 @@ impl FrameRealm {
     ///
     /// A caller that fetches over the network needs the list before running
     /// anything, because `run_document_scripts` resolves sources synchronously.
-    pub fn external_script_urls(&self, parent: &mut ObscuraJsRuntime) -> Vec<String> {
-        self.list_scripts(parent)
+    pub fn external_script_urls(&self, _parent: &mut ObscuraJsRuntime) -> Vec<String> {
+        self.list_scripts()
             .unwrap_or_default()
             .iter()
             .filter(|script| script.is_classic() && !script.src.is_empty())
@@ -308,32 +379,43 @@ impl FrameRealm {
     /// Resolves a subresource URL against the frame's own document URL, not the
     /// parent's. A relative `src` in a frame is relative to the frame.
     fn resolve(&self, src: &str) -> String {
+        if self.url == "about:srcdoc" {
+            if let Some(base) = self.realms.borrow().by_frame_id(self.frame_id)
+                .and_then(|state| crate::ops::document_base_url(&state.borrow()))
+            {
+                return url::Url::parse(&base).and_then(|base| base.join(src))
+                    .map(|url| url.to_string()).unwrap_or_else(|_| src.to_string());
+            }
+        }
         url::Url::parse(&self.url)
             .and_then(|base| base.join(src))
             .map(|url| url.to_string())
             .unwrap_or_else(|_| src.to_string())
     }
 
-    fn list_scripts(&self, parent: &mut ObscuraJsRuntime) -> Result<Vec<DocumentScript>, String> {
-        let listed = self.evaluate(
-            parent,
-            r#"[...document.querySelectorAll('script')].map(node => ({
-                src: node.getAttribute('src') || '',
-                type: (node.getAttribute('type') || '').toLowerCase(),
-                text: node.textContent || '',
-            }))"#,
-        );
-        match listed {
-            Ok(value) => Ok(serde_json::from_value(value).unwrap_or_default()),
-            Err(error) => Err(format!("could not list frame scripts: {error}")),
-        }
+    fn list_scripts(&self) -> Result<Vec<DocumentScript>, String> {
+        // Browser-owned discovery must not execute script-overridden DOM APIs.
+        let state = self.realms.borrow().by_frame_id(self.frame_id)
+            .ok_or_else(|| "could not list frame scripts: missing realm".to_string())?;
+        let state = state.borrow();
+        if !state.scripting_enabled { return Ok(Vec::new()); }
+        let dom = state.dom.as_ref()
+            .ok_or_else(|| "could not list frame scripts: missing document".to_string())?;
+        let nodes = dom.query_selector_all("script")?;
+        Ok(nodes.into_iter().filter_map(|id| {
+            if dom.parser_script_already_started(id) { return None; }
+            let text = dom.text_content(id);
+            dom.with_node(id, |node| DocumentScript {
+                src: node.get_attribute("src").unwrap_or("").to_string(),
+                type_attribute: node.get_attribute("type").unwrap_or("").to_lowercase(),
+                text,
+            })
+        }).collect())
     }
 }
 
-#[derive(serde::Deserialize)]
 struct DocumentScript {
     src: String,
-    #[serde(rename = "type")]
     type_attribute: String,
     text: String,
 }
@@ -383,6 +465,226 @@ mod tests {
         runtime.set_url(url);
         runtime.run_page_init();
         runtime
+    }
+
+    #[test]
+    fn frame_shadow_root_append_uses_its_own_document() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent, r#"(() => {
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'open' });
+            const child = document.createElement('span');
+            child.textContent = 'shadow child';
+            root.appendChild(child);
+            return [
+                host.shadowRoot === root,
+                root.host === host,
+                root.ownerDocument === document,
+                child.parentNode === root,
+                root.textContent
+            ];
+        })()"#).unwrap();
+
+        assert_eq!(result, serde_json::json!([true, true, true, true, "shadow child"]));
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot === null").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn frame_shadow_root_lookup_does_not_read_parent() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        parent.execute_script("parent-shadow", r#"
+            document.getElementById('host').attachShadow({ mode: 'open' })
+                .innerHTML = '<span>parent shadow</span>';
+        "#).unwrap();
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent,
+            "document.getElementById('host').shadowRoot === null").unwrap();
+
+        assert_eq!(result, serde_json::json!(true));
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot.textContent").unwrap(),
+            serde_json::json!("parent shadow"));
+    }
+
+    #[test]
+    fn initial_frame_shadow_root_uses_its_own_document() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+
+        let result = parent.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            const childDocument = frame.contentDocument;
+            const host = childDocument.createElement('div');
+            childDocument.body.appendChild(host);
+            const root = host.attachShadow({ mode: 'open' });
+            const child = childDocument.createElement('span');
+            child.textContent = 'initial frame shadow';
+            root.appendChild(child);
+            return [
+                host.shadowRoot === root,
+                root.ownerDocument === childDocument,
+                child.parentNode === root,
+                root.textContent,
+                document.getElementById('host').shadowRoot === null
+            ];
+        })()"#).unwrap();
+
+        assert_eq!(result,
+            serde_json::json!([true, true, true, "initial frame shadow", true]));
+    }
+
+    #[test]
+    fn frame_closed_shadow_root_stays_private_and_rejects_duplicate_attach() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent, r#"(() => {
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'closed' });
+            const child = document.createElement('span');
+            child.textContent = 'closed frame shadow';
+            root.appendChild(child);
+            return [host.shadowRoot === null, root.mode, root.textContent];
+        })()"#).unwrap();
+        let error = frame.evaluate(&mut parent,
+            "document.getElementById('host').attachShadow({ mode: 'open' })").unwrap_err();
+
+        assert_eq!(result, serde_json::json!([true, "closed", "closed frame shadow"]));
+        assert!(error.contains("NotSupportedError"), "{error}");
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot === null").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn borrowed_form_getters_keep_the_owning_document() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><form id='same'><input id='parent'></form></body></html>");
+        let _frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body><form id='same'><input id='inside'></form><input id='outside' form='same'></body></html>").unwrap();
+        assert_eq!(parent.evaluate(r#"(() => {
+            const doc = globalThis.__obscura_frameObjects[1].document;
+            const form = doc.querySelector('form'), outside = doc.getElementById('outside');
+            const elements = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get;
+            const owner = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'form').get;
+            return [owner.call(outside) === form, elements.call(form)[1] === outside,
+                Array.from(elements.call(form), n => n.id).join(','),
+                document.querySelector('form').elements[0].id];
+        })()"#).unwrap(), serde_json::json!([true,true,"inside,outside","parent"]));
+    }
+
+    #[test]
+    fn html_interface_brands_stay_in_the_creation_realm() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='parent'>Parent</div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body><div id='child'>Child</div><span></span></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            HTMLDivElement.prototype.__brandProbe = 'child';
+            const node = document.getElementById('child');
+            return [node.constructor === HTMLDivElement, node instanceof HTMLDivElement,
+                !(node instanceof HTMLSpanElement), document.createElement('div').__brandProbe,
+                document.querySelector('span').__brandProbe === undefined];
+        })()"#).unwrap(), serde_json::json!([true,true,true,"child",true]));
+        assert_eq!(parent.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document.getElementById('child');
+            const node = document.getElementById('parent');
+            return [child.constructor.name, child.__brandProbe, child instanceof HTMLDivElement,
+                node.constructor === HTMLDivElement, node.__brandProbe === undefined,
+                document.createElement('div').__brandProbe === undefined];
+        })()"#).unwrap(), serde_json::json!(["HTMLDivElement","child",false,true,true,true]));
+    }
+
+    #[test]
+    fn borrowed_select_and_option_methods_keep_the_owning_dom() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><select id='parent'><option>Parent</option></select></body></html>");
+        let _frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body><select><option id='a'>A</option><optgroup><option id='b'>B</option></optgroup></select></body></html>").unwrap();
+        assert_eq!(parent.evaluate(r#"(() => {
+            const select = globalThis.__obscura_frameObjects[1].document.querySelector('select');
+            const length = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'length');
+            const index = Object.getOwnPropertyDescriptor(HTMLOptionElement.prototype, 'index').get;
+            const item = HTMLSelectElement.prototype.item.call(select, 1);
+            const named = HTMLSelectElement.prototype.namedItem.call(select, 'b');
+            const initial = [length.get.call(select), item.id, named === item, index.call(item)];
+            length.set.call(select, 3);
+            HTMLSelectElement.prototype.remove.call(select, 0);
+            const changed = [select.length, select.item(0).id, index.call(item)];
+            const div = select.ownerDocument.createElement('div');
+            const rejected = [() => length.get.call(div), () => length.set.call(div, 1),
+                () => HTMLSelectElement.prototype.item.call(div, 0),
+                () => HTMLSelectElement.prototype.namedItem.call(div, ''),
+                () => HTMLSelectElement.prototype.remove.call(div), () => index.call(div)].map(call => {
+                    try { call(); return false; } catch (error) { return error instanceof TypeError; }
+                });
+            HTMLSelectElement.prototype.remove.call(select);
+            return {initial, changed, rejected, childConnected:select.isConnected,
+                parent:[document.getElementById('parent').length, document.querySelector('option').textContent]};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[2,"b",true,1], "changed":[2,"b",0], "rejected":[true,true,true,true,true,true],
+            "childConnected":false,
+            "parent":[1,"Parent"],
+        }));
+    }
+
+    #[test]
+    fn borrowed_style_getter_keeps_the_elements_declaration() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _frame = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/frame", "<html><body style='color: red'>Child</body></html>")
+            .expect("frame realm");
+        assert_eq!(parent.evaluate(r#"(() => {
+            const element = globalThis.__obscura_frameObjects[1].document.body;
+            const getter = Object.getOwnPropertyDescriptor(Element.prototype, 'style').get;
+            const borrowed = getter.call(element);
+            const same = borrowed === element.style;
+            element.setAttribute('style', 'color: blue');
+            return [same, borrowed.color, element.style.color];
+        })()"#).unwrap(), serde_json::json!([true, "blue", "blue"]));
+    }
+
+    #[test]
+    fn borrowed_content_type_getter_reads_the_frame_document() {
+        let mut parent = ObscuraJsRuntime::new();
+        parent.set_dom(parse_html("<html><body></body></html>"));
+        parent.set_url("https://parent.example/page");
+        parent.set_content_type("text/plain");
+        parent.run_page_init();
+        let _frame = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/frame", "<html><body>Child</body></html>")
+            .expect("frame realm");
+        assert_eq!(parent.evaluate(r#"(function(){
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const get = Object.getOwnPropertyDescriptor(Document.prototype, 'contentType').get;
+            return [get.call(child), child.contentType, document.contentType];
+        })()"#).unwrap(), serde_json::json!(["text/html", "text/html", "text/plain"]));
+    }
+
+    #[test]
+    fn fetched_frame_contexts_survive_runtime_teardown_under_gc_stress() {
+        crate::set_v8_flags("--stress-compaction --stress-marking=1");
+        for _ in 0..10 {
+            let mut parent = page("https://parent.example/page", "<html><body>Parent</body></html>");
+            let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+                "<html><body>Child</body></html>").expect("frame realm");
+            assert_eq!(frame.evaluate(&mut parent, "document.body.textContent").unwrap(),
+                serde_json::json!("Child"));
+            drop(frame);
+            drop(parent);
+        }
     }
 
     #[test]
@@ -443,7 +745,147 @@ mod tests {
     }
 
     #[test]
-    fn frame_uses_its_embedding_viewport() {
+    fn initial_frame_adoption_preserves_the_realm_and_inherited_base() {
+        let mut parent = page("https://parent.example/pages/index.html", "<html><body></body></html>");
+        parent.execute_script("initial-frame", r#"
+            globalThis.frameElementProbe = document.createElement('iframe');
+            document.body.appendChild(frameElementProbe);
+            globalThis.initialWindowProbe = frameElementProbe.contentWindow;
+            initialWindowProbe.eval('globalThis.marker = 42; document.body.textContent = "child"');
+        "#).unwrap();
+        let pending = parent.take_pending_frames().pop().expect("initial frame queued");
+        let frame = FrameRealm::new(&mut parent, pending.frame_id, pending.parent_frame_id,
+            &pending.url, &pending.html).expect("adopt initial realm");
+        assert_eq!(frame.origin(), "https://parent.example");
+        assert_eq!(frame.evaluate(&mut parent,
+            "[marker, document.body.textContent, document.URL, document.baseURI]").unwrap(),
+            serde_json::json!([42, "child", "about:blank", "https://parent.example/pages/index.html"]));
+        assert_eq!(parent.evaluate(
+            "[initialWindowProbe === frameElementProbe.contentWindow, initialWindowProbe.parent === window, typeof marker, document.body.textContent]").unwrap(),
+            serde_json::json!([true, true, "undefined", ""]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_frame_messages_keep_the_calling_realm_as_sender() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent.execute_script("initial-frame", r#"
+            globalThis.frameElementProbe = document.createElement('iframe');
+            document.body.appendChild(frameElementProbe);
+            globalThis.initialWindowProbe = frameElementProbe.contentWindow;
+            initialWindowProbe.postMessage('from-parent', '*');
+        "#).unwrap();
+        let pending = parent.take_pending_frames().pop().unwrap();
+        let frame = FrameRealm::new(&mut parent, pending.frame_id, 0,
+            &pending.url, &pending.html).unwrap();
+        frame.execute_script(&mut parent,
+            "parent.postMessage('from-child', '*'); postMessage('to-self', '*');").unwrap();
+        let messages = parent.take_pending_frame_messages();
+        assert_eq!(messages.iter().map(|message| (
+            message.target_frame_id, message.source_frame_id, message.origin.as_str()
+        )).collect::<Vec<_>>(), vec![
+            (frame.frame_id(), 0, "https://parent.example"),
+            (0, frame.frame_id(), "https://parent.example"),
+            (frame.frame_id(), frame.frame_id(), "https://parent.example"),
+        ]);
+    }
+
+    #[test]
+    fn nested_message_source_parent_keeps_the_intermediate_frame() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _child = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/child", "<html><body></body></html>").unwrap();
+        let _grandchild = FrameRealm::new(&mut parent, 2, 1,
+            "https://parent.example/grandchild", "<html><body></body></html>").unwrap();
+        parent.execute_script("nested-message-parent", r#"
+            globalThis.sources = [];
+            addEventListener('message', event => sources.push(event.source));
+            __obscura_deliverMessage('{"v":"child"}', 'https://parent.example', 1, '*');
+            __obscura_deliverMessage('{"v":"grandchild"}', 'https://parent.example', 2, '*');
+            sources[1].parent.postMessage('reply', '*');
+        "#).unwrap();
+        assert_eq!(parent.evaluate(
+            "[sources[1].parent === sources[0], sources[1].parent.parent === window, sources[1].top === window]"
+        ).unwrap(), serde_json::json!([true, true, true]));
+        let messages = parent.take_pending_frame_messages();
+        assert_eq!(messages.iter().map(|message| (
+            message.target_frame_id, message.source_frame_id,
+        )).collect::<Vec<_>>(), vec![(1, 0)]);
+    }
+
+    #[test]
+    fn message_source_parent_stays_opaque_across_origins() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _child = FrameRealm::new(&mut parent, 1, 0,
+            "https://other.example/child", "<html><body></body></html>").unwrap();
+        let _grandchild = FrameRealm::new(&mut parent, 2, 1,
+            "https://parent.example/grandchild", "<html><body></body></html>").unwrap();
+        parent.execute_script("opaque-message-parent", r#"
+            addEventListener('message', event => { globalThis.sourceParent = event.source.parent; });
+            __obscura_deliverMessage('{"v":"grandchild"}', 'https://parent.example', 2, '*');
+            sourceParent.postMessage('reply', '*');
+        "#).unwrap();
+        assert_eq!(parent.evaluate("[sourceParent !== window, (() => { try { sourceParent.document; return false; } catch (e) { return e.name === 'SecurityError'; } })()]").unwrap(),
+            serde_json::json!([true, true]));
+        let messages = parent.take_pending_frame_messages();
+        assert_eq!(messages.iter().map(|message| (
+            message.target_frame_id, message.source_frame_id,
+        )).collect::<Vec<_>>(), vec![(1, 0)]);
+    }
+
+    #[test]
+    fn nested_initial_frame_uses_its_owner_document_not_the_entered_page() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent.execute_script("nested-initial-frame", r#"
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const child = iframe.contentWindow;
+            const nested = child.document.createElement('iframe');
+            child.document.body.appendChild(nested);
+            globalThis.nestedWindowProbe = nested.contentWindow;
+        "#).unwrap();
+        let pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].parent_frame_id, 0);
+        assert_eq!(pending[1].parent_frame_id, pending[0].frame_id);
+    }
+
+    #[test]
+    fn initial_frame_script_discovery_does_not_read_the_parent_after_prototype_remap() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><script src='/parent.js'></script></body></html>");
+        parent.execute_script("initial-frame", r#"
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const child = iframe.contentWindow;
+            Object.setPrototypeOf(child.document, Document.prototype);
+        "#).unwrap();
+        let pending = parent.take_pending_frames().pop().unwrap();
+        let frame = FrameRealm::new(&mut parent, pending.frame_id, 0,
+            &pending.url, &pending.html).unwrap();
+        assert!(frame.external_script_urls(&mut parent).is_empty(),
+            "initial frame must not replay its parent's author scripts");
+    }
+
+    #[test]
+    fn initial_frame_script_discovery_ignores_overridden_dom_methods() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><script src='/parent.js'></script></body></html>");
+        parent.execute_script("initial-frame", r#"
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const child = iframe.contentWindow;
+            const parentScripts = document.querySelectorAll('script');
+            child.document.querySelectorAll = () => parentScripts;
+        "#).unwrap();
+        let pending = parent.take_pending_frames().pop().unwrap();
+        let frame = FrameRealm::new(&mut parent, pending.frame_id, 0,
+            &pending.url, &pending.html).unwrap();
+        assert!(frame.external_script_urls(&mut parent).is_empty(),
+            "author script discovery must use the actual frame DOM");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_uses_its_embedding_viewport() {
         let mut parent = page(
             "https://parent.example/page",
             "<html><body><iframe style='width:300px;height:65px'></iframe></body></html>",
@@ -469,10 +911,36 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_renderer_viewport_changes_do_not_resize_the_page() {
+        let mut parent = page("https://parent.example/",
+            "<html><head><style>body{margin:0}#page{width:100vw;height:100vh}</style></head><body><div id='page'></div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><head><style>body{margin:0}div{width:50vw;height:25vh}</style></head><body><div id='box'></div></body></html>").unwrap();
+        frame.set_viewport(&mut parent, 300.0, 80.0).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            const r = document.getElementById('box').getBoundingClientRect();
+            globalThis.savedStyle = getComputedStyle(document.getElementById('box'));
+            return [r.width, r.height, savedStyle.width, savedStyle.height];
+        })()"#).unwrap(), serde_json::json!([150, 20, "150px", "20px"]));
+        frame.set_viewport(&mut parent, 200.0, 120.0).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            const r = document.getElementById('box').getBoundingClientRect();
+            const fresh = getComputedStyle(document.getElementById('box'));
+            return [r.width, r.height, savedStyle.width, savedStyle.height,
+                fresh.width, fresh.height];
+        })()"#).unwrap(), serde_json::json!([100, 30, "100px", "30px", "100px", "30px"]));
+        assert_eq!(parent.evaluate(r#"(() => {
+            const r = document.getElementById('page').getBoundingClientRect();
+            return [r.width, r.height];
+        })()"#).unwrap(), serde_json::json!([1280, 720]));
+    }
+
     /// A frame must not look like a different browser than its parent. Anti-bot
     /// code fingerprints inside the frame and compares it with the top document.
-    #[test]
-    fn frame_inherits_the_parent_browser_identity() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_inherits_the_parent_browser_identity() {
         let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TestAgent/150.0.0.0";
         let mut parent = ObscuraJsRuntime::new();
         parent.set_user_agent(user_agent);
@@ -505,6 +973,30 @@ mod tests {
             frame.evaluate(&mut parent, "navigator.userAgent").unwrap(),
             serde_json::json!(user_agent)
         );
+    }
+
+    #[test]
+    fn frame_eof_scripts_are_not_fetched_or_executed() {
+        let mut parent = page("https://parent.example/", "<body></body>");
+        for (index, (external, complete)) in [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter().enumerate()
+        {
+            let src = if external { "src=/script.js" } else { "" };
+            let end = if complete { "</script>" } else { "" };
+            let frame = FrameRealm::new(&mut parent, index as u32 + 1, 0,
+                "https://child.example/", &format!("<body><script {src}>window.runs=1;{end}"))
+                .expect("frame realm");
+            let expected_urls = if external && complete { vec!["https://child.example/script.js"] } else { vec![] };
+            assert_eq!(frame.external_script_urls(&mut parent), expected_urls);
+            let requested = RefCell::new(Vec::new());
+            assert!(frame.run_document_scripts(&mut parent, |url| {
+                requested.borrow_mut().push(url.to_string());
+                Some("window.runs=1;".into())
+            }).is_empty());
+            assert_eq!(requested.into_inner(), expected_urls);
+            assert_eq!(frame.evaluate(&mut parent, "window.runs||0").unwrap(),
+                serde_json::json!(if complete { 1 } else { 0 }));
+        }
     }
 
     /// The capability the frame realm exists for: scripts that arrived with the
@@ -679,6 +1171,47 @@ mod tests {
     }
 
     #[test]
+    fn frame_navigation_timing_records_its_own_event_boundaries() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body></body></html>").unwrap();
+        frame.execute_script(&mut parent, r#"
+            globalThis.samples = [];
+            function sample() {
+                samples.push([performance.timing.domContentLoadedEventStart,
+                    performance.timing.domContentLoadedEventEnd,
+                    performance.timing.loadEventStart, performance.timing.loadEventEnd]);
+            }
+            document.addEventListener('DOMContentLoaded', sample);
+            window.addEventListener('load', sample);
+            Date.now = () => 0;
+        "#).unwrap();
+        frame.dispatch_load_events(&mut parent).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            const [dom, load] = samples;
+            return [dom[0] > 0 && dom[1] === 0, load[2] > 0 && load[3] === 0,
+                performance.timing.domContentLoadedEventEnd >= dom[0],
+                performance.timing.loadEventEnd >= load[2]];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true]));
+        assert_eq!(parent.evaluate("performance.timing.loadEventEnd").unwrap().as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn frame_navigation_timing_terminated_load_does_not_record_completion() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body></body></html>").unwrap();
+        frame.execute_script(&mut parent,
+            "window.addEventListener('load',()=>{globalThis.entered=true;while(true){}});").unwrap();
+        let token = parent.arm_watchdog(std::time::Duration::from_millis(250));
+        let result = frame.dispatch_load_events(&mut parent);
+        let fired = parent.disarm_watchdog(token);
+        assert!(fired && result.is_err(), "the infinite load handler must be terminated");
+        assert_eq!(frame.evaluate(&mut parent, "globalThis.entered === true").unwrap(), serde_json::json!(true));
+        assert_eq!(frame.evaluate(&mut parent, "performance.timing.loadEventEnd").unwrap().as_f64(), Some(0.0));
+    }
+
+    #[test]
     fn frame_body_onload_content_attribute_reflects_to_window() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
@@ -748,8 +1281,8 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("module")), "{problems:?}");
     }
 
-    #[test]
-    fn many_frames_can_be_alive_at_once() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn many_frames_can_be_alive_at_once() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frames: Vec<FrameRealm> = (0..4)
             .map(|index| {
@@ -912,6 +1445,46 @@ mod tests {
                 .unwrap(),
             serde_json::json!("https://child.example/"),
         );
+    }
+
+    // #850 / #841 — a promise rejection or dynamic import() inside a frame realm
+    // used to null-deref deno_core's global callbacks (which read per-context
+    // state from V8 embedder slots) and segfault the whole process. The realm
+    // must now alias the main realm's state so these run without crashing.
+    #[test]
+    fn a_frame_rejection_does_not_crash_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        // Reaching this line at all (no SIGSEGV) is the regression check.
+        frame
+            .execute_script(&mut parent, "Promise.reject(new Error('boom')); 'ok'")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_frame_dynamic_import_does_not_crash_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        frame
+            .execute_script(
+                &mut parent,
+                "import('data:text/javascript,export default 1').catch(() => {}); 'ok'",
+            )
+            .unwrap();
     }
 
     /// A frame posting to `parent` must reach the page, arrive trusted, and
@@ -1291,6 +1864,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_dom_nodes_preserve_foreign_document_identity_and_reject_stale_frames() {
+        let mut parent = page("https://example.com/", "<div id=parent>parent</div>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://example.com/child",
+            "<base href='/assets/'><span id=child>child</span>").unwrap();
+        let info = parent.store_object_with_meta(
+            "globalThis.__obscura_frameObjects[1].document.getElementById('child')").unwrap();
+        let object_id = info.object_id.unwrap();
+        let description = parent.with_remote_dom_node(&object_id, |dom, node, frame, url, base| {
+            (frame, url.to_string(), base.to_string(), dom.outer_html(node))
+        }).unwrap();
+        assert_eq!(description, (1, "https://example.com/child".into(),
+            "https://example.com/assets/".into(), "<span id=\"child\">child</span>".into()));
+        frame.execute_script(&mut parent, "history.pushState({},'', '/changed');").unwrap();
+        assert_eq!(parent.with_remote_dom_node(&object_id, |_, _, _, url, base| {
+            (url.to_string(), base.to_string())
+        }).unwrap(), ("https://example.com/changed".into(), "https://example.com/assets/".into()));
+        let document = parent.store_object_with_meta(
+            "globalThis.__obscura_frameObjects[1].document").unwrap().object_id.unwrap();
+        assert_eq!(parent.with_remote_dom_node(&document, |dom, node, frame, _, _| {
+            (node == dom.document(), frame)
+        }).unwrap(), (true, 1));
+        let forged = parent.store_object_with_meta("({_nid:0})").unwrap().object_id.unwrap();
+        parent.execute_script("override", "Map.prototype.get=function(){return this};").unwrap();
+        assert!(parent.with_remote_dom_node(&forged, |_, _, _, _, _| ()).is_err());
+        assert_eq!(parent.with_remote_dom_node(&document, |_, _, frame, _, _| frame).unwrap(), 1);
+        parent.forget_frame_state(frame.frame_id());
+        assert!(parent.with_remote_dom_node(&document, |_, _, _, _, _| ()).is_err());
+    }
+
+    #[test]
     fn opaque_origin_frames_are_never_same_origin() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
@@ -1304,5 +1907,163 @@ mod tests {
         assert_eq!(frame.origin(), "null");
         assert!(!frame.is_same_origin_as("null"));
         assert!(!frame.is_same_origin_as("https://parent.example"));
+    }
+
+    #[test]
+    fn file_list_global_exists_and_input_files_is_instance() {
+        // Issue #1232: `typeof FileList` was `undefined`, crashing apps that
+        // reference it while booting.
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f></body></html>",
+        );
+        assert_eq!(
+            rt.evaluate("typeof FileList").unwrap(),
+            serde_json::json!("function")
+        );
+        assert_eq!(
+            rt.evaluate("Object.prototype.toString.call(document.getElementById('f').files)")
+                .unwrap(),
+            serde_json::json!("[object FileList]")
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').files instanceof FileList")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').files.length").unwrap(),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            rt.evaluate("(() => { try { new FileList(); return 'no-throw'; } catch (e) { return e.name + ': ' + e.message; } })()").unwrap(),
+            serde_json::json!("TypeError: Illegal constructor")
+        );
+    }
+
+    #[test]
+    fn file_list_iteration_preserves_uploaded_files() {
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f multiple></body></html>",
+        );
+        let result = rt.evaluate(r#"(() => {
+            const input = document.getElementById('f');
+            const empty = [...input.files].length;
+            __obscura_setInputFiles(input, [
+                {name: 'first.txt', type: 'text/plain', b64: 'YQ=='},
+                {name: 'second.txt', type: 'text/plain', b64: 'Yg=='}
+            ]);
+            const files = input.files;
+            const names = [];
+            for (const file of files) names.push(file.name);
+            const iterator = files[Symbol.iterator]();
+            return {
+                empty,
+                spread: [...files].map(file => file.name),
+                names,
+                sameFile: [...files][0] === files.item(0),
+                iterableIterator: iterator[Symbol.iterator]() === iterator
+            };
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "empty": 0,
+            "spread": ["first.txt", "second.txt"],
+            "names": ["first.txt", "second.txt"],
+            "sameFile": true,
+            "iterableIterator": true
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsed_frame_metadata_exists_without_eager_realms_or_started_loads() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><iframe name='a' src='https://other.example/a'></iframe>\
+             <iframe name='b' src='https://other.example/b'></iframe></body></html>");
+        assert_eq!(parent.evaluate("frames.length").unwrap().as_f64(), Some(2.0));
+        assert_eq!(parent.realm_states().borrow().live_count(), 0);
+        assert!(parent.take_pending_frames().is_empty());
+        assert_eq!(parent.evaluate(
+            "[frames.a === frames[0], frames.b === frames[1], frames[0] !== frames[1]]"
+        ).unwrap(), serde_json::json!([true, true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unowned_frame_realms_do_not_alias_connected_frame_owners() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body>\
+                <iframe name=\"a\" src=\"https://other.example/a\"></iframe>\
+                <iframe name=\"b\" src=\"https://other.example/b\"></iframe>\
+            </body></html>",
+        );
+        parent.evaluate_script("__obscura_init_frames();").unwrap();
+        let frame_a = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://other.example/a",
+            "<html><body></body></html>",
+        ).unwrap();
+        let frame_b = FrameRealm::new(
+            &mut parent,
+            2,
+            0,
+            "https://other.example/b",
+            "<html><body></body></html>",
+        ).unwrap();
+
+        let result_a = frame_a.evaluate(&mut parent, r#"
+            [
+                parent.frames.length,
+                parent.length,
+                parent.frames[0] === window,
+                parent.frames[1] === window,
+                typeof parent.frames.b,
+                parent.frames.a !== window,
+                parent.frames.b !== window,
+                parent.parent === parent,
+                parent.top === parent,
+            ]
+        "#).unwrap();
+        assert_eq!(result_a, serde_json::json!([
+            2, 2, false, false, "object", true, true, true, true
+        ]));
+
+        let result_b = frame_b.evaluate(&mut parent, r#"
+            [
+                parent.frames.length,
+                parent.length,
+                parent.frames[0] === window,
+                parent.frames[1] === window,
+                parent.frames.b === window,
+                typeof parent.frames.a,
+            ]
+        "#).unwrap();
+        assert_eq!(result_b, serde_json::json!([
+            2, 2, false, false, false, "object"
+        ]));
+
+        frame_a.execute_script(&mut parent, r#"
+            parent.frames.b.postMessage('hello from a', '*');
+        "#).unwrap();
+        assert!(parent.take_pending_frame_messages().is_empty(),
+            "an unowned realm must not receive a pending owner's message");
+
+        let frame_c = FrameRealm::new(
+            &mut parent,
+            3,
+            1,
+            "https://other.example/c",
+            "<html><body></body></html>",
+        ).unwrap();
+        let result_c = frame_c.evaluate(&mut parent, r#"
+            [
+                parent.parent === top,
+                parent.parent.frames.length,
+                parent.parent.frames.a === parent,
+            ]
+        "#).unwrap();
+        assert_eq!(result_c, serde_json::json!([true, 2, false]));
     }
 }

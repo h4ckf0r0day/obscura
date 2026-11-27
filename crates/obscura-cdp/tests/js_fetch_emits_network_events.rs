@@ -7,6 +7,7 @@
 
 use obscura_cdp::dispatch::{dispatch, CdpContext};
 use obscura_cdp::types::CdpRequest;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -17,7 +18,7 @@ async fn serve() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        for _ in 0..6 {
+        for _ in 0..12 {
             let (mut socket, _) = listener.accept().await.unwrap();
             tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
@@ -26,6 +27,12 @@ async fn serve() -> String {
                 if req.starts_with("GET /api/start.json") {
                     let resp = "HTTP/1.1 302 Found\r\nLocation: /api/data.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = socket.write_all(resp.as_bytes()).await;
+                    return;
+                }
+                if req.starts_with("GET /api/missing.json") {
+                    let body = r#"{"error":"missing"}"#;
+                    let response = format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = socket.write_all(response.as_bytes()).await;
                     return;
                 }
                 let (ct, body) = if req.starts_with("GET /api/data.json") {
@@ -51,6 +58,76 @@ window.__done = new Promise(function (resolve) {
                     body.len()
                 );
                 let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+async fn serve_binary_fetch() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..16 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let (content_type, body): (Option<&str>, Vec<u8>) = if request.starts_with("GET /bytes.bin") {
+                    (Some("application/octet-stream"), (0u8..=255).collect())
+                } else if request.starts_with("GET /ascii.bin") {
+                    (Some("application/octet-stream"), b"ABC".to_vec())
+                } else if request.starts_with("GET /invalid.txt") {
+                    (Some("text/plain"), vec![0xff])
+                } else if request.starts_with("GET /win1252.txt") {
+                    (Some("text/plain; charset=windows-1252"), vec![0x80])
+                } else if request.starts_with("GET /legacy-euro.txt") {
+                    (Some("text/plain; charset=windows-1252"), "€".as_bytes().to_vec())
+                } else if request.starts_with("GET /gbk.txt") {
+                    (Some("text/plain; charset=gbk"), vec![0xd6, 0xd0, 0xce, 0xc4])
+                } else if request.starts_with("GET /invalid.json") {
+                    (Some("application/json"), vec![0xff])
+                } else if request.starts_with("GET /legacy-module.js") {
+                    (Some("application/javascript; charset=windows-1252"), b"export const value='caf\xe9';".to_vec())
+                } else if request.starts_with("GET /legacy.js") {
+                    (Some("application/x-javascript"), b"legacy()".to_vec())
+                } else if request.starts_with("GET /legacy.css") {
+                    (Some("text/css"), vec![0xff])
+                } else if request.starts_with("GET /no-type") {
+                    (None, vec![0x81, 0x8d])
+                } else if request.starts_with("GET /empty.json") {
+                    (Some("application/json"), Vec::new())
+                } else if request.starts_with("GET /empty-no-type") {
+                    (None, Vec::new())
+                } else {
+                    (
+                        Some("text/html"),
+                        br#"<script>Promise.all([
+                          fetch('/bytes.bin').then(r => r.arrayBuffer()),
+                          fetch('/ascii.bin').then(r => r.arrayBuffer()),
+                          fetch('/invalid.txt').then(r => r.text()),
+                          fetch('/win1252.txt').then(r => r.text()),
+                          fetch('/legacy-euro.txt').then(r => r.arrayBuffer()),
+                          fetch('/gbk.txt').then(r => r.text()),
+                          fetch('/invalid.json').then(r => r.arrayBuffer()),
+                          fetch('/legacy.js').then(r => r.text()),
+                          fetch('/legacy.css').then(r => r.text()),
+                          fetch('/no-type').then(r => r.arrayBuffer()),
+                          fetch('/empty.json').then(r => r.text()),
+                          fetch('/empty-no-type').then(r => r.text())
+                        ]).then(() => { globalThis.__done = true; });</script>"#.to_vec(),
+                    )
+                };
+                let content_type = content_type
+                    .map(|value| format!("Content-Type: {value}\r\n"))
+                    .unwrap_or_default();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
             });
         }
     });
@@ -151,6 +228,349 @@ async fn js_fetch_emits_network_request_and_response() {
         Some("{\"value\":42}"),
         "Network.getResponseBody must return the script-fetched JSON"
     );
+    assert_eq!(body.get("base64Encoded"), Some(&json!(false)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_fetch_get_response_body_preserves_binary_bytes() {
+    check_binary_fetch_response_body(false).await;
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn native_stealth_fetch_response_body_preserves_binary_bytes() {
+    check_binary_fetch_response_body(true).await;
+}
+
+async fn check_binary_fetch_response_body(stealth: bool) {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = serve_binary_fetch().await;
+    let mut ctx = CdpContext::new_with_options(None, stealth);
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": base, "waitUntil": "networkidle0"}),
+        session_id,
+    )
+    .await;
+
+    let request_id = response_request_id(&ctx, "/bytes.bin")
+        .expect("binary fetch must emit a response with a requestId");
+    let body = cdp(
+        &mut ctx,
+        2,
+        "Network.getResponseBody",
+        json!({"requestId": request_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(body.get("base64Encoded"), Some(&json!(true)));
+    let encoded = body.get("body").and_then(Value::as_str).expect("response body");
+    assert_eq!(BASE64.decode(encoded).unwrap(), (0u8..=255).collect::<Vec<_>>());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_get_response_body_uses_chromium_mime_encoding_rules() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = serve_binary_fetch().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": base, "waitUntil": "networkidle0"}),
+        session_id,
+    )
+    .await;
+
+    let ascii_id = response_request_id(&ctx, "/ascii.bin").expect("ASCII binary response");
+    let ascii = cdp(
+        &mut ctx,
+        2,
+        "Network.getResponseBody",
+        json!({"requestId": ascii_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(ascii, json!({"body": "QUJD", "base64Encoded": true}));
+
+    let text_id = response_request_id(&ctx, "/invalid.txt").expect("invalid text response");
+    let text = cdp(
+        &mut ctx,
+        3,
+        "Network.getResponseBody",
+        json!({"requestId": text_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(text, json!({"body": "ÿ", "base64Encoded": false}));
+
+    let windows_id = response_request_id(&ctx, "/win1252.txt").expect("windows-1252 response");
+    let windows = cdp(
+        &mut ctx,
+        4,
+        "Network.getResponseBody",
+        json!({"requestId": windows_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(windows, json!({"body": "€", "base64Encoded": false}));
+
+    let invalid_json_id = response_request_id(&ctx, "/invalid.json").expect("invalid JSON");
+    let invalid_json = cdp(
+        &mut ctx,
+        5,
+        "Network.getResponseBody",
+        json!({"requestId": invalid_json_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(invalid_json, json!({"body": "/w==", "base64Encoded": true}));
+
+    let legacy_id = response_request_id(&ctx, "/legacy.js").expect("legacy JavaScript MIME");
+    let legacy = cdp(
+        &mut ctx,
+        6,
+        "Network.getResponseBody",
+        json!({"requestId": legacy_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(legacy, json!({"body": "legacy()", "base64Encoded": false}));
+
+    let missing_id = response_request_id(&ctx, "/no-type").expect("missing MIME response");
+    let missing = cdp(
+        &mut ctx,
+        7,
+        "Network.getResponseBody",
+        json!({"requestId": missing_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(missing, json!({"body": "gY0=", "base64Encoded": true}));
+
+    let empty_id = response_request_id(&ctx, "/empty.json").expect("empty JSON response");
+    let empty = cdp(
+        &mut ctx,
+        8,
+        "Network.getResponseBody",
+        json!({"requestId": empty_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(empty, json!({"body": "", "base64Encoded": false}));
+
+    let empty_no_type_id = response_request_id(&ctx, "/empty-no-type")
+        .expect("empty response without MIME type");
+    let empty_no_type = cdp(
+        &mut ctx,
+        9,
+        "Network.getResponseBody",
+        json!({"requestId": empty_no_type_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(empty_no_type, json!({"body": "", "base64Encoded": false}));
+
+    let legacy_css_id = response_request_id(&ctx, "/legacy.css").expect("legacy CSS text MIME");
+    let legacy_css = cdp(
+        &mut ctx,
+        10,
+        "Network.getResponseBody",
+        json!({"requestId": legacy_css_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(legacy_css, json!({"body": "ÿ", "base64Encoded": false}));
+
+    let gbk_id = response_request_id(&ctx, "/gbk.txt").expect("GBK text response");
+    let gbk = cdp(
+        &mut ctx,
+        11,
+        "Network.getResponseBody",
+        json!({"requestId": gbk_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(gbk, json!({"body": "中文", "base64Encoded": false}));
+
+    let navigated = cdp(
+        &mut ctx,
+        12,
+        "Page.navigate",
+        json!({"url": format!("{base}gbk.txt")}),
+        session_id,
+    )
+    .await;
+    let loader_id = navigated["loaderId"].as_str().unwrap();
+    let document_gbk = cdp(
+        &mut ctx,
+        13,
+        "Network.getResponseBody",
+        json!({"requestId": loader_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(
+        document_gbk,
+        json!({"body": "中文", "base64Encoded": false}),
+    );
+    assert_eq!(ctx.get_session_page(&Some(session_id.to_string())).unwrap()
+        .get_response_body(loader_id).unwrap().body, [0xd6, 0xd0, 0xce, 0xc4]);
+    assert!(!ctx.get_session_page(&Some(session_id.to_string())).unwrap()
+        .get_response_body(loader_id).unwrap().base64_encoded);
+
+    let navigated = cdp(
+        &mut ctx,
+        14,
+        "Page.navigate",
+        json!({"url": format!("{base}bytes.bin")}),
+        session_id,
+    )
+    .await;
+    let loader_id = navigated["loaderId"].as_str().unwrap();
+    let document_binary = cdp(
+        &mut ctx,
+        15,
+        "Network.getResponseBody",
+        json!({"requestId": loader_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(document_binary["base64Encoded"], true);
+    assert_eq!(
+        BASE64.decode(document_binary["body"].as_str().unwrap()).unwrap(),
+        (0u8..=255).collect::<Vec<_>>(),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_fetch_response_stream_preserves_original_bytes() {
+    check_response_stream_bytes(false).await;
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn native_stealth_response_stream_preserves_original_bytes() {
+    check_response_stream_bytes(true).await;
+}
+
+async fn check_response_stream_bytes(stealth: bool) {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = serve_binary_fetch().await;
+    let mut ctx = CdpContext::new_with_options(None, stealth);
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": base, "waitUntil": "networkidle0"}),
+        session_id,
+    )
+    .await;
+    for (path, expected) in [
+        ("/bytes.bin", (0u8..=255).collect::<Vec<_>>()),
+        ("/legacy-euro.txt", "€".as_bytes().to_vec()),
+        ("/win1252.txt", vec![0x80]),
+    ] {
+        let request_id = response_request_id(&ctx, path).expect("response");
+        let stream = cdp(
+            &mut ctx,
+            2,
+            "Fetch.takeResponseBodyAsStream",
+            json!({"requestId": request_id}),
+            session_id,
+        )
+        .await;
+        let handle = stream.get("stream").and_then(Value::as_str).expect("stream handle");
+        let read = cdp(
+            &mut ctx,
+            3,
+            "IO.read",
+            json!({"handle": handle, "size": 512}),
+            session_id,
+        )
+        .await;
+        assert_eq!(read.get("eof"), Some(&json!(true)));
+        assert_eq!(read.get("base64Encoded"), Some(&json!(true)));
+        let encoded = read.get("data").and_then(Value::as_str).expect("stream data");
+        assert_eq!(BASE64.decode(encoded).unwrap(), expected, "{path}");
+        cdp(&mut ctx, 4, "IO.close", json!({"handle": handle}), session_id).await;
+        assert!(ctx.get_session_page_mut(&Some(session_id.to_string())).unwrap()
+            .get_response_body(&request_id).is_none(), "streamed body must leave the cache");
+        // The remaining responses must retain their original bytes across teardown.
+        ctx.get_session_page_mut(&Some(session_id.to_string())).unwrap().suspend_js();
+    }
+
+    let navigated = cdp(&mut ctx, 4, "Page.navigate", json!({
+        "url": format!("{base}legacy-euro.txt")
+    }), session_id).await;
+    let stream = cdp(&mut ctx, 5, "Fetch.takeResponseBodyAsStream", json!({
+        "requestId": navigated["loaderId"]
+    }), session_id).await;
+    let read = cdp(&mut ctx, 6, "IO.read", json!({"handle": stream["stream"]}), session_id).await;
+    assert_eq!(BASE64.decode(read["data"].as_str().unwrap()).unwrap(), "€".as_bytes());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_module_response_stream_keeps_transport_bytes_after_suspension() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = serve_binary_fetch().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session = "retained-module";
+    ctx.sessions.insert(session.into(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": base, "waitUntil": "networkidle0"}), session).await;
+    let result = cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression": "import('/legacy-module.js').then(m=>m.value)",
+        "awaitPromise": true, "returnByValue": true,
+    }), session).await;
+    assert_eq!(result["result"]["value"], "café");
+    let page = ctx.get_session_page_mut(&Some(session.into())).unwrap();
+    page.sync_js_network_events();
+    let id = page.network_events.iter().find(|event| event.url.ends_with("/legacy-module.js"))
+        .expect("module response").request_id.clone();
+    assert_eq!(page.get_response_body_for_cdp(&id).unwrap().body, BASE64.encode(b"export const value='caf\xe9';"));
+    assert_eq!(page.get_response_body(&id).unwrap().body, b"export const value='caf\xe9';");
+    assert!(page.get_response_body(&id).unwrap().base64_encoded);
+    page.suspend_js();
+    assert_eq!(page.get_response_body_for_cdp(&id).unwrap().body, BASE64.encode(b"export const value='caf\xe9';"));
+    assert_eq!(page.get_response_body(&id).unwrap().body, b"export const value='caf\xe9';");
+    assert!(page.get_response_body(&id).unwrap().base64_encoded);
+    assert_eq!(page.take_response_body_raw(&id).unwrap(), b"export const value='caf\xe9';");
+    assert!(page.take_response_body_raw(&id).is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_disable_clears_raw_response_bodies_after_suspension() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = serve_binary_fetch().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session = "retained-body-clear";
+    ctx.sessions.insert(session.into(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": base, "waitUntil": "networkidle0"}), session).await;
+    let request_id = response_request_id(&ctx, "/bytes.bin").unwrap();
+    let page = ctx.get_session_page_mut(&Some(session.into())).unwrap();
+    assert!(page.get_response_body(&request_id).is_some());
+    page.suspend_js();
+    assert!(page.get_response_body(&request_id).is_some());
+    cdp(&mut ctx, 2, "Network.disable", json!({}), session).await;
+    let page = ctx.get_session_page_mut(&Some(session.into())).unwrap();
+    assert!(page.get_response_body(&request_id).is_none());
+    assert!(page.take_response_body_raw(&request_id).is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -189,4 +609,107 @@ async fn navigation_without_script_fetch_is_unaffected() {
         !urls.iter().any(|u| u.contains("/api/")),
         "no spurious script-fetch events for a page that makes none; saw {urls:?}"
     );
+}
+
+#[cfg(feature = "stealth")]
+async fn stealth_context() -> (CdpContext, String, String) {
+    let mut ctx = CdpContext::new();
+    ctx.default_context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+        "stealth-events".into(), None, true, None, None, true,
+    ));
+    let page = ctx.create_page();
+    let session = "stealth-session".to_string();
+    ctx.sessions.insert(session.clone(), page);
+    let base = serve().await;
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), &session).await;
+    (ctx, session, base)
+}
+
+#[cfg(feature = "stealth")]
+fn recorded_live_request_id(ctx: &mut CdpContext, session: &str) -> String {
+    // dispatch() does not run the WebSocket server's post-command drain.
+    let page = ctx.get_session_page_mut(&Some(session.to_string())).unwrap();
+    page.sync_js_network_events();
+    let event = page.network_events.pop().expect("scripted request recorded by the transport");
+    assert!(event.url.ends_with("/api/data.json"));
+    assert_eq!(event.status, 200);
+    assert_eq!(event.method, "GET");
+    assert_eq!(event.body_size, 12);
+    event.request_id
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_fetch_records_redirect_identity_and_readable_response_body() {
+    let (mut ctx, session, _base) = stealth_context().await;
+    let request_id = response_request_id(&ctx, "/api/data.json").expect("stealth response event");
+    let events = ctx.pending_events.iter().filter(|event|
+        event.method.starts_with("Network.") && event.params["requestId"] == request_id
+    ).collect::<Vec<_>>();
+    assert_eq!(events.iter().map(|event| event.method.as_str()).collect::<Vec<_>>(),
+        ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"]);
+    assert_eq!(events[1].params["response"]["status"], 200);
+    assert_eq!(events[2].params["encodedDataLength"], 12);
+    let body = cdp(&mut ctx, 2, "Network.getResponseBody", json!({"requestId":request_id}), &session).await;
+    assert_eq!(body["body"], r#"{"value":42}"#);
+    assert_eq!(body["base64Encoded"], false);
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_xhr_records_events_after_navigation() {
+    let (mut ctx, session, _base) = stealth_context().await;
+    ctx.pending_events.clear();
+    let response = cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression":"new Promise((resolve,reject)=>{let xhr=new XMLHttpRequest();xhr.open('GET','/api/data.json');xhr.onload=()=>resolve(xhr.responseText);xhr.onerror=reject;xhr.send()})",
+        "awaitPromise":true,"returnByValue":true
+    }), &session).await;
+    assert_eq!(response["result"]["value"], r#"{"value":42}"#);
+    let request_id = recorded_live_request_id(&mut ctx, &session);
+    let body = cdp(&mut ctx, 3, "Network.getResponseBody", json!({"requestId":request_id}), &session).await;
+    assert_eq!(body["body"], r#"{"value":42}"#);
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_events_survive_disabled_response_body_retention() {
+    std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "0");
+    let (mut ctx, session, _base) = stealth_context().await;
+    let request_id = response_request_id(&ctx, "/api/data.json").expect("retention opt-out must not disable observation");
+    let response = dispatch(&CdpRequest { id: 2, method: "Network.getResponseBody".into(),
+        params: json!({"requestId":request_id}), session_id: Some(session) }, &mut ctx).await;
+    assert!(response.error.is_some(), "opt-out must not retain the body");
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_response_body_buffer_evicts_old_requests() {
+    std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "2");
+    let (mut ctx, session, _base) = stealth_context().await;
+    let oldest = response_request_id(&ctx, "/api/data.json").expect("first response");
+    let mut latest = String::new();
+    for id in 2..6 {
+        ctx.pending_events.clear();
+        let response = cdp(&mut ctx, id, "Runtime.evaluate", json!({"expression":"fetch('/api/data.json').then(r=>r.text())", "awaitPromise":true, "returnByValue":true}), &session).await;
+        assert_eq!(response["result"]["value"], r#"{"value":42}"#);
+        latest = recorded_live_request_id(&mut ctx, &session);
+    }
+    let evicted = dispatch(&CdpRequest { id: 6, method: "Network.getResponseBody".into(),
+        params: json!({"requestId":oldest}), session_id: Some(session.clone()) }, &mut ctx).await;
+    assert!(evicted.error.is_some(), "bounded cache must evict old responses");
+    assert_eq!(cdp(&mut ctx, 7, "Network.getResponseBody", json!({"requestId":latest}), &session).await["body"], r#"{"value":42}"#);
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_http_error_response_keeps_status_and_body() {
+    let (mut ctx, session, _base) = stealth_context().await;
+    let response = cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":"fetch('/api/missing.json').then(async r=>{await r.text();return r.status})","awaitPromise":true,"returnByValue":true}), &session).await;
+    assert_eq!(response["result"]["value"].as_f64(), Some(404.0));
+    let page = ctx.get_session_page_mut(&Some(session.clone())).unwrap();
+    page.sync_js_network_events();
+    let event = page.network_events.pop().expect("HTTP error response must be recorded");
+    assert_eq!(event.status, 404);
+    assert!(event.url.ends_with("/api/missing.json"));
+    assert_eq!(cdp(&mut ctx, 3, "Network.getResponseBody", json!({"requestId":event.request_id}), &session).await["body"], r#"{"error":"missing"}"#);
 }

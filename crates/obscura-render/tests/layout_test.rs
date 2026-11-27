@@ -7,6 +7,146 @@ use obscura_dom::tree_sink::parse_html;
 use obscura_render::{layout_dom, layout_dom_with_images};
 use std::collections::HashMap;
 
+#[test]
+fn word_spacing_changes_intrinsic_width() {
+    let tree = parse_html(r#"<style>
+        span { display:inline-block; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        </style><span id="normal">A B C</span><span id="spaced">A B C</span>"#);
+    let layout = layout_dom(&tree, (600.0, 200.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+    assert!((width("spaced") - width("normal") - 60.0).abs() < 0.1);
+}
+
+#[test]
+fn word_spacing_rejects_invalid_and_unsupported_lengths() {
+    for value in ["bogus", "30", "10%", "3 px", "min(30px,bogus)", "calc(30px) bogus",
+        "calc(30)", "calc(2px * 3px)", "min(1px,max(2px,bogus))", "1px 2px", "1e99px"]
+    {
+        let tree = parse_html(&format!("<div id='copy' style='word-spacing:3px;word-spacing:{value}'>A B</div>"));
+        let layout = layout_dom(&tree, (400.0, 200.0));
+        assert_eq!(layout.styles[&tree.get_element_by_id("copy").unwrap()].word_spacing, Some(3.0), "{value}");
+        assert!(!obscura_render::style::supports_declaration("word-spacing", value), "{value}");
+    }
+    for value in ["normal", "0", "-3px", ".75em", "2rem"] {
+        assert!(obscura_render::style::supports_declaration("word-spacing", value), "{value}");
+    }
+}
+
+#[test]
+fn word_spacing_resolves_before_inheritance_and_preserves_cascade() {
+    let tree = parse_html(r#"<style>
+        section { font-size:20px; word-spacing:1.5em }
+        span { display:inline-block; font-size:40px; white-space:nowrap }
+        #normal { word-spacing:normal }
+        #inherit { word-spacing:3px; word-spacing:inherit }
+        #unset { word-spacing:3px; word-spacing:unset }
+        #invalid { word-spacing:3px; word-spacing:bogus; word-spacing:calc(bogus) }
+        #negative { word-spacing:-.25em }
+        #revert { word-spacing:3px; word-spacing:revert }
+        </style><section>
+        <span id="inherited">A B C</span><span id="normal">A B C</span>
+        <span id="inherit">A B C</span><span id="unset">A B C</span>
+        <span id="invalid">A B C</span><span id="negative">A B C</span>
+        <span id="revert">A B C</span></section>"#);
+    let layout = layout_dom(&tree, (1800.0, 300.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+    for (id, spacing) in [("inherited", 30.0), ("normal", 0.0), ("inherit", 30.0),
+        ("unset", 30.0), ("invalid", 3.0), ("negative", -10.0), ("revert", 30.0)]
+    {
+        assert_eq!(layout.styles[&tree.get_element_by_id(id).unwrap()].word_spacing, Some(spacing), "{id}");
+        assert!((width(id) - width("normal") - 2.0 * spacing).abs() <= 1.0, "{id}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_changes_wrapping_and_native_control_widths() {
+    let tree = parse_html(r#"<style>
+        div { width:140px; font:40px/60px monospace }
+        .spaced { word-spacing:30px }
+        button, select { font:40px/60px monospace }
+        </style><div id="normal">A B C</div><div id="spaced" class="spaced">A B C</div>
+        <button id="button">A B C</button><button id="button-spaced" class="spaced">A B C</button>
+        <select id="select"><option>A B C</option></select>
+        <select id="select-spaced" class="spaced"><option>A B C</option></select>"#);
+    let layout = layout_dom(&tree, (1000.0, 500.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    assert_eq!(rect("normal").height, 60.0);
+    assert_eq!(rect("spaced").height, 120.0);
+    for (normal, spaced) in [("button", "button-spaced"), ("select", "select-spaced")] {
+        assert!((rect(spaced).width - rect(normal).width - 60.0).abs() <= 1.0,
+            "{normal}: {:?} -> {:?}", rect(normal), rect(spaced));
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_handles_whitespace_nested_spans_and_generated_content() {
+    for (content, extra_css, delta) in [
+        ("  A   B  C  ", "", 60.0),
+        ("A&nbsp;B&nbsp;C", "", 60.0),
+        ("A  B", "white-space:pre", 60.0),
+        ("A\tB", "white-space:pre", 0.0),
+        ("A B C", "letter-spacing:2px", 60.0),
+        ("A<span> B</span> C", "", 60.0),
+        ("אב גד", "direction:rtl", 30.0),
+    ] {
+        let tree = parse_html(&format!(r#"<style>
+            div {{ display:inline-block; font:40px/60px monospace; white-space:nowrap; {extra_css} }}
+            #spaced {{ word-spacing:30px }}
+            </style><div id="normal">{content}</div><div id="spaced">{content}</div>"#));
+        let layout = layout_dom(&tree, (1000.0, 300.0));
+        let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+        assert!((width("spaced") - width("normal") - delta).abs() <= 1.0, "{content:?}, {extra_css}");
+    }
+    let tree = parse_html(r#"<style>
+        div { display:inline-block; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        div::before { content:'A B C'; font-size:20px }
+        div::after { content:'A B C'; word-spacing:normal }
+        </style><div id="normal"></div><div id="spaced"></div>"#);
+    let layout = layout_dom(&tree, (1000.0, 300.0));
+    let id = tree.get_element_by_id("spaced").unwrap();
+    assert_eq!(layout.styles[&id].before_pseudo.as_ref().unwrap().word_spacing, Some(30.0));
+    assert_eq!(layout.styles[&id].after_pseudo.as_ref().unwrap().word_spacing, Some(0.0));
+    let normal = layout.rects[&tree.get_element_by_id("normal").unwrap()].width;
+    assert!((layout.rects[&id].width - normal - 60.0).abs() <= 1.0);
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_moves_painted_glyphs() {
+    let tree = parse_html(r#"<style>
+        body { margin:0; background:white; color:black }
+        div { height:80px; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        </style><div>A B C</div><div id="spaced">A B C</div>"#);
+    let png = obscura_render::screenshot_png(&tree, (400.0, 180.0), None).unwrap();
+    let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+    let starts = |top: usize| {
+        let mut result = Vec::new();
+        let mut previous = false;
+        for x in 0..400 {
+            let ink = (top..top + 70).any(|y| {
+                let pixel = pixmap.pixels()[y * 400 + x];
+                pixel.red() < 128 && pixel.green() < 128 && pixel.blue() < 128
+            });
+            if ink && !previous { result.push(x as i32); }
+            previous = ink;
+        }
+        result
+    };
+    let normal = starts(0);
+    let spaced = starts(80);
+    assert_eq!(normal.len(), 3, "normal glyph columns: {normal:?}");
+    assert_eq!(spaced.len(), 3, "spaced glyph columns: {spaced:?}");
+    for i in 0..3 {
+        assert!((spaced[i] - normal[i] - i as i32 * 30).abs() <= 1,
+            "painted positions: {normal:?} -> {spaced:?}");
+    }
+}
+
 const HN_HTML: &str = r##"
     <table border="0" cellpadding="0" cellspacing="0" width="85%" bgcolor="#f6f6ef">
         <tr>
@@ -33,6 +173,40 @@ const HN_HTML: &str = r##"
         </tr>
     </table>
 "##;
+
+#[cfg(feature = "paint")]
+#[test]
+fn mixed_content_shaped_runs_retain_inline_owner_geometry() {
+    for content in ["ABCD", "AB<b id='nested'>CD</b>"] {
+        let tree = parse_html(&format!(
+            "<style>body{{margin:0;font:20px/24px monospace}}</style>\
+             <div id='parent'>AAAA<div style='height:30px'></div>\
+             <span id='owner'>{content}</span></div>"));
+        let layout = layout_dom(&tree, (200.0, 200.0));
+        let owner = tree.get_element_by_id("owner").unwrap();
+        let rect = layout.rects.get(&owner).expect("shaped inline owner has geometry");
+        assert!(rect.x.abs() < 0.01 && (52.0..=57.0).contains(&rect.y)
+            && (40.0..=55.0).contains(&rect.width) && (18.0..=26.0).contains(&rect.height),
+            "inline following a 24px line and 30px block: {rect:?}");
+        let pieces = layout.inline_fragments.get(&owner).expect("canonical inline fragments");
+        assert!(!pieces.is_empty());
+        for piece in pieces {
+            assert!(piece.width > 0.0 && piece.height > 0.0
+                && piece.x >= rect.x && piece.y >= rect.y
+                && piece.x + piece.width <= rect.x + rect.width + 0.01
+                && piece.y + piece.height <= rect.y + rect.height + 0.01,
+                "inline fragments remain within their owner bounds: {piece:?}, {rect:?}");
+        }
+        let parent = tree.get_element_by_id("parent").unwrap();
+        assert!((layout.rects[&parent].height - 78.0).abs() < 0.01,
+            "preserving inline ownership must not add a line or change block flow");
+        if let Some(nested) = tree.get_element_by_id("nested") {
+            let nested = layout.rects.get(&nested).expect("nested inline owner has geometry");
+            assert!((20.0..=28.0).contains(&nested.x) && (20.0..=28.0).contains(&nested.width)
+                && (nested.y - rect.y).abs() < 1.0, "nested text bounds: {nested:?}");
+        }
+    }
+}
 
 /// Top-left of the tightest laid-out element box whose text contains
 /// `needle`. Text geometry is no longer a per-word list: a pure-text
@@ -150,6 +324,189 @@ fn table_width_uses_local_space_and_keeps_width_hints_shrinkable() {
             && (wide.width + narrow.width - 200.0).abs() < 0.01,
         "cell width hints are preferred contributions, not minimums: wide={wide:?} narrow={narrow:?}"
     );
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn hidden_table_rows_do_not_generate_cells_tracks_or_rowspan_slots() {
+    let tree = parse_html(r#"<style>
+        html,body{margin:0}table{border-spacing:0}td{width:30px;height:20px;padding:0}
+        .gone{display:none}.wide{width:500px;height:90px}
+        </style><table id="table"><tbody>
+        <tr><td id="span" rowspan="2"></td><td></td></tr>
+        <tr class="gone" id="gone"><td class="wide" id="gone-cell"></td></tr>
+        <tr><td id="next"></td></tr><tr><td id="last"></td></tr>
+        </tbody></table>"#);
+    let layout = layout_dom(&tree, (600.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["gone", "gone-cell"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(id).unwrap()),
+            "hidden {id} generated a box");
+    }
+    assert_eq!((rect("table").width, rect("table").height), (60.0, 60.0));
+    assert_eq!(rect("span").height, 40.0);
+    assert_eq!((rect("next").x, rect("next").y), (30.0, 20.0));
+    assert_eq!((rect("last").x, rect("last").y), (0.0, 40.0));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn hidden_table_sections_do_not_contribute_rows_or_cell_widths() {
+    for section in ["thead", "tbody", "tfoot"] {
+        let tree = parse_html(&format!(r#"<style>
+            html,body{{margin:0}}table{{border-spacing:0}}td{{width:30px;height:20px;padding:0}}
+            </style><table id="table"><{section} id="gone" style="display:none">
+            <tr id="gone-row"><td id="gone-cell" style="width:500px;height:90px;visibility:visible"></td></tr>
+            </{section}><tbody><tr style="visibility:hidden"><td id="invisible"></td></tr>
+            <tr><td id="visible"></td></tr></tbody></table>"#));
+        let layout = layout_dom(&tree, (600.0, 400.0));
+        for id in ["gone", "gone-row", "gone-cell"] {
+            assert!(!layout.rects.contains_key(&tree.get_element_by_id(id).unwrap()),
+                "display:none {section} generated a box for {id}");
+        }
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert_eq!((rect("table").width, rect("table").height), (30.0, 40.0));
+        assert_eq!(rect("invisible").height, 20.0, "visibility:hidden must retain its track");
+        assert_eq!(rect("visible").y, 20.0);
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn table_display_keywords_restore_hidden_native_rows_and_groups() {
+    for (tag, display) in [("tr", "table-row"), ("tbody", "table-row-group"),
+        ("thead", "table-header-group"), ("tfoot", "table-footer-group")] {
+        let content = if tag == "tr" { "<td id='cell'></td>" }
+            else { "<tr><td id='cell'></td></tr>" };
+        let tree = parse_html(&format!(r#"<style>html,body{{margin:0}}
+            table{{border-spacing:0}}td{{width:40px;height:20px;padding:0}}</style>
+            <table id="table"><{tag} id="restored" style="display:none;display:{display}">
+            {content}</{tag}></table>"#));
+        let layout = layout_dom(&tree, (600.0, 400.0));
+        for id in ["table", "restored", "cell"] {
+            let rect = layout.rects.get(&tree.get_element_by_id(id).unwrap())
+                .unwrap_or_else(|| panic!("{display}: missing {id} box"));
+            assert_eq!((rect.width, rect.height), (40.0, 20.0), "{display}: {id}");
+        }
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn css_table_rows_share_tracks_and_generate_row_and_group_boxes() {
+    let tree = parse_html(r#"<style>html,body{margin:0}.table{display:table;border-spacing:0}
+        .group{display:table-row-group}.row{display:table-row}.cell{display:table-cell;height:20px}
+        .a{width:30px}.b{width:40px}</style><div id="table" class="table"><div id="group" class="group">
+        <div id="row1" class="row"><div id="a1" class="cell a"></div><div id="b1" class="cell b"></div></div>
+        <div id="row2" class="row"><div id="a2" class="cell a"></div><div id="b2" class="cell b"></div></div>
+        </div></div>"#);
+    let layout = layout_dom(&tree, (600.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["table", "group"] {
+        assert_eq!((rect(id).width, rect(id).height), (70.0, 40.0), "{id}");
+    }
+    for (id, x, y, width, height) in [("row1",0.0,0.0,70.0,20.0), ("row2",0.0,20.0,70.0,20.0),
+        ("a1",0.0,0.0,30.0,20.0), ("b1",30.0,0.0,40.0,20.0),
+        ("a2",0.0,20.0,30.0,20.0), ("b2",30.0,20.0,40.0,20.0)] {
+        let r = rect(id);
+        assert_eq!((r.x,r.y,r.width,r.height), (x,y,width,height), "{id}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn table_display_keywords_compute_inherit_reset_and_blockify() {
+    for display in ["table-row", "table-row-group", "table-header-group", "table-footer-group"] {
+        let tree = parse_html(&format!(r#"<div id="parent" style="display:{display}">
+            <span id="inherited" style="display:inherit"></span></div>
+            <div style="display:flex"><div id="item" style="display:{display}"></div></div>
+            <div id="reset" style="display:{display};display:block"></div>
+            <div id="invalid" style="display:{display};display:invalid"></div>"#));
+        let mut resources = obscura_render::RenderResourceCache::default();
+        let prepared = obscura_render::prepare_dom(&tree, (600.0,400.0), None, &mut resources).unwrap();
+        for (id, expected) in [("parent",display), ("inherited",display), ("item","block"),
+            ("reset","block"), ("invalid",display)] {
+            assert_eq!(prepared.computed_style(tree.get_element_by_id(id).unwrap()).unwrap()["display"],
+                expected, "{display}: {id}");
+        }
+        assert!(obscura_render::style::supports_declaration("display",display));
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn css_table_header_and_footer_groups_use_visual_order() {
+    let tree = parse_html(r#"<style>html,body{margin:0}.table{display:table;border-spacing:0}
+        .row{display:table-row}.cell{display:table-cell;width:30px;height:20px}</style>
+        <div class="table"><div style="display:table-footer-group"><div class="row"><div id="footer" class="cell"></div></div></div>
+        <div class="row"><div id="body" class="cell"></div></div>
+        <div style="display:table-header-group"><div class="row"><div id="header" class="cell"></div></div></div></div>"#);
+    let layout = layout_dom(&tree, (600.0,400.0));
+    for (id,y) in [("header",0.0), ("body",20.0), ("footer",40.0)] {
+        assert_eq!(layout.rects[&tree.get_element_by_id(id).unwrap()].y,y,"{id}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn native_row_geometry_retains_cells_with_authored_block_display() {
+    let tree = parse_html(r#"<style>html,body{margin:0}table{border-spacing:0}
+        td{display:block;width:40px;height:20px;padding:0}</style><table><tr id="row"><td></td></tr></table>"#);
+    let layout = layout_dom(&tree,(600.0,400.0));
+    let row = layout.rects.get(&tree.get_element_by_id("row").unwrap()).expect("native row box");
+    assert_eq!((row.width,row.height),(40.0,20.0));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn table_row_display_does_not_unhide_native_hidden_inputs() {
+    let tree = parse_html(r#"<div style="display:flex">
+        <input id="flex" type="hidden" style="display:table-row;width:40px;height:20px"></div>
+        <input id="absolute" type="hidden" style="display:table-row-group;position:absolute;width:40px;height:20px">
+        <table style="display:flex"><tbody id="attribute" hidden><tr><td></td></tr></tbody></table>"#);
+    let layout = layout_dom(&tree,(600.0,400.0));
+    for id in ["flex","absolute","attribute"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(id).unwrap()), "{id} became visible");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn css_table_mixed_children_are_not_discarded() {
+    for content in [
+        "<div class='row'><div class='cell'></div></div><div id='keep'></div>",
+        "<div class='group'><div class='row'><div class='cell'></div></div><div id='keep'></div></div>",
+        "<div class='row'><div class='cell'></div><div id='keep'></div></div>",
+    ] {
+        let tree = parse_html(&format!(r#"<style>.table{{display:table}}.group{{display:table-row-group}}
+            .row{{display:table-row}}.cell{{display:table-cell;width:30px;height:20px}}
+            #keep{{width:40px;height:17px}}</style><div class="table">{content}</div>"#));
+        let layout = layout_dom(&tree,(600.0,400.0));
+        let kept = layout.rects.get(&tree.get_element_by_id("keep").unwrap()).expect("mixed child box");
+        assert_eq!((kept.width,kept.height),(40.0,17.0));
+    }
+}
+
+#[test]
+fn closed_html_dialogs_use_a_ua_display_rule_below_author_styles() {
+    let tree = parse_html(r#"<!doctype html><style>
+        html,body{margin:0} dialog{width:80px;height:30px}
+        #authored{display:block} #contents{display:contents}
+        #contents > div{width:20px;height:10px}
+    </style><dialog id=closed><div id=closed_child>hidden</div></dialog>
+    <dialog id=opened open></dialog><dialog id=authored></dialog>
+    <dialog id=contents><div id=visible_child></div></dialog>
+    <svg><dialog id=svg_dialog></dialog></svg>"#);
+    let layout = layout_dom(&tree, (400.0,300.0));
+    for name in ["closed", "closed_child"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(name).unwrap()), "{name} generated a box");
+    }
+    for name in ["opened", "authored"] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!((rect.width,rect.height),(80.0,30.0), "{name}");
+    }
+    assert!(layout.rects.contains_key(&tree.get_element_by_id("visible_child").unwrap()));
+    assert_ne!(layout.styles[&tree.get_element_by_id("svg_dialog").unwrap()].display, obscura_render::Display::None);
 }
 
 #[test]
@@ -306,6 +663,34 @@ fn percentage_padding_uses_final_flex_containing_block_width() {
             "paint/content consumers must see final used padding for {id}: {:?}",
             layout.styles[&node].padding
         );
+    }
+}
+
+#[test]
+fn aspect_ratio_height_resolves_percentage_child_before_nested_absolute_fill() {
+    let tree = parse_html(r#"
+        <style>
+          html,body{margin:0}*{box-sizing:border-box}
+          #frame{width:300px;aspect-ratio:3/4;position:relative}
+          #control{width:100%;height:100%;position:relative;display:flex;
+                   border:1px solid black;padding:0;overflow:hidden}
+          #fill{position:absolute;inset:-1px}
+          #image{position:absolute;inset:0;width:100%;height:100%}
+          #auto{width:300px}#auto-child{height:100%;line-height:24px}
+        </style>
+        <div id="frame"><button id="control"><div id="fill"><div id="image"></div></div></button></div>
+        <div id="auto"><div id="auto-child">ordinary auto height</div></div>
+    "#);
+    let layout = layout_dom(&tree, (1280.0, 720.0));
+    for id in ["frame", "control", "fill", "image"] {
+        let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!((rect.width - 300.0).abs() < 0.01 && (rect.height - 400.0).abs() < 0.01,
+            "ratio-derived height must remain a percentage basis for {id}: {rect:?}");
+    }
+    for id in ["auto", "auto-child"] {
+        let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!((rect.height - 24.0).abs() < 0.01,
+            "ordinary indefinite height must still resolve to content for {id}: {rect:?}");
     }
 }
 
@@ -528,6 +913,26 @@ fn inset_absolute_uses_nearest_positioned_ancestor() {
     assert!((abs_percent.y - 160.0).abs() < 1.0, "wrong percent-inset y: {abs_percent:?}");
     assert!((fixed.x - 520.0).abs() < 1.0, "fixed box did not use viewport x: {fixed:?}");
     assert!((fixed.y - 40.0).abs() < 1.0, "fixed box did not use viewport y: {fixed:?}");
+}
+
+#[test]
+fn inset_absolute_fills_positioned_inline_flex_ancestor() {
+    let tree = parse_html(
+        r#"<body style="margin:0">
+          <div style="display:flex">
+            <div id="button" style="position:relative;display:inline-flex;width:115px;height:40px;padding:0 12px;box-sizing:border-box">
+              <a id="overlay" style="position:absolute;inset:unset;top:50%;left:50%;width:max(48px,100%);height:max(48px,100%);transform:translate(-50%,-50%)"></a>
+            </div>
+          </div>
+        </body>"#,
+    );
+    let layout = layout_dom(&tree, (1120.0, 780.0));
+    let button = layout.rects[&tree.get_element_by_id("button").unwrap()];
+    let overlay = layout.rects[&tree.get_element_by_id("overlay").unwrap()];
+
+    assert_eq!((button.width, button.height), (115.0, 40.0));
+    assert_eq!(overlay.width, 91.0);
+    assert_eq!(overlay.height, 48.0, "functional percentage height must use the 40px containing block");
 }
 
 #[test]
@@ -1184,6 +1589,268 @@ fn float_exclusion_continues_through_non_bfc_block_wrappers() {
 }
 
 #[test]
+fn resolved_float_margins_preserve_ordinary_block_width() {
+    for side in ["left", "right"] {
+        let away = if side == "left" { "right" } else { "left" };
+        for margin in ["16px", "1em", "1rem", "1.25vw", "2ex", "1vmin", "1vmax"] {
+            for width in ["30em", "46em"] {
+                for control in ["", "<input style='display:inline-block;width:100px;height:20px;border:0;padding:0'>",
+                    "<button style='display:inline-block;width:100px;height:20px;border:0;padding:0'>Action</button>"] {
+                let tree = parse_html(&format!(r#"<style>
+                    html {{font-size:16px}} body {{margin:0;font:16px/20px sans-serif}}
+                    #float {{float:{side};width:{width};height:100px;margin-{away}:{margin};padding:8px;border:1px solid}}
+                    #main {{margin-{side}:32em;padding:8px}}
+                    </style><div id="float">Links</div><div id="main">
+                    <h1>Account details</h1><p>The main panel keeps its border box width beside a float. {control}</p></div>"#));
+                let layout = layout_dom(&tree, (1280.0, 720.0));
+                let main = layout.rects[&tree.get_element_by_id("main").unwrap()];
+                let expected_x = if side == "left" { 512.0 } else { 0.0 };
+                assert!((main.width - 768.0).abs() < 0.01 && (main.x - expected_x).abs() < 0.01,
+                    "{side}, {margin}, {width}, {control}: {main:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn resolved_float_margins_preserve_independent_context_avoidance() {
+    for side in ["left", "right"] {
+        let away = if side == "left" { "right" } else { "left" };
+        for (flow, inner, measured) in [
+            ("display:flow-root", "", "flow"),
+            ("overflow:hidden", "", "flow"),
+            ("display:flex", "", "flow"),
+            ("display:grid", "", "flow"),
+            ("", "display:flow-root", "inner"),
+        ] {
+            let tree = parse_html(&format!(r#"<style>
+                body {{margin:0;font-size:16px}} #root {{width:800px}}
+                #float {{float:{side};width:200px;height:100px;margin-{away}:1em}}
+                #flow {{height:20px;{flow}}} #inner {{height:20px;{inner}}}
+                </style><div id="root"><div id="float"></div>
+                <div id="flow"><div id="inner"></div></div></div>"#));
+            let layout = layout_dom(&tree, (1280.0, 720.0));
+            let content = layout.rects[&tree.get_element_by_id(measured).unwrap()];
+            let expected_x = if side == "left" { 216.0 } else { 0.0 };
+            assert!((content.width - 584.0).abs() < 0.01 && (content.x - expected_x).abs() < 0.01,
+                "{side}, {flow}, {inner}: {content:?}");
+        }
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn nested_text_wraps_around_floats_and_recovers_full_line_width() {
+    let text = vec!["AAAAA"; 300].join(" ");
+    for side in ["right", "left"] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            body {{ margin:0; background:white; color:black; font:10px/20px monospace }}
+            #panel {{ display:flow-root; width:760px; margin:20px }}
+            #float {{ float:{side}; width:300px; height:200px; background:#ccc;
+                margin-{}:16px }}
+            #lead {{ height:40px }} .inner {{ padding-right:24px }}
+            </style><div id="panel"><div id="float"></div><div class="content">
+            <div id="lead"></div><div class="inner"><div id="copy">{text}</div>
+            </div></div></div>"#, if side == "right" { "left" } else { "right" }));
+        let layout = layout_dom(&tree, (800.0, 500.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        let floating = rect("float");
+        let copy = rect("copy");
+        assert_eq!((copy.x, copy.y, copy.width), (20.0, 60.0, 736.0),
+            "{side}: ordinary block geometry must span below the float");
+        assert!((copy.height - 380.0).abs() <= 1.0,
+            "{side}: lines must wrap beside the float and widen below it: {copy:?}");
+        assert!((rect("panel").height - 420.0).abs() <= 1.0);
+
+        let png = obscura_render::screenshot_png(&tree, (800.0, 500.0), None).unwrap();
+        let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+        let ink = |x: u32, y: u32| {
+            let pixel = pixmap.pixel(x, y).unwrap();
+            pixel.red() < 100 && pixel.green() < 100 && pixel.blue() < 100
+        };
+        let overlaps = (floating.y as u32 + 1..(floating.y + floating.height) as u32 - 1)
+            .any(|y| (floating.x as u32 + 1..(floating.x + floating.width) as u32 - 1)
+                .any(|x| ink(x, y)));
+        assert!(!overlaps, "{side}: text painted through the floated figure");
+        let recovered = ((floating.y + floating.height) as u32 + 2..(copy.y + copy.height) as u32)
+            .any(|y| (floating.x as u32 + 1..(floating.x + floating.width).min(copy.x + copy.width) as u32 - 1)
+                .any(|x| ink(x, y)));
+        assert!(recovered, "{side}: text never reclaimed the width below the float");
+    }
+}
+
+#[test]
+fn leaf_measurement_observes_changed_float_context_after_cached_layout() {
+    use taffy::{AvailableSpace, Display, Size, Style, TaffyTree};
+    struct Measure<'a>(&'a mut Vec<f32>);
+    impl taffy::tree::LeafMeasure<()> for Measure<'_> {
+        const USES_FLOAT_CONTEXT: bool = true;
+        fn measure(&mut self, known: Size<Option<f32>>, _: Size<AvailableSpace>,
+            _: taffy::NodeId, _: Option<&mut ()>, _: &Style) -> Size<f32>
+        {
+            let width = known.width.unwrap_or(760.0);
+            Size { width, height: (1200.0 / width).ceil() * 20.0 }
+        }
+        fn measure_with_block_context(&mut self, known: Size<Option<f32>>,
+            available: Size<AvailableSpace>, node: taffy::NodeId, context: Option<&mut ()>,
+            style: &Style, _: Size<Option<f32>>, block: Option<&mut taffy::BlockContext<'_>>)
+            -> Size<f32>
+        {
+            if let Some(block) = block.filter(|block| block.has_active_floats(0.0)) {
+                let slot = block.find_content_slot(0.0, taffy::style::Clear::None, None);
+                self.0.push(slot.width);
+                return Size { width: known.width.unwrap_or(760.0), height: (1200.0 / slot.width).ceil() * 20.0 };
+            }
+            self.measure(known, available, node, context, style)
+        }
+    }
+    let mut tree = TaffyTree::new();
+    let mut float_style = Style { display:Display::Block, float:taffy::style::Float::Right,
+        size:Size { width:taffy::Dimension::length(300.0), height:taffy::Dimension::length(200.0) },
+        ..Default::default() };
+    let floating = tree.new_leaf(float_style.clone()).unwrap();
+    let text = tree.new_leaf_with_context(Style { display:Display::Block, ..Default::default() }, ()).unwrap();
+    let root = tree.new_with_children(Style { display:Display::Block,
+        size:Size { width:taffy::Dimension::length(760.0), height:taffy::Dimension::auto() },
+        ..Default::default() }, &[floating, text]).unwrap();
+    for (width, expected_slot, expected_height) in [(300.0, 460.0, 60.0), (400.0, 360.0, 80.0)] {
+        float_style.size.width = taffy::Dimension::length(width);
+        tree.set_style(floating, float_style.clone()).unwrap();
+        let mut slots = Vec::new();
+        tree.compute_layout_with_measure_context(root,
+            Size { width:AvailableSpace::Definite(900.0), height:AvailableSpace::MaxContent },
+            Measure(&mut slots)).unwrap();
+        assert!(slots.iter().any(|slot| (*slot - expected_slot).abs() < 0.01), "{slots:?}");
+        assert_eq!(tree.layout(text).unwrap().size, Size { width:760.0, height:expected_height });
+    }
+}
+
+#[test]
+fn removing_float_refreshes_cached_text_measurement_context() {
+    use taffy::{AvailableSpace, Display, Size, Style, TaffyTree};
+    struct Measure<'a>(&'a mut Vec<bool>);
+    impl taffy::tree::LeafMeasure<()> for &mut Measure<'_> {
+        const USES_FLOAT_CONTEXT: bool = true;
+        fn measure(&mut self, _: Size<Option<f32>>, _: Size<AvailableSpace>,
+            _: taffy::NodeId, context: Option<&mut ()>, _: &Style) -> Size<f32>
+        {
+            if context.is_some() { self.0.push(false); }
+            Size { width:760.0, height:40.0 }
+        }
+        fn measure_with_block_context(&mut self, known: Size<Option<f32>>,
+            available: Size<AvailableSpace>, node: taffy::NodeId, context: Option<&mut ()>,
+            style: &Style, _: Size<Option<f32>>, block: Option<&mut taffy::BlockContext<'_>>)
+            -> Size<f32>
+        {
+            if context.is_some() && block.is_some_and(|block| block.has_active_floats(0.0)) {
+                self.0.push(true);
+                return Size { width:760.0, height:60.0 };
+            }
+            self.measure(known, available, node, context, style)
+        }
+    }
+    let mut tree = TaffyTree::new();
+    let text = tree.new_leaf_with_context(Style { display:Display::Block, ..Default::default() }, ()).unwrap();
+    let root = tree.new_with_children(Style { display:Display::Block,
+        size:Size { width:taffy::Dimension::length(760.0), height:taffy::Dimension::auto() },
+        ..Default::default() }, &[text]).unwrap();
+    let available = Size { width:AvailableSpace::Definite(900.0), height:AvailableSpace::MaxContent };
+    let mut calls = Vec::new();
+    tree.compute_layout_with_measure_context(root, available, &mut Measure(&mut calls)).unwrap();
+    let floating = tree.new_leaf(Style { display:Display::Block, float:taffy::style::Float::Right,
+        size:Size { width:taffy::Dimension::length(300.0), height:taffy::Dimension::length(200.0) },
+        ..Default::default() }).unwrap();
+    tree.insert_child_at_index(root, 0, floating).unwrap();
+    tree.compute_layout_with_measure_context(root, available, &mut Measure(&mut calls)).unwrap();
+    assert_eq!(calls.last(), Some(&true));
+    calls.clear();
+    tree.remove_child(root, floating).unwrap();
+    tree.compute_layout_with_measure_context(root, available, &mut Measure(&mut calls)).unwrap();
+    assert_eq!(calls.last(), Some(&false), "cached text must discard the removed exclusion");
+    assert_eq!(tree.layout(text).unwrap().size.height, 40.0);
+}
+
+#[test]
+fn a_later_taller_float_keeps_its_exclusion_below_an_earlier_float() {
+    use taffy::{Clear, FloatContext, FloatDirection, Size};
+    for (first, second, expected_x) in [
+        (FloatDirection::Left, FloatDirection::Right, 0.0),
+        (FloatDirection::Right, FloatDirection::Left, 200.0),
+    ] {
+        let mut context = FloatContext::new();
+        context.set_width(760.0);
+        context.place_floated_box(Size { width:250.0, height:120.0 }, 0.0,
+            [0.0, 0.0], first, Clear::None);
+        context.place_floated_box(Size { width:200.0, height:200.0 }, 0.0,
+            [0.0, 0.0], second, Clear::None);
+        assert!(context.has_active_floats(160.0), "the taller float still occupies this band");
+        let slot = context.find_content_slot(160.0, [0.0, 0.0], Clear::None, None);
+        assert_eq!((slot.x, slot.width), (expected_x, 560.0));
+        assert!(!context.has_active_floats(200.0));
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn opposing_floats_restore_text_width_at_each_float_bottom() {
+    let text = vec!["AAAAA"; 300].join(" ");
+    for (left, right, margin, height) in [(250, 200, 16, 380.0), (396, 364, 0, 420.0)] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            body {{margin:0;background:white;color:black;font:10px/20px monospace}}
+            #panel {{display:flow-root;width:760px;margin:20px}}
+            #left {{float:left;width:{left}px;height:120px;background:#ccc}}
+            #right {{float:right;width:{right}px;height:200px;background:#ccc;margin-left:{margin}px}}
+            #lead {{height:40px}} #inner {{padding-right:24px}}
+            </style><div id="panel"><div id="left"></div><div id="right"></div>
+            <div><div id="lead"></div><div id="inner"><div id="copy">{text}</div></div></div></div>"#));
+        let layout = layout_dom(&tree, (900.0, 800.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        let copy = rect("copy");
+        assert_eq!((copy.x, copy.y, copy.width, copy.height), (20.0, 60.0, 736.0, height));
+        let png = obscura_render::screenshot_png(&tree, (900.0, 800.0), None).unwrap();
+        let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+        for floating in [rect("left"), rect("right")] {
+            assert!(!(floating.y as u32 + 1..(floating.y + floating.height) as u32 - 1)
+                .any(|y| (floating.x as u32 + 1..(floating.x + floating.width) as u32 - 1)
+                    .any(|x| {
+                        let p = pixmap.pixel(x, y).unwrap();
+                        p.red() < 100 && p.green() < 100 && p.blue() < 100
+                    })), "text crossed a float: {floating:?}");
+        }
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn inline_borders_stop_at_their_owner_when_text_wraps_around_a_float() {
+    let text = vec!["AAAAA"; 300].join(" ");
+    let tree = parse_html(&format!(r#"<!doctype html><style>
+        body {{margin:0;background:white;color:black;font:10px/20px monospace}}
+        #panel {{display:flow-root;width:760px;margin:20px}}
+        #float {{float:right;width:300px;height:200px;background:#ccc;margin-left:16px}}
+        #lead {{height:40px}} #inner {{padding-right:24px}}
+        #owner {{padding:0 10px;border:2px solid red}}
+        </style><div id="panel"><div id="float"></div><div><div id="lead"></div>
+        <div id="inner"><div id="copy"><span id="owner">{}</span> {}</div></div></div></div>"#,
+        &text[..200], &text[200..]));
+    let layout = layout_dom(&tree, (900.0, 800.0));
+    let owner = tree.get_element_by_id("owner").unwrap();
+    let copy = layout.rects[&tree.get_element_by_id("copy").unwrap()];
+    let pieces = &layout.inline_fragments[&owner];
+    assert_eq!(pieces.len(), 3, "the short inline must not own later visual lines: {pieces:?}");
+    assert!(pieces.iter().all(|piece| piece.y + piece.height < copy.y + 65.0));
+    let png = obscura_render::screenshot_png(&tree, (900.0, 800.0), None).unwrap();
+    let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+    let red = |y| (0..900).any(|x| {
+        let p = pixmap.pixel(x, y).unwrap();
+        p.red() > 200 && p.green() < 50 && p.blue() < 50
+    });
+    assert!((60..125).any(red));
+    assert!(!(150..500).any(red), "border leaked onto following plain text");
+}
+
+#[test]
 fn full_width_percentage_float_uses_definite_containing_block() {
     let tree = parse_html(
         r#"
@@ -1686,6 +2353,50 @@ fn absolute_inline_svg_keeps_percentage_width_and_view_box_ratio() {
     assert!((art.height - 160.0).abs() < 0.01, "viewBox ratio: {art:?}");
 }
 
+/// `span 0` is an invalid grid line (CSS Grid 1 section 8.3), so the
+/// declaration is ignored: the earlier placement wins, or the item stays
+/// auto-placed. Shopify themes reach it through
+/// `grid-column: span var(--menu-content-columns-desktop) / -1` with the
+/// variable at 0; that once gave taffy a zero-track grid area and aborted the
+/// whole page ("slice index starts at 13 but ends at 12").
+#[test]
+fn grid_placement_with_zero_span_is_ignored() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             .grid{--n:0;display:grid;grid-template-columns:repeat(6,1fr);width:600px}
+             #literal{grid-column:span 0 / -1}
+             #variable{grid-column:span var(--n) / -1}
+             #kept{grid-column:2 / 4;grid-column:span 0 / -1}
+             #side{grid-column-start:3;grid-column-start:span 0}
+           </style></head><body>
+             <div class="grid"><div id="literal">x</div></div>
+             <div class="grid"><div id="variable">x</div></div>
+             <div class="grid"><div id="kept">x</div></div>
+             <div class="grid"><div id="side">x</div></div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["literal", "variable"] {
+        let r = rect(id);
+        assert!(
+            r.x.abs() < 0.01 && (r.width - 100.0).abs() < 0.01,
+            "{id}: an ignored declaration leaves the item auto-placed in the first track: {r:?}"
+        );
+    }
+    let kept = rect("kept");
+    assert!(
+        (kept.x - 100.0).abs() < 0.01 && (kept.width - 200.0).abs() < 0.01,
+        "the earlier valid grid-column must win: {kept:?}"
+    );
+    let side = rect("side");
+    assert!(
+        (side.x - 200.0).abs() < 0.01 && (side.width - 100.0).abs() < 0.01,
+        "the earlier valid grid-column-start must win: {side:?}"
+    );
+}
+
 /// Chromium 150 includes collapsed descendant margins in a grid item's
 /// intrinsic block-size. The nested 64px margin reaches through `section`,
 /// making the first item 200px tall; the second row therefore begins after
@@ -1810,6 +2521,28 @@ fn inline_block_flex_items_keep_block_inner_flow() {
             && (gamma.x - 60.0).abs() < 0.01,
         "chips: {chips:?}, items: {alpha:?} {beta:?} {gamma:?}"
     );
+}
+
+#[test]
+fn inline_block_block_children_stack_and_shrink_to_the_widest_child() {
+    let tree = parse_html(include_str!("../../../render-repros/inline-block-block-children.html"));
+    let layout = layout_dom(&tree, (300.0, 200.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for (id, expected) in [
+        ("plain", (0.0, 0.0, 144.0, 74.0)),
+        ("plain-one", (12.0, 12.0, 80.0, 20.0)),
+        ("plain-two", (12.0, 32.0, 120.0, 30.0)),
+        ("margins", (0.0, 74.0, 144.0, 89.0)),
+        ("margin-one", (12.0, 86.0, 80.0, 20.0)),
+        ("margin-two", (12.0, 121.0, 120.0, 30.0)),
+    ] {
+        let actual = rect(id);
+        assert!((actual.x - expected.0).abs() < 0.01
+            && (actual.y - expected.1).abs() < 0.01
+            && (actual.width - expected.2).abs() < 0.01
+            && (actual.height - expected.3).abs() < 0.01,
+            "{id}: {actual:?}, expected {expected:?}");
+    }
 }
 
 #[test]
@@ -2840,6 +3573,105 @@ fn nested_full_span_column_subgrid_shares_ancestor_tracks() {
     }
 }
 
+#[test]
+fn mixed_grid_placement_longhands_retain_the_opposite_edge() {
+    let cases = [
+        ("grid-column-start:4;grid-column-end:main", (240.0, 200.0), (100.0, 80.0)),
+        ("grid-column-end:main;grid-column-start:4", (240.0, 200.0), (100.0, 80.0)),
+        ("grid-column-start:full;grid-column-end:4", (0.0, 240.0), (0.0, 100.0)),
+        ("grid-column-end:4;grid-column-start:full", (0.0, 240.0), (0.0, 100.0)),
+        ("grid-column-end:span 2;grid-column-start:main-start", (40.0, 200.0), (20.0, 80.0)),
+        ("grid-column-start:main-start;grid-column-end:span 2", (40.0, 200.0), (20.0, 80.0)),
+        ("grid-column-start:-4;grid-column-end:main-end", (240.0, 200.0), (100.0, 80.0)),
+        ("grid-column-start:main-start;grid-column-end:-2", (40.0, 400.0), (20.0, 160.0)),
+        ("grid-column:main;grid-column-start:4", (240.0, 200.0), (100.0, 80.0)),
+        ("grid-column:main;grid-column-start:auto", (340.0, 100.0), (140.0, 40.0)),
+        ("grid-column:main;grid-column-start:2;grid-column-end:4", (40.0, 200.0), (20.0, 80.0)),
+        ("grid-column-start:main-start;grid-column-end:auto", (40.0, 100.0), (20.0, 40.0)),
+        ("--from:4;--to:main;grid-column-start:var(--from);grid-column-end:var(--to)", (240.0, 200.0), (100.0, 80.0)),
+    ];
+    for column in [true, false] {
+        let template = if column {
+            "width:480px;height:40px;grid-template-columns:[full-start] 40px [main-start] repeat(4,100px) [main-end] 40px [full-end];grid-template-rows:40px"
+        } else {
+            "width:100px;height:200px;grid-template-columns:100px;grid-template-rows:[full-start] 20px [main-start] repeat(4,40px) [main-end] 20px [full-end]"
+        };
+        for (declarations, expected_column, expected_row) in cases {
+            let declarations = if column { declarations.to_string() }
+                else { declarations.replace("grid-column", "grid-row") };
+            let tree = parse_html(&format!("<style>html,body{{margin:0}}#grid{{display:grid;{template}}}</style><div id='grid'><div id='item' style='{declarations}'></div></div>"));
+            let layout = layout_dom(&tree, (800.0, 600.0));
+            let parent = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+            let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            let (start, size) = if column { (item.x - parent.x, item.width) }
+                else { (item.y - parent.y, item.height) };
+            let expected = if column { expected_column } else { expected_row };
+            assert!((start - expected.0).abs() < 0.01 && (size - expected.1).abs() < 0.01,
+                "{declarations}: start={start}, size={size}, expected={expected:?}");
+        }
+    }
+}
+
+#[test]
+fn mixed_grid_longhands_with_adjacent_line_names_keep_text_in_its_area() {
+    for template in [
+        "[full-start] 40px [main-start] repeat(4,100px) [main-end] 40px [full-end]",
+        "[full-start]40px[main-start]repeat(4,100px)[main-end]40px[full-end]",
+        "[full-start]40px[main-start]repeat(4,[track]100px)[main-end]40px[full-end]",
+    ] {
+        for placement in ["grid-column-end:main;grid-column-start:4", "grid-column:main;grid-column-start:4"] {
+            let tree = parse_html(&format!("<style>html,body{{margin:0}}#grid{{display:grid;width:480px;height:40px;grid-template-columns:{template};grid-template-rows:40px}}#item{{padding:8px;box-sizing:border-box}}</style><div id='grid'><div id='item' style='{placement}'>Placed item</div></div>"));
+            let layout = layout_dom(&tree, (900.0, 1000.0));
+            let parent = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+            let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            assert!((item.x - parent.x - 240.0).abs() < 0.01 && (item.width - 200.0).abs() < 0.01,
+                "{template}; {placement}: parent={parent:?}, item={item:?}");
+        }
+    }
+}
+
+#[test]
+fn numeric_grid_edges_survive_unresolved_named_lines() {
+    for column in [true, false] {
+        for named_tracks in [true, false] {
+            let tracks = if named_tracks { "[first] 40px 40px 40px 40px [last]" }
+                else { "40px 40px 40px 40px" };
+            let (axis, container) = if column {
+                ("column", format!("width:160px;height:40px;grid-template-columns:{tracks};grid-template-rows:40px;grid-auto-columns:40px"))
+            } else {
+                ("row", format!("width:40px;height:160px;grid-template-columns:40px;grid-template-rows:{tracks};grid-auto-rows:40px"))
+            };
+            let tree = parse_html(&format!("<style>html,body{{margin:0}}#grid{{display:grid;{container}}}</style><div id='grid'><div id='item' style='grid-{axis}-end:missing;grid-{axis}-start:5'></div></div>"));
+            let layout = layout_dom(&tree, (900.0, 1000.0));
+            let parent = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+            let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            let (start, size) = if column { (item.x - parent.x, item.width) }
+                else { (item.y - parent.y, item.height) };
+            assert!((start - 160.0).abs() < 0.01 && (size - 40.0).abs() < 0.01,
+                "{axis}, named tracks={named_tracks}: start={start}, size={size}");
+        }
+    }
+}
+
+#[test]
+fn grid_numeric_longhands_after_named_placement_need_no_parent_names() {
+    for column in [true, false] {
+        let (axis, template, expected) = if column {
+            ("column", "width:480px;height:40px;grid-template-columns:40px repeat(4,100px) 40px;grid-template-rows:40px", (40.0, 200.0))
+        } else {
+            ("row", "width:100px;height:200px;grid-template-columns:100px;grid-template-rows:20px repeat(4,40px) 20px", (20.0, 80.0))
+        };
+        let tree = parse_html(&format!("<style>html,body{{margin:0}}#grid{{display:grid;{template}}}</style><div id='grid'><div id='item' style='grid-{axis}-start:missing;grid-{axis}-end:4;grid-{axis}-start:2'></div></div>"));
+        let layout = layout_dom(&tree, (800.0, 600.0));
+        let parent = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+        let item = layout.rects[&tree.get_element_by_id("item").unwrap()];
+        let (start, size) = if column { (item.x - parent.x, item.width) }
+            else { (item.y - parent.y, item.height) };
+        assert!((start - expected.0).abs() < 0.01 && (size - expected.1).abs() < 0.01,
+            "{axis}: start={start}, size={size}, expected={expected:?}");
+    }
+}
+
 /// Cases outside the bounded reduction must retain the existing fallback,
 /// rather than freezing an invented set of ancestor tracks. The narrow parent
 /// cannot fit every max-content growth limit, and the second row only spans a
@@ -3484,6 +4316,99 @@ fn cyclic_descendant_percentages_do_not_inflate_a_flex_items_intrinsic_minimum()
             (216.0..=217.0).contains(&child.width),
             "the final reflow must resolve calc() against the 697px flex item: {child:?}"
         );
+    }
+}
+
+#[test]
+fn cyclic_percentage_flex_row_keeps_its_intrinsic_content_width() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #scroller { display:flex; width:768px }
+          #month { flex:0 0 auto; width:auto; max-width:336px; padding:0 24px }
+          #week { display:flex; width:100% }
+          .day { flex:1 0 48px; width:48px; height:48px }
+        </style>
+        <div id="scroller"><div id="month"><div><div id="week">
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div>
+        </div></div></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(rect("week").width, 336.0, "percentage row: {:?}", rect("week"));
+    assert_eq!(
+        rect("month").width,
+        384.0,
+        "content width plus inline padding: {:?}",
+        rect("month")
+    );
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn cyclic_functional_width_keeps_text_and_control_intrinsic_contributions() {
+    let tree = parse_html(r#"<!doctype html><body style="margin:0;font:14px Arial">
+        <div style="display:flex;width:1560px"><div id="textwrap"><div><span>
+          <div id="text" style="width:calc(100% - 32px);height:20px">hello world</div>
+        </span></div></div></div>
+        <div style="display:flex;width:1560px"><div id="wrap"><div><label><span>
+          <input id="control" style="width:calc(100% - 32px);padding-left:25px;
+            height:30px;margin:0;border:1px solid #999">
+        </span></label></div></div></div>
+        <input id="auto" style="padding-left:25px;height:30px;margin:0;border:1px solid #999">
+        <div style="width:1560px"><div><label><span>
+          <input id="noflex" style="width:calc(100% - 32px);padding-left:25px;
+            height:30px;margin:0;border:1px solid #999">
+        </span></label></div></div>
+        <div style="display:flex;width:1560px"><div id="buttonwrap">
+          <input id="button" type="BuTtOn" style="box-sizing:border-box;
+            width:calc(100% - 20px);height:20px;padding:0;margin:0;border:2px solid">
+        </div></div>
+        <div style="display:flex;width:1560px"><div id="gridbuttonwrap"><div style="display:grid">
+          <input id="gridbutton" type="BuTtOn" style="box-sizing:border-box;
+            width:calc(100% - 20px);height:20px;padding:0;margin:0;border:2px solid">
+        </div></div></div>
+        </body>"#);
+    let layout = layout_dom(&tree, (1600.0, 900.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+
+    // Chromium: 66.9375px max-content wrapper, then calc(100% - 32px).
+    assert_eq!(width("textwrap"), 67.0);
+    assert_eq!(width("text"), 35.0);
+    assert_eq!(width("noflex"), 1557.0);
+    // The control contributes its auto width, then resolves its content width
+    // against the wrapper. Its 29px padding/border leaves a 3px outer delta.
+    assert_eq!(width("wrap"), width("auto"));
+    assert_eq!(width("control"), width("wrap") - 3.0);
+    assert_eq!(width("buttonwrap"), 4.0);
+    assert_eq!(width("button"), 4.0);
+    assert_eq!(width("gridbuttonwrap"), 4.0);
+    assert_eq!(width("gridbutton"), 4.0);
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn cyclic_fixed_table_width_keeps_its_column_sizing_mode() {
+    for (width, basis) in [("100%", 200), ("calc(100%)", 200), ("50%", 400),
+        ("calc(50%)", 400), ("calc(100% - 20px)", 220)]
+    {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            body{{margin:0;font:14px Arial}}table{{width:{width};table-layout:fixed;border-collapse:collapse}}
+            td{{padding:0;height:20px}}
+            </style><div style="display:flex;width:800px"><div style="flex:0 0 {basis}px">
+            <table id="table"><colgroup><col style="width:80px"><col style="width:120px"></colgroup>
+            <tr><td id="first">VeryLongUnbreakableText</td><td id="second">other</td></tr>
+            </table></div></div>"#));
+        let layout = layout_dom(&tree, (1000.0, 300.0));
+        for (id, expected) in [("table", 200.0), ("first", 80.0), ("second", 120.0)] {
+            let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+            assert_eq!(rect.width, expected, "width={width}, id={id}: {rect:?}");
+        }
     }
 }
 
@@ -4374,6 +5299,36 @@ fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
 }
 
 #[test]
+fn nested_grid_input_contributes_intrinsic_height_without_preventing_stretch() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; font:14px Arial; line-height:22px }
+          .outer { display:grid; width:214px; align-items:center }
+          .editor { display:inline-grid; grid-area:1 / 1 / 2 / 3;
+                    grid-template-columns:0 min-content }
+          input { display:block; width:100%; grid-area:1 / 2;
+                  font:inherit; min-width:2px; padding:0; border:0 }
+          .short { grid-template-rows:12px }
+        </style>
+        <div class="outer"><div class="editor" id="auto-editor"><input id="auto-input"></div></div>
+        <div class="outer"><div class="editor short" id="short-editor"><input id="short-input"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (input, editor, height) in [
+        ("auto-input", "auto-editor", 22.0),
+        ("short-input", "short-editor", 12.0),
+    ] {
+        let input_rect = layout.rects[&tree.get_element_by_id(input).unwrap()];
+        let editor_rect = layout.rects[&tree.get_element_by_id(editor).unwrap()];
+        assert_eq!(input_rect.height, height, "{input}");
+        assert_eq!(editor_rect.height, height, "{editor}");
+        assert!(input_rect.width >= 2.0, "{input}");
+    }
+}
+
+#[test]
 fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     let tree = parse_html(
         r#"
@@ -4436,6 +5391,56 @@ fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
 }
 
 #[test]
+fn inline_block_percentage_height_uses_definite_block_content_height() {
+    let tree = parse_html(r#"<!doctype html>
+        <style>
+          html, body { margin:0 }
+          .switch { position:relative; width:32px; height:16px; line-height:1 }
+          input { position:absolute; width:100%; height:100%; margin:0; opacity:0; z-index:-1000 }
+          label { display:inline-block; box-sizing:border-box; width:100%; height:100%; border:1px solid }
+          .padded { height:30px; box-sizing:border-box; padding:4px; border:1px solid }
+          .indefinite { height:auto; min-height:40px }
+        </style>
+        <div class="switch"><input type="checkbox"><label id="percentage"></label></div>
+        <div class="switch"><input type="checkbox"><label id="pixels" style="height:16px"></label></div>
+        <div class="switch padded"><label id="content-box"></label></div>
+        <div class="switch padded"><label id="half" style="height:50%"></label></div>
+        <div class="switch indefinite"><label id="indefinite"></label></div>
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (name, width, height) in [
+        ("percentage", 32.0, 16.0), ("pixels", 32.0, 16.0),
+        ("content-box", 22.0, 20.0), ("half", 22.0, 10.0), ("indefinite", 32.0, 2.0),
+    ] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!(rect.width, width, "{name}");
+        assert_eq!(rect.height, height, "{name}");
+    }
+}
+
+#[test]
+fn inherited_font_shorthand_overrides_native_control_typography() {
+    let tree = parse_html(r#"
+        <style>
+          body { font:700 20px/30px Arial }
+          input { display:block; border:0; padding:0 }
+        </style>
+        <input id="inherit" style="font:inherit">
+        <input id="unset" style="font:unset">
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for name in ["inherit", "unset"] {
+        let node = tree.get_element_by_id(name).unwrap();
+        let style = &layout.styles[&node];
+        assert_eq!(style.font_size, Some(20.0), "{name}");
+        assert_eq!(style.line_height, Some(obscura_render::LineHeight::Px(30.0)), "{name}");
+        assert_eq!(style.font_weight.as_deref(), Some("700"), "{name}");
+        assert_eq!(style.font_family.as_deref(), Some("arial"), "{name}");
+        assert_eq!(layout.rects[&node].height, 30.0, "{name}");
+    }
+}
+
+#[test]
 fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     let tree = parse_html(
         r#"
@@ -4495,4 +5500,238 @@ fn deeply_nested_wrappers_cascade_without_stack_overflow() {
         (rect.width - 50.0).abs() < 0.01,
         "the descendant rule must match at depth 400, got {rect:?}"
     );
+}
+
+#[test]
+fn float_ending_at_rounded_segment_boundary_does_not_panic() {
+    use taffy::{compute::FloatContext, Clear, FloatDirection, Size};
+
+    fn place(
+        context: &mut FloatContext,
+        height: f32,
+        direction: FloatDirection,
+    ) -> taffy::Point<f32> {
+        context.place_floated_box(
+            Size { width: 100.0, height },
+            1859.0,
+            [0.0, 0.0],
+            direction,
+            Clear::None,
+        )
+    }
+
+    let mut context = FloatContext::new();
+    context.set_width(1000.0);
+    place(&mut context, 421.3333, FloatDirection::Left);
+    place(&mut context, 400.3333, FloatDirection::Right);
+
+    assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
+}
+#[test]
+fn a_float_keeps_its_percentage_width_when_it_has_a_percentage_margin() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/float-percentage-margin.html"
+    ));
+    let layout = layout_dom(&tree, (1400.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let offset = rect("offset");
+    let plain = rect("plain");
+    let row = rect("row-offset");
+    assert!((offset.width - 1000.0).abs() < 1.0, "width: {}", offset.width);
+    assert!((offset.x - 100.0).abs() < 1.0, "offset: {}", offset.x);
+    assert!((offset.width - plain.width).abs() < 1.0);
+    assert!(row.height > 0.0, "the row must contain its float");
+}
+
+#[test]
+fn percentage_float_margins_resolve_against_containing_width_on_every_side() {
+    for (float, margin, expected_x, expected_height) in [
+        ("left", "margin-left:8.33333333%", 100.0, 40.0),
+        ("left", "margin-left:-8.33333333%", -100.0, 40.0),
+        ("left", "margin-right:8.33333333%", 0.0, 40.0),
+        ("left", "margin-top:8.33333333%", 0.0, 140.0),
+        ("left", "margin-bottom:8.33333333%", 0.0, 140.0),
+        ("right", "margin-left:8.33333333%", 200.0, 40.0),
+        ("right", "margin-right:8.33333333%", 100.0, 40.0),
+    ] {
+        let html = format!(
+            r#"<style>
+              body{{margin:0}} #row{{width:1200px}}
+              #row::after{{content:" ";display:table;clear:both}}
+              #column{{float:{float};width:83.33333333%;{margin}}}
+              #inner{{width:300px;height:40px}} #after{{height:20px}}
+            </style><div id="row"><div id="column"><div id="inner"></div></div></div><div id="after"></div>"#
+        );
+        let tree = parse_html(&html);
+        let layout = layout_dom(&tree, (1400.0, 1000.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        let column = rect("column");
+        let row = rect("row");
+        assert!((column.width - 1000.0).abs() < 1.0, "{margin}: {}", column.width);
+        assert!((column.x - expected_x).abs() < 1.0, "{margin}: {}", column.x);
+        assert!((row.height - expected_height).abs() < 1.0, "{margin}: {}", row.height);
+        assert!((rect("after").y - expected_height).abs() < 1.0, "{margin}: following flow overlaps");
+    }
+}
+
+#[test]
+fn nested_offset_float_uses_the_expanded_row_width() {
+    let tree = parse_html(r#"<!doctype html><style>
+        * { box-sizing:border-box } body { margin:0 }
+        .container { width:1170px; margin:0 auto; padding:0 15px }
+        .row { margin-left:-15px; margin-right:-15px }
+        .row::before, .row::after { content:' '; display:table }
+        .row::after { clear:both }
+        .full, #left, #right { float:left; padding:0 15px }
+        .full { width:100% }
+        #left { width:41.66666667%; height:520px }
+        #right { width:50%; margin-left:8.33333333%; margin-top:35px; height:470px }
+        </style><div class=container><div class=row><div class=full>
+            <div class=row><div id=left></div><div id=right></div></div>
+        </div></div></div>"#);
+    let layout = layout_dom(&tree, (1440.0, 1000.0));
+    let left = layout.rects[&tree.get_element_by_id("left").unwrap()];
+    let right = layout.rects[&tree.get_element_by_id("right").unwrap()];
+    assert!((left.width - 487.5).abs() < 1.0, "{left:?}");
+    assert!((right.width - 585.0).abs() < 1.0, "{right:?}");
+    assert!((right.x - 720.0).abs() < 1.0, "{right:?}");
+    assert!((right.y - left.y - 35.0).abs() < 1.0, "{left:?} {right:?}");
+}
+
+#[test]
+fn native_float_fit_allows_roundoff_but_not_real_overflow() {
+    use taffy::{compute::FloatContext, Clear, FloatDirection, Size};
+
+    // The parsed 41.66666667% column is one rounding step wider than 487.5px.
+    let first_width = 1170.0 * (41.66666667_f32 / 100.0);
+    for (width, insets) in [
+        (1170.0, [0.0, 0.0]),
+        (1140.0, [-15.0, -15.0]),
+        (1140.0, [-15.25, -15.25]),
+        (1170.0, [0.25, 0.25]),
+    ] {
+        for direction in [FloatDirection::Left, FloatDirection::Right] {
+            for extra in [0.0, 1.0 / 64.0, 1.0] {
+                let mut context = FloatContext::new();
+                context.set_width(width);
+                context.place_floated_box(
+                    Size { width: first_width, height: 20.0 },
+                    0.0, insets, direction, Clear::None,
+                );
+                let second_width = width - insets[0] - insets[1] - 487.5 + extra;
+                let second = context.place_floated_box(
+                    Size { width: second_width, height: 20.0 },
+                    0.0, insets, direction, Clear::None,
+                );
+                assert_eq!(second.y, if extra == 0.0 { 0.0 } else { 20.0 },
+                    "width={width}, insets={insets:?}, direction={direction:?}, extra={extra}: {second:?}");
+            }
+        }
+    }
+    // At large coordinates, one f32 step is real visible overflow, not a subpixel rounding allowance.
+    for direction in [FloatDirection::Left, FloatDirection::Right] {
+        let mut context = FloatContext::new();
+        context.set_width(1_048_576.0);
+        context.place_floated_box(Size { width: 524_288.125, height: 20.0 },
+            0.0, [0.0, 0.0], direction, Clear::None);
+        let next = context.place_floated_box(Size { width: 524_288.0, height: 20.0 },
+            0.0, [0.0, 0.0], direction, Clear::None);
+        assert_eq!(next.y, 20.0, "visible overflow must still wrap: {next:?}");
+    }
+}
+
+#[test]
+fn functional_flex_basis_uses_the_final_main_axis() {
+    for (parent, basis, expected) in [
+        ("display:flex;width:1200px", "flex-basis:calc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0 0 calc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0\t0\tcalc(100% - 314px)", (886.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:min(50%, 300px)", (300.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:max(25%, 120px)", (300.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:clamp(120px, 60%, 900px)", (720.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(200px + 20px)", (220.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px;height:800px", "flex-basis:calc(50% - 20px)", (500.0, 380.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:calc(50% - 20px);height:90px", (500.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:50%;height:90px", (500.0, 20.0)),
+        ("display:flex;flex-direction:column;width:500px", "flex-basis:auto;height:90px", (500.0, 90.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(50% - 20px);flex-basis:80px", (80.0, 20.0)),
+        ("display:flex;width:1200px", "flex-basis:calc(50% - 20px);flex:none;width:160px", (160.0, 20.0)),
+        ("display:flex;width:1200px", "flex:0 0 calc(50% - 20px);flex:initial;width:70px", (70.0, 20.0)),
+        ("display:flex;width:1200px", "flex:calc(50% - 20px)", (1200.0, 20.0)),
+    ] {
+        let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}div{{min-width:0;min-height:0}}</style><div id=parent style='{parent}'><div id=item style='flex-shrink:0;{basis}'><div style='width:40px;height:20px'></div></div></div>"));
+        let layout = layout_dom(&tree, (1400.0, 900.0));
+        let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+        assert!((rect.width - expected.0).abs() < 0.01 && (rect.height - expected.1).abs() < 0.01,
+            "parent={parent}, basis={basis}: {rect:?}, expected={expected:?}");
+        if parent.contains("flex-direction:column") && !parent.contains("height:") {
+            assert_eq!(layout.rects[&tree.get_element_by_id("parent").unwrap()].height, expected.1,
+                "container {parent};{basis}");
+        }
+    }
+}
+
+#[test]
+fn functional_flex_basis_follows_a_nested_flex_items_used_width() {
+    let tree = parse_html("<!doctype html><style>body{margin:0}div{min-width:0;min-height:0}</style><div style='display:flex;width:1200px'><div style='flex:0 0 300px'></div><div style='flex:1'><div style='display:flex;width:100%'><div id=item style='flex:0 0 calc(100% - 20px);height:20px'></div></div></div></div>");
+    let layout = layout_dom(&tree, (1400.0, 900.0));
+    let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+    assert!((rect.width - 880.0).abs() < 0.01, "{rect:?}");
+}
+
+#[test]
+fn functional_flex_basis_preserves_fixed_intrinsic_rows() {
+    for basis in ["300px", "calc(300px)", "calc(200px + 100px)", "min(300px, 400px)"] {
+        let tree = parse_html(&format!("<!doctype html><style>html,body{{margin:0}}#outer{{display:flex;width:768px}}#parent{{flex:0 0 auto;width:auto}}#item{{display:flex;width:100%}}#cell{{flex:0 0 {basis};height:20px}}</style><div id=outer><div id=parent><div><div id=item><div id=cell></div></div></div></div></div>"));
+        let layout = layout_dom(&tree, (800.0, 600.0));
+        for id in ["parent", "item", "cell"] {
+            let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+            assert_eq!(rect.width, 300.0, "{basis};{id}: {rect:?}");
+            assert_eq!(rect.height, 20.0, "{basis};{id}: {rect:?}");
+        }
+    }
+}
+
+#[test]
+fn functional_flex_basis_preserves_content_aspect_ratio_transfer() {
+    for basis in ["50%", "calc(50% - 10px)", "auto"] {
+        for (width, height, expected_cross) in [
+            ("width:100px", "", 100.0),
+            ("width:100px", "height:90px", 100.0),
+            ("", "height:90px", 300.0),
+        ] {
+            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}div{{min-width:0;min-height:0}}</style><div id=parent style='display:flex;flex-direction:column;width:300px'><div id=item style='flex:0 0 {basis};aspect-ratio:2;{width};{height}'></div></div>"));
+            let layout = layout_dom(&tree, (800.0, 600.0));
+            let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            let expected_main = if basis == "auto" && !height.is_empty() { 90.0 } else { expected_cross / 2.0 };
+            assert_eq!(rect.width, expected_cross, "{basis};{width};{height}: {rect:?}");
+            assert_eq!(rect.height, expected_main, "{basis};{width};{height}: {rect:?}");
+            assert_eq!(layout.rects[&tree.get_element_by_id("parent").unwrap()].height, expected_main,
+                "container {basis};{width};{height}");
+        }
+    }
+}
+
+#[test]
+fn functional_flex_basis_resolves_after_intrinsic_row_ratio_sizing() {
+    for (basis, fraction, offset) in [("50%", 0.5, 0.0), ("calc(50% - 10px)", 0.5, 10.0), ("auto", 1.0, 0.0)] {
+        for (width, expected_parent) in [("width:90px", 90.0), ("", 200.0)] {
+            let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}div{{min-width:0;min-height:0}}</style><div id=parent style='display:inline-flex'><div id=item style='height:100px;aspect-ratio:2;flex:0 0 {basis};{width}'></div></div>"));
+            let layout = layout_dom(&tree, (800.0, 600.0));
+            let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+            assert_eq!(layout.rects[&tree.get_element_by_id("parent").unwrap()].width, expected_parent);
+            assert_eq!(rect.width, expected_parent * fraction - offset, "{basis};{width}: {rect:?}");
+            assert_eq!(rect.height, 100.0, "{basis};{width}: {rect:?}");
+        }
+    }
+}
+
+#[test]
+fn a_functional_zero_basis_preserves_intrinsic_column_content() {
+    for basis in ["0px", "calc(0px)"] {
+        let tree = parse_html(&format!("<!doctype html><style>body{{margin:0}}</style><div id=parent style='display:flex;flex-direction:column;width:500px'><div id=item style='flex:1 1 {basis};overflow:auto'><div style='height:100px'></div></div></div>"));
+        let layout = layout_dom(&tree, (1400.0, 900.0));
+        let rect = layout.rects[&tree.get_element_by_id("item").unwrap()];
+        assert_eq!(rect.height, 100.0, "{basis}: {rect:?}");
+    }
 }

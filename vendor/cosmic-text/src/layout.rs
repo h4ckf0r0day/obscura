@@ -97,6 +97,8 @@ impl LayoutGlyph {
 /// A line of laid out glyphs
 #[derive(Clone, Debug)]
 pub struct LayoutLine {
+    /// Extra space before this line, used when an exclusion leaves no room.
+    pub top_offset: f32,
     /// Width of the line
     pub w: f32,
     /// Maximum ascent of the glyphs in line

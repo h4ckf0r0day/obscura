@@ -6,13 +6,10 @@
 # notices for transitive crates with no available fix; they are explicitly
 # accepted until the upstream parents drop them.
 ignore = [
-    "RUSTSEC-2025-0141", # bincode 1.x unmaintained, transitive via deno_core
     "RUSTSEC-2025-0057", # fxhash unmaintained, transitive via selectors
     "RUSTSEC-2024-0436", # paste unmaintained, transitive via v8
-    # These rendering dependencies have no safe upgrade yet. Keep their
-    # unmaintained notices explicit so vulnerability advisories still fail.
-    "RUSTSEC-2026-0206", # rustybuzz, transitive via cosmic-text and usvg
-    "RUSTSEC-2026-0192", # ttf-parser, transitive via rendering dependencies
+    "RUSTSEC-2026-0206", # rustybuzz unmaintained, transitive via the pinned cosmic-text
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained, transitive via cosmic-text and the SVG stack
 ]
 
 [bans]
@@ -38,6 +35,12 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
+
+# jpeg-encoder ports libjpeg code and carries the Independent JPEG Group
+# license in addition to MIT OR Apache-2.0. Allow IJG for that crate only.
+[[licenses.exceptions]]
+allow = ["IJG"]
+crate = "jpeg-encoder"
 
 [sources]
 unknown-registry = "deny"

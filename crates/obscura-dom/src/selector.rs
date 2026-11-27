@@ -322,10 +322,8 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn parent_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let parent_id = node.parent?;
-        let parent = self.tree.get_node(parent_id)?;
-        if parent.is_element() {
+        let parent_id = self.tree.with_node(self.node_id, |node| node.parent)??;
+        if self.tree.with_node(parent_id, |parent| parent.is_element())? {
             Some(DomElement::new(self.tree, parent_id))
         } else {
             None
@@ -354,40 +352,43 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn prev_sibling_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.prev_sibling;
+        let mut current = self.tree.with_node(self.node_id, |node| node.prev_sibling)?;
         while let Some(sibling_id) = current {
-            let sibling = self.tree.get_node(sibling_id)?;
-            if sibling.is_element() {
+            let (is_element, previous) = self.tree.with_node(sibling_id, |sibling| {
+                (sibling.is_element(), sibling.prev_sibling)
+            })?;
+            if is_element {
                 return Some(DomElement::new(self.tree, sibling_id));
             }
-            current = sibling.prev_sibling;
+            current = previous;
         }
         None
     }
 
     fn next_sibling_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.next_sibling;
+        let mut current = self.tree.with_node(self.node_id, |node| node.next_sibling)?;
         while let Some(sibling_id) = current {
-            let sibling = self.tree.get_node(sibling_id)?;
-            if sibling.is_element() {
+            let (is_element, next) = self.tree.with_node(sibling_id, |sibling| {
+                (sibling.is_element(), sibling.next_sibling)
+            })?;
+            if is_element {
                 return Some(DomElement::new(self.tree, sibling_id));
             }
-            current = sibling.next_sibling;
+            current = next;
         }
         None
     }
 
     fn first_element_child(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.first_child;
+        let mut current = self.tree.with_node(self.node_id, |node| node.first_child)?;
         while let Some(child_id) = current {
-            let child = self.tree.get_node(child_id)?;
-            if child.is_element() {
+            let (is_element, next) = self.tree.with_node(child_id, |child| {
+                (child.is_element(), child.next_sibling)
+            })?;
+            if is_element {
                 return Some(DomElement::new(self.tree, child_id));
             }
-            current = child.next_sibling;
+            current = next;
         }
         None
     }
@@ -500,12 +501,13 @@ impl<'a> Element for DomElement<'a> {
             PseudoClass::Enabled => self.is_form_control() && !self.has_boolean_attr("disabled"),
             PseudoClass::Disabled => self.is_form_control() && self.has_boolean_attr("disabled"),
             PseudoClass::Checked => {
-                self.has_boolean_attr("checked") || self.has_boolean_attr("selected")
+                self.tree
+                    .form_control_checked(self.node_id)
+                    .unwrap_or_else(|| self.has_boolean_attr("checked") || self.has_boolean_attr("selected"))
             }
-            // Dynamic user-interaction pseudo-classes have no meaning against
-            // a static DOM snapshot with no live user input.
-            PseudoClass::Hover
-            | PseudoClass::Active
+            PseudoClass::Hover => self.tree.is_hovered(self.node_id),
+            // These dynamic states are not tracked yet.
+            PseudoClass::Active
             | PseudoClass::Focus
             | PseudoClass::FocusVisible
             | PseudoClass::FocusWithin => false,
@@ -586,13 +588,18 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |node| {
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
-                    if let Some(child_node) = self.tree.get_node(child_id) {
-                        match &child_node.data {
-                            NodeData::Element { .. } => return false,
-                            NodeData::Text { contents } if !contents.is_empty() => return false,
-                            _ => {}
+                    if let Some((nonempty, next)) = self.tree.with_node(child_id, |child| {
+                        let nonempty = match &child.data {
+                            NodeData::Element { .. } => true,
+                            NodeData::Text { contents } => !contents.is_empty(),
+                            _ => false,
+                        };
+                        (nonempty, child.next_sibling)
+                    }) {
+                        if nonempty {
+                            return false;
                         }
-                        child = child_node.next_sibling;
+                        child = next;
                     } else {
                         break;
                     }
@@ -730,8 +737,15 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        // Element.querySelector() scopes :scope to the element on which it was
+        // called. Leaving this unset makes the selector crate use the document
+        // element, so `root.querySelector(':scope .nested .item')` can treat
+        // `root` itself as `.nested` and return direct children incorrectly.
+        if self.with_node(root, |node| node.is_element()).unwrap_or(false) {
+            context.scope_element = Some(DomElement::new(self, root).opaque());
+        }
 
-        for desc_id in self.descendants(root) {
+        for desc_id in self.descendants_iter(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -772,9 +786,12 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        if self.with_node(root, |node| node.is_element()).unwrap_or(false) {
+            context.scope_element = Some(DomElement::new(self, root).opaque());
+        }
         let mut results = Vec::new();
 
-        for desc_id in self.descendants(root) {
+        for desc_id in self.descendants_iter(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -809,6 +826,7 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        context.scope_element = Some(DomElement::new(self, nid).opaque());
         Ok(selectors::matching::matches_selector_list(
             &selector_list,
             &DomElement::new(self, nid),
@@ -1260,6 +1278,60 @@ mod tests {
 
     use super::{DomElement, SelectorKey};
 
+    #[test]
+    fn streaming_selectors_keep_scope_order_and_see_reparented_matches() {
+        let tree = parse_html("<!doctype html><i id='duplicate'></i><main id='root'><section id='duplicate' class='hit early'><b class='hit'></b></section>text<!--gap--><span class='hit late'></span></main><aside class='hit'></aside>");
+        let root = tree.get_element_by_id("root").unwrap();
+        let hits = tree.query_selector_all_from(root, ".hit").unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(tree.query_selector_from(root, ".late, .early").unwrap(), Some(hits[0]));
+        assert_eq!(tree.query_selector_from(root, "#duplicate").unwrap(), Some(hits[0]));
+        assert_eq!(tree.query_selector_all_from(root, ":scope > .hit").unwrap(), vec![hits[0], hits[2]]);
+        assert_eq!(tree.query_selector_from(root, ":scope").unwrap(), None);
+        assert_eq!(tree.query_selector_from(root, "aside").unwrap(), None);
+        tree.append_child(root, hits[0]);
+        assert_eq!(tree.query_selector_from(root, ".hit").unwrap(), Some(hits[2]));
+        assert_eq!(tree.query_selector_all_from(root, ".hit").unwrap(), vec![hits[2], hits[0], hits[1]]);
+        tree.remove(hits[2]);
+        assert_eq!(tree.query_selector_from(root, ".hit").unwrap(), Some(hits[0]));
+        assert!(tree.query_selector_from(root, "[").is_err());
+    }
+
+
+    #[test]
+    fn borrowed_selector_traversal_preserves_links_and_shadow_boundaries() {
+        let payload = "x".repeat(4096);
+        let tree = parse_html(&format!(
+            "<main id='parent' data-payload='{payload}'>text<!--gap--><i id='a'></i>text<!--gap--><b id='b'></b></main><div id='host'></div>"
+        ));
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let a = tree.get_element_by_id("a").unwrap();
+        let b = tree.get_element_by_id("b").unwrap();
+        let element = |id| DomElement::new(&tree, id);
+        assert_eq!(element(parent).first_element_child(), Some(element(a)));
+        assert_eq!(element(a).next_sibling_element(), Some(element(b)));
+        assert_eq!(element(b).prev_sibling_element(), Some(element(a)));
+        assert_eq!(element(b).parent_element(), Some(element(parent)));
+        assert!(tree.matches_selector(b, "main:has(> i) > i + b:nth-child(2)").unwrap());
+        tree.detach(a);
+        assert_eq!(element(a).parent_element(), None);
+        assert_eq!(element(a).next_sibling_element(), None);
+        assert_eq!(element(parent).first_element_child(), Some(element(b)));
+        assert_eq!(element(b).prev_sibling_element(), None);
+        assert!(tree.matches_selector(b, "main > b:first-child").unwrap());
+        let host = tree.get_element_by_id("host").unwrap();
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        tree.append_child(root, a);
+        assert_eq!(element(a).parent_element(), None);
+        assert!(element(a).parent_node_is_shadow_root());
+        assert_eq!(element(a).containing_shadow_host(), Some(element(host)));
+        tree.remove(a);
+        assert_eq!(element(a).parent_element(), None);
+        assert_eq!(element(a).first_element_child(), None);
+        assert_eq!(element(a).next_sibling_element(), None);
+        assert_eq!(element(a).prev_sibling_element(), None);
+    }
+
     fn shadow_element(
         tree: &crate::tree::DomTree,
         tag: &str,
@@ -1688,6 +1760,31 @@ mod tests {
         assert!(tree.query_selector_from(root, ".x").unwrap().is_none());
         // `span` finds the child.
         assert!(tree.query_selector_from(root, "span").unwrap().is_some());
+    }
+
+    #[test]
+    fn scoped_queries_bind_scope_to_the_element_root() {
+        let tree = parse_html(
+            r#"<ul id="root" class="menu">
+                <li id="direct" class="item">direct</li>
+                <li><ul class="menu"><li id="nested" class="item">nested</li></ul></li>
+            </ul>"#,
+        );
+        let root = tree.get_element_by_id("root").expect("ul#root");
+        let direct = tree.get_element_by_id("direct").expect("li#direct");
+        let nested = tree.get_element_by_id("nested").expect("li#nested");
+
+        assert_eq!(
+            tree.query_selector_all_from(root, ":scope > .item")
+                .unwrap(),
+            vec![direct]
+        );
+        assert_eq!(
+            tree.query_selector_all_from(root, ":scope .menu .item")
+                .unwrap(),
+            vec![nested]
+        );
+        assert!(tree.matches_selector(root, ":scope").unwrap());
     }
 
     #[test]

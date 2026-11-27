@@ -9,10 +9,18 @@
 //! whatever width taffy offers. Line wrapping, alignment, and intrinsic
 //! sizing then come from a real text engine instead of flexbox tricks.
 //!
-//! Fonts are loaded from embedded bytes only, never the OS, so layout is
-//! byte-for-byte deterministic across hosts (the whole engine's guarantee).
+//! Fonts are loaded from embedded bytes by default, never implicitly from the
+//! OS, so layout remains deterministic unless the operator supplies fonts.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cosmic_text::{
     Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap,
@@ -108,6 +116,20 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
     FAMILY
 }
 
+#[cfg(feature = "paint")]
+pub(crate) fn bundled_font_bytes(family: Option<&str>, bold: bool) -> &'static [u8] {
+    match (resolve_font_family(family), bold) {
+        (SYSTEM_FAMILY, true) => SYSTEM_B,
+        (SYSTEM_FAMILY, false) => SYSTEM_R,
+        (SERIF_FAMILY, true) => SERIF_B,
+        (SERIF_FAMILY, false) => SERIF_R,
+        (MONO_FAMILY, true) => MONO_B,
+        (MONO_FAMILY, false) => MONO_R,
+        (_, true) => SANS_B,
+        _ => SANS_R,
+    }
+}
+
 fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
     let token = token
         .trim()
@@ -188,12 +210,269 @@ struct ResolvedFont {
     synthetic_italic: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct WebFont {
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub family: Option<String>,
     pub weight: Option<(u16, u16)>,
     pub italic: Option<bool>,
+}
+
+type FontDatabase = (
+    cosmic_text::fontdb::Database,
+    HashMap<String, LoadedFamily>,
+);
+type FontDeclaration = (
+    cosmic_text::fontdb::ID,
+    Option<String>,
+    Option<(u16, u16)>,
+    Option<bool>,
+);
+
+const WEB_FONT_CACHE_ENTRIES: usize = 8;
+const WEB_FONT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+struct CachedWebFontSet {
+    signature: u64,
+    load_emoji: bool,
+    fonts: Vec<WebFont>,
+    bytes: usize,
+    database: FontDatabase,
+}
+
+static FONT_DIRECTORIES: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static BASE_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
+static EMOJI_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
+static WEB_FONT_DATABASES: OnceLock<Mutex<VecDeque<Arc<CachedWebFontSet>>>> = OnceLock::new();
+
+#[cfg(test)]
+static BASE_FONT_DATABASE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Configure additional process-wide fonts before the first render.
+///
+/// Returns false when fonts have already been configured or initialized.
+pub fn configure_font_directories(directories: Vec<PathBuf>) -> bool {
+    if BASE_FONT_DATABASE.get().is_some() {
+        return false;
+    }
+    FONT_DIRECTORIES.set(directories).is_ok()
+}
+
+fn load_font_directories(
+    database: &mut cosmic_text::fontdb::Database,
+    directories: &[PathBuf],
+) -> Vec<cosmic_text::fontdb::ID> {
+    let mut pending = directories.to_vec();
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "ttf" | "ttc" | "otf" | "otc"
+                        )
+                    })
+            {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort_unstable();
+    files.dedup();
+    let mut ids = Vec::new();
+    for path in files {
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        ids.extend(database.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(data))));
+    }
+    ids
+}
+
+fn register_loaded_faces(
+    database: &cosmic_text::fontdb::Database,
+    declarations: Vec<FontDeclaration>,
+) -> HashMap<String, LoadedFamily> {
+    let mut loaded_families = HashMap::new();
+    for (id, declared_family, declared_weight, declared_italic) in declarations {
+        let Some(face) = database.face(id) else {
+            continue;
+        };
+        let names = face.families.clone();
+        let internal_name = names
+            .first()
+            .map(|(name, _)| Arc::<str>::from(name.as_str()))
+            .unwrap_or_else(|| Arc::from(FAMILY));
+        let shape_weight = face.weight.0;
+        let metrics = font_metrics(database, id)
+            .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
+        let italic = declared_italic
+            .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
+        let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
+        let declared_names: Vec<String> = declared_family
+            .map(|name| vec![name])
+            .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
+        for name in declared_names {
+            let family = loaded_families
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| LoadedFamily { faces: Vec::new() });
+            family.faces.push(LoadedFace {
+                name: Arc::clone(&internal_name),
+                font_id: Some(id),
+                metrics,
+                min_weight: weight.0,
+                max_weight: weight.1,
+                italic,
+            });
+        }
+    }
+    loaded_families
+}
+
+fn base_font_database(load_emoji: bool) -> &'static FontDatabase {
+    let base = BASE_FONT_DATABASE.get_or_init(|| {
+        #[cfg(test)]
+        BASE_FONT_DATABASE_BUILDS.fetch_add(1, Ordering::Relaxed);
+
+        let mut database = cosmic_text::fontdb::Database::new();
+        let mut declarations = Vec::new();
+        for bytes in [
+            SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
+            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
+        ] {
+            for id in database
+                .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)))
+            {
+                declarations.push((id, None, None, None));
+            }
+        }
+        declarations.extend(
+            load_font_directories(
+                &mut database,
+                FONT_DIRECTORIES.get_or_init(Vec::new),
+            )
+            .into_iter()
+            .map(|id| (id, None, None, None)),
+        );
+        let loaded_families = register_loaded_faces(&database, declarations);
+        database.set_sans_serif_family(FAMILY);
+        (database, loaded_families)
+    });
+
+    if !load_emoji {
+        return base;
+    }
+    EMOJI_FONT_DATABASE.get_or_init(|| {
+        let (mut database, _) = (*base).clone();
+        let declarations = database
+            .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R)))
+            .into_iter()
+            .map(|id| (id, None, None, None))
+            .collect();
+        let loaded_families = register_loaded_faces(&database, declarations);
+        let mut all_loaded_families = base.1.clone();
+        for (name, mut family) in loaded_families {
+            all_loaded_families
+                .entry(name)
+                .or_insert_with(|| LoadedFamily { faces: Vec::new() })
+                .faces
+                .append(&mut family.faces);
+        }
+        (database, all_loaded_families)
+    })
+}
+
+fn web_font_signature(fonts: &[WebFont], load_emoji: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    load_emoji.hash(&mut hasher);
+    fonts.len().hash(&mut hasher);
+    for font in fonts {
+        font.family.hash(&mut hasher);
+        font.weight.hash(&mut hasher);
+        font.italic.hash(&mut hasher);
+        let data = font.data.as_slice();
+        data.len().hash(&mut hasher);
+        data[..data.len().min(64)].hash(&mut hasher);
+        if data.len() > 64 {
+            data[data.len() - 64..].hash(&mut hasher);
+        }
+        if data.len() > 128 {
+            let middle = data.len() / 2;
+            data[middle - 32..middle + 32].hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn cached_web_font_database(
+    fonts: &[WebFont],
+    load_emoji: bool,
+) -> Option<Arc<CachedWebFontSet>> {
+    let signature = web_font_signature(fonts, load_emoji);
+    let candidates: Vec<_> = WEB_FONT_DATABASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|entry| entry.signature == signature && entry.load_emoji == load_emoji)
+        .cloned()
+        .collect();
+    candidates.into_iter().find(|entry| entry.fonts == fonts)
+}
+
+fn cache_web_font_database(
+    fonts: &[WebFont],
+    load_emoji: bool,
+    database: FontDatabase,
+) -> FontDatabase {
+    let bytes = fonts
+        .iter()
+        .fold(0usize, |total, font| total.saturating_add(font.data.len()));
+    if bytes > WEB_FONT_CACHE_BYTES {
+        return database;
+    }
+
+    let signature = web_font_signature(fonts, load_emoji);
+    let mut cache = WEB_FONT_DATABASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = cache.iter().find(|entry| {
+        entry.signature == signature && entry.load_emoji == load_emoji && entry.fonts == fonts
+    }) {
+        return existing.database.clone();
+    }
+    while cache.len() >= WEB_FONT_CACHE_ENTRIES
+        || cache.iter().map(|entry| entry.bytes).sum::<usize>()
+            > WEB_FONT_CACHE_BYTES.saturating_sub(bytes)
+    {
+        cache.pop_front();
+    }
+    cache.push_back(Arc::new(CachedWebFontSet {
+        signature,
+        load_emoji,
+        fonts: fonts.to_vec(),
+        bytes,
+        database: database.clone(),
+    }));
+    database
 }
 
 fn resolve_loaded_font(
@@ -423,11 +702,27 @@ type ClipTextFill = (f32, Vec<([u8; 4], Option<f32>)>);
 /// directly, while the upper half is a one-based index into an optional
 /// variation-set table.
 const META_UNDERLINE: usize = 1;
-const META_FILL_SHIFT: usize = 1;
+const META_OVERLINE: usize = 2;
+const META_LINE_THROUGH: usize = 4;
+const META_DECORATIONS: usize = META_UNDERLINE | META_OVERLINE | META_LINE_THROUGH;
+const META_FILL_SHIFT: usize = 3;
 const META_VARIATION_BITS: usize = usize::BITS as usize / 2;
 const META_VARIATION_SHIFT: usize = usize::BITS as usize - META_VARIATION_BITS;
 const META_VARIATION_MASK: usize = ((1usize << META_VARIATION_BITS) - 1) << META_VARIATION_SHIFT;
-const META_FILL_MASK: usize = ((1usize << META_VARIATION_SHIFT) - 1) & !META_UNDERLINE;
+const META_FILL_MASK: usize = ((1usize << META_VARIATION_SHIFT) - 1) & !META_DECORATIONS;
+
+fn decoration_stroke(
+    (start, end, size, color, relative): (f32, f32, f32, [u8; 4], (f32, f32)),
+    baseline: f32,
+    flag: usize,
+) -> (f32, f32, f32, f32, [u8; 4]) {
+    let offset = match flag {
+        META_OVERLINE => -size * 0.8,
+        META_LINE_THROUGH => -size * 0.3,
+        _ => (size * 0.12).max(1.0),
+    };
+    (start, end, baseline + relative.1 + offset, (size / 14.0).max(1.0), color)
+}
 
 fn metadata_fill(metadata: usize) -> Option<usize> {
     ((metadata & META_FILL_MASK) >> META_FILL_SHIFT).checked_sub(1)
@@ -447,10 +742,10 @@ pub struct InlineItem {
     /// from `layout_wrap` for `overflow-wrap: break-word`: emergency breaks
     /// are available during reflow but do not reduce min-content.
     min_content_wrap: Wrap,
-    /// Unmodified shaped content retained only when `text-indent` is nonzero.
-    /// Each Taffy measurement can then derive a first-line-only wrap boundary
-    /// without accumulating synthetic hard breaks across repeated probes.
+    /// Unmodified paragraphs retained for indent, inline edges or float exclusions.
+    /// Repeated measurements must not accumulate synthetic hard breaks.
     source_buffer: Option<Buffer>,
+    float_bands: Vec<Rect>,
     text_indent: Dimension,
     /// Used LTR paint offset for the first formatted line at the most recently
     /// shaped width. Later lines retain the ordinary content-box origin.
@@ -499,6 +794,65 @@ pub struct InlineItem {
     /// Empty for ordinary IFCs and for nested inlines that remain at their
     /// normal-flow position, so paint pays no provenance cost on that path.
     relative_owner_ranges: Vec<RelativeOwnerTextRange>,
+    /// Mixed-content IFCs own only this sibling range. Caret queries replay
+    /// the collector on demand rather than retaining a map for every glyph.
+    caret_run: Option<(NodeId, NodeId)>,
+    /// Exact measurement results retained across repeated Taffy probes.
+    measured: Vec<(Option<u32>, Wrap, (f32, f32))>,
+}
+
+pub(crate) struct TextMeasure<'a>(pub &'a mut TextEngine);
+
+impl taffy::tree::LeafMeasure<usize> for &mut TextMeasure<'_> {
+    const USES_FLOAT_CONTEXT: bool = true;
+
+    fn measure(&mut self, known: taffy::Size<Option<f32>>,
+        available: taffy::Size<taffy::AvailableSpace>, _: taffy::NodeId,
+        context: Option<&mut usize>, _: &taffy::Style) -> taffy::Size<f32>
+    {
+        context.map_or(taffy::Size::ZERO, |idx| self.0.measure_taffy(*idx, known, available))
+    }
+
+    fn measure_with_block_context(&mut self, known: taffy::Size<Option<f32>>,
+        available: taffy::Size<taffy::AvailableSpace>, _node: taffy::NodeId,
+        context: Option<&mut usize>, style: &taffy::Style,
+        parent_size: taffy::Size<Option<f32>>, block: Option<&mut taffy::BlockContext<'_>>)
+        -> taffy::Size<f32>
+    {
+        use taffy::util::ResolveOrZero;
+        let Some(idx) = context.map(|idx| *idx) else { return taffy::Size::ZERO; };
+        if idx & REPLACED_CONTEXT_BIT == 0 {
+            let item = &mut self.0.items[idx];
+            let mut bands = Vec::new();
+            if let Some(block) = block.filter(|block| block.has_active_floats(0.0)) {
+                let padding = style.padding.resolve_or_zero(parent_size.width, |_, _| 0.0);
+                let border = style.border.resolve_or_zero(parent_size.width, |_, _| 0.0);
+                let left = padding.left + border.left;
+                let top = padding.top + border.top;
+                let mut y = top;
+                while block.has_active_floats(y) {
+                    let slot = block.find_content_slot(y, taffy::style::Clear::None, None);
+                    if !slot.height.is_finite() || slot.height <= 0.0 { break; }
+                    bands.push(Rect { x: slot.x - left, y: slot.y - top,
+                        width: slot.width, height: slot.height });
+                    y = slot.y + slot.height;
+                }
+            }
+            if item.float_bands != bands {
+                if !bands.is_empty() && item.source_buffer.is_none() {
+                    item.source_buffer = Some(item.buffer.clone());
+                }
+                item.float_bands = bands;
+                item.measured.clear();
+                if item.float_bands.is_empty() && item.boundary_events.is_empty()
+                    && matches!(item.text_indent, Dimension::Px(value) if value == 0.0)
+                {
+                    if let Some(source) = item.source_buffer.take() { item.buffer = source; }
+                }
+            }
+        }
+        self.0.measure_taffy(idx, known, available)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -589,8 +943,27 @@ pub struct TextEngine {
     loaded_families: HashMap<String, LoadedFamily>,
     swash: SwashCache,
     variable_swash: VariableSwashCache,
+    shape_templates: HashMap<String, Vec<ShapeTemplate>>,
+    shape_template_count: usize,
+    #[cfg(test)]
+    shape_template_hits: usize,
     items: Vec<InlineItem>,
     replaced: Vec<ReplacedItem>,
+}
+
+// Repeated labels, table cells, and list/card rows are common, and building
+// cosmic-text's attributed buffer for each identical run is measurable. Keep
+// only small templates and stop admitting entries once this per-layout cache
+// is full: memory stays bounded even for attacker-controlled page text.
+const SHAPE_TEMPLATE_LIMIT: usize = 64;
+const SHAPE_TEMPLATE_TEXT_LIMIT: usize = 256;
+
+struct ShapeTemplate {
+    font_size_bits: u32,
+    line_height_bits: u32,
+    wrap: Wrap,
+    attrs: SpanAttrs,
+    buffer: Buffer,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -772,6 +1145,7 @@ const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 
 #[derive(Clone, Copy)]
 struct ReplacedItem {
+    independent_axes: bool,
     intrinsic_width: Option<f32>,
     intrinsic_height: Option<f32>,
     preferred_width: Option<f32>,
@@ -829,6 +1203,7 @@ impl ReplacedItem {
             })
             .unwrap_or(2.0);
         ReplacedItem {
+            independent_axes: false,
             intrinsic_width: intrinsic
                 .width
                 .filter(|width| width.is_finite() && *width > 0.0),
@@ -908,6 +1283,12 @@ impl ReplacedItem {
     }
 
     fn size(self, known: taffy::Size<Option<f32>>) -> taffy::Size<f32> {
+        if self.independent_axes {
+            return taffy::Size {
+                width: known.width.or(self.intrinsic_width).unwrap_or(0.0),
+                height: known.height.or(self.intrinsic_height).unwrap_or(0.0),
+            };
+        }
         let (width, height) = match (known.width, known.height) {
             (Some(width), Some(height)) => (width, height),
             (Some(width), None) => (width, width / self.preferred_ratio),
@@ -975,7 +1356,7 @@ impl TextEngine {
         let fonts: Vec<_> = fonts
             .iter()
             .map(|data| WebFont {
-                data: data.clone(),
+                data: Arc::new(data.clone()),
                 family: None,
                 weight: None,
                 italic: None,
@@ -989,69 +1370,39 @@ impl TextEngine {
     }
 
     pub(crate) fn new_with_web_fonts_and_emoji(fonts: &[WebFont], load_emoji: bool) -> Self {
-        // Build a database from embedded and page-provided faces. Never call
-        // load_system_fonts: a host's font set would make layout differ
-        // machine to machine and add a multi-millisecond startup scan.
-        let mut db = cosmic_text::fontdb::Database::new();
-        let mut declarations = Vec::new();
-        for bytes in [
-            SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
-            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
-        ] {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
-                declarations.push((id, None, None, None));
+        let (db, loaded_families) = if fonts.is_empty() {
+            (*base_font_database(load_emoji)).clone()
+        } else if let Some(cached) = cached_web_font_database(fonts, load_emoji) {
+            cached.database.clone()
+        } else {
+            let (mut db, mut loaded_families) = (*base_font_database(load_emoji)).clone();
+            let mut declarations = Vec::new();
+            for font in fonts {
+                for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(
+                    font.data.clone(),
+                )) {
+                    declarations.push((id, font.family.clone(), font.weight, font.italic));
+                }
             }
-        }
-        if load_emoji {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R))) {
-                declarations.push((id, None, None, None));
+            for (name, mut family) in register_loaded_faces(&db, declarations) {
+                loaded_families
+                    .entry(name)
+                    .or_insert_with(|| LoadedFamily { faces: Vec::new() })
+                    .faces
+                    .append(&mut family.faces);
             }
-        }
-        for font in fonts {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
-                font.data.clone(),
-            ))) {
-                declarations.push((id, font.family.clone(), font.weight, font.italic));
-            }
-        }
-        let mut loaded_families = HashMap::new();
-        for (id, declared_family, declared_weight, declared_italic) in declarations {
-            let Some(face) = db.face(id) else { continue };
-            let names = face.families.clone();
-            let internal_name = names
-                .first()
-                .map(|(name, _)| Arc::<str>::from(name.as_str()))
-                .unwrap_or_else(|| Arc::from(FAMILY));
-            let shape_weight = face.weight.0;
-            let metrics = font_metrics(&db, id)
-                .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
-            let italic = declared_italic
-                .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
-            let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
-            let declared_names: Vec<String> = declared_family
-                .map(|name| vec![name])
-                .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
-            for name in declared_names {
-                let family = loaded_families
-                    .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| LoadedFamily { faces: Vec::new() });
-                family.faces.push(LoadedFace {
-                    name: Arc::clone(&internal_name),
-                    font_id: Some(id),
-                    metrics,
-                    min_weight: weight.0,
-                    max_weight: weight.1,
-                    italic,
-                });
-            }
-        }
-        db.set_sans_serif_family(FAMILY);
+            cache_web_font_database(fonts, load_emoji, (db, loaded_families))
+        };
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         TextEngine {
             font_system,
             loaded_families,
             swash: SwashCache::new(),
             variable_swash: VariableSwashCache::new(),
+            shape_templates: HashMap::new(),
+            shape_template_count: 0,
+            #[cfg(test)]
+            shape_template_hits: 0,
             items: Vec::new(),
             replaced: Vec::new(),
         }
@@ -1067,6 +1418,17 @@ impl TextEngine {
     /// line and must not enlarge backgrounds, borders, or DOM client rects.
     pub(crate) fn inline_font_box_height(&self, style: &LayoutStyle) -> f32 {
         let (ascent, descent) = self.inline_font_box_metrics(style);
+        ascent + descent
+    }
+
+    pub(crate) fn font_box_height_for_size(&self, style: &LayoutStyle, font_size: f32) -> f32 {
+        let font = resolve_loaded_font(
+            style.font_family.as_deref(),
+            crate::style::used_font_weight(style),
+            style.font_style_italic.unwrap_or(false),
+            &self.loaded_families,
+        );
+        let (ascent, descent) = fitted_font_box_metrics(font_size, font.metrics);
         ascent + descent
     }
 
@@ -1091,6 +1453,146 @@ impl TextEngine {
             &self.loaded_families,
         );
         used_line_height_for_font(style, &font)
+    }
+
+    /// Shape and paint a single standalone string (such as a form control value,
+    /// placeholder, `<select>` label, or `<img alt>` fallback) through the
+    /// configured font database so `--font-dir` and webfont fallback apply.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_direct_text(
+        &mut self,
+        pixmap: &mut tiny_skia::Pixmap,
+        text: &str,
+        x: f32,
+        y: f32,
+        color: [u8; 4],
+        font_size: f32,
+        style: Option<&LayoutStyle>,
+        align_right: bool,
+        clip: Option<Rect>,
+        clip_mask: Option<&tiny_skia::Mask>,
+        raster_scale: f32,
+    ) {
+        if text.is_empty()
+            || color[3] == 0
+            || !font_size.is_finite()
+            || font_size <= 0.0
+            || clip.is_some_and(|c| c.width <= 0.0 || c.height <= 0.0)
+        {
+            return;
+        }
+        // Match the earlier single-line native paint behavior where control
+        // characters never introduce extra vertical lines inside a control.
+        let shaped_text: std::borrow::Cow<'_, str> = if text.chars().any(char::is_control) {
+            std::borrow::Cow::Owned(text.chars().filter(|c| !c.is_control()).collect())
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        if shaped_text.is_empty() {
+            return;
+        }
+        let weight = style
+            .map(crate::style::used_font_weight)
+            .unwrap_or(400);
+        let italic = style.and_then(|s| s.font_style_italic).unwrap_or(false);
+        let family_stack = style.and_then(|s| s.font_family.as_deref());
+        let font = resolve_loaded_font(family_stack, weight, italic, &self.loaded_families);
+        let (ascent, descent) = fitted_font_box_metrics(font_size, font.metrics);
+        let box_height = (ascent + descent).max(1.0);
+        let variations = style.and_then(|s| resolved_font_variations(s, &font));
+        let span_attrs = SpanAttrs {
+            font_size,
+            line_height: box_height,
+            letter_spacing: style.and_then(|s| s.letter_spacing).unwrap_or(0.0),
+            word_spacing: style.and_then(|s| s.word_spacing).unwrap_or(0.0),
+            letter_spacing_non_normal: style
+                .and_then(|s| s.letter_spacing_non_normal)
+                .unwrap_or(false),
+            weight,
+            optical_sizing: style
+                .and_then(|s| s.font_optical_sizing)
+                .unwrap_or_default(),
+            font_id: font.font_id,
+            variations: variations.clone(),
+            italic,
+            synthetic_italic: font.synthetic_italic,
+            underline: false,
+            overline: false,
+            line_through: false,
+            color,
+            family: font.family,
+            clip_fill: None,
+            white_space: crate::WhiteSpace::Pre,
+            overflow_wrap: crate::OverflowWrap::Normal,
+            word_break: crate::WordBreak::Normal,
+        };
+        let metrics = Metrics::new(font_size.max(1.0), box_height);
+        let mut buffer = Buffer::new_empty(metrics);
+        buffer.set_wrap(&mut self.font_system, Wrap::None);
+        let variation_sets: Vec<Arc<FontVariations>> = variations.into_iter().collect();
+        let variation_index = usize::from(!variation_sets.is_empty());
+        let attrs = span_attrs.to_attrs(variation_index);
+        let defaults = Attrs::new().family(Family::Name(FAMILY));
+        buffer.set_rich_text(
+            &mut self.font_system,
+            [(shaped_text.as_ref(), attrs)],
+            &defaults,
+            Shaping::Advanced,
+            None,
+        );
+        buffer.set_size(&mut self.font_system, None, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+
+        let clip_bounds = clip.map(|c| {
+            (
+                c.x * raster_scale,
+                c.y * raster_scale,
+                (c.x + c.width) * raster_scale,
+                (c.y + c.height) * raster_scale,
+            )
+        });
+        let oy = y * raster_scale;
+        let pw = pixmap.width() as i32;
+        let ph = pixmap.height() as i32;
+        let default = Color::rgba(color[0], color[1], color[2], color[3]);
+        let pixels = pixmap.pixels_mut();
+        let TextEngine {
+            font_system,
+            swash,
+            variable_swash,
+            ..
+        } = self;
+
+        for run in buffer.layout_runs() {
+            let ox = (if align_right { x - run.line_w } else { x }) * raster_scale;
+            for glyph in run.glyphs {
+                let physical = glyph.physical((0.0, 0.0), raster_scale);
+                let glyph_color = glyph.color_opt.unwrap_or(default);
+                let line_y = run.line_y;
+                paint_swash_glyph(
+                    font_system,
+                    swash,
+                    variable_swash,
+                    glyph,
+                    physical,
+                    &variation_sets,
+                    glyph_color,
+                    ox,
+                    oy,
+                    line_y,
+                    raster_scale,
+                    clip_bounds,
+                    clip_mask,
+                    pw,
+                    ph,
+                    pixels,
+                    |gx, gy, color| {
+                        let _ = (gx, gy);
+                        (color.r(), color.g(), color.b())
+                    },
+                );
+            }
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
@@ -1196,7 +1698,7 @@ impl TextEngine {
                 &self.loaded_families,
             );
         }
-        self.push_shaped_item(
+        let index = self.push_shaped_item(
             base,
             line_height,
             spans,
@@ -1204,7 +1706,9 @@ impl TextEngine {
             collector.owner_ranges,
             collector.owner_boxes,
             collector.boundary_events,
-        )
+        )?;
+        self.items[index].caret_run = Some((*run.first()?, *run.last()?));
+        Some(index)
     }
 
     /// Shape generated text that owns a positioned pseudo box.
@@ -1228,6 +1732,7 @@ impl TextEngine {
             font_size: context.font_size,
             line_height: context.line_height,
             letter_spacing: context.letter_spacing,
+            word_spacing: context.word_spacing,
             letter_spacing_non_normal: context.letter_spacing_non_normal,
             weight: context.weight,
             optical_sizing: context.optical_sizing,
@@ -1236,6 +1741,8 @@ impl TextEngine {
             italic: context.italic,
             synthetic_italic: context.synthetic_italic,
             underline: context.underline,
+            overline: context.overline,
+            line_through: context.line_through,
             color: context.color,
             family: context.family,
             clip_fill: context.clip_fill,
@@ -1251,6 +1758,7 @@ impl TextEngine {
             &attrs,
             &mut spans,
             &mut collector,
+            None,
         );
         self.push_shaped_item(
             style,
@@ -1369,7 +1877,31 @@ impl TextEngine {
         // ~invisible, matching the intent, and one page can never abort a worker.
         let cosmic_size = base_size.max(1.0);
         let metrics = Metrics::new(cosmic_size, line_h.max(1.0));
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        let cacheable_template = clip_fills.is_empty()
+            && owner_ranges.is_empty()
+            && owner_boxes.is_empty()
+            && boundary_events.is_empty()
+            && text_len <= SHAPE_TEMPLATE_TEXT_LIMIT
+            && spans.len() == 1;
+        let template_text = cacheable_template.then(|| spans[0].0.as_str());
+        let cached_buffer = template_text.and_then(|text| {
+            self.shape_templates.get(text).and_then(|templates| {
+                templates.iter().find_map(|template| {
+                    (template.font_size_bits == metrics.font_size.to_bits()
+                        && template.line_height_bits == metrics.line_height.to_bits()
+                        && template.wrap == layout_wrap
+                        && template.attrs == spans[0].1)
+                        .then(|| template.buffer.clone())
+                })
+            })
+        });
+        let template_hit = cached_buffer.is_some();
+        #[cfg(test)]
+        if template_hit {
+            self.shape_template_hits += 1;
+        }
+        let mut buffer =
+            cached_buffer.unwrap_or_else(|| Buffer::new(&mut self.font_system, metrics));
         // Install the used-layout mode now; intrinsic measurement temporarily
         // swaps to `min_content_wrap` below. Keeping those modes separate is
         // what prevents `overflow-wrap: break-word` from shrinking a
@@ -1415,13 +1947,30 @@ impl TextEngine {
             (text.as_str(), attrs.to_attrs(variation_index))
         });
         let defaults = Attrs::new().family(Family::Name(FAMILY));
-        buffer.set_rich_text(
-            &mut self.font_system,
-            rich,
-            &defaults,
-            Shaping::Advanced,
-            None,
-        );
+        if !template_hit {
+            buffer.set_rich_text(
+                &mut self.font_system,
+                rich,
+                &defaults,
+                Shaping::Advanced,
+                None,
+            );
+            if let Some(text) = template_text {
+                if self.shape_template_count < SHAPE_TEMPLATE_LIMIT {
+                    self.shape_templates
+                        .entry(text.to_owned())
+                        .or_default()
+                        .push(ShapeTemplate {
+                            font_size_bits: metrics.font_size.to_bits(),
+                            line_height_bits: metrics.line_height.to_bits(),
+                            wrap: layout_wrap,
+                            attrs: spans[0].1.clone(),
+                            buffer: buffer.clone(),
+                        });
+                    self.shape_template_count += 1;
+                }
+            }
+        }
 
         let marker_buffer = marker_attrs.map(|attrs| {
             let variation_index = attrs
@@ -1469,6 +2018,7 @@ impl TextEngine {
             layout_wrap,
             min_content_wrap,
             source_buffer,
+            float_bands: Vec::new(),
             text_indent,
             first_line_offset: 0.0,
             balance_wrap: base.text_wrap_style == Some(crate::TextWrapStyle::Balance),
@@ -1487,6 +2037,8 @@ impl TextEngine {
             owner_boxes,
             boundary_events,
             relative_owner_ranges: Vec::new(),
+            caret_run: None,
+            measured: Vec::new(),
         });
         Some(idx)
     }
@@ -1507,20 +2059,34 @@ impl TextEngine {
     }
 
     fn measure_text_with_wrap(&mut self, idx: usize, width: Option<f32>, wrap: Wrap) -> (f32, f32) {
+        let key = width.map(f32::to_bits);
+        if let Some((_, _, size)) = self.items[idx]
+            .measured
+            .iter()
+            .find(|(cached_width, cached_wrap, _)| self.items[idx].float_bands.is_empty()
+                && *cached_width == key && *cached_wrap == wrap)
+        {
+            return *size;
+        }
         let TextEngine {
             font_system, items, ..
         } = self;
         let item = &mut items[idx];
         shape_with_text_indent(font_system, item, width, wrap);
         let (width, height, clamped) = buffer_size(item);
-        (
+        let size = (
             width,
             if clamped {
                 height
             } else {
                 height.max(item.forced_min_height)
             },
-        )
+        );
+        if item.measured.len() == 16 {
+            item.measured.remove(0);
+        }
+        item.measured.push((key, wrap, size));
+        size
     }
 
     /// Exact max-content size for one fallback word item. Paragraph IFCs keep
@@ -1549,8 +2115,8 @@ impl TextEngine {
             } else {
                 0.0
             };
-            let line_start = starts.get(run.line_i).copied().unwrap_or(0);
-            let line_end = line_start + run.text.len();
+            let paragraph_start = starts.get(run.line_i).copied().unwrap_or(0);
+            let (line_start, line_end) = visual_line_source_bounds(item, &run, paragraph_start);
             width = width.max(
                 (run.line_w + offset + line_edge_advance(item, line_start, line_end)).max(0.0),
             );
@@ -1567,6 +2133,16 @@ impl TextEngine {
             crate::ReplacedIntrinsic::from_dimensions(width, height),
             style,
         )
+    }
+
+    pub(crate) fn register_native_control(
+        &mut self, width: f32, height: f32, style: &LayoutStyle,
+    ) -> usize {
+        let mut item = ReplacedItem::from_style(width, height, style);
+        item.independent_axes = true;
+        let index = self.replaced.len();
+        self.replaced.push(item);
+        REPLACED_CONTEXT_BIT | index
     }
 
     pub(crate) fn register_replaced_intrinsic(
@@ -1647,8 +2223,7 @@ impl TextEngine {
         let content_width = content_width.max(0.0);
         let wrap = item.layout_wrap;
         shape_with_text_indent(font_system, item, Some(content_width), wrap);
-        let balanced_width = item
-            .balance_wrap
+        let balanced_width = (item.balance_wrap && item.float_bands.is_empty())
             .then(|| balance_wrap_width(font_system, &mut item.buffer, content_width))
             .flatten()
             .unwrap_or(content_width);
@@ -1769,10 +2344,10 @@ impl TextEngine {
             let line_starts = source_line_starts(&item.buffer, source);
 
             for (line_index, run) in item.buffer.layout_runs().enumerate() {
-                let Some(&line_start) = line_starts.get(run.line_i) else {
+                let Some(&paragraph_start) = line_starts.get(run.line_i) else {
                     continue;
                 };
-                let line_end = line_start.saturating_add(run.text.len());
+                let (line_start, line_end) = visual_line_source_bounds(item, &run, paragraph_start);
                 let first_line_offset = if line_index == 0 {
                     item.first_line_offset
                 } else {
@@ -1793,7 +2368,7 @@ impl TextEngine {
                     let first = owner.start >= line_start && owner.start < line_end || empty;
                     let last = owner.end > line_start && owner.end <= line_end || empty;
                     let raw_left = if first {
-                        run_cursor_x(&run, owner.start.saturating_sub(line_start))
+                        run_cursor_x(&run, owner.start.saturating_sub(paragraph_start))
                             + line_advance_before_event(
                                 item,
                                 owner.start_event,
@@ -1805,7 +2380,7 @@ impl TextEngine {
                         run_cursor_x(&run, 0)
                     };
                     let raw_right = if last {
-                        run_cursor_x(&run, owner.end.saturating_sub(line_start))
+                        run_cursor_x(&run, owner.end.saturating_sub(paragraph_start))
                             + line_advance_before_event(item, owner.end_event, line_start, line_end)
                             + owner.end_edge.border_padding()
                     } else {
@@ -1838,6 +2413,146 @@ impl TextEngine {
         }
         out
     }
+
+    fn caret_source(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+    ) -> Option<(String, Vec<CaretBoundary>)> {
+        let item = self.items.get(index)?;
+        let base = styles.get(&parent)?;
+        let mut collector = Collector::new();
+        collector.caret_boundaries = Some(Vec::new());
+        let font = resolve_loaded_font(base.font_family.as_deref(),
+            crate::style::used_font_weight(base), base.font_style_italic.unwrap_or(false),
+            &self.loaded_families);
+        let ctx = base_span_ctx(base, font, &mut collector);
+        let mut spans = Vec::new();
+        if let Some((first, last)) = item.caret_run {
+            let mut children = crate::dom::rendered_children(tree, parent);
+            if !children.contains(&first) || !children.contains(&last) {
+                let mut flattened = Vec::new();
+                crate::dom::flatten_boxless_inline_children(tree, &children, styles, &mut flattened);
+                children = flattened;
+            }
+            let start = children.iter().position(|id| *id == first)?;
+            let end = children.iter().position(|id| *id == last)?;
+            for &id in children.get(start..=end)? {
+                collect_node_spans(tree, id, styles, ctx.clone(), &mut spans,
+                    &mut collector, &self.loaded_families);
+            }
+        } else {
+            collect_spans(tree, parent, styles, ctx, &mut spans,
+                &mut collector, &self.loaded_families);
+        }
+        let mut source: String = spans.into_iter().map(|(text, _)| text).collect();
+        if matches!(base.white_space.unwrap_or_default(),
+            crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine)
+            && source.ends_with(' ')
+        {
+            source.pop();
+        }
+        let mut boundaries = collector.caret_boundaries?;
+        boundaries.retain(|boundary| boundary.byte <= source.len());
+        Some((source, boundaries))
+    }
+
+    /// Use the retained glyph clusters for hit testing, then translate the
+    /// shaped byte cursor into the original DOM node's UTF-16 boundary.
+    pub(crate) fn caret_from_point(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+        x: f32,
+        y: f32,
+        hit: NodeId,
+    ) -> Option<(NodeId, usize, f32)> {
+        let item = self.items.get(index)?;
+        let (source, boundaries) = self.caret_source(index, parent, tree, styles)?;
+        if hit != parent && !boundaries.iter().any(|boundary|
+            boundary.node == hit || tree.ancestors(boundary.node).contains(&hit))
+        { return None; }
+        let starts = source_line_starts(&item.buffer, &source);
+        let mut best: Option<(f32, usize, cosmic_text::Affinity)> = None;
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            let start = *starts.get(run.line_i)?;
+            let (line_start, end) = visual_line_source_bounds(item, &run, start);
+            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            for glyph in run.glyphs {
+                if glyph.w <= 0.0 || item.marker.is_some_and(|marker|
+                    marker.line_index == line_index && glyph.x + indent + glyph.w > marker.content_end)
+                { continue; }
+                let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+                let dx = item.origin.0 + indent + relative.0
+                    + line_edge_alignment_shift(item, line_start, end)
+                    + line_advance_before_text(item, start + glyph.start, line_start, end);
+                let dy = item.origin.1 + relative.1;
+                let left = dx + glyph.x;
+                let top = dy + run.line_top;
+                let distance = (x - x.clamp(left, left + glyph.w)).powi(2)
+                    + (y - y.clamp(top, top + run.line_height)).powi(2);
+                if best.as_ref().is_some_and(|(old, _, _)| *old <= distance) { continue; }
+                // Buffer::hit already implements grapheme/ligature and bidi
+                // boundaries. Remove the extra offsets applied by paint.
+                let hit_x = (x - dx).clamp(glyph.x, glyph.x + glyph.w);
+                let cursor = item.buffer.hit(hit_x, run.line_top + run.line_height * 0.5)?;
+                best = Some((distance, start + cursor.index, cursor.affinity));
+            }
+        }
+        let (distance, byte, affinity) = best?;
+        let nearest = boundaries.iter().map(|boundary| boundary.byte.abs_diff(byte)).min()?;
+        let matches = |boundary: &&CaretBoundary| boundary.byte.abs_diff(byte) == nearest;
+        let boundary = if affinity == cosmic_text::Affinity::Before {
+            boundaries.iter().find(matches)
+        } else {
+            boundaries.iter().rev().find(matches)
+        }?;
+        Some((boundary.node, boundary.offset, distance))
+    }
+
+    pub(crate) fn caret_rect(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+        node: NodeId,
+        offset: usize,
+    ) -> Option<Rect> {
+        let item = self.items.get(index)?;
+        let (source, boundaries) = self.caret_source(index, parent, tree, styles)?;
+        let boundary = boundaries.iter().filter(|boundary| boundary.node == node)
+            .min_by_key(|boundary| boundary.offset.abs_diff(offset))?;
+        let starts = source_line_starts(&item.buffer, &source);
+        let style = tree.with_node(node, |node| node.parent)
+            .flatten().and_then(|id| styles.get(&id)).or_else(|| styles.get(&parent))?;
+        let (ascent, descent) = self.inline_font_box_metrics(style);
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            let start = *starts.get(run.line_i)?;
+            let (line_start, line_end) = visual_line_source_bounds(item, &run, start);
+            let byte = boundary.byte.checked_sub(start)?;
+            let Some(glyph) = run.glyphs.iter().find(|glyph| glyph.start <= byte && byte <= glyph.end) else {
+                continue;
+            };
+            let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            return Some(Rect {
+                x: item.origin.0 + run_cursor_x(&run, byte) + indent + relative.0
+                    + line_edge_alignment_shift(item, line_start, line_end)
+                    + line_advance_before_text(item, start + glyph.start, line_start, line_end),
+                y: item.origin.1 + run.line_y + relative.1 - ascent,
+                width: 0.0,
+                height: ascent + descent,
+            });
+        }
+        None
+    }
 }
 
 /// A run of same-styled inline text.
@@ -1846,6 +2561,7 @@ struct SpanAttrs {
     font_size: f32,
     line_height: f32,
     letter_spacing: f32,
+    word_spacing: f32,
     letter_spacing_non_normal: bool,
     weight: u16,
     optical_sizing: crate::FontOpticalSizing,
@@ -1854,6 +2570,8 @@ struct SpanAttrs {
     italic: bool,
     synthetic_italic: bool,
     underline: bool,
+    overline: bool,
+    line_through: bool,
     color: [u8; 4],
     family: Arc<str>,
     clip_fill: Option<usize>,
@@ -1909,6 +2627,9 @@ impl SpanAttrs {
         if self.synthetic_italic {
             a = a.cache_key_flags(CacheKeyFlags::FAKE_ITALIC);
         }
+        if self.word_spacing.is_finite() && self.word_spacing != 0.0 {
+            a = a.word_spacing(self.word_spacing / self.font_size.max(1.0));
+        }
         if self.letter_spacing.is_finite() && self.letter_spacing != 0.0 {
             a = a.letter_spacing(self.letter_spacing / self.font_size.max(1.0));
         }
@@ -1955,7 +2676,12 @@ impl SpanAttrs {
             word_break,
             overflow_wrap,
         });
-        a = a.metadata(fill | variation | usize::from(self.underline));
+        a = a.metadata(
+            fill | variation
+                | usize::from(self.underline) * META_UNDERLINE
+                | usize::from(self.overline) * META_OVERLINE
+                | usize::from(self.line_through) * META_LINE_THROUGH,
+        );
         a
     }
 }
@@ -1966,6 +2692,7 @@ struct SpanCtx {
     font_size: f32,
     line_height: f32,
     letter_spacing: f32,
+    word_spacing: f32,
     letter_spacing_non_normal: bool,
     color: [u8; 4],
     weight: u16,
@@ -1976,6 +2703,8 @@ struct SpanCtx {
     italic: bool,
     synthetic_italic: bool,
     underline: bool,
+    overline: bool,
+    line_through: bool,
     transform: TextTransform,
     white_space: crate::WhiteSpace,
     overflow_wrap: crate::OverflowWrap,
@@ -1992,6 +2721,14 @@ struct Collector {
     owner_boxes: Vec<InlineOwnerBox>,
     boundary_events: Vec<InlineBoundaryEvent>,
     text_len: usize,
+    caret_boundaries: Option<Vec<CaretBoundary>>,
+}
+
+#[derive(Clone, Copy)]
+struct CaretBoundary {
+    byte: usize,
+    node: NodeId,
+    offset: usize,
 }
 
 impl Collector {
@@ -2004,6 +2741,7 @@ impl Collector {
             owner_boxes: Vec::new(),
             boundary_events: Vec::new(),
             text_len: 0,
+            caret_boundaries: None,
         }
     }
 
@@ -2109,6 +2847,7 @@ fn base_span_ctx(base: &LayoutStyle, font: ResolvedFont, collector: &mut Collect
         font_size: base.font_size.unwrap_or(16.0),
         line_height,
         letter_spacing: base.letter_spacing.unwrap_or(0.0),
+        word_spacing: base.word_spacing.unwrap_or(0.0),
         letter_spacing_non_normal: base.letter_spacing_non_normal.unwrap_or(false),
         color: base.color.unwrap_or([0, 0, 0, 255]),
         weight: crate::style::used_font_weight(base),
@@ -2119,6 +2858,8 @@ fn base_span_ctx(base: &LayoutStyle, font: ResolvedFont, collector: &mut Collect
         italic: base.font_style_italic.unwrap_or(false),
         synthetic_italic: font.synthetic_italic,
         underline: base.underline.unwrap_or(false),
+        overline: base.overline.unwrap_or(false),
+        line_through: base.line_through.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
         white_space: base.white_space.unwrap_or_default(),
         overflow_wrap: base.overflow_wrap.unwrap_or_default(),
@@ -2155,7 +2896,7 @@ fn collect_node_spans(
     c: &mut Collector,
     loaded_families: &HashMap<String, LoadedFamily>,
 ) {
-    let Some(node) = tree.get_node(cid) else {
+    let Some(node) = tree.borrow_node(cid) else {
         return;
     };
     match &node.data {
@@ -2164,6 +2905,7 @@ fn collect_node_spans(
                 font_size: ctx.font_size,
                 line_height: ctx.line_height,
                 letter_spacing: ctx.letter_spacing,
+                word_spacing: ctx.word_spacing,
                 letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                 weight: ctx.weight,
                 optical_sizing: ctx.optical_sizing,
@@ -2172,6 +2914,8 @@ fn collect_node_spans(
                 italic: ctx.italic,
                 synthetic_italic: ctx.synthetic_italic,
                 underline: ctx.underline,
+                overline: ctx.overline,
+                line_through: ctx.line_through,
                 color: ctx.color,
                 family: Arc::clone(&ctx.family),
                 clip_fill: ctx.clip_fill,
@@ -2179,7 +2923,7 @@ fn collect_node_spans(
                 overflow_wrap: ctx.overflow_wrap,
                 word_break: ctx.word_break,
             };
-            push_text(contents, ctx.transform, ctx.white_space, &attrs, out, c);
+            push_text(contents, ctx.transform, ctx.white_space, &attrs, out, c, Some(cid));
         }
         _ => {
             let Some(elem) = node.as_element() else {
@@ -2196,6 +2940,7 @@ fn collect_node_spans(
                         font_size: ctx.font_size,
                         line_height: ctx.line_height,
                         letter_spacing: ctx.letter_spacing,
+                        word_spacing: ctx.word_spacing,
                         letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                         weight: ctx.weight,
                         optical_sizing: ctx.optical_sizing,
@@ -2204,6 +2949,8 @@ fn collect_node_spans(
                         italic: ctx.italic,
                         synthetic_italic: ctx.synthetic_italic,
                         underline: ctx.underline,
+                        overline: ctx.overline,
+                        line_through: ctx.line_through,
                         color: ctx.color,
                         family: Arc::clone(&ctx.family),
                         clip_fill: ctx.clip_fill,
@@ -2266,6 +3013,9 @@ fn collect_node_spans(
                 letter_spacing: style
                     .and_then(|style| style.letter_spacing)
                     .unwrap_or(ctx.letter_spacing),
+                word_spacing: style
+                    .and_then(|style| style.word_spacing)
+                    .unwrap_or(ctx.word_spacing),
                 letter_spacing_non_normal: style
                     .and_then(|style| style.letter_spacing_non_normal)
                     .unwrap_or(ctx.letter_spacing_non_normal),
@@ -2282,6 +3032,8 @@ fn collect_node_spans(
                 // Underline propagates in: an ancestor's underline covers
                 // descendant text; an element only sets its own via CSS.
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
+                overline: ctx.overline || style.and_then(|style| style.overline).unwrap_or(false),
+                line_through: ctx.line_through || style.and_then(|style| style.line_through).unwrap_or(false),
                 transform: style
                     .and_then(|s| s.text_transform)
                     .unwrap_or(ctx.transform),
@@ -2308,9 +3060,44 @@ fn push_text(
     attrs: &SpanAttrs,
     out: &mut Vec<(String, SpanAttrs)>,
     c: &mut Collector,
+    node: Option<NodeId>,
 ) {
+    let start = c.text_len;
+    let buf = if let (Some(boundaries), Some(node)) = (&mut c.caret_boundaries, node) {
+        normalize_text(raw, transform, white_space, &mut c.last_was_space, |byte, offset| {
+            // Pre-line normalization can remove the space before a newline.
+            while boundaries.last().is_some_and(|boundary| boundary.byte > start + byte) {
+                boundaries.pop();
+            }
+            boundaries.push(CaretBoundary { byte: start + byte, node, offset });
+        })
+    } else {
+        normalize_text(raw, transform, white_space, &mut c.last_was_space, |_, _| {})
+    };
+    if buf.is_empty() {
+        return;
+    }
+    c.record_text(buf.len());
+    if let Some((last_text, last_attrs)) = out.last_mut() {
+        if last_attrs == attrs {
+            last_text.push_str(&buf);
+            return;
+        }
+    }
+    out.push((buf, attrs.clone()));
+}
+
+fn normalize_text(
+    raw: &str,
+    transform: TextTransform,
+    white_space: crate::WhiteSpace,
+    last_was_space: &mut bool,
+    mut boundary: impl FnMut(usize, usize),
+) -> String {
     let mut buf = String::new();
-    let mut at_word_start = c.last_was_space;
+    let mut at_word_start = *last_was_space;
+    let mut offset = 0;
+    boundary(0, 0);
     for ch in raw.chars() {
         if ch.is_whitespace() {
             match white_space {
@@ -2323,10 +3110,10 @@ fn push_text(
                     }
                     buf.push('\n');
                 }
-                _ if !c.last_was_space => buf.push(' '),
+                _ if !*last_was_space => buf.push(' '),
                 _ => {}
             }
-            c.last_was_space = true;
+            *last_was_space = true;
             at_word_start = true;
         } else {
             match transform {
@@ -2335,21 +3122,13 @@ fn push_text(
                 TextTransform::Capitalize if at_word_start => buf.extend(ch.to_uppercase()),
                 _ => buf.push(ch),
             }
-            c.last_was_space = false;
+            *last_was_space = false;
             at_word_start = false;
         }
+        offset += ch.len_utf16();
+        boundary(buf.len(), offset);
     }
-    if buf.is_empty() {
-        return;
-    }
-    c.record_text(buf.len());
-    if let Some((last_text, last_attrs)) = out.last_mut() {
-        if last_attrs == attrs {
-            last_text.push_str(&buf);
-            return;
-        }
-    }
-    out.push((buf, attrs.clone()));
+    buf
 }
 
 fn boundary_event_on_line(
@@ -2437,8 +3216,8 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
         } else {
             0.0
         };
-        let line_start = line_starts.get(run.line_i).copied().unwrap_or(0);
-        let line_end = line_start + run.text.len();
+        let paragraph_start = line_starts.get(run.line_i).copied().unwrap_or(0);
+        let (line_start, line_end) = visual_line_source_bounds(item, &run, paragraph_start);
         let edges = line_edge_advance(item, line_start, line_end);
         w = w.max((run.line_w + offset + edges).max(0.0));
         h = h.max(run.line_top + run.line_height);
@@ -2503,6 +3282,16 @@ fn run_cursor_x(run: &cosmic_text::LayoutRun<'_>, byte: usize) -> f32 {
     }
 }
 
+fn visual_line_source_bounds(item: &InlineItem, run: &cosmic_text::LayoutRun<'_>,
+    paragraph_start: usize) -> (usize, usize)
+{
+    if item.float_bands.is_empty() {
+        return (paragraph_start, paragraph_start + run.text.len());
+    }
+    (paragraph_start + run.glyphs.iter().map(|glyph| glyph.start).min().unwrap_or(0),
+        paragraph_start + run.glyphs.iter().map(|glyph| glyph.end).max().unwrap_or(run.text.len()))
+}
+
 fn glyph_relative_offset(
     ranges: &[RelativeOwnerTextRange],
     line_start: usize,
@@ -2534,6 +3323,93 @@ fn used_text_indent(value: Dimension, width: Option<f32>) -> f32 {
     }
 }
 
+fn shape_with_floats(font_system: &mut FontSystem, item: &mut InlineItem, width: f32, wrap: Wrap) {
+    let Some(source) = &item.source_buffer else { return; };
+    item.buffer = source.clone();
+    item.buffer.set_wrap(font_system, wrap);
+    item.buffer.set_size(font_system, Some(width.max(0.0)), None);
+    item.first_line_offset = 0.0;
+    let metrics = item.buffer.metrics();
+    let mono = item.buffer.monospace_width();
+    let tab_width = item.buffer.tab_width();
+    let starts = item.owner_text.as_deref()
+        .map(|text| source_line_starts(&item.buffer, text)).unwrap_or_default();
+    let mut paragraph_y = 0.0;
+    for paragraph in 0..item.buffer.lines.len() {
+        let mut widths = Vec::<f32>::new();
+        let mut positions = Vec::<(f32, f32)>::new();
+        let mut end_y = paragraph_y;
+        // Bound retries by text and exclusion boundaries, even for degenerate fonts.
+        let retries = item.buffer.lines[paragraph].text().len() + item.float_bands.len() + 1;
+        for _ in 0..retries {
+            let layouts = item.buffer.lines[paragraph].layout_with_line_widths(font_system,
+                metrics.font_size, width, &widths, wrap, mono, tab_width)
+                .iter().map(|line| (line.line_height_opt.unwrap_or(metrics.line_height).max(0.0),
+                    line.w, line.glyphs.iter().map(|glyph| glyph.start).min().unwrap_or(0),
+                    line.glyphs.iter().map(|glyph| glyph.end).max().unwrap_or(0)))
+                .collect::<Vec<_>>();
+            let mut next_widths = Vec::with_capacity(layouts.len());
+            let mut next_positions = Vec::with_capacity(layouts.len());
+            let mut y = paragraph_y;
+            for (index, &(height, line_width, glyph_start, glyph_end)) in layouts.iter().enumerate() {
+                let (x, available) = loop {
+                    let mut left = 0.0f32;
+                    let mut right = width;
+                    let mut next_bottom = f32::INFINITY;
+                    for band in &item.float_bands {
+                        if band.y < y + height && band.y + band.height > y {
+                            left = left.max(band.x);
+                            right = right.min(band.x + band.width);
+                            next_bottom = next_bottom.min(band.y + band.height);
+                        }
+                    }
+                    let available = (right - left).max(0.0);
+                    let long_word = widths.get(index).is_some_and(|prior|
+                        (*prior - available).abs() < 0.01 && line_width > available + 0.01);
+                    if next_bottom.is_finite() && next_bottom > y
+                        && (available <= 0.0 || long_word)
+                    {
+                        y = next_bottom;
+                        continue;
+                    }
+                    break (left, available);
+                };
+                let indent = if paragraph == 0 && index == 0 {
+                    used_text_indent(item.text_indent, Some(width))
+                } else { 0.0 };
+                let line_start = starts.get(paragraph).copied().unwrap_or(0)
+                    + glyph_start;
+                let line_end = starts.get(paragraph).copied().unwrap_or(0)
+                    + glyph_end;
+                let edges = line_edge_advance(item, line_start, line_end);
+                next_widths.push((available - indent - edges).max(0.0));
+                let indent_offset = indent * match item.align {
+                    Some(Align::Center) => 0.5,
+                    Some(Align::End | Align::Right) => 0.0,
+                    _ => 1.0,
+                };
+                next_positions.push((x + indent_offset, y));
+                y += height;
+            }
+            let stable = widths == next_widths;
+            widths = next_widths;
+            positions = next_positions;
+            end_y = y;
+            if stable { break; }
+        }
+        let layouts = item.buffer.lines[paragraph].layout_with_line_widths(font_system,
+            metrics.font_size, width, &widths, wrap, mono, tab_width);
+        let mut y = paragraph_y;
+        for (line, &(x, top)) in layouts.iter_mut().zip(&positions) {
+            line.top_offset = (top - y).max(0.0);
+            for glyph in &mut line.glyphs { glyph.x += x; }
+            line.w += x;
+            y = top + line.line_height_opt.unwrap_or(metrics.line_height);
+        }
+        paragraph_y = end_y;
+    }
+}
+
 /// Shape one IFC with first-line indent and ordinary-inline boundary advances.
 ///
 /// The pristine buffer remains one shaping stream across DOM owners. For a
@@ -2548,6 +3424,10 @@ fn shape_with_text_indent(
     width: Option<f32>,
     wrap: Wrap,
 ) {
+    if let Some(width) = width.filter(|_| !item.float_bands.is_empty()) {
+        shape_with_floats(font_system, item, width, wrap);
+        return;
+    }
     let indent = used_text_indent(item.text_indent, width);
     item.first_line_offset = indent
         * match item.align {
@@ -2836,13 +3716,13 @@ pub(crate) fn default_replaced_intrinsic_size(
 /// genuinely cannot fold are rejected: replaced/atomic elements, block-level
 /// children, floats, out-of-flow positioned boxes, and elements with generated
 /// content (which would be lost).
-fn inline_child_ok(
+pub(crate) fn inline_child_ok(
     tree: &DomTree,
     cid: NodeId,
     styles: &std::collections::HashMap<NodeId, LayoutStyle>,
     has_text: &mut bool,
 ) -> bool {
-    let Some(node) = tree.get_node(cid) else {
+    let Some(node) = tree.borrow_node(cid) else {
         return true;
     };
     match &node.data {
@@ -3175,10 +4055,6 @@ impl TextEngine {
             .map(|source| source_line_starts(&item.buffer, source))
             .unwrap_or_default();
 
-        // Collect underline segments before drawing glyphs (both borrow the
-        // buffer). Underline is carried per glyph via metadata; group runs of
-        // consecutive underlined glyphs on a line into one stroke below the
-        // baseline. Done first so the draw() mutable borrow does not overlap.
         let mut underlines: Vec<(f32, f32, f32, f32, [u8; 4])> = Vec::new(); // x0, x1, y, thickness, color
         let mut fill_bounds: Vec<Option<(f32, f32, f32, f32)>> = vec![None; item.clip_fills.len()];
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
@@ -3188,11 +4064,12 @@ impl TextEngine {
                 0.0
             };
             let line_source_start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
-            let line_source_end = line_source_start + run.text.len();
+            let (line_start, line_source_end) = visual_line_source_bounds(item, &run, line_source_start);
             let inline_alignment =
-                line_edge_alignment_shift(item, line_source_start, line_source_end);
+                line_edge_alignment_shift(item, line_start, line_source_end);
             let base_y = run.line_y;
-            let mut seg: Option<(f32, f32, f32, [u8; 4], (f32, f32))> = None;
+            let mut segments: [Option<(f32, f32, f32, [u8; 4], (f32, f32))>; 3] = [None; 3];
+            let mut active_decorations = 0;
             for g in run.glyphs {
                 // Keep decoration and background-clip bounds in lockstep with
                 // glyph painting. A truncated glyph must not leave an
@@ -3213,10 +4090,10 @@ impl TextEngine {
                     + line_advance_before_text(
                         item,
                         line_source_start + g.start,
-                        line_source_start,
+                        line_start,
                         line_source_end,
                     );
-                let underlined = g.metadata & META_UNDERLINE != 0;
+                let decoration_flags = g.metadata & META_DECORATIONS;
                 if let Some(fill_index) = metadata_fill(g.metadata) {
                     if let Some(bounds) = fill_bounds.get_mut(fill_index) {
                         let glyph_bounds = (
@@ -3243,51 +4120,42 @@ impl TextEngine {
                 if print_economy {
                     col = crate::paint::print_economy_color(col);
                 }
-                if underlined {
-                    match &mut seg {
-                        Some((_, x1, fs, c, prior_relative))
-                            if *c == col && *prior_relative == relative =>
-                        {
-                            *x1 = g.x + line_offset + g.w + relative.0;
-                            *fs = fs.max(g.font_size);
-                        }
-                        _ => {
-                            if let Some((x0, x1, fs, c, prior_relative)) = seg.take() {
-                                underlines.push((
-                                    x0,
-                                    x1,
-                                    base_y + prior_relative.1 + (fs * 0.12).max(1.0),
-                                    (fs / 14.0).max(1.0),
-                                    c,
+                if decoration_flags | active_decorations == 0 {
+                    continue;
+                }
+                active_decorations = decoration_flags;
+                for (index, flag) in [META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH].into_iter().enumerate() {
+                    let segment = &mut segments[index];
+                    if decoration_flags & flag != 0 {
+                        match segment {
+                            Some((_, end, size, color, prior_relative))
+                                if *color == col && *prior_relative == relative =>
+                            {
+                                *end = g.x + line_offset + g.w + relative.0;
+                                *size = size.max(g.font_size);
+                            }
+                            _ => {
+                                if let Some(previous) = segment.take() {
+                                    underlines.push(decoration_stroke(previous, base_y, flag));
+                                }
+                                *segment = Some((
+                                    g.x + line_offset + relative.0,
+                                    g.x + line_offset + g.w + relative.0,
+                                    g.font_size,
+                                    col,
+                                    relative,
                                 ));
                             }
-                            seg = Some((
-                                g.x + line_offset + relative.0,
-                                g.x + line_offset + g.w + relative.0,
-                                g.font_size,
-                                col,
-                                relative,
-                            ));
                         }
+                    } else if let Some(previous) = segment.take() {
+                        underlines.push(decoration_stroke(previous, base_y, flag));
                     }
-                } else if let Some((x0, x1, fs, c, relative)) = seg.take() {
-                    underlines.push((
-                        x0,
-                        x1,
-                        base_y + relative.1 + (fs * 0.12).max(1.0),
-                        (fs / 14.0).max(1.0),
-                        c,
-                    ));
                 }
             }
-            if let Some((x0, x1, fs, c, relative)) = seg.take() {
-                underlines.push((
-                    x0,
-                    x1,
-                    base_y + relative.1 + (fs * 0.12).max(1.0),
-                    (fs / 14.0).max(1.0),
-                    c,
-                ));
+            for (segment, flag) in segments.into_iter().zip([META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH]) {
+                if let Some(previous) = segment {
+                    underlines.push(decoration_stroke(previous, base_y, flag));
+                }
             }
         }
 
@@ -3308,9 +4176,9 @@ impl TextEngine {
                 0.0
             };
             let line_source_start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
-            let line_source_end = line_source_start + run.text.len();
+            let (line_start, line_source_end) = visual_line_source_bounds(item, &run, line_source_start);
             let inline_alignment =
-                line_edge_alignment_shift(item, line_source_start, line_source_end);
+                line_edge_alignment_shift(item, line_start, line_source_end);
             for glyph in run.glyphs {
                 if item.marker.is_some_and(|marker| {
                     marker.line_index == line_index
@@ -3328,7 +4196,7 @@ impl TextEngine {
                     + line_advance_before_text(
                         item,
                         line_source_start + glyph.start,
-                        line_source_start,
+                        line_start,
                         line_source_end,
                     );
                 let physical = glyph.physical((line_offset + relative.0, relative.1), raster_scale);
@@ -3337,111 +4205,45 @@ impl TextEngine {
                 if print_economy && fill_index.is_some() {
                     continue;
                 }
-                let mut draw_pixel = |x, y, color: Color| {
-                    // cosmic-text's mask rasterizer replaces the authored
-                    // alpha with glyph coverage (see its `blend base alpha?`
-                    // TODO). Reapply the span alpha here so transparent and
-                    // translucent CSS text do not become opaque at paint.
-                    let a = color.a() as u32 * glyph_color.a() as u32 / 255;
-                    if a == 0 {
-                        return;
-                    }
-                    let gx = physical.x + x;
-                    let gy = (run.line_y * raster_scale) as i32 + physical.y + y;
-                    let (mut r, mut g, mut b) = fill_index
-                        .and_then(|index| {
-                            let fill = clip_fills.get(index)?;
-                            let (x0, y0, x1, y1) = fill_bounds.get(index).copied().flatten()?;
-                            let sampled = sample_gradient(
-                                fill,
-                                (gx as f32 + 0.5) / raster_scale - x0,
-                                (gy as f32 + 0.5) / raster_scale - y0,
-                                x1 - x0,
-                                y1 - y0,
-                            );
-                            Some((sampled[0], sampled[1], sampled[2]))
-                        })
-                        .unwrap_or_else(|| (color.r(), color.g(), color.b()));
-                    if print_economy {
-                        let adjusted = crate::paint::print_economy_color([r, g, b, 255]);
-                        (r, g, b) = (adjusted[0], adjusted[1], adjusted[2]);
-                    }
-                    let px = ox as i32 + gx;
-                    let py = oy as i32 + gy;
-                    if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
-                        if (px as f32) < cx0
-                            || (px as f32) >= cx1
-                            || (py as f32) < cy0
-                            || (py as f32) >= cy1
-                        {
-                            return;
+                paint_swash_glyph(
+                    font_system,
+                    swash,
+                    variable_swash,
+                    glyph,
+                    physical,
+                    &item.variation_sets,
+                    glyph_color,
+                    ox,
+                    oy,
+                    run.line_y,
+                    raster_scale,
+                    clip_bounds,
+                    clip_mask,
+                    pw,
+                    ph,
+                    pixels,
+                    |gx, gy, color| {
+                        let (mut r, mut g, mut b) = fill_index
+                            .and_then(|index| {
+                                let fill = clip_fills.get(index)?;
+                                let (x0, y0, x1, y1) = fill_bounds.get(index).copied().flatten()?;
+                                let sampled = sample_gradient(
+                                    fill,
+                                    (gx as f32 + 0.5) / raster_scale - x0,
+                                    (gy as f32 + 0.5) / raster_scale - y0,
+                                    x1 - x0,
+                                    y1 - y0,
+                                );
+                                Some((sampled[0], sampled[1], sampled[2]))
+                            })
+                            .unwrap_or_else(|| (color.r(), color.g(), color.b()));
+                        if print_economy {
+                            let adjusted = crate::paint::print_economy_color([r, g, b, 255]);
+                            (r, g, b) = (adjusted[0], adjusted[1], adjusted[2]);
                         }
-                    }
-                    if px < 0 || px >= pw || py < 0 || py >= ph {
-                        return;
-                    }
-                    let idx = (py * pw + px) as usize;
-                    let mask_alpha = clip_mask
-                        .and_then(|mask| mask.data().get(idx))
-                        .copied()
-                        .unwrap_or(255) as u32;
-                    let a = a * mask_alpha / 255;
-                    if a == 0 {
-                        return;
-                    }
-                    let dst = pixels[idx];
-                    let sa = a;
-                    let sr = (r as u32 * sa) / 255;
-                    let sg = (g as u32 * sa) / 255;
-                    let sb = (b as u32 * sa) / 255;
-                    let inv = 255 - sa;
-                    let out_a = sa + (dst.alpha() as u32 * inv / 255);
-                    if out_a == 0 {
-                        return;
-                    }
-                    let out_r = sr + (dst.red() as u32 * inv / 255);
-                    let out_g = sg + (dst.green() as u32 * inv / 255);
-                    let out_b = sb + (dst.blue() as u32 * inv / 255);
-                    pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
-                        out_r as u8,
-                        out_g as u8,
-                        out_b as u8,
-                        out_a as u8,
-                    )
-                    .unwrap_or(dst);
-                };
-                let explicit_variations = metadata_variation(glyph.metadata)
-                    .and_then(|index| item.variation_sets.get(index))
-                    .map(Arc::clone);
-                let effective_variations = glyph
-                    .font_is_variable
-                    .then(|| {
-                        variable_swash.effective_variations(
-                            font_system,
-                            physical.cache_key.font_id,
-                            glyph.font_weight_axis_opt,
-                            glyph.font_optical_size_opt,
-                            glyph.font_italic_axis,
-                            explicit_variations,
-                        )
-                    })
-                    .flatten();
-                if let Some(variations) = effective_variations {
-                    variable_swash.with_pixels(
-                        font_system,
-                        physical.cache_key,
-                        variations,
-                        glyph_color,
-                        &mut draw_pixel,
-                    );
-                } else {
-                    swash.with_pixels(
-                        font_system,
-                        physical.cache_key,
-                        glyph_color,
-                        &mut draw_pixel,
-                    );
-                }
+                        (r, g, b)
+                    },
+                );
             }
         }
 
@@ -3533,6 +4335,114 @@ impl TextEngine {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn paint_swash_glyph<F>(
+    font_system: &mut FontSystem,
+    swash: &mut SwashCache,
+    variable_swash: &mut VariableSwashCache,
+    glyph: &cosmic_text::LayoutGlyph,
+    physical: cosmic_text::PhysicalGlyph,
+    variation_sets: &[Arc<FontVariations>],
+    glyph_color: Color,
+    ox: f32,
+    oy: f32,
+    line_y: f32,
+    raster_scale: f32,
+    clip_bounds: Option<(f32, f32, f32, f32)>,
+    clip_mask: Option<&tiny_skia::Mask>,
+    pw: i32,
+    ph: i32,
+    pixels: &mut [tiny_skia::PremultipliedColorU8],
+    mut resolve_rgb: F,
+) where
+    F: FnMut(i32, i32, Color) -> (u8, u8, u8),
+{
+    let mut draw_pixel = |x, y, color: Color| {
+        // cosmic-text's mask rasterizer replaces the authored alpha with glyph
+        // coverage (see its `blend base alpha?` TODO). Reapply span alpha here
+        // so transparent and translucent CSS text do not become opaque at paint.
+        let a = color.a() as u32 * glyph_color.a() as u32 / 255;
+        if a == 0 {
+            return;
+        }
+        let gx = physical.x + x;
+        let gy = (line_y * raster_scale) as i32 + physical.y + y;
+        let (r, g, b) = resolve_rgb(gx, gy, color);
+        let px = ox as i32 + gx;
+        let py = oy as i32 + gy;
+        if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
+            if (px as f32) < cx0 || (px as f32) >= cx1 || (py as f32) < cy0 || (py as f32) >= cy1
+            {
+                return;
+            }
+        }
+        if px < 0 || px >= pw || py < 0 || py >= ph {
+            return;
+        }
+        let idx = (py * pw + px) as usize;
+        let mask_alpha = clip_mask
+            .and_then(|mask| mask.data().get(idx))
+            .copied()
+            .unwrap_or(255) as u32;
+        let a = a * mask_alpha / 255;
+        if a == 0 {
+            return;
+        }
+        let dst = pixels[idx];
+        let sa = a;
+        let sr = (r as u32 * sa) / 255;
+        let sg = (g as u32 * sa) / 255;
+        let sb = (b as u32 * sa) / 255;
+        let inv = 255 - sa;
+        let out_a = sa + (dst.alpha() as u32 * inv / 255);
+        if out_a == 0 {
+            return;
+        }
+        let out_r = sr + (dst.red() as u32 * inv / 255);
+        let out_g = sg + (dst.green() as u32 * inv / 255);
+        let out_b = sb + (dst.blue() as u32 * inv / 255);
+        pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
+            out_r as u8,
+            out_g as u8,
+            out_b as u8,
+            out_a as u8,
+        )
+        .unwrap_or(dst);
+    };
+    let explicit_variations = metadata_variation(glyph.metadata)
+        .and_then(|index| variation_sets.get(index))
+        .map(Arc::clone);
+    let effective_variations = glyph
+        .font_is_variable
+        .then(|| {
+            variable_swash.effective_variations(
+                font_system,
+                physical.cache_key.font_id,
+                glyph.font_weight_axis_opt,
+                glyph.font_optical_size_opt,
+                glyph.font_italic_axis,
+                explicit_variations,
+            )
+        })
+        .flatten();
+    if let Some(variations) = effective_variations {
+        variable_swash.with_pixels(
+            font_system,
+            physical.cache_key,
+            variations,
+            glyph_color,
+            &mut draw_pixel,
+        );
+    } else {
+        swash.with_pixels(
+            font_system,
+            physical.cache_key,
+            glyph_color,
+            &mut draw_pixel,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3556,6 +4466,142 @@ mod tests {
             .unwrap();
         engine.finalize(item, (0.0, 10.0), 200.0, None);
         (engine, item)
+    }
+
+    #[test]
+    fn embedded_font_database_is_initialized_once() {
+        let _first = TextEngine::new();
+        let _second = TextEngine::new();
+        assert_eq!(BASE_FONT_DATABASE_BUILDS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn repeated_web_font_set_reuses_the_parsed_database() {
+        let font = WebFont {
+            data: Arc::new(FALLBACK.to_vec()),
+            family: Some("Issue 879 cache fixture".to_string()),
+            weight: Some((400, 400)),
+            italic: Some(false),
+        };
+        assert!(cached_web_font_database(std::slice::from_ref(&font), false).is_none());
+        let first = TextEngine::new_with_web_fonts(std::slice::from_ref(&font));
+        assert!(cached_web_font_database(std::slice::from_ref(&font), false).is_some());
+        let second = TextEngine::new_with_web_fonts(std::slice::from_ref(&font));
+        assert_eq!(
+            first.loaded_families["issue 879 cache fixture"].faces[0].metrics,
+            second.loaded_families["issue 879 cache fixture"].faces[0].metrics,
+        );
+
+        let mut different_descriptor = font;
+        different_descriptor.weight = Some((700, 700));
+        assert!(
+            cached_web_font_database(std::slice::from_ref(&different_descriptor), false).is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_plain_text_reuses_the_attributed_buffer_template() {
+        let tree = obscura_dom::parse_html(
+            "<p id='first'>repeated label</p><p id='second'>repeated label</p>",
+        );
+        let first = tree.get_element_by_id("first").unwrap();
+        let second = tree.get_element_by_id("second").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            line_height: Some(crate::LineHeight::Px(20.0)),
+            ..Default::default()
+        };
+        let styles = HashMap::from([(first, style.clone()), (second, style)]);
+        let mut engine = TextEngine::new();
+        let first_item = engine.try_build(&tree, first, &styles).unwrap();
+        let second_item = engine.try_build(&tree, second, &styles).unwrap();
+
+        assert_eq!(engine.shape_template_count, 1);
+        assert_eq!(engine.shape_template_hits, 1);
+        assert_eq!(
+            engine.measure(first_item, Some(120.0)),
+            engine.measure(second_item, Some(120.0))
+        );
+    }
+
+    #[test]
+    fn repeated_measurements_reuse_exact_results_and_preserve_final_paint() {
+        let tree = obscura_dom::parse_html(
+            "<p id='copy'>alpha <span id='inline'>beta gamma delta epsilon</span> zeta</p>",
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let inline = tree.get_element_by_id("inline").unwrap();
+        let base = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            text_indent: Some(Dimension::Px(7.25)),
+            ..Default::default()
+        };
+        let child = LayoutStyle {
+            display: Display::Inline,
+            padding: crate::Edges {
+                left: 3.5,
+                right: 2.25,
+                ..Default::default()
+            },
+            ..base.clone()
+        };
+        let styles = HashMap::from([(copy, base), (inline, child)]);
+        let mut engine = TextEngine::new();
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+
+        for (width, wrap) in [
+            (None, Wrap::WordOrGlyph),
+            (Some(0.0), Wrap::WordOrGlyph),
+            (Some(100.01), Wrap::None),
+            (Some(100.49), Wrap::WordOrGlyph),
+            (Some(100.51), Wrap::Glyph),
+        ] {
+            let actual = engine.measure_text_with_wrap(item, width, wrap);
+            let cached_entries = engine.items[item].measured.len();
+            assert_eq!(
+                engine.measure_text_with_wrap(item, width, wrap),
+                actual
+            );
+            assert_eq!(engine.items[item].measured.len(), cached_entries);
+
+            let mut fresh = TextEngine::new();
+            let fresh_item = fresh.try_build(&tree, copy, &styles).unwrap();
+            assert_eq!(
+                actual,
+                fresh.measure_text_with_wrap(fresh_item, width, wrap)
+            );
+            engine.finalize(item, (0.0, 0.0), 100.49, None);
+            fresh.finalize(fresh_item, (0.0, 0.0), 100.49, None);
+            let mut actual_image = tiny_skia::Pixmap::new(220, 120).unwrap();
+            let mut expected_image = tiny_skia::Pixmap::new(220, 120).unwrap();
+            engine.paint_item(item, &mut actual_image, (0.0, 0.0));
+            fresh.paint_item(fresh_item, &mut expected_image, (0.0, 0.0));
+            assert_eq!(actual_image.data(), expected_image.data());
+        }
+    }
+
+    #[test]
+    fn configured_font_directory_loads_nested_fonts_and_skips_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "obscura-font-directory-test-{}",
+            std::process::id()
+        ));
+        let nested = root.join("nested");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&nested).unwrap();
+        let font = variable_font_fixture();
+        std::fs::write(nested.join("fixture.TTF"), &font).unwrap();
+        std::fs::write(nested.join("ignored.txt"), &font).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, nested.join("cycle")).unwrap();
+
+        assert!(configure_font_directories(vec![root.clone()]));
+        let engine = TextEngine::new();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(engine.loaded_families.contains_key("obscura vf test"));
     }
 
     #[test]
@@ -3762,7 +4808,7 @@ mod tests {
     #[test]
     fn declared_web_family_keeps_the_loaded_faces_line_metrics() {
         let engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: FALLBACK.to_vec(),
+            data: Arc::new(FALLBACK.to_vec()),
             family: Some("Page Face".to_string()),
             weight: Some((400, 400)),
             italic: Some(false),
@@ -4017,7 +5063,7 @@ mod tests {
 
     #[test]
     fn descriptor_selected_resource_pins_the_exact_font_face() {
-        let data = SANS_R.to_vec();
+        let data = Arc::new(SANS_R.to_vec());
         let mut engine = TextEngine::new_with_web_fonts(&[
             WebFont {
                 data: data.clone(),
@@ -4118,6 +5164,7 @@ mod tests {
             font_size: 16.0,
             line_height: 18.0,
             letter_spacing: 0.0,
+            word_spacing: 0.0,
             letter_spacing_non_normal: false,
             weight: 400,
             optical_sizing: crate::FontOpticalSizing::Auto,
@@ -4126,6 +5173,8 @@ mod tests {
             italic: false,
             synthetic_italic: false,
             underline: true,
+            overline: true,
+            line_through: true,
             color: [1, 2, 3, 255],
             family: Arc::from(FAMILY),
             clip_fill: Some(37),
@@ -4134,7 +5183,7 @@ mod tests {
             word_break: crate::WordBreak::Normal,
         };
         let shaped = attrs.to_attrs(42);
-        assert_ne!(shaped.metadata & META_UNDERLINE, 0);
+        assert_eq!(shaped.metadata & META_DECORATIONS, META_DECORATIONS);
         assert_eq!(metadata_fill(shaped.metadata), Some(37));
         assert_eq!(metadata_variation(shaped.metadata), Some(41));
         assert_eq!(
@@ -4198,6 +5247,7 @@ mod tests {
             font_size: 20.0,
             line_height: 24.0,
             letter_spacing: 2.0,
+            word_spacing: 0.0,
             letter_spacing_non_normal: true,
             weight: 400,
             optical_sizing: crate::FontOpticalSizing::Auto,
@@ -4206,6 +5256,8 @@ mod tests {
             italic: false,
             synthetic_italic: false,
             underline: false,
+            overline: false,
+            line_through: false,
             color: [0, 0, 0, 255],
             family: Arc::from(FAMILY),
             clip_fill: None,
@@ -4271,7 +5323,7 @@ mod tests {
     #[test]
     fn variable_font_multi_axis_shaping_preserves_space_advance() {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".into()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4306,14 +5358,16 @@ mod tests {
     {
         let mut engine = TextEngine::new_with_web_fonts(&[
             WebFont {
-                data: include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf")
-                    .to_vec(),
+                data: Arc::new(
+                    include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf")
+                        .to_vec(),
+                ),
                 family: Some("Static Primary".to_string()),
                 weight: Some((400, 400)),
                 italic: Some(false),
             },
             WebFont {
-                data: variable_font_fixture(),
+                data: Arc::new(variable_font_fixture()),
                 family: Some("Variable Fallback".to_string()),
                 weight: Some((100, 900)),
                 italic: Some(false),
@@ -4458,7 +5512,7 @@ mod tests {
 
     fn render_variable_weight(weight: u16) -> ((f32, f32), u64, Vec<u16>) {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4552,7 +5606,7 @@ mod tests {
     #[test]
     fn variable_glyph_cache_keys_include_weight_axis() {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4599,7 +5653,7 @@ mod tests {
         width: f32,
     ) -> ((f32, f32), usize, std::collections::HashSet<u32>) {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),

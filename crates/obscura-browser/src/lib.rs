@@ -1,5 +1,7 @@
+pub mod accessibility;
 pub mod context;
 mod fork_virtual_url;
+mod idle_deadline;
 pub mod lifecycle;
 pub mod page;
 #[cfg(feature = "render")]
@@ -14,7 +16,7 @@ pub use obscura_js::{
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
     CaptureError, CaptureRegion,
 };
-pub use page::{NetworkEvent, Page, PageError};
+pub use page::{url_matches_cdp_pattern, NetworkEvent, Page, PageError};
 #[cfg(feature = "render")]
 pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};
 // Re-exported so the embeddable `obscura` crate (which depends on obscura-browser,

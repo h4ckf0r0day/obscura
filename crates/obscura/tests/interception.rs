@@ -27,6 +27,12 @@ fn spawn_echo_server() -> String {
                 ("application/json", "{\"hello\":\"world\"}".to_string())
             } else if path.starts_with("/modified") {
                 ("text/plain", "REWRITTEN".to_string())
+            } else if path.starts_with("/probe") {
+                // Report how the page's own fetch('/api') settled.
+                (
+                    "text/html",
+                    "<script>fetch('/api').then(r => { document.title = 'resolved:' + r.status; }, e => { document.title = 'rejected:' + e.name; });</script>".to_string(),
+                )
             } else {
                 ("text/html", "<script>fetch('/api');</script>".to_string())
             };
@@ -210,6 +216,60 @@ async fn page_rewrites_request_url_via_interception() {
         body.contains("REWRITTEN"),
         "interception Continue url-rewrite did not take effect; captured: {:?}",
         body
+    );
+}
+
+/// A Continue rewrite that is not a URL must be refused like a forbidden one.
+/// Before the fix the SSRF re-validation was skipped when the override failed
+/// to parse and the raw string went on to the transport, which reported it as
+/// an ordinary transport failure (an opaque status-0 response) instead of a
+/// blocked request.
+#[tokio::test]
+async fn unparsable_continue_rewrite_is_blocked() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_echo_server();
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+
+    let mut rx = page.enable_interception();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let new_url = req
+                .url
+                .contains("/api")
+                .then(|| "not a url at all".to_string());
+            if req
+                .resolver
+                .send(InterceptResolution::Continue {
+                    url: new_url,
+                    method: None,
+                    headers: None,
+                    body: None,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    page.goto(&format!("{}/probe", base)).await.unwrap();
+    let mut outcome = String::new();
+    for _ in 0..20 {
+        page.settle(500).await;
+        outcome = page
+            .evaluate("document.title")
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if !outcome.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        outcome, "rejected:AbortError",
+        "an unparsable Continue rewrite must be blocked, not attempted"
     );
 }
 

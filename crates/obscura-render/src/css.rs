@@ -25,6 +25,50 @@ pub enum CssMediaType {
     #[default]
     Screen,
     Print,
+    ScreenReducedMotion,
+    PrintReducedMotion,
+    ScreenDark,
+    PrintDark,
+    ScreenDarkReducedMotion,
+    PrintDarkReducedMotion,
+}
+
+impl CssMediaType {
+    pub fn with_reduced_motion(self, reduce: bool) -> Self {
+        match (self.is_print(), reduce, self.dark_color_scheme()) {
+            (false, false, false) => Self::Screen,
+            (false, true, false) => Self::ScreenReducedMotion,
+            (true, false, false) => Self::Print,
+            (true, true, false) => Self::PrintReducedMotion,
+            (false, false, true) => Self::ScreenDark,
+            (false, true, true) => Self::ScreenDarkReducedMotion,
+            (true, false, true) => Self::PrintDark,
+            (true, true, true) => Self::PrintDarkReducedMotion,
+        }
+    }
+
+    pub fn with_dark_color_scheme(self, dark: bool) -> Self {
+        let medium = if self.is_print() { Self::Print } else { Self::Screen };
+        let medium = if dark {
+            if medium.is_print() { Self::PrintDark } else { Self::ScreenDark }
+        } else { medium };
+        medium.with_reduced_motion(self.reduced_motion())
+    }
+
+    pub fn reduced_motion(self) -> bool {
+        matches!(self, Self::ScreenReducedMotion | Self::PrintReducedMotion
+            | Self::ScreenDarkReducedMotion | Self::PrintDarkReducedMotion)
+    }
+
+    pub fn dark_color_scheme(self) -> bool {
+        matches!(self, Self::ScreenDark | Self::PrintDark
+            | Self::ScreenDarkReducedMotion | Self::PrintDarkReducedMotion)
+    }
+
+    pub fn is_print(self) -> bool {
+        matches!(self, Self::Print | Self::PrintReducedMotion
+            | Self::PrintDark | Self::PrintDarkReducedMotion)
+    }
 }
 
 /// The part of the tree whose selector match may change when a dependency on
@@ -111,7 +155,7 @@ fn relational_key_may_match(
     tree: &DomTree,
     node: NodeId,
 ) -> bool {
-    let Some(dom_node) = tree.get_node(node) else {
+    let Some(dom_node) = tree.borrow_node(node) else {
         return false;
     };
     if dom_node.as_element().is_none() {
@@ -147,7 +191,7 @@ impl RelationalInvalidation {
     }
 
     pub(crate) fn relative_path_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
-        let Some(dom_node) = tree.get_node(node) else {
+        let Some(dom_node) = tree.borrow_node(node) else {
             return false;
         };
         let Some(element) = dom_node.as_element() else {
@@ -200,9 +244,14 @@ pub struct InvalidationMap {
     adjacent_sibling_selectors: bool,
     general_sibling_selectors: bool,
     unkeyed_sibling_selectors: bool,
+    dynamic_attribute_reads: bool,
 }
 
 impl InvalidationMap {
+    pub(crate) fn has_dynamic_attribute_reads(&self) -> bool {
+        self.dynamic_attribute_reads
+    }
+
     pub fn id_dependencies(&self, id: &str) -> &[InvalidationDependency] {
         self.ids.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -281,7 +330,7 @@ impl InvalidationMap {
         {
             return true;
         }
-        let Some(node) = tree.get_node(node) else {
+        let Some(node) = tree.borrow_node(node) else {
             return false;
         };
         let reaches_sibling = |dependencies: &[InvalidationDependency]| {
@@ -616,17 +665,11 @@ fn invalidation_compounds(selector: &str) -> (Vec<(String, InvalidationReaches)>
     } else if compounds.is_empty() {
         malformed = true;
     }
-    let mut descendants_to_right = false;
-    for (_, reaches) in compounds.iter_mut().rev() {
-        if reaches.contains(InvalidationReaches::DESCENDANTS) {
-            descendants_to_right = true;
-        } else if descendants_to_right && reaches.contains(InvalidationReaches::SIBLINGS) {
-            // `.foo ~ .bar .child`: a change to `.foo` can affect descendants
-            // of following siblings. A flat Siblings reach is insufficient
-            // unless phase 2 also carries the remaining descendant path.
-            *reaches = reaches.union(InvalidationReaches::CONSERVATIVE);
-        }
-    }
+    // The renderer expands SIBLINGS into entire following-sibling subtrees.
+    // An ordinary chain such as `.foo ~ .bar .child` therefore remains within
+    // that scope: later combinators move only down or to later siblings.
+    // Nested selector-list composition still uses its separate conservative
+    // fallback when a flat reach cannot describe the outer continuation.
     (compounds, malformed)
 }
 
@@ -1315,6 +1358,22 @@ fn note_compound_dependencies(
                         );
                         map.mark_conservative(rule_order);
                     }
+                    "host" => {
+                        // The argument matches the shadow host from inside
+                        // its shadow tree, so key its dependencies but always
+                        // take the full fallback.
+                        map.push_state(name, rule_order, reaches);
+                        map.mark_conservative(rule_order);
+                        for alternative in split_selector_list(&arguments) {
+                            note_selector_dependencies(
+                                map,
+                                alternative.trim(),
+                                InvalidationReaches::CONSERVATIVE,
+                                rule_order,
+                                !inside_relational,
+                            );
+                        }
+                    }
                     _ => {
                         // A compiled functional pseudo outside the explicitly
                         // modeled set may hide selector or document state.
@@ -1389,6 +1448,16 @@ fn note_selector_for_invalidation(
 /// in the selector.  Keep this deliberately broader than the property parser;
 /// an extra self invalidation is cheap, while missing a supported `attr()`
 /// spelling would retain stale computed values.
+#[cfg(feature = "paint")]
+pub(crate) fn declaration_value_reads_attribute(value: &str, attribute: &str) -> bool {
+    if !value.as_bytes().windows(4).any(|part| part.eq_ignore_ascii_case(b"attr")) {
+        return false;
+    }
+    let mut dependencies = InvalidationMap::default();
+    note_declaration_attribute_dependencies(&mut dependencies, value, 0);
+    dependencies.has_dynamic_attribute_reads() || !dependencies.attribute_dependencies(attribute).is_empty()
+}
+
 fn note_declaration_attribute_dependencies(
     map: &mut InvalidationMap,
     declarations: &str,
@@ -1464,6 +1533,10 @@ fn note_declaration_attribute_dependencies(
             name_start += 1;
         }
         let (attribute, name_end) = consume_css_identifier(&chars, name_start);
+        if chars.get(name_end) == Some(&'(') {
+            // An attribute name supplied by var() is resolved at computed-value time.
+            map.dynamic_attribute_reads = true;
+        }
         if !attribute.is_empty() && name_end <= close {
             map.push_attribute(attribute, rule_order, InvalidationReaches::SELF);
         }
@@ -1507,6 +1580,7 @@ struct ContainerQuery {
 #[derive(Clone, Debug, PartialEq)]
 enum ContainerQueryExpr {
     Feature(ContainerSizeFeature),
+    Style { name: String, value: Option<String> },
     /// Syntactically valid future/general-enclosed syntax has Kleene
     /// `unknown` truth. Retaining it prevents one unknown comma arm from
     /// discarding supported alternatives in the same `@container` rule.
@@ -1592,9 +1666,9 @@ fn append_declaration_stream(target: &mut String, declarations: &str) {
 const NO_CANDIDATE_SLOT: u32 = u32::MAX;
 
 fn is_root_element(tree: &DomTree, nid: NodeId) -> bool {
-    tree.get_node(nid)
+    tree.borrow_node(nid)
         .and_then(|node| node.parent)
-        .and_then(|parent| tree.get_node(parent))
+        .and_then(|parent| tree.borrow_node(parent))
         .is_some_and(|parent| parent.is_document())
 }
 
@@ -1722,7 +1796,7 @@ impl PseudoRuleMap {
         if self.candidate_slot_count != 0 {
             matcher.begin_candidate_collection(self.candidate_slot_count);
         }
-        let Some(node) = tree.get_node(nid) else {
+        let Some(node) = tree.borrow_node(nid) else {
             return false;
         };
         node.as_element().is_some_and(|element| {
@@ -2111,9 +2185,23 @@ pub(crate) struct ContainerQueryStats {
     pub(crate) ancestor_steps: usize,
 }
 
+struct StyleQueryContainer {
+    id: NodeId,
+    container_type: crate::ContainerType,
+    names: Vec<String>,
+    props: std::rc::Rc<HashMap<String, String>>,
+}
+
+struct StyleQueryValues<'a> {
+    props: &'a HashMap<String, String>,
+    parent_props: Option<&'a HashMap<String, String>>,
+    registrations: &'a HashMap<String, RegisteredCustomProperty>,
+}
+
 pub(crate) struct ContainerQueryEvaluator<'a> {
     tree: &'a DomTree,
     snapshot: &'a ContainerSnapshot,
+    style_containers: Option<Vec<StyleQueryContainer>>,
     cache: HashMap<ContainerQueryCacheKey, ContainerQueryDecision>,
     stats: ContainerQueryStats,
 }
@@ -2123,8 +2211,33 @@ impl<'a> ContainerQueryEvaluator<'a> {
         Self {
             tree,
             snapshot,
+            style_containers: None,
             cache: HashMap::new(),
             stats: ContainerQueryStats::default(),
+        }
+    }
+
+    pub(crate) fn enable_style_queries(&mut self) {
+        self.style_containers = Some(Vec::new());
+    }
+
+    pub(crate) fn push_style_container(
+        &mut self, id: NodeId, style: &LayoutStyle,
+        props: &std::rc::Rc<HashMap<String, String>>,
+    ) {
+        if let Some(containers) = self.style_containers.as_mut() {
+            containers.push(StyleQueryContainer {
+                id, container_type: style.container_type,
+                names: style.container_names.clone(), props: props.clone(),
+            });
+        }
+    }
+
+    pub(crate) fn pop_style_container(&mut self, id: NodeId) {
+        if let Some(containers) = self.style_containers.as_mut() {
+            if containers.last().is_some_and(|container| container.id == id) {
+                containers.pop();
+            }
         }
     }
 
@@ -2176,7 +2289,7 @@ impl<'a> ContainerQueryEvaluator<'a> {
         let mut own_truth = ContainerQueryTruth::False;
         let mut selected_containers = Vec::with_capacity(node.alternatives.len());
         for query in &node.alternatives {
-            let (truth, selected) = self.evaluate_query(subject, kind, query);
+            let (truth, selected) = self.evaluate_query(sheet, subject, kind, query);
             own_truth = own_truth.or(truth);
             selected_containers.push(selected);
             if own_truth == ContainerQueryTruth::True {
@@ -2203,6 +2316,7 @@ impl<'a> ContainerQueryEvaluator<'a> {
 
     fn evaluate_query(
         &mut self,
+        sheet: &Stylesheet,
         subject: NodeId,
         kind: ContainerQuerySubjectKind,
         query: &ContainerQuery,
@@ -2212,15 +2326,50 @@ impl<'a> ContainerQueryEvaluator<'a> {
             .as_ref()
             .map(container_query_required_axes)
             .unwrap_or_default();
+        if required_axes.style {
+            if let Some(containers) = self.style_containers.as_ref() {
+                for (index, current) in containers.iter().enumerate().rev() {
+                    self.stats.ancestor_steps += 1;
+                    let supports_axis = match current.container_type {
+                        crate::ContainerType::Normal => !required_axes.inline && !required_axes.block,
+                        crate::ContainerType::InlineSize => !required_axes.block,
+                        crate::ContainerType::Size => true,
+                    };
+                    if !supports_axis || query.name.as_ref().is_some_and(|name|
+                        !current.names.iter().any(|item| item == name)) {
+                        continue;
+                    }
+                    let container = self.snapshot.boxes.get(&current.id);
+                    let axis_available = container.is_some_and(|container| match container.available_type {
+                        crate::ContainerType::Normal => !required_axes.inline && !required_axes.block,
+                        crate::ContainerType::InlineSize => !required_axes.block,
+                        crate::ContainerType::Size => true,
+                    });
+                    if (required_axes.inline || required_axes.block) && !axis_available {
+                        return (ContainerQueryTruth::Unknown, Some(current.id));
+                    }
+                    let values = StyleQueryValues {
+                        props: &current.props,
+                        parent_props: index.checked_sub(1).map(|parent| &*containers[parent].props),
+                        registrations: &sheet.registered_custom_properties,
+                    };
+                    return (evaluate_container_query_expr(
+                        query.condition.as_ref().expect("style query condition"), container,
+                        self.snapshot.root_font_size, Some(&values),
+                    ), Some(current.id));
+                }
+            }
+            return (ContainerQueryTruth::False, None);
+        }
         let mut candidate = match kind {
             ContainerQuerySubjectKind::Element => {
-                self.tree.get_node(subject).and_then(|node| node.parent)
+                self.tree.borrow_node(subject).and_then(|node| node.parent)
             }
             ContainerQuerySubjectKind::OriginatingPseudo => Some(subject),
         };
         while let Some(id) = candidate {
             self.stats.ancestor_steps += 1;
-            let parent = self.tree.get_node(id).and_then(|node| node.parent);
+            let parent = self.tree.borrow_node(id).and_then(|node| node.parent);
             if let Some(container) = self.snapshot.boxes.get(&id) {
                 let supports_axis = match container.container_type {
                     crate::ContainerType::Normal => !required_axes.inline && !required_axes.block,
@@ -2249,8 +2398,9 @@ impl<'a> ContainerQueryEvaluator<'a> {
                             .map_or(ContainerQueryTruth::True, |condition| {
                                 evaluate_container_query_expr(
                                     condition,
-                                    container,
+                                    Some(container),
                                     self.snapshot.root_font_size,
+                                    None,
                                 )
                             });
                     return (truth, Some(id));
@@ -2266,6 +2416,7 @@ impl<'a> ContainerQueryEvaluator<'a> {
 struct ContainerQueryRequiredAxes {
     inline: bool,
     block: bool,
+    style: bool,
 }
 
 fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryRequiredAxes {
@@ -2275,14 +2426,19 @@ fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryReq
                 ContainerQueryRequiredAxes {
                     inline: true,
                     block: false,
+                    style: false,
                 }
             }
             ContainerQueryAxis::Height | ContainerQueryAxis::BlockSize => {
                 ContainerQueryRequiredAxes {
                     inline: false,
                     block: true,
+                    style: false,
                 }
             }
+        },
+        ContainerQueryExpr::Style { .. } => ContainerQueryRequiredAxes {
+            style: true, ..Default::default()
         },
         ContainerQueryExpr::Unknown => ContainerQueryRequiredAxes::default(),
         ContainerQueryExpr::Not(inner) => container_query_required_axes(inner),
@@ -2293,6 +2449,7 @@ fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryReq
                     let item = container_query_required_axes(item);
                     axes.inline |= item.inline;
                     axes.block |= item.block;
+                    axes.style |= item.style;
                     axes
                 })
         }
@@ -2301,11 +2458,13 @@ fn container_query_required_axes(expr: &ContainerQueryExpr) -> ContainerQueryReq
 
 fn evaluate_container_query_expr(
     expr: &ContainerQueryExpr,
-    container: &ContainerBox,
+    container: Option<&ContainerBox>,
     root_font_size: f32,
+    style_values: Option<&StyleQueryValues<'_>>,
 ) -> ContainerQueryTruth {
     match expr {
         ContainerQueryExpr::Feature(feature) => {
+            let Some(container) = container else { return ContainerQueryTruth::Unknown };
             let actual = match feature.axis {
                 ContainerQueryAxis::Width | ContainerQueryAxis::InlineSize => {
                     container.content_width
@@ -2335,9 +2494,33 @@ fn evaluate_container_query_expr(
                 ContainerQueryTruth::False
             }
         }
+        ContainerQueryExpr::Style { name, value } => {
+            let Some(values) = style_values else { return ContainerQueryTruth::Unknown };
+            // shortcut: Typed registrations need retained computed values before their style queries can be evaluated.
+            if values.registrations.contains_key(name) {
+                return ContainerQueryTruth::Unknown;
+            }
+            let actual = values.props.get(name).map(|value| value.trim());
+            let matches = match value {
+                None => actual.is_some(),
+                Some(value) => {
+                    let computed = substitute_var_value(value, values.props, 0);
+                    let expected = computed.as_deref().map(str::trim);
+                    match expected {
+                        Some(value) if ["revert", "revert-layer", "revert-rule"].iter()
+                            .any(|keyword| value.eq_ignore_ascii_case(keyword)) => false,
+                        Some(value) if value.eq_ignore_ascii_case("initial") => actual.is_none(),
+                        Some(value) if value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset") => actual == values.parent_props
+                            .and_then(|props| props.get(name)).map(|value| value.trim()),
+                        _ => actual == expected,
+                    }
+                }
+            };
+            if matches { ContainerQueryTruth::True } else { ContainerQueryTruth::False }
+        }
         ContainerQueryExpr::Unknown => ContainerQueryTruth::Unknown,
         ContainerQueryExpr::Not(inner) => {
-            evaluate_container_query_expr(inner, container, root_font_size).not()
+            evaluate_container_query_expr(inner, container, root_font_size, style_values).not()
         }
         ContainerQueryExpr::And(items) => {
             let mut truth = ContainerQueryTruth::True;
@@ -2346,6 +2529,7 @@ fn evaluate_container_query_expr(
                     item,
                     container,
                     root_font_size,
+                    style_values,
                 ));
                 if truth == ContainerQueryTruth::False {
                     break;
@@ -2360,6 +2544,7 @@ fn evaluate_container_query_expr(
                     item,
                     container,
                     root_font_size,
+                    style_values,
                 ));
                 if truth == ContainerQueryTruth::True {
                     break;
@@ -2432,6 +2617,20 @@ struct CachedStylesheet {
 }
 
 impl StylesheetCache {
+    // A style-only read must not replace the key that validates retained layout
+    // styles. A miss goes through normal preparation before taking this path.
+    pub(crate) fn get(
+        &self,
+        sources: &[String],
+        viewport: (f32, f32),
+        media_type: CssMediaType,
+    ) -> Option<Arc<Stylesheet>> {
+        let entry = self.entry.as_ref()?;
+        (entry.viewport_bits == (viewport.0.to_bits(), viewport.1.to_bits())
+            && entry.media_type == media_type && entry.sources == sources)
+            .then(|| Arc::clone(&entry.sheet))
+    }
+
     pub(crate) fn get_or_parse(
         &mut self,
         tree: &DomTree,
@@ -2440,14 +2639,9 @@ impl StylesheetCache {
         media_type: CssMediaType,
     ) -> (Arc<Stylesheet>, bool) {
         let viewport_bits = (viewport.0.to_bits(), viewport.1.to_bits());
-        if let Some(entry) = self.entry.as_ref() {
-            if entry.viewport_bits == viewport_bits
-                && entry.media_type == media_type
-                && entry.sources == sources
-            {
-                self.hits = self.hits.saturating_add(1);
-                return (Arc::clone(&entry.sheet), true);
-            }
+        if let Some(sheet) = self.get(sources, viewport, media_type) {
+            self.hits = self.hits.saturating_add(1);
+            return (sheet, true);
         }
 
         self.misses = self.misses.saturating_add(1);
@@ -2519,6 +2713,29 @@ impl Stylesheet {
             .is_some_and(|evaluator| evaluator.condition_matches(self, subject, id, kind))
     }
 
+    pub(crate) fn animation_affects_non_geometric_style(&self, name: &str) -> bool {
+        // Only tracks exposed by the partial CSSOM snapshot require live sampling.
+        self.keyframes.get(name).is_some_and(|keyframes| {
+            keyframes.tracks.keys().any(|property| matches!(property,
+                AnimatedProperty::Opacity | AnimatedProperty::Color
+                    | AnimatedProperty::BackgroundColor | AnimatedProperty::Visibility
+            ))
+        })
+    }
+
+    pub(crate) fn has_style_container_queries(&self) -> bool {
+        self.container_conditions.iter().any(|node| node.alternatives.iter().any(|query|
+            query.condition.as_ref().is_some_and(|condition| container_query_required_axes(condition).style)))
+    }
+
+    pub(crate) fn has_geometry_container_queries(&self) -> bool {
+        self.container_conditions.iter().any(|node| node.alternatives.iter().any(|query|
+            query.condition.as_ref().map_or(true, |condition| {
+                let axes = container_query_required_axes(condition);
+                axes.inline || axes.block
+            })))
+    }
+
     pub(crate) fn has_container_queries(&self) -> bool {
         self.rules
             .iter()
@@ -2564,7 +2781,7 @@ impl Stylesheet {
         if self.candidate_slot_count != 0 {
             matcher.begin_candidate_collection(self.candidate_slot_count);
         }
-        let Some(node) = tree.get_node(nid) else {
+        let Some(node) = tree.borrow_node(nid) else {
             return false;
         };
         let normal_match = node.as_element().is_some_and(|element| {
@@ -3062,7 +3279,7 @@ impl Stylesheet {
                     }
                 };
 
-            if let Some(node) = tree.get_node(nid) {
+            if let Some(node) = tree.borrow_node(nid) {
                 if let Some(element) = node.as_element() {
                     consider(
                         rules.by_local.get(element.local.as_ref()),
@@ -3225,7 +3442,7 @@ impl Stylesheet {
             }
         };
         let supports_placeholder = tree
-            .get_node(nid)
+            .borrow_node(nid)
             .is_some_and(|node| {
                 node.as_element().is_some_and(|element| {
                     matches!(element.local.as_ref(), "input" | "textarea")
@@ -3452,6 +3669,7 @@ impl Stylesheet {
             None,
             animation_sample,
             animation_timeline,
+            false,
         )
     }
 
@@ -3519,6 +3737,7 @@ impl Stylesheet {
             Some(evaluator),
             animation_sample,
             animation_timeline,
+            false,
         )
     }
 
@@ -3543,6 +3762,7 @@ impl Stylesheet {
         evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
+        ancestor_display_none: bool,
     ) -> Option<HashMap<String, String>> {
         self.apply_internal(
             tree,
@@ -3559,6 +3779,7 @@ impl Stylesheet {
             evaluator,
             animation_sample,
             animation_timeline,
+            ancestor_display_none,
         )
     }
 
@@ -3578,6 +3799,7 @@ impl Stylesheet {
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
+        ancestor_display_none: bool,
     ) -> Option<HashMap<String, String>> {
         let shadow_host_declarations = shadow_host_sheet
             .map(|sheet| {
@@ -3688,7 +3910,7 @@ impl Stylesheet {
             );
         }
         if !self.by_attribute.is_empty() {
-            if let Some(node) = tree.get_node(nid) {
+            if let Some(node) = tree.borrow_node(nid) {
                 if let Some(attributes) = node.attrs() {
                     for attribute in attributes {
                         consider(
@@ -4014,35 +4236,24 @@ impl Stylesheet {
         if !self.keyframes.is_empty() && (style.animation_name.is_some() || important_has_animation)
         {
             let mut animation_style = style.clone();
+            // The winning display declaration participates in animation
+            // eligibility, including !important and shadow-scope declarations.
             for &(_, _, i) in &important_matched {
                 let rule = &self.rules[i];
-                if !rule.important_flags.has_animation {
-                    continue;
-                }
                 let expanded = substitute_declarations(
-                    &rule.important_decls,
-                    props,
-                    rule.important_flags.has_var,
+                    &rule.important_decls, props, rule.important_flags.has_var,
                 );
                 crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             }
-            if inline_important_flags.has_animation {
-                let expanded = substitute_declarations(
-                    &inline_important,
-                    props,
-                    inline_important_flags.has_var,
-                );
-                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-            }
-            if shadow_important_flags.has_animation {
-                let expanded = substitute_declarations(
-                    &shadow_scope_declarations.important,
-                    props,
-                    shadow_important_flags.has_var,
-                );
-                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-            }
-            if let Some(name) = animation_style.animation_name.as_deref() {
+            let expanded = substitute_declarations(&inline_important, props, inline_important_flags.has_var);
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            let expanded = substitute_declarations(
+                &shadow_scope_declarations.important, props, shadow_important_flags.has_var,
+            );
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            if ancestor_display_none || animation_style.display == crate::Display::None {
+                animation_timeline.suppress_css_animation(nid, animation_sample);
+            } else if let Some(name) = animation_style.animation_name.as_deref() {
                 if let Some(keyframes) = self.keyframes.get(name) {
                     style.animation_has_render_effect = !keyframes.tracks.is_empty();
                     style.animation_effect_impact = keyframes
@@ -5654,7 +5865,7 @@ fn parse_generated_content_items(
                     .next()
                     .filter(|name| !name.is_empty())?;
                 let value = tree
-                    .get_node(nid)
+                    .borrow_node(nid)
                     .and_then(|node| node.get_attribute(attribute).map(str::to_owned))
                     .unwrap_or_default();
                 items.push(crate::GeneratedContentItem::Text(value));
@@ -6324,7 +6535,8 @@ fn parse_container_query(input: &str) -> Option<ContainerQuery> {
         return None;
     }
     let starts_with_condition =
-        input.starts_with('(') || strip_ascii_keyword(input, "not").is_some();
+        input.starts_with('(') || strip_ascii_keyword(input, "not").is_some()
+            || input.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("style("));
     let (name, condition) = if starts_with_condition {
         (None, Some(input))
     } else if let Some(split) = input.find(char::is_whitespace) {
@@ -6374,14 +6586,19 @@ fn is_reserved_container_custom_ident(lower: &str) -> bool {
 const MAX_CONTAINER_QUERY_DEPTH: usize = 64;
 
 fn parse_container_query_expr(input: &str) -> Option<ContainerQueryExpr> {
-    parse_container_query_expr_at_depth(input, 0)
+    parse_container_query_expr_at_depth(input, 0, false)
 }
 
-fn parse_container_query_expr_at_depth(input: &str, depth: usize) -> Option<ContainerQueryExpr> {
+fn parse_container_query_expr_at_depth(input: &str, depth: usize, style: bool) -> Option<ContainerQueryExpr> {
     if depth >= MAX_CONTAINER_QUERY_DEPTH {
         return None;
     }
     let input = input.trim();
+    if style {
+        if let Some(feature) = parse_container_style_feature(input) {
+            return Some(feature);
+        }
+    }
     let or_parts = split_supports_operator(input, "or");
     let and_parts = split_supports_operator(input, "and");
     // One grammar level is either a homogeneous AND chain or a homogeneous OR
@@ -6393,7 +6610,7 @@ fn parse_container_query_expr_at_depth(input: &str, depth: usize) -> Option<Cont
         return Some(ContainerQueryExpr::Or(
             parts
                 .into_iter()
-                .map(|part| parse_container_query_in_parens(part, depth + 1))
+                .map(|part| parse_container_query_in_parens(part, depth + 1, style))
                 .collect::<Option<_>>()?,
         ));
     }
@@ -6401,29 +6618,71 @@ fn parse_container_query_expr_at_depth(input: &str, depth: usize) -> Option<Cont
         return Some(ContainerQueryExpr::And(
             parts
                 .into_iter()
-                .map(|part| parse_container_query_in_parens(part, depth + 1))
+                .map(|part| parse_container_query_in_parens(part, depth + 1, style))
                 .collect::<Option<_>>()?,
         ));
     }
     if let Some(rest) = strip_ascii_keyword(input, "not") {
         return Some(ContainerQueryExpr::Not(Box::new(
-            parse_container_query_in_parens(rest, depth + 1)?,
+            parse_container_query_in_parens(rest, depth + 1, style)?,
         )));
     }
-    parse_container_query_in_parens(input, depth + 1)
+    parse_container_query_in_parens(input, depth + 1, style)
 }
 
-fn parse_container_query_in_parens(input: &str, depth: usize) -> Option<ContainerQueryExpr> {
+fn parse_container_query_in_parens(input: &str, depth: usize, style: bool) -> Option<ContainerQueryExpr> {
     if depth >= MAX_CONTAINER_QUERY_DEPTH {
         return None;
     }
-    let inner = enclosing_parenthesized(input)?;
-    if let Some(feature) = parse_container_size_feature(inner) {
-        return Some(feature);
+    if !style && input.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("style(")) {
+        let inner = enclosing_parenthesized(&input[5..])?;
+        return Some(parse_container_query_expr_at_depth(inner, depth + 1, true)
+            .unwrap_or(ContainerQueryExpr::Unknown));
     }
-    parse_container_query_expr_at_depth(inner, depth + 1).or_else(|| {
+    let inner = enclosing_parenthesized(input)?;
+    if !style {
+        if let Some(feature) = parse_container_size_feature(inner) {
+            return Some(feature);
+        }
+    }
+    parse_container_query_expr_at_depth(inner, depth + 1, style).or_else(|| {
         is_general_enclosed_container_query(inner).then_some(ContainerQueryExpr::Unknown)
     })
+}
+
+fn parse_container_style_feature(input: &str) -> Option<ContainerQueryExpr> {
+    let mut source = cssparser::ParserInput::new(input);
+    let mut parser = cssparser::Parser::new(&mut source);
+    let name = parser.expect_ident_cloned().ok()?.to_string();
+    if !name.starts_with("--") || name.len() <= 2 { return None; }
+    if parser.is_exhausted() {
+        return Some(ContainerQueryExpr::Style { name, value: None });
+    }
+    parser.expect_colon().ok()?;
+    let start = parser.position();
+    let mut end = start;
+    while !parser.is_exhausted() {
+        let position = parser.position();
+        if parser.try_parse(cssparser::parse_important).is_ok() {
+            if !parser.is_exhausted() { return None; }
+            end = position;
+            break;
+        }
+        match parser.next_including_whitespace_and_comments().ok()? {
+            cssparser::Token::Semicolon | cssparser::Token::Delim('!' | '<' | '>' | '=')
+                | cssparser::Token::BadString(_) | cssparser::Token::BadUrl(_) => return None,
+            cssparser::Token::Function(_) | cssparser::Token::ParenthesisBlock
+                | cssparser::Token::SquareBracketBlock | cssparser::Token::CurlyBracketBlock => {
+                parser.parse_nested_block(|inner| {
+                    while inner.next_including_whitespace_and_comments().is_ok() {}
+                    Ok::<(), cssparser::ParseError<'_, ()>>(())
+                }).ok()?;
+            }
+            _ => {}
+        }
+        end = parser.position();
+    }
+    Some(ContainerQueryExpr::Style { name, value: Some(parser.slice(start..end).trim().to_string()) })
 }
 
 fn is_general_enclosed_container_query(input: &str) -> bool {
@@ -6850,8 +7109,8 @@ fn single_media_query_applies_for_viewport(
     let medium = compact.split_once("and").map_or(compact, |(medium, _)| medium);
     let medium_matches = match medium {
         "all" => true,
-        "screen" => media_type == CssMediaType::Screen,
-        "print" => media_type == CssMediaType::Print,
+        "screen" => !media_type.is_print(),
+        "print" => media_type.is_print(),
         medium if medium.starts_with('(') => true,
         // Unknown named media such as `speech` do not match either visual
         // rendering mode.
@@ -6861,15 +7120,18 @@ fn single_media_query_applies_for_viewport(
         return false;
     }
 
-    // Color-scheme: we render the light (default) context. A site's
-    // `@media (prefers-color-scheme: dark)` block must NOT apply on top of its
-    // light defaults (that is what was leaking dark backgrounds, e.g. near
-    // black inline <code>); a `:light` block should apply.
-    if compact.contains("prefers-color-scheme:dark") {
-        return false;
+    for feature in compact.split('(') {
+        if let Some(value) = feature.strip_prefix("prefers-color-scheme:") {
+            let value = value.split(')').next().unwrap_or(value);
+            let expected = if media_type.dark_color_scheme() { "dark" } else { "light" };
+            if value != expected {
+                return false;
+            }
+        }
     }
     // Reduced-motion / high-contrast / inverted: default (no preference).
-    if compact.contains("prefers-reduced-motion:reduce")
+    if (compact.contains("prefers-reduced-motion:reduce") && !media_type.reduced_motion())
+        || (compact.contains("prefers-reduced-motion:no-preference") && media_type.reduced_motion())
         || compact.contains("prefers-contrast:more")
         || compact.contains("prefers-contrast:less")
         || compact.contains("inverted-colors:inverted")
@@ -7636,7 +7898,7 @@ mod tests {
             trigger,
             InvalidationReaches::SIBLINGS,
         ));
-        assert!(dependencies_reach(
+        assert!(!dependencies_reach(
             trigger,
             InvalidationReaches::CONSERVATIVE,
         ));
@@ -7702,7 +7964,10 @@ mod tests {
         assert!(!entries[2].text_side_effect);
         assert!(entries[3].structural_side_effect);
         assert!(entries[3].text_side_effect);
-        assert!(entries[4].unrepresentable_outer_path);
+        assert!(entries[4]
+            .anchor_reaches
+            .contains(InvalidationReaches::SIBLINGS));
+        assert!(!entries[4].unrepresentable_outer_path);
 
         let tree = obscura_dom::parse_html(
             "<section id=host class=host></section><section id=other class=other></section>",
@@ -9935,32 +10200,36 @@ mod tests {
         assert_eq!(
             evaluate_container_query_expr(
                 &ContainerQueryExpr::Or(vec![min_width(100.0), ContainerQueryExpr::Unknown,]),
-                &container,
+                Some(&container),
                 16.0,
+                None,
             ),
             ContainerQueryTruth::True
         );
         assert_eq!(
             evaluate_container_query_expr(
                 &ContainerQueryExpr::And(vec![min_width(300.0), ContainerQueryExpr::Unknown,]),
-                &container,
+                Some(&container),
                 16.0,
+                None,
             ),
             ContainerQueryTruth::False
         );
         assert_eq!(
             evaluate_container_query_expr(
                 &ContainerQueryExpr::Or(vec![min_width(300.0), ContainerQueryExpr::Unknown,]),
-                &container,
+                Some(&container),
                 16.0,
+                None,
             ),
             ContainerQueryTruth::Unknown
         );
         assert_eq!(
             evaluate_container_query_expr(
                 &ContainerQueryExpr::Not(Box::new(ContainerQueryExpr::Unknown)),
-                &container,
+                Some(&container),
                 16.0,
+                None,
             ),
             ContainerQueryTruth::Unknown
         );
@@ -9980,7 +10249,7 @@ mod tests {
         ] {
             let expression = parse_container_query_expr(query).expect("valid range query");
             assert_eq!(
-                evaluate_container_query_expr(&expression, &container, 16.0),
+                evaluate_container_query_expr(&expression, Some(&container), 16.0, None),
                 ContainerQueryTruth::True,
                 "{query}"
             );
@@ -9993,7 +10262,7 @@ mod tests {
         ] {
             let expression = parse_container_query_expr(query).expect("valid range query");
             assert_eq!(
-                evaluate_container_query_expr(&expression, &container, 16.0),
+                evaluate_container_query_expr(&expression, Some(&container), 16.0, None),
                 ContainerQueryTruth::False,
                 "{query}"
             );
@@ -10252,6 +10521,30 @@ mod tests {
             left_height_calc,
             (1280.0, 705.0)
         ));
+    }
+
+    #[test]
+    fn media_color_scheme_preserves_motion_and_medium() {
+        for medium in [CssMediaType::Screen, CssMediaType::Print] {
+            for reduce in [false, true] {
+                for dark in [false, true] {
+                    let media = medium.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+                    assert_eq!(media.reduced_motion(), reduce);
+                    assert_eq!(media.is_print(), medium.is_print());
+                    assert_eq!(media.dark_color_scheme(), dark);
+                    let applies = |q| media_query_applies_for_viewport_and_type(q, (800.0, 600.0), media);
+                    assert_eq!(applies("(prefers-color-scheme:dark)"), dark);
+                    assert_eq!(applies("(prefers-color-scheme:light)"), !dark);
+                    assert!(!applies("(prefers-color-scheme:no-preference)"));
+                    assert!(!applies("(prefers-color-scheme:invalid)"));
+                    assert!(applies("(prefers-color-scheme)"));
+                    assert_eq!(applies("not all and (prefers-color-scheme:dark)"), !dark);
+                    assert_eq!(applies("(prefers-color-scheme:dark) and (prefers-reduced-motion:reduce)"), dark && reduce);
+                    assert!(applies("(prefers-color-scheme:light), (prefers-color-scheme:dark)"));
+                    assert_eq!(media.with_dark_color_scheme(!dark).with_reduced_motion(!reduce).is_print(), medium.is_print());
+                }
+            }
+        }
     }
 
     #[test]

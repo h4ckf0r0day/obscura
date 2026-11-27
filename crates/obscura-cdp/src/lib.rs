@@ -6,8 +6,15 @@ pub mod domains;
 pub mod cookie_params;
 pub(crate) mod util;
 
+#[cfg(test)]
+mod partial_document_tests;
+
+#[cfg(test)]
+mod partial_document_ws_tests;
+
 pub use server::{
     start, start_with_full_options, start_with_full_serve_options, start_with_host,
-    start_with_host_and_security, start_with_options, start_with_serve_options_and_limit,
+    start_with_host_and_security, start_with_options,
+    start_with_serve_options_and_limit, start_with_serve_options_limit_and_ready_file,
     DEFAULT_MAX_CONNECTIONS,
 };

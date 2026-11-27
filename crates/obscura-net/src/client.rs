@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -12,7 +12,7 @@ use reqwest::{Client, Method};
 use tokio::sync::{RwLock, watch};
 use url::Url;
 
-use crate::cookies::CookieJar;
+use crate::cookies::{same_site, CookieJar, SameSiteContext};
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
 fn configured_root_paths() -> Vec<std::path::PathBuf> {
@@ -116,6 +116,28 @@ impl Response {
     }
 }
 
+/// Fold one response header line into the collected header map.
+///
+/// A plain `HashMap` insert keeps only the *last* value when a response repeats
+/// a header name (`Link`, `Via`, `WWW-Authenticate`, ...), silently dropping the
+/// earlier lines. Per RFC 9110 §5.3 duplicate field lines of the same name may
+/// be combined into one comma-separated value without changing semantics.
+/// `Set-Cookie` is the exception (RFC 6265 forbids folding it): it is captured
+/// individually by the cookie jar via `get_all`, so the map keeps it only as a
+/// presence signal and last-wins there is fine.
+pub(crate) fn merge_response_header(map: &mut HashMap<String, String>, name: String, value: String) {
+    if name == "set-cookie" {
+        map.insert(name, value);
+        return;
+    }
+    map.entry(name)
+        .and_modify(|existing| {
+            existing.push_str(", ");
+            existing.push_str(&value);
+        })
+        .or_insert(value);
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
     pub url: Url,
@@ -184,6 +206,11 @@ pub struct ResourceRequest {
 }
 
 impl ResourceRequest {
+    /// Navigate with metadata and cookie context derived from the owning document.
+    pub fn navigation_from_document(initiator: &Url) -> Self {
+        Self::subresource(ResourceType::Document, initiator)
+    }
+
     pub fn navigation() -> Self {
         Self {
             resource_type: ResourceType::Document,
@@ -242,7 +269,13 @@ impl ResourceRequest {
             referrer: Some(referrer.clone()),
             mode: RequestMode::Cors,
             credentials: RequestCredentials::SameOrigin,
-            max_response_bytes: 32 * 1024 * 1024,
+            // OBSCURA_FETCH_MAX_BODY_BYTES (the fetch()/XHR override from #581)
+            // also raises this cap: a large SPA bundle otherwise dies silently
+            // at 32 MiB while fetch() of the same URL succeeds (#849).
+            max_response_bytes: std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32 * 1024 * 1024),
         }
     }
 
@@ -266,10 +299,8 @@ impl ResourceRequest {
         match self.resource_type {
             ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             ResourceType::Stylesheet => "text/css,*/*;q=0.1",
-            // AVIF is intentionally omitted until obscura's decoder can paint
-            // it. Advertising a format and then discarding the selected body
-            // is less faithful than negotiating the best format we can use.
-            ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            // Wildcards also permit AVIF/JXL, which the renderer cannot decode.
+            ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/png,image/jpeg,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon",
             ResourceType::Script
             | ResourceType::Font
             | ResourceType::Xhr
@@ -407,11 +438,11 @@ pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
     }
 }
 
-pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
+pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url, redirect_tainted: bool) -> &'static str {
     let Some(initiator) = request.initiator.as_ref() else {
         return "none";
     };
-    if initiator.origin() == target.origin() {
+    if !redirect_tainted && initiator.origin() == target.origin() {
         "same-origin"
     } else {
         // A public-suffix-aware `same-site` classification will be added with
@@ -421,11 +452,41 @@ pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'s
     }
 }
 
-pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
-    let source = request
-        .referrer
-        .as_ref()
-        .or(request.initiator.as_ref())?;
+pub(crate) fn request_origin_header<'a>(
+    request: &ResourceRequest, target: &Url, serialized_origin: &'a str, method_is_safe: bool,
+) -> Option<&'a str> {
+    if cors_required(request, target) {
+        return Some(serialized_origin);
+    }
+    if request.mode != RequestMode::Navigate || method_is_safe || request.initiator.is_none() {
+        return None;
+    }
+    if request.initiator.as_ref().is_some_and(|source| source.scheme() == "https" && target.scheme() == "http") {
+        Some("null")
+    } else {
+        Some(serialized_origin)
+    }
+}
+
+pub(crate) fn same_site_context(
+    request: &ResourceRequest,
+    target: &Url,
+    method_is_safe: bool,
+) -> SameSiteContext {
+    let Some(initiator) = request.initiator.as_ref() else {
+        return SameSiteContext::SameSite;
+    };
+    if same_site(initiator, target) {
+        SameSiteContext::SameSite
+    } else if request.mode == RequestMode::Navigate && method_is_safe {
+        SameSiteContext::CrossSiteTopLevelSafe
+    } else {
+        SameSiteContext::CrossSite
+    }
+}
+
+pub(crate) fn request_referrer(source: Option<&Url>, target: &Url) -> Option<String> {
+    let source = source?;
     if !matches!(source.scheme(), "http" | "https")
         || !matches!(target.scheme(), "http" | "https")
         || (source.scheme() == "https" && target.scheme() == "http")
@@ -547,115 +608,7 @@ impl Default for CallbackRegistry {
     }
 }
 
-/// Process-wide opt-in via env var. Older flow that issue #4 introduced. The
-/// new `--allow-private-network` CLI flag (issue #33) sets a per-client field
-/// that is OR'd with this so existing scripts and Docker setups that pin the
-/// env var keep working unchanged.
-pub fn env_allows_private_network() -> bool {
-    matches!(
-        std::env::var("OBSCURA_ALLOW_PRIVATE_NETWORK")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
-/// True when `ip` must never be the target of an outbound request from the
-/// engine: loopback, RFC1918 private, link-local (incl. the 169.254.169.254
-/// cloud-metadata endpoint), broadcast, documentation, the unspecified address
-/// (0.0.0.0 / ::, which the OS routes to localhost), IPv6 unique-local
-/// (fc00::/7), and any IPv4-mapped/compatible IPv6 form of the above.
-/// Centralizes the SSRF deny-set so the literal-host check and the
-/// DNS-resolution check (`SsrfGuardResolver`) can never disagree.
-pub fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || o[0] == 0
-                // std's is_private() covers only RFC1918, so add the IANA
-                // special-purpose ranges that also host internal services and
-                // are common SSRF targets:
-                //   100.64.0.0/10  CGNAT / RFC6598 — cloud metadata (e.g.
-                //                  Alibaba 100.100.100.200) lives here.
-                //   198.18.0.0/15  benchmarking / RFC2544.
-                //   192.88.99.0/24 6to4 relay anycast / RFC7526.
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-                // Most of 192.0.0.0/24 is special-purpose and not globally
-                // reachable. Keep the two globally reachable PCP anycast
-                // assignments usable rather than blocking the entire /24.
-                || (o[0] == 192
-                    && o[1] == 0
-                    && o[2] == 0
-                    && o[3] != 9
-                    && o[3] != 10)
-                // 240.0.0.0/4 is reserved (255.255.255.255 was already
-                // covered by is_broadcast()).
-                || o[0] >= 240
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || v6.is_multicast()
-            {
-                return true;
-            }
-            // Unwrap IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
-            // forms and re-check the embedded v4 so e.g. [::ffff:127.0.0.1] or
-            // [::ffff:169.254.169.254] cannot slip past the v6 arm.
-            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
-                return is_forbidden_ip(IpAddr::V4(v4));
-            }
-
-            let s = v6.segments();
-            // IPv4/IPv6 translation prefix (RFC 6052). Only /96 has a fixed
-            // embedded-address position; the local-use /48 is therefore
-            // blocked outright below.
-            if s[0] == 0x64
-                && s[1] == 0xff9b
-                && s[2] == 0
-                && s[3] == 0
-                && s[4] == 0
-                && s[5] == 0
-            {
-                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
-                    (s[6] >> 8) as u8,
-                    s[6] as u8,
-                    (s[7] >> 8) as u8,
-                    s[7] as u8,
-                )));
-            }
-            // 6to4 carries its IPv4 endpoint in bits 16..48.
-            if s[0] == 0x2002 {
-                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
-                    (s[1] >> 8) as u8,
-                    s[1] as u8,
-                    (s[2] >> 8) as u8,
-                    s[2] as u8,
-                )));
-            }
-
-            // Discard-only, local-use NAT64, and documentation prefixes.
-            (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
-                || (s[0] == 0x2001 && s[1] == 0x0db8)
-                || (s[0] == 0x3fff && s[1] & 0xf000 == 0)
-        }
-    }
-}
+pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip};
 
 /// DNS resolver that performs the lookup and then rejects the whole request if
 /// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
@@ -689,12 +642,11 @@ impl Resolve for SsrfGuardResolver {
                 .collect();
             if !allow {
                 if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
-                    return Err(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "SSRF blocked: '{}' resolves to forbidden address {}",
                         host,
                         bad.ip()
-                    )
-                    .into());
+                    )).into());
                 }
             }
             let iter: Addrs = Box::new(addrs.into_iter());
@@ -721,7 +673,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
         match host {
             url::Host::Ipv4(ip) => {
                 if is_forbidden_ip(IpAddr::V4(ip)) {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
                     )));
@@ -729,12 +681,17 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
             }
             url::Host::Ipv6(ip) => {
                 if is_forbidden_ip(IpAddr::V6(ip)) {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip
                     )));
                 }
             }
+            // Octal, hex, decimal and overlong IPv4 spellings ("0x7f000001",
+            // "0177.0.0.1", "2130706433") never reach this arm: for the http
+            // and https schemes the url crate normalizes them to Host::Ipv4,
+            // which is checked above. This arm is a belt-and-braces check on
+            // names, and the resolver re-checks whatever the name resolves to.
             url::Host::Domain(domain) => {
                 let lower_domain = domain.to_lowercase();
                 if lower_domain == "localhost"
@@ -742,7 +699,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                     || lower_domain == "127.0.0.1"
                     || lower_domain == "::1"
                 {
-                    return Err(ObscuraNetError::Network(format!(
+                    return Err(ObscuraNetError::Blocked(format!(
                         "Access to localhost domain '{}' is not allowed",
                         domain
                     )));
@@ -754,10 +711,18 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
     Ok(())
 }
 
+/// The only reader of local files in the net layer. It checks the opt-in
+/// itself so a new caller cannot read `file://` by forgetting the gate.
 pub(crate) async fn fetch_file_url(
     url: &Url,
     max_response_bytes: usize,
+    allow_file_access: bool,
 ) -> Result<Response, ObscuraNetError> {
+    if !allow_file_access {
+        return Err(ObscuraNetError::Network(format!(
+            "file:// access is disabled (requires --allow-file-access): {url}"
+        )));
+    }
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
@@ -869,27 +834,51 @@ fn reject_oversized_content_length(
     Ok(())
 }
 
-async fn read_reqwest_body_limited(
-    mut response: reqwest::Response,
+/// Read a response with a cap on both advertised and decoded body bytes.
+pub async fn read_reqwest_body_limited(
+    response: reqwest::Response,
     url: &Url,
     limit: usize,
 ) -> Result<Vec<u8>, ObscuraNetError> {
-    reject_oversized_content_length(response.headers(), url, limit)?;
+    let mut body = Vec::new();
+    read_reqwest_body_into(response, url, limit, &mut body).await.map_err(|failure| failure.error)?;
+    Ok(body)
+}
+
+pub(crate) struct BodyReadFailure {
+    pub error: ObscuraNetError,
+    pub timeout: bool,
+}
+
+impl BodyReadFailure {
+    pub(crate) fn failed(error: ObscuraNetError) -> Self { Self { error, timeout: false } }
+}
+
+async fn read_reqwest_body_into(
+    mut response: reqwest::Response,
+    url: &Url,
+    limit: usize,
+    body: &mut Vec<u8>,
+) -> Result<(), BodyReadFailure> {
+    reject_oversized_content_length(response.headers(), url, limit).map_err(BodyReadFailure::failed)?;
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(0)
         .min(limit);
-    let mut body = Vec::with_capacity(capacity);
+    body.reserve_exact(capacity);
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error))
+        BodyReadFailure {
+            timeout: error.is_timeout(),
+            error: ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error))),
+        }
     })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
-            return Err(response_too_large(url, limit));
+            return Err(BodyReadFailure::failed(response_too_large(url, limit)));
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(())
 }
 
 pub struct ObscuraHttpClient {
@@ -908,6 +897,9 @@ pub struct ObscuraHttpClient {
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+    /// Lets `fetch_file_url` read local files. Off by default. Atomic because
+    /// `BrowserContext` flips it after the client is already shared.
+    allow_file_access: AtomicBool,
 }
 
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
@@ -984,6 +976,7 @@ impl ResourceCache {
         if entry.expires_at <= Instant::now() {
             let expired = self.entries.remove(key)?;
             self.body_bytes = self.body_bytes.saturating_sub(expired.response.body.len());
+            self.insertion_order.retain(|queued| queued != key);
             return None;
         }
         Some(entry.response.clone())
@@ -1020,7 +1013,20 @@ impl ResourceCache {
     }
 }
 
-fn response_cache_lifetime(response: &Response) -> Option<Duration> {
+fn response_cache_lifetime(response: &Response, response_delay: Duration) -> Option<Duration> {
+    response_cache_lifetime_with_clock(response, response_delay, || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|time| time.as_secs())
+    })
+}
+
+fn response_cache_lifetime_with_clock(
+    response: &Response,
+    response_delay: Duration,
+    now: impl FnOnce() -> Option<u64>,
+) -> Option<Duration> {
     if !(200..300).contains(&response.status)
         || !response.redirected_from.is_empty()
         || response.header("set-cookie").is_some()
@@ -1030,20 +1036,71 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
     {
         return None;
     }
-    let cache_control = response.header("cache-control")?;
-    let mut max_age = None;
-    for directive in cache_control.split(',').map(str::trim) {
-        let lower = directive.to_ascii_lowercase();
-        if lower == "no-store" || lower == "no-cache" {
-            return None;
+    if let Some(cache_control) = response.header("cache-control") {
+        let mut max_age = None;
+        for directive in cache_control.split(',').map(str::trim) {
+            let (name, value) = match directive.split_once('=') {
+                Some((name, value)) => (name.trim(), Some(value.trim())),
+                None => (directive, None),
+            };
+            if name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache") {
+                // Qualified no-cache would require stripping or validating fields.
+                return None;
+            }
+            if name.eq_ignore_ascii_case("max-age") {
+                let value = value?;
+                let value = if value.starts_with('"') { value.strip_prefix('"')?.strip_suffix('"')? } else { value };
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                let seconds = value.parse::<u64>().ok()?;
+                // Invalid or repeated explicit freshness must not enable heuristics.
+                if max_age.replace(seconds).is_some() {
+                    return None;
+                }
+            }
         }
-        if let Some(value) = lower.strip_prefix("max-age=") {
-            max_age = value.trim_matches('"').parse::<u64>().ok();
+        if let Some(seconds) = max_age {
+            return (seconds > 0).then(|| Duration::from_secs(seconds));
         }
     }
-    max_age
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
+    heuristic_cache_lifetime(response, now()?, response_delay)
+}
+
+/// Upper bound for a heuristic lifetime, so a file last changed years ago is
+/// still re-checked at least daily.
+const HEURISTIC_FRESHNESS_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// RFC 9111 4.2.2: with no explicit expiry a cache may assign a heuristic
+/// freshness lifetime. Browsers use 10% of the time since Last-Modified, so
+/// servers that send only Last-Modified for static files (common on older
+/// stacks) do not get every script re-downloaded on each navigation.
+fn heuristic_cache_lifetime(response: &Response, now: u64, response_delay: Duration) -> Option<Duration> {
+    // Heuristically cacheable 2xx codes (RFC 9110 15.1).
+    if !matches!(response.status, 200 | 203 | 204 | 206) {
+        return None;
+    }
+    // An explicit Expires is not evaluated here; stay uncached rather than
+    // second-guess it with a heuristic.
+    if response.header("expires").is_some() {
+        return None;
+    }
+    let last_modified = crate::cookies::parse_http_date(response.header("last-modified")?).ok()?;
+    // An unparsed Date must not make an old response look newly generated.
+    let date = match response.header("date") {
+        Some(value) => crate::cookies::parse_http_date(value).ok()?,
+        None => now,
+    };
+    let lifetime = Duration::from_secs(date.checked_sub(last_modified)? / 10).min(HEURISTIC_FRESHNESS_CAP);
+    // Freshness is measured from origin generation/validation, not cache insertion.
+    let age = match response.header("age") {
+        Some(value) => value.parse::<u64>().ok()?,
+        None => 0,
+    };
+    let current_age = Duration::from_secs(now.saturating_sub(date))
+        .max(Duration::from_secs(age).checked_add(response_delay)?);
+    let lifetime = lifetime.checked_sub(current_age)?;
+    (!lifetime.is_zero()).then_some(lifetime)
 }
 
 /// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
@@ -1119,7 +1176,16 @@ impl ObscuraHttpClient {
             block_trackers: false,
             resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
+            allow_file_access: AtomicBool::new(false),
         }
+    }
+
+    pub fn allow_file_access(&self) -> bool {
+        self.allow_file_access.load(Ordering::Relaxed)
+    }
+
+    pub fn set_allow_file_access(&self, allow: bool) {
+        self.allow_file_access.store(allow, Ordering::Relaxed);
     }
 
     async fn get_client(&self) -> &Client {
@@ -1128,6 +1194,9 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
+                // Read a folded header line (obs-fold) as browsers do instead of
+                // failing the response.
+                .http1_allow_obsolete_multiline_headers_in_responses(true)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
@@ -1228,6 +1297,17 @@ impl ObscuraHttpClient {
             .await
     }
 
+    /// Continue an intercepted subresource with request-local overrides.
+    pub async fn fetch_resource_request_with_callbacks(
+        &self, url: &Url, request: ResourceRequest, method: &str,
+        body: Option<Vec<u8>>, headers: Option<HashMap<String, String>>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
+    }
+
     async fn resource_cache_key(
         &self,
         method: &Method,
@@ -1260,7 +1340,12 @@ impl ObscuraHttpClient {
         }) {
             return None;
         }
-        if request.sends_credentials_to(url) && !self.cookie_jar.get_cookie_header(url).is_empty() {
+        if request.sends_credentials_to(url)
+            && !self
+                .cookie_jar
+                .get_cookie_header_in_context(url, SameSiteContext::SameSite)
+                .is_empty()
+        {
             return None;
         }
         Some(ResourceCacheKey {
@@ -1368,6 +1453,7 @@ impl ObscuraHttpClient {
                     sender,
                     finished: false,
                 };
+                let request_started = Instant::now();
                 let result = self
                     .fetch_with_profile_uncached(
                         initial_method,
@@ -1378,7 +1464,7 @@ impl ObscuraHttpClient {
                     )
                     .await;
                 let shared_outcome = match &result {
-                    Ok(response) => match response_cache_lifetime(response) {
+                    Ok(response) => match response_cache_lifetime(response, request_started.elapsed()) {
                         Some(lifetime) => {
                             self.resource_loader.lock().unwrap().cache.insert(
                                 cache_key,
@@ -1428,11 +1514,41 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request_uncached(initial_method, url, initial_body, callbacks, request, None).await
+    }
+
+    /// A navigation continued by an interceptor uses request-local overrides.
+    pub async fn fetch_navigation_request(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_navigation_request_from_document(url, method, body, headers, None, callbacks).await
+    }
+
+    /// Fetch a navigation with an optional owning document, retaining it across redirects.
+    pub async fn fetch_navigation_request_from_document(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, initiator: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        let request = initiator.map(ResourceRequest::navigation_from_document)
+            .unwrap_or_else(ResourceRequest::navigation);
+        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
+    }
+
+    async fn fetch_request_uncached(
+        &self, initial_method: Method, url: &Url, initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>, request: ResourceRequest,
+        mut request_headers: Option<HashMap<String, String>>,
+    ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
+        let document_request = crate::DocumentRequest::claim(request.resource_type);
 
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            return fetch_file_url(url, request.max_response_bytes, self.allow_file_access()).await;
         }
 
         let mut method = initial_method;
@@ -1461,6 +1577,7 @@ impl ObscuraHttpClient {
         // total and thus followed only 19 (WPT redirect-count: 20 must pass).
         let max_redirects = 20;
         let mut redirect_tainted = false;
+        let mut referrer = request.referrer.clone().or_else(|| request.initiator.clone());
         let mut request_callback_fired = false;
 
         for _redirect_count in 0..=max_redirects {
@@ -1468,7 +1585,7 @@ impl ObscuraHttpClient {
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: match request_headers.as_ref() { Some(headers) => headers.clone(), None => self.extra_headers.read().await.clone() },
                 resource_type: request.resource_type.clone(),
             };
 
@@ -1524,7 +1641,7 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static(request_fetch_site(&request, &current_url)),
+                HeaderValue::from_static(request_fetch_site(&request, &current_url, redirect_tainted)),
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-mode"),
@@ -1537,8 +1654,9 @@ impl ObscuraHttpClient {
                 HeaderName::from_static("sec-fetch-dest"),
                 HeaderValue::from_static(request.destination()),
             );
-            if let Some(referer) = request_referrer(&request, &current_url) {
-                if let Ok(value) = HeaderValue::from_str(&referer) {
+            let referer = request_referrer(referrer.as_ref(), &current_url);
+            if let Some(referer) = &referer {
+                if let Ok(value) = HeaderValue::from_str(referer) {
                     headers.insert(reqwest::header::REFERER, value);
                 }
             }
@@ -1551,7 +1669,14 @@ impl ObscuraHttpClient {
             }
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
-                self.cookie_jar.get_cookie_header(&current_url)
+                self.cookie_jar.get_cookie_header_in_context(
+                    &current_url,
+                    same_site_context(
+                        &request,
+                        &current_url,
+                        matches!(method, Method::GET | Method::HEAD),
+                    ),
+                )
             } else {
                 String::new()
             };
@@ -1585,7 +1710,9 @@ impl ObscuraHttpClient {
                 }
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            let extra_headers = self.extra_headers.read().await;
+            let supplied = request_headers.as_ref();
+            for (k, v) in supplied.unwrap_or(&extra_headers).iter() {
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -1595,19 +1722,21 @@ impl ObscuraHttpClient {
             }
             // Origin is a forbidden browser request header. Keep it derived
             // from the initiator even when callers supplied extra headers.
-            if cors_required(&request, &current_url) {
-                if let Ok(value) = HeaderValue::from_str(&request_origin) {
-                    headers.insert(reqwest::header::ORIGIN, value);
-                }
+            if let Some(origin) = request_origin_header(&request, &current_url, &request_origin, matches!(method, Method::GET | Method::HEAD)) {
+                let value = HeaderValue::from_str(origin)
+                    .map_err(|error| ObscuraNetError::Network(format!("Invalid request origin: {error}")))?;
+                headers.insert(reqwest::header::ORIGIN, value);
             } else {
                 headers.remove(reqwest::header::ORIGIN);
             }
 
+            drop(extra_headers);
+            let default_form_type = method == Method::POST && !headers.contains_key(reqwest::header::CONTENT_TYPE);
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
-                if method == Method::POST {
+                if default_form_type {
                     req_builder = req_builder.header(
                         reqwest::header::CONTENT_TYPE,
                         "application/x-www-form-urlencoded",
@@ -1618,7 +1747,7 @@ impl ObscuraHttpClient {
 
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, e))
+                request_error(&current_url, &e)
             })?;
 
             let status = resp.status();
@@ -1637,11 +1766,14 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let response_headers: HashMap<String, String> = resp
-                .headers()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
-                .collect();
+            let mut response_headers: HashMap<String, String> = HashMap::new();
+            for (k, v) in resp.headers().iter() {
+                merge_response_header(
+                    &mut response_headers,
+                    k.as_str().to_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                );
+            }
 
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
@@ -1653,42 +1785,55 @@ impl ObscuraHttpClient {
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
                     validate_request_mode(&request, &next_url)?;
+                    referrer = referer.as_deref().map(Url::parse).transpose()
+                        .map_err(|error| ObscuraNetError::Network(format!("Invalid redirect referrer: {error}")))?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    if next_url.origin() != current_url.origin() {
+                        if let Some(headers) = request_headers.as_mut() {
+                            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                        }
+                    }
                     redirects.push(current_url.clone());
                     current_url = next_url;
-                    if status == reqwest::StatusCode::MOVED_PERMANENTLY
-                        || status == reqwest::StatusCode::FOUND
-                        || status == reqwest::StatusCode::SEE_OTHER
+                    if ((status == reqwest::StatusCode::MOVED_PERMANENTLY || status == reqwest::StatusCode::FOUND) && method == Method::POST)
+                        || (status == reqwest::StatusCode::SEE_OTHER && method != Method::GET && method != Method::HEAD)
                     {
                         method = Method::GET;
                         body = None;
+                        if let Some(headers) = request_headers.as_mut() {
+                            headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(),
+                                "content-type" | "content-encoding" | "content-language" | "content-location" | "content-length"));
+                        }
                     }
                     continue;
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
-                resp,
-                &current_url,
-                request.max_response_bytes,
-            )
-            .await?;
-            drop(in_flight);
-
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
-                body: body_bytes,
+                body: Vec::new(),
                 redirected_from: redirects,
             };
+            let mut captured = document_request.response(response, method.as_str(), referer.as_deref().unwrap_or(""));
+            let read = {
+                let response = captured.get_mut();
+                read_reqwest_body_into(resp, &response.url, request.max_response_bytes, &mut response.body).await
+            };
+            if let Err(failure) = read {
+                captured.failed(failure.timeout);
+                return Err(failure.error);
+            }
+            captured.complete();
+            drop(in_flight);
 
             if let Some(cbs) = callbacks {
-                cbs.fire_response(&request_info, &response).await;
+                cbs.fire_response(&request_info, captured.get()).await;
             }
 
-            return Ok(response);
+            return Ok(captured.finish());
         }
 
         Err(ObscuraNetError::TooManyRedirects(current_url.to_string()))
@@ -1721,6 +1866,38 @@ impl Default for ObscuraHttpClient {
     }
 }
 
+/// `error` followed by the message of each error in its `source()` chain, joined
+/// with ": ". reqwest and wreq only say "error sending request" at the top level;
+/// the cause (expired certificate, handshake failure, refused connection, DNS)
+/// is further down the chain.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        // Some layers already include their source's message in their own.
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
+// Keep a resolver's policy refusal typed through transport error wrappers.
+pub(crate) fn request_error(url: &Url, error: &(dyn std::error::Error + 'static)) -> ObscuraNetError {
+    let text = format!("{}: {}", url, error_chain(error));
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if matches!(error.downcast_ref::<ObscuraNetError>(), Some(ObscuraNetError::Blocked(_))) {
+            return ObscuraNetError::Blocked(text);
+        }
+        cause = error.source();
+    }
+    ObscuraNetError::Network(text)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObscuraNetError {
     #[error("Network error: {0}")]
@@ -1740,11 +1917,219 @@ pub enum ObscuraNetError {
 }
 
 #[cfg(test)]
+#[path = "document_progress_tests.rs"]
+mod document_progress_tests;
+
+#[cfg(test)]
+mod resource_cache_tests {
+    use super::{ResourceCache, ResourceCacheKey, ResourceType, RequestMode,
+        RequestCredentials, Response, RESOURCE_CACHE_MAX_ENTRIES};
+    use super::{response_cache_lifetime, response_cache_lifetime_with_clock, HEURISTIC_FRESHNESS_CAP};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    use url::Url;
+
+    fn cache_test_resource(name: &str) -> (ResourceCacheKey, Response) {
+        let url = Url::parse(&format!("https://example.test/{name}.js")).unwrap();
+        let key = ResourceCacheKey {
+            url: url.to_string(),
+            resource_type: ResourceType::Script,
+            mode: RequestMode::NoCors,
+            credentials: RequestCredentials::Omit,
+            initiator: None,
+            referrer: None,
+            user_agent: "cache-test".into(),
+            extra_headers: Vec::new(),
+            max_response_bytes: 1024,
+        };
+        let response = Response {
+            url,
+            status: 200,
+            headers: HashMap::new(),
+            body: vec![1],
+            redirected_from: Vec::new(),
+        };
+        (key, response)
+    }
+
+    #[test]
+    fn expired_resource_cache_keys_do_not_accumulate() {
+        let (key, response) = cache_test_resource("reused");
+        let mut cache = ResourceCache::default();
+        for _ in 0..10_000 {
+            cache.insert(key.clone(), response.clone(), Duration::from_secs(60));
+            cache.entries.get_mut(&key).unwrap().expires_at = Instant::now();
+            assert!(cache.get(&key).is_none());
+            assert!(cache.entries.is_empty());
+            assert!(cache.insertion_order.is_empty());
+            assert_eq!(cache.body_bytes, 0);
+        }
+        cache.insert(key.clone(), response, Duration::from_secs(60));
+        assert!(cache.get(&key).is_some());
+        assert_eq!(cache.insertion_order.len(), 1);
+        assert_eq!(cache.body_bytes, 1);
+    }
+
+    #[test]
+    fn expired_then_reinserted_resource_keeps_its_new_eviction_position() {
+        let (reused, response) = cache_test_resource("reused");
+        let (oldest, oldest_response) = cache_test_resource("oldest");
+        let mut cache = ResourceCache::default();
+        cache.insert(reused.clone(), response.clone(), Duration::from_secs(60));
+        cache.entries.get_mut(&reused).unwrap().expires_at = Instant::now();
+        assert!(cache.get(&reused).is_none());
+        cache.insert(oldest.clone(), oldest_response, Duration::from_secs(60));
+        cache.insert(reused.clone(), response, Duration::from_secs(60));
+        for index in 0..RESOURCE_CACHE_MAX_ENTRIES - 1 {
+            let (key, response) = cache_test_resource(&format!("fill-{index}"));
+            cache.insert(key, response, Duration::from_secs(60));
+        }
+        assert!(cache.get(&oldest).is_none(), "evict the oldest live entry");
+        assert!(cache.get(&reused).is_some(), "keep the refreshed entry");
+        assert_eq!(cache.entries.len(), RESOURCE_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.insertion_order.len(), RESOURCE_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.body_bytes, RESOURCE_CACHE_MAX_ENTRIES);
+    }
+
+
+    fn heuristic_test_response(status: u16, headers: &[(&str, &str)]) -> Response {
+        Response {
+            url: Url::parse("http://example.test/app.js").unwrap(),
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: vec![1],
+            redirected_from: Vec::new(),
+        }
+    }
+
+    // Receive the dated unit fixtures at their Date, independent of the wall clock.
+    fn cache_lifetime_at_fixture_time(response: &Response) -> Option<Duration> {
+        response_cache_lifetime_with_clock(response, Duration::ZERO, || {
+            crate::cookies::parse_http_date("Fri, 06 Nov 2026 08:59:06 GMT").ok()
+        })
+    }
+
+    #[test]
+    fn last_modified_without_explicit_expiry_gets_a_tenth_of_its_age() {
+        // 3 days 21 h 1 min 46 s (334906 s) since Last-Modified: a tenth is 33490 s.
+        let response = heuristic_test_response(200, &[
+            ("date", "Fri, 06 Nov 2026 08:59:06 GMT"),
+            ("last-modified", "Mon, 02 Nov 2026 11:57:20 GMT"),
+        ]);
+        assert_eq!(cache_lifetime_at_fixture_time(&response), Some(Duration::from_secs(33490)));
+    }
+
+    #[test]
+    fn heuristic_lifetime_is_capped_and_respects_explicit_directives() {
+        let old = [("date", "Fri, 06 Nov 2026 08:59:06 GMT"), ("last-modified", "Mon, 01 Jan 2018 00:00:00 GMT")];
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(200, &old)), Some(HEURISTIC_FRESHNESS_CAP));
+        // A directive without max-age (public, private) still allows the heuristic.
+        let with_public = [old[0], old[1], ("cache-control", "public")];
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(200, &with_public)), Some(HEURISTIC_FRESHNESS_CAP));
+        for blocked in [
+            vec![old[0], old[1], ("cache-control", "no-cache")],
+            vec![old[0], old[1], ("cache-control", "no-store")],
+            vec![old[0], old[1], ("cache-control", "max-age=0")],
+            vec![old[0], old[1], ("expires", "Fri, 06 Nov 2026 09:00:00 GMT")],
+            vec![old[0], old[1], ("set-cookie", "a=1")],
+            vec![old[0], ("last-modified", "Fri, 06 Nov 2026 08:59:06 GMT")],
+            vec![old[0], ("last-modified", "Sat, 07 Nov 2026 00:00:00 GMT")],
+            vec![old[0], ("last-modified", "not a date")],
+            vec![old[0]],
+        ] {
+            assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(200, &blocked)), None, "{blocked:?}");
+        }
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(201, &old)), None);
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(404, &old)), None);
+        // Explicit max-age still wins over the heuristic.
+        let explicit = [old[0], old[1], ("cache-control", "max-age=60")];
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(200, &explicit)), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn explicit_cache_directives_do_not_fall_back_to_heuristic_freshness() {
+        for directive in [
+            "max-age=invalid",
+            "max-age=-1",
+            "max-age=18446744073709551616",
+            "max-age",
+            "max-age=",
+            "max-age = 0",
+            "max-age=\"0\"",
+            "max-age=0, max-age=60",
+            "max-age=60, max-age=invalid",
+            "no-cache=\"X-Version\"",
+            "No-Cache = \"X-Version, X-Other\"",
+        ] {
+            let response = heuristic_test_response(200, &[
+                ("last-modified", "Mon, 01 Jan 2018 00:00:00 GMT"),
+                ("cache-control", directive),
+            ]);
+            assert_eq!(response_cache_lifetime(&response, Duration::ZERO), None, "{directive}");
+        }
+    }
+
+    #[test]
+    fn already_stale_heuristic_responses_are_not_cached() {
+        let old = "Mon, 01 Jan 2018 00:00:00 GMT";
+        for headers in [
+            vec![("last-modified", old), ("age", "86400")],
+            vec![("last-modified", old), ("age", "18446744073709551616")],
+            vec![
+                ("date", "Tue, 02 Jan 2018 00:00:00 GMT"),
+                ("last-modified", old),
+            ],
+            vec![
+                ("date", "Tuesday, 02-Jan-18 00:00:00 GMT"),
+                ("last-modified", old),
+            ],
+            vec![
+                ("date", "Tue Jan  2 00:00:00 2018"),
+                ("last-modified", old),
+            ],
+        ] {
+            assert_eq!(
+                response_cache_lifetime(&heuristic_test_response(200, &headers), Duration::ZERO),
+                None,
+                "{headers:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn remaining_heuristic_freshness_accounts_for_age_and_transport_delay() {
+        let response = heuristic_test_response(200, &[
+            ("date", "Fri, 06 Nov 2026 08:59:06 GMT"),
+            ("last-modified", "Mon, 02 Nov 2026 11:57:20 GMT"),
+            ("age", "1000"),
+        ]);
+        let now = crate::cookies::parse_http_date("Fri, 06 Nov 2026 08:59:06 GMT").unwrap();
+        let delay = Duration::from_millis(200);
+        assert_eq!(
+            response_cache_lifetime_with_clock(&response, delay, || Some(now)),
+            Some(Duration::from_secs(32490) - delay),
+        );
+        assert_eq!(
+            response_cache_lifetime_with_clock(&response, delay, || Some(now + 2000)),
+            Some(Duration::from_secs(31490)),
+        );
+        assert_eq!(
+            response_cache_lifetime_with_clock(&response, Duration::from_secs(33490), || Some(now)),
+            None,
+        );
+    }
+
+}
+
+#[cfg(test)]
 mod ssrf_tests {
     use super::{
-        is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
+        is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
         CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
-        ResourceRequest, ResourceType, SsrfGuardResolver,
+        ResourceRequest, ResourceType, Response, SsrfGuardResolver,
     };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
@@ -1758,6 +2143,34 @@ mod ssrf_tests {
 
     fn ip(s: &str) -> IpAddr {
         IpAddr::from_str(s).unwrap()
+    }
+
+    // A response that repeats a header name (Link, Via, WWW-Authenticate, ...)
+    // must not lose all but the last line. See #913.
+    #[test]
+    fn response_headers_preserve_duplicate_values() {
+        let mut headers = HashMap::new();
+        merge_response_header(&mut headers, "link".into(), "<a>; rel=preload".into());
+        merge_response_header(&mut headers, "link".into(), "<b>; rel=preconnect".into());
+        assert_eq!(
+            headers.get("link").map(String::as_str),
+            Some("<a>; rel=preload, <b>; rel=preconnect"),
+            "duplicate header lines must be combined per RFC 9110, not dropped"
+        );
+    }
+
+    // Set-Cookie must not be comma-folded (RFC 6265); the cookie jar captures
+    // each line via get_all, so the map keeps it only as a presence signal.
+    #[test]
+    fn response_headers_do_not_fold_set_cookie() {
+        let mut headers = HashMap::new();
+        merge_response_header(&mut headers, "set-cookie".into(), "a=1".into());
+        merge_response_header(&mut headers, "set-cookie".into(), "b=2".into());
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("b=2"),
+            "Set-Cookie must stay a single (last) value, never comma-folded"
+        );
     }
 
     #[test]
@@ -1891,6 +2304,21 @@ mod ssrf_tests {
     }
 
     #[test]
+    fn teredo_cannot_hide_a_forbidden_ipv4() {
+        // RFC 4380: 2001:0::/32 embeds the Teredo server's IPv4 in bits
+        // 32..64 and the client's public IPv4, bit-inverted, in the last 32
+        // bits. Both are IPv4-in-IPv6 forms like NAT64 and 6to4.
+        // Client 127.1.1.1 (inverted 80fe:fefe) behind server 65.54.227.120.
+        assert!(is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:80fe:fefe")));
+        // Client 10.0.0.1 (inverted f5ff:fffe).
+        assert!(is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:f5ff:fffe")));
+        // Server 10.0.0.1 with a public client.
+        assert!(is_forbidden_ip(ip("2001:0:a00:1:8000:63bf:f7f7:f7f7")));
+        // Public server and public client 8.8.8.8 (inverted f7f7:f7f7).
+        assert!(!is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:f7f7:f7f7")));
+    }
+
+    #[test]
     fn native_non_global_ipv6_ranges_are_forbidden() {
         for s in [
             "100::1",       // discard-only
@@ -1900,6 +2328,39 @@ mod ssrf_tests {
             "ff0e::1",      // global-scope multicast
         ] {
             assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+    }
+
+    #[test]
+    fn private_network_denials_have_a_blocked_error_kind() {
+        for text in ["http://127.0.0.1/", "http://localhost/", "http://[::1]/"] {
+            assert!(matches!(validate_url(&Url::parse(text).unwrap(), false),
+                Err(ObscuraNetError::Blocked(_))), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_dns_policy_refusals_survive_transport_wrapping() {
+        struct Resolver(bool);
+        impl Resolve for Resolver {
+            fn resolve(&self, _: Name) -> reqwest::dns::Resolving {
+                let blocked = self.0;
+                Box::pin(async move {
+                    let error = if blocked {
+                        ObscuraNetError::Blocked("test resolver denied the destination".into())
+                    } else {
+                        ObscuraNetError::Network("SSRF blocked: untrusted error text".into())
+                    };
+                    Err(error.into())
+                })
+            }
+        }
+        for blocked in [true, false] {
+            let client = ObscuraHttpClient::new();
+            client.client.set(reqwest::Client::builder().no_proxy()
+                .dns_resolver(Arc::new(Resolver(blocked))).build().unwrap()).unwrap();
+            let error = client.fetch(&Url::parse("http://policy.example.test/").unwrap()).await.unwrap_err();
+            assert_eq!(matches!(error, ObscuraNetError::Blocked(_)), blocked, "{error}");
         }
     }
 
@@ -1974,17 +2435,17 @@ mod ssrf_tests {
         let cross_origin = Url::parse("https://cdn.example/image.png").unwrap();
         let downgrade = Url::parse("http://cdn.example/image.png").unwrap();
 
-        assert_eq!(request_fetch_site(&request, &same_origin), "same-origin");
-        assert_eq!(request_fetch_site(&request, &cross_origin), "cross-site");
+        assert_eq!(request_fetch_site(&request, &same_origin, false), "same-origin");
+        assert_eq!(request_fetch_site(&request, &cross_origin, false), "cross-site");
         assert_eq!(
-            request_referrer(&request, &same_origin).as_deref(),
+            request_referrer(Some(&source), &same_origin).as_deref(),
             Some("https://app.example/path?q=1")
         );
         assert_eq!(
-            request_referrer(&request, &cross_origin).as_deref(),
+            request_referrer(Some(&source), &cross_origin).as_deref(),
             Some("https://app.example/")
         );
-        assert_eq!(request_referrer(&request, &downgrade), None);
+        assert_eq!(request_referrer(Some(&source), &downgrade), None);
     }
 
     async fn http_fixture(
@@ -2010,8 +2471,11 @@ mod ssrf_tests {
                         break;
                     }
                     request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
+                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head.lines().find_map(|line| line.strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
                     }
                 }
                 let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
@@ -2035,6 +2499,210 @@ mod ssrf_tests {
     fn redirect_to_self() -> String {
         "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .to_string()
+    }
+
+    async fn assert_image_negotiates_supported_format(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Url::parse(&format!("http://{}/image", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            let accept = request.lines().find_map(|line| line.strip_prefix("accept:")).unwrap();
+            let ranges: Vec<_> = accept.split(',').map(|part| part.split(';').next().unwrap().trim()).collect();
+            // This server prefers AVIF when allowed, with PNG as its supported fallback.
+            let mime = if ranges.iter().any(|range| ["image/avif", "image/*", "*/*"].contains(range)) {
+                "image/avif"
+            } else if ranges.contains(&"image/png") {
+                "image/png"
+            } else {
+                "application/octet-stream"
+            };
+            stream.write_all(ok_response(&format!("Content-Type: {mime}\r\n"), "image").as_bytes()).await.unwrap();
+        });
+        let request = ResourceRequest::subresource(ResourceType::Image, &target);
+        let jar = Arc::new(CookieJar::new());
+        #[cfg(feature = "stealth")]
+        let response = if stealth {
+            crate::StealthHttpClient::with_proxy(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        } else {
+            ObscuraHttpClient::with_full_options(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        };
+        #[cfg(not(feature = "stealth"))]
+        let response = {
+            assert!(!stealth);
+            ObscuraHttpClient::with_full_options(jar, None, true)
+                .fetch_resource_with_callbacks(&target, request, None).await.unwrap()
+        };
+        server.await.unwrap();
+        assert_eq!(response.content_type(), Some("image/png"));
+    }
+
+    #[tokio::test]
+    async fn image_request_negotiates_supported_format() {
+        assert_image_negotiates_supported_format(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn stealth_image_request_negotiates_supported_format() {
+        assert_image_negotiates_supported_format(true).await;
+    }
+
+    async fn form_navigation_probe(
+        stealth: bool, target: &Url, source: Option<&Url>, method: &str,
+        body: Option<Vec<u8>>, jar: Arc<CookieJar>,
+    ) -> Response {
+        let headers = Some([("Origin".into(), "http://forged.example".into())].into());
+        #[cfg(feature = "stealth")]
+        if stealth {
+            return crate::StealthHttpClient::with_proxy(jar, None, true)
+                .fetch_navigation_request_from_document(target, method, body, headers, source, None)
+                .await.unwrap();
+        }
+        assert!(!stealth);
+        ObscuraHttpClient::with_full_options(jar, None, true)
+            .fetch_navigation_request_from_document(target, method, body, headers, source, None)
+            .await.unwrap()
+    }
+
+    async fn assert_form_navigation_metadata_and_redirects(stealth: bool) {
+        let (target, mut received) = http_fixture(vec![ok_response("", "posted"), ok_response("", "direct")]).await;
+        let source = target.join("/source?keep=1#fragment").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("confirm=fixture; Path=/; SameSite=Strict", &source);
+        form_navigation_probe(stealth, &target, Some(&source), "POST",
+            Some(b"confirm=a%2Bb&same=first&same=second".to_vec()), jar.clone()).await;
+        let request = received.recv().await.unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.starts_with("post /resource http/1.1"));
+        assert!(headers.contains("sec-fetch-site: same-origin\r\n"));
+        assert!(headers.contains("sec-fetch-mode: navigate\r\n"));
+        assert!(headers.contains(&format!("origin: {}\r\n", source.origin().ascii_serialization())));
+        assert!(headers.contains(&format!("referer: {}/source?keep=1\r\n", source.origin().ascii_serialization())));
+        assert!(headers.contains("cookie: confirm=fixture\r\n"));
+        assert!(headers.contains("content-type: application/x-www-form-urlencoded\r\n"));
+        assert_eq!(body, "confirm=a%2Bb&same=first&same=second");
+        form_navigation_probe(stealth, &target, None, "GET", None, jar).await;
+        let direct = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(direct.contains("sec-fetch-site: none\r\n"));
+        assert!(!direct.contains("\r\norigin:"));
+        assert!(!direct.contains("\r\nreferer:"));
+
+        let (target, mut received) = http_fixture(vec![redirect_to_self(), ok_response("", "arrived")]).await;
+        let source = target.join("/form").unwrap();
+        form_navigation_probe(stealth, &target, Some(&source), "POST",
+            Some(b"field=unchanged".to_vec()), Arc::new(CookieJar::new())).await;
+        let post = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(post.starts_with("post "));
+        assert!(post.contains("sec-fetch-site: same-origin\r\n"));
+        assert!(post.contains(&format!("origin: {}\r\n", source.origin().ascii_serialization())));
+        let get = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(get.starts_with("get "));
+        assert!(get.contains("sec-fetch-site: same-origin\r\n"));
+        assert!(!get.contains("\r\norigin:"));
+        assert!(!get.contains("\r\ncontent-type:"));
+    }
+
+    async fn assert_form_navigation_downgrade_and_cross_site_cookies(stealth: bool) {
+        let (target, mut received) = http_fixture(vec![
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            ok_response("", "arrived"),
+        ]).await;
+        let source = Url::parse("https://source.example/form?private=1").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("strict=private; Path=/; SameSite=Strict", &target);
+        jar.set_cookie("lax=private; Path=/; SameSite=Lax", &target);
+        form_navigation_probe(stealth, &target, Some(&source), "POST", Some(b"field=unchanged".to_vec()), jar).await;
+        for _ in 0..2 {
+            let request = received.recv().await.unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("post "));
+            assert!(request.contains("sec-fetch-site: cross-site\r\n"));
+            assert!(request.contains("origin: null\r\n"));
+            assert!(!request.contains("\r\nreferer:"));
+            assert!(!request.contains("\r\ncookie:"));
+            assert!(request.ends_with("\r\n\r\nfield=unchanged"));
+        }
+    }
+
+    async fn assert_form_navigation_cross_origin_return_taints_metadata(stealth: bool) {
+        let (final_target, mut final_received) = http_fixture(vec![ok_response("", "arrived")]).await;
+        let redirect = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {final_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (other_origin, mut other_received) = http_fixture(vec![redirect]).await;
+        let source = final_target.join("/form?private=1#fragment").unwrap();
+        form_navigation_probe(stealth, &other_origin, Some(&source), "POST",
+            Some(b"field=unchanged".to_vec()), Arc::new(CookieJar::new())).await;
+        let first = other_received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(first.contains(&format!("origin: {}\r\n", source.origin().ascii_serialization())));
+        assert!(first.contains("sec-fetch-site: cross-site\r\n"));
+        assert!(first.contains(&format!("referer: {}/\r\n", source.origin().ascii_serialization())));
+        let returned = final_received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(returned.starts_with("post "));
+        assert!(returned.contains("origin: null\r\n"));
+        assert!(returned.contains("sec-fetch-site: cross-site\r\n"));
+        assert!(returned.contains(&format!("referer: {}/\r\n", source.origin().ascii_serialization())));
+        assert!(!returned.contains("private=1"));
+        assert!(returned.ends_with("\r\n\r\nfield=unchanged"));
+    }
+
+    #[tokio::test]
+    async fn form_navigation_metadata_and_redirects() {
+        assert_form_navigation_metadata_and_redirects(false).await;
+    }
+
+    #[tokio::test]
+    async fn form_navigation_downgrade_and_cross_site_cookies() {
+        assert_form_navigation_downgrade_and_cross_site_cookies(false).await;
+    }
+
+    #[tokio::test]
+    async fn form_navigation_cross_origin_return_taints_metadata() {
+        assert_form_navigation_cross_origin_return_taints_metadata(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn form_navigation_metadata_and_redirects_in_stealth() {
+        assert_form_navigation_metadata_and_redirects(true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn form_navigation_downgrade_and_cross_site_cookies_in_stealth() {
+        assert_form_navigation_downgrade_and_cross_site_cookies(true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn form_navigation_cross_origin_return_taints_metadata_in_stealth() {
+        assert_form_navigation_cross_origin_return_taints_metadata(true).await;
+    }
+
+    // Browsers read a folded header line (obs-fold, RFC 9112 5.2) as part of
+    // the line above. Some origins still fold long values: promodirect.com
+    // sends its Content-Security-Policy over several lines, each continuation
+    // after a bare LF and two spaces. httparse rejects the whole response
+    // unless obs-fold is allowed.
+    #[tokio::test]
+    async fn navigation_accepts_a_folded_response_header() {
+        let folded = "Content-Security-Policy: default-src 'self'\n  https://a.example\n  https://b.example\r\n";
+        let (target, _rx) = http_fixture(vec![ok_response(folded, "folded")]).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let response = client
+            .fetch(&target)
+            .await
+            .expect("a folded header must not fail the response");
+        assert_eq!(response.body, b"folded");
     }
 
     // WPT fetch/api/redirect/redirect-count: the 20th redirect must still be
@@ -2088,7 +2756,38 @@ mod ssrf_tests {
         assert!(request.contains("sec-fetch-mode: cors\r\n"));
         assert!(request.contains("sec-fetch-dest: font\r\n"));
         assert!(!request.contains("cookie:"));
-        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+        assert_eq!(jar.get_cookie_header_same_site(&target), "seed=1");
+    }
+
+    // #849 — the OBSCURA_FETCH_MAX_BODY_BYTES override #581 gave fetch()/XHR
+    // must also reach the module-script cap; a large SPA bundle otherwise dies
+    // silently at a hardcoded 32 MiB while fetch() of the same URL succeeds.
+    // (nextest runs each test in its own process, so set_var cannot race.)
+    #[test]
+    fn module_script_cap_honours_the_fetch_body_env_override() {
+        let u = Url::parse("https://example.com/app.mjs").unwrap();
+
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            32 * 1024 * 1024,
+            "default module cap stays 32 MiB"
+        );
+
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "134217728");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            128 * 1024 * 1024,
+            "the env override must reach the module-script cap"
+        );
+
+        // Garbage stays on the default rather than panicking.
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "not-a-number");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            32 * 1024 * 1024,
+        );
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
     }
 
     #[tokio::test]
@@ -2119,7 +2818,7 @@ mod ssrf_tests {
         assert!(request.contains("sec-fetch-dest: script\r\n"));
         assert!(request.contains(&format!("referer: {}\r\n", importing_module)));
         assert!(!request.contains("cookie:"));
-        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+        assert_eq!(jar.get_cookie_header_same_site(&target), "seed=1");
     }
 
     #[tokio::test]
@@ -2155,7 +2854,7 @@ mod ssrf_tests {
         let second = received.recv().await.unwrap().to_ascii_lowercase();
         assert!(first.contains("cookie: seed=1\r\n"));
         assert!(second.contains("cookie: seed=1\r\n"));
-        let cookies = jar.get_cookie_header(&target);
+        let cookies = jar.get_cookie_header_same_site(&target);
         assert!(cookies.contains("seed=1"));
         assert!(cookies.contains("accepted=1"));
     }
@@ -2587,6 +3286,52 @@ mod ssrf_tests {
     }
 
     #[tokio::test]
+    async fn last_modified_only_subresource_is_reused_on_the_next_load() {
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Last-Modified: Mon, 01 Jan 2018 00:00:00 GMT\r\n",
+        )
+        .await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        for _ in 0..3 {
+            let response = client
+                .fetch_resource_with_callbacks(&url, request.clone(), None)
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+        }
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_last_modified_subresources_are_not_reused() {
+        for headers in [
+            "Last-Modified: Mon, 01 Jan 2018 00:00:00 GMT\r\nAge: 86400\r\n",
+            "Date: Tue, 02 Jan 2018 00:00:00 GMT\r\nLast-Modified: Mon, 01 Jan 2018 00:00:00 GMT\r\n",
+            "Date: Tue Jan  2 00:00:00 2018\r\nLast-Modified: Mon, 01 Jan 2018 00:00:00 GMT\r\n",
+        ] {
+            let (url, network_requests) = cacheable_resource_fixture(200, headers).await;
+            let initiator = url.join("/page.html").unwrap();
+            let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            for _ in 0..2 {
+                let response = client
+                    .fetch_resource_with_callbacks(&url, request.clone(), None)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status, 200);
+            }
+            assert_eq!(
+                network_requests.load(Ordering::SeqCst),
+                2,
+                "{headers}",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn no_store_vary_star_and_error_responses_are_not_reused() {
         for (status, headers) in [
             (200, "Cache-Control: no-store\r\n"),
@@ -2775,7 +3520,38 @@ mod ssrf_tests {
         let client =
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
-        assert!(client.fetch(&url).await.is_err(), "unknown CA must be rejected");
+        let error = client.fetch(&url).await.expect_err("unknown CA must be rejected");
+        // The message must carry the TLS cause, not only "error sending request".
+        let message = error.to_string();
+        assert!(message.contains("invalid peer certificate"), "{message}");
+    }
+
+    #[test]
+    fn error_chain_appends_each_source_once() {
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl fmt::Display for Layer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+
+        let leaf = Layer("certificate expired", None);
+        // The middle layer already quotes the leaf, so the leaf is not repeated.
+        let middle = Layer("tls: certificate expired", Some(Box::new(leaf)));
+        let top = Layer("error sending request", Some(Box::new(middle)));
+        assert_eq!(
+            super::error_chain(&top),
+            "error sending request: tls: certificate expired"
+        );
+        assert_eq!(super::error_chain(&Layer("alone", None)), "alone");
     }
 }
 
@@ -2806,5 +3582,52 @@ mod cert_env_tests {
             None,
             Some(OsStr::new("/etc/ssl/certs"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod file_access_tests {
+    use super::{fetch_file_url, ObscuraHttpClient};
+    use crate::cookies::CookieJar;
+    use std::sync::Arc;
+    use url::Url;
+
+    fn fixture() -> (tempfile::TempDir, Url) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.html");
+        std::fs::write(&path, "local-secret").unwrap();
+        let url = Url::from_file_path(&path).unwrap();
+        (dir, url)
+    }
+
+    // The gate lives in the loader, so a caller that never checks the flag
+    // still cannot read a local file.
+    #[tokio::test]
+    async fn loader_refuses_file_urls_without_the_opt_in() {
+        let (_dir, url) = fixture();
+        let error = fetch_file_url(&url, 1024, false)
+            .await
+            .expect_err("file:// must be refused without allow_file_access")
+            .to_string();
+        assert!(error.contains("allow-file-access"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn loader_reads_file_urls_with_the_opt_in() {
+        let (_dir, url) = fixture();
+        let response = fetch_file_url(&url, 1024, true).await.expect("opted in");
+        assert_eq!(response.body, b"local-secret");
+        assert_eq!(response.headers.get("content-type").unwrap(), "text/html");
+    }
+
+    #[tokio::test]
+    async fn client_fetch_follows_its_file_access_setting() {
+        let (_dir, url) = fixture();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, false);
+        assert!(client.fetch(&url).await.is_err());
+        client.set_allow_file_access(true);
+        assert_eq!(client.fetch(&url).await.unwrap().body, b"local-secret");
+        client.set_allow_file_access(false);
+        assert!(client.fetch(&url).await.is_err());
     }
 }

@@ -1,7 +1,9 @@
 use html5ever::{LocalName, Namespace, Prefix, QualName};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
@@ -244,15 +246,80 @@ impl Node {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct FormOwnershipKey {
+    tag: Option<QualName>,
+    id: Option<String>,
+    form: Option<String>,
+    connected: bool,
+    links: [Option<NodeId>; 5],
+}
+
+impl FormOwnershipKey {
+    fn of(node: &Node) -> Self {
+        Self {
+            tag: node.as_element().cloned(),
+            id: node.get_attribute("id").map(str::to_owned),
+            form: node.get_attribute("form").map(str::to_owned),
+            connected: node.connected,
+            links: [node.parent, node.first_child, node.last_child, node.prev_sibling, node.next_sibling],
+        }
+    }
+}
+
 pub struct DomTree {
     inner: RefCell<DomTreeInner>,
+    form_id_cache: RefCell<HashMap<NodeId, HashMap<String, NodeId>>>,
+    form_controls_cache: RefCell<HashMap<NodeId, Vec<NodeId>>>,
+    form_cache_generation: Arc<AtomicU64>,
+    form_cache_observers: RefCell<Vec<Weak<dyn Fn(u64) + Send + Sync>>>,
+    // Only the last parser parent/child pair is cached; external tree changes
+    // invalidate it rather than maintaining depths across DOM reparenting.
+    pub(crate) parser_depth_cache: Cell<Option<(NodeId, usize, NodeId, usize)>>,
+}
+
+/// Host-fetched author CSS kept outside the page-visible DOM.
+///
+/// A linked stylesheet may participate in rendering even when the response is
+/// not origin-clean. Keeping those bytes here prevents a synthetic `<style>`
+/// node from exposing them through ordinary DOM APIs.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalStylesheet {
+    pub sources: Vec<Arc<str>>,
+    pub origin_clean: bool,
+    /// CSSOM edits are rule-owned, never mutations of the owner's DOM text.
+    pub cssom_rules: Option<Vec<Arc<str>>>,
+}
+
+/// Live control state is separate from content attributes and serialization.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormControlState {
+    pub value: Option<String>,
+    pub checked: Option<bool>,
+    pub indeterminate: bool,
+}
+
+#[derive(Default)]
+struct NodeAllocationGenerations {
+    reused: HashMap<NodeId, u64>,
+    next: u64,
+    // EOF state shares this rare allocation without enlarging ordinary DOM storage.
+    parser_started_scripts: HashSet<NodeId>,
+    incomplete_document: bool,
 }
 
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
+    node_generations: Option<Box<NodeAllocationGenerations>>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    form_controls: HashMap<NodeId, FormControlState>,
+    // Only parser-associated controls outside their form subtree need records.
+    parser_form_owners: HashMap<NodeId, NodeId>,
+    external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
+    external_stylesheet_generation: u64,
+    hovered: Option<NodeId>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -279,11 +346,22 @@ impl DomTree {
             data: NodeData::Document,
         };
         DomTree {
+            parser_depth_cache: Cell::new(None),
+            form_id_cache: RefCell::new(HashMap::new()),
+            form_controls_cache: RefCell::new(HashMap::new()),
+            form_cache_generation: Arc::new(AtomicU64::new(0)),
+            form_cache_observers: RefCell::new(Vec::new()),
             inner: RefCell::new(DomTreeInner {
                 nodes: vec![Some(doc_node)],
                 free_list: Vec::new(),
+                node_generations: None,
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                form_controls: HashMap::new(),
+                parser_form_owners: HashMap::new(),
+                external_stylesheets: HashMap::new(),
+                external_stylesheet_generation: 0,
+                hovered: None,
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
@@ -296,6 +374,200 @@ impl DomTree {
         self.inner.borrow().document
     }
 
+    pub fn replace_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        inner.external_stylesheets.insert(
+            owner,
+            ExternalStylesheet {
+                sources: vec![Arc::from(source)],
+                origin_clean,
+                cssom_rules: None,
+            },
+        );
+        inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        true
+    }
+
+    pub fn append_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        let sheet = inner
+            .external_stylesheets
+            .entry(owner)
+            .or_insert_with(|| ExternalStylesheet {
+                sources: Vec::new(),
+                origin_clean: true,
+                cssom_rules: None,
+            });
+        sheet.sources.push(Arc::from(source));
+        sheet.origin_clean &= origin_clean;
+        inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        true
+    }
+
+    pub fn remove_external_stylesheet(&self, owner: NodeId) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let removed = inner.external_stylesheets.remove(&owner).is_some();
+        if removed {
+            inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        }
+        removed
+    }
+
+    pub fn external_stylesheet_generation(&self) -> u64 {
+        self.inner.borrow().external_stylesheet_generation
+    }
+
+    pub fn has_cssom_stylesheet(&self, owner: NodeId) -> bool {
+        self.inner.borrow().external_stylesheets.get(&owner)
+            .is_some_and(|sheet| sheet.cssom_rules.is_some())
+    }
+
+    pub fn update_cssom_stylesheet(
+        &self, owner: NodeId, index: usize, delete_count: usize,
+        rules: Vec<String>, reset: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let Some(element) = inner.nodes.get(owner.index()).and_then(Option::as_ref)
+            .and_then(Node::as_element) else { return false };
+        if element.local.as_ref() != "style" { return false; }
+        let sheet = inner.external_stylesheets.entry(owner).or_insert_with(|| ExternalStylesheet {
+            origin_clean: true, ..ExternalStylesheet::default()
+        });
+        // Only inline owners reach this path. A cross-origin @import is kept
+        // in sources, but does not make the owner's own CSS rules opaque.
+        if reset {
+            sheet.cssom_rules = Some(rules.into_iter().map(Arc::from).collect());
+        } else {
+            let Some(existing) = sheet.cssom_rules.as_mut() else { return false };
+            if index > existing.len() || delete_count > existing.len() - index { return false; }
+            existing.splice(index..index + delete_count, rules.into_iter().map(Arc::from));
+        }
+        true
+    }
+
+    pub fn clear_cssom_stylesheet(&self, owner: NodeId) -> bool {
+        Self::clear_cssom_stylesheet_inner(&mut self.inner.borrow_mut(), owner)
+    }
+
+    fn clear_cssom_stylesheet_inner(inner: &mut DomTreeInner, owner: NodeId) -> bool {
+        let removed = inner.external_stylesheets.get_mut(&owner)
+            .is_some_and(|sheet| sheet.cssom_rules.take().is_some());
+        if removed {
+            inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+            if inner.external_stylesheets.get(&owner).is_some_and(|sheet| sheet.sources.is_empty()) {
+                inner.external_stylesheets.remove(&owner);
+            }
+        }
+        removed
+    }
+
+    fn invalidate_cssom_source(inner: &mut DomTreeInner, node: NodeId) {
+        if inner.external_stylesheets.is_empty() { return; }
+        let mut current = Some(node);
+        for _ in 0..inner.nodes.len() {
+            let Some(id) = current else { break };
+            Self::clear_cssom_stylesheet_inner(inner, id);
+            current = inner.nodes.get(id.index()).and_then(Option::as_ref).and_then(|node| node.parent);
+        }
+    }
+
+    pub fn external_stylesheet(&self, owner: NodeId) -> Option<ExternalStylesheet> {
+        self.inner
+            .borrow()
+            .external_stylesheets
+            .get(&owner)
+            .cloned()
+    }
+
+    pub fn external_stylesheets(&self) -> HashMap<NodeId, ExternalStylesheet> {
+        self.inner.borrow().external_stylesheets.clone()
+    }
+
+    pub fn form_control_state(&self, node: NodeId) -> Option<FormControlState> {
+        self.inner.borrow().form_controls.get(&node).cloned()
+    }
+
+    pub fn form_control_value_matches(&self, node: NodeId, value: &str) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.value.as_deref())
+            == Some(value)
+    }
+
+    pub fn form_control_checked(&self, node: NodeId) -> Option<bool> {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.checked)
+    }
+
+    pub fn form_control_indeterminate(&self, node: NodeId) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .is_some_and(|control| control.indeterminate)
+    }
+
+    pub fn set_hovered(&self, node: Option<NodeId>) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.hovered == node {
+            return false;
+        }
+        inner.hovered = node;
+        true
+    }
+
+    pub fn is_hovered(&self, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let mut current = inner.hovered;
+        while let Some(id) = current {
+            if id == node {
+                return true;
+            }
+            current = inner.nodes.get(id.index())
+                .and_then(|entry| entry.as_ref())
+                .and_then(|entry| entry.parent);
+        }
+        false
+    }
+
+    pub fn update_form_control_state(&self, node: NodeId, update: impl FnOnce(&mut FormControlState)) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.nodes.get(node.index()).is_some_and(|entry| entry.as_ref().is_some_and(Node::is_element)) {
+            update(inner.form_controls.entry(node).or_default());
+        }
+    }
+
     /// Record whether the document was parsed in (full) quirks mode.
     pub fn set_quirks(&self, quirks: bool) {
         self.inner.borrow_mut().quirks = quirks;
@@ -305,6 +577,39 @@ impl DomTree {
     /// selectors match ASCII-case-insensitively.
     pub fn is_quirks(&self) -> bool {
         self.inner.borrow().quirks
+    }
+
+    /// EOF in script text makes the element already started, even before a
+    /// JavaScript realm is installed. This state follows the node, not its markup.
+    pub fn parser_script_already_started(&self, node: NodeId) -> bool {
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| metadata.parser_started_scripts.contains(&node))
+    }
+
+    pub fn has_parser_started_scripts(&self) -> bool {
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| !metadata.parser_started_scripts.is_empty())
+    }
+
+    pub fn is_document_incomplete(&self) -> bool {
+        self.inner.borrow().node_generations.as_ref()
+            .is_some_and(|metadata| metadata.incomplete_document)
+    }
+
+    pub fn mark_document_incomplete(&self, incomplete: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if incomplete {
+            inner.node_generations.get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()))
+                .incomplete_document = true;
+        } else if let Some(metadata) = inner.node_generations.as_mut() {
+            metadata.incomplete_document = false;
+        }
+    }
+
+    pub(crate) fn mark_parser_script_started(&self, node: NodeId) {
+        self.inner.borrow_mut().node_generations
+            .get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()))
+            .parser_started_scripts.insert(node);
     }
 
     pub(crate) fn set_allow_declarative_shadow_roots(&self, allow: bool) {
@@ -391,6 +696,7 @@ impl DomTree {
             return Err(AttachShadowError::InvalidShadowRoot);
         }
 
+        self.invalidate_form_caches();
         let info = ShadowRoot {
             id: root,
             host,
@@ -411,6 +717,11 @@ impl DomTree {
     /// visibility is intentionally left to the caller.
     pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
         self.inner.borrow().shadow_roots_by_host.get(&host).copied()
+    }
+
+    /// Whether any native shadow roots exist, including detached roots.
+    pub fn has_shadow_roots(&self) -> bool {
+        !self.inner.borrow().shadow_roots.is_empty()
     }
 
     pub fn shadow_root_info(&self, root: NodeId) -> Option<ShadowRoot> {
@@ -481,6 +792,7 @@ impl DomTree {
             .is_some_and(|node| node.first_child.is_none())
             && !inner.shadow_roots_by_host.contains_key(&root);
         if is_leaf {
+            if !connected { Self::clear_cssom_stylesheet_inner(inner, root); }
             if let Some(Some(node)) = inner.nodes.get_mut(root.index()) {
                 node.connected = connected;
             }
@@ -493,6 +805,7 @@ impl DomTree {
             if !seen.insert(node_id) {
                 continue;
             }
+            if !connected { Self::clear_cssom_stylesheet_inner(inner, node_id); }
             let (mut child, shadow_root) = match inner
                 .nodes
                 .get_mut(node_id.index())
@@ -528,6 +841,37 @@ impl DomTree {
             .and_then(|entry| entry.as_ref())
             .and_then(|entry| entry.parent)
             .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
+    }
+
+    /// Whether `ancestor` is an inclusive ancestor of `node` through ordinary
+    /// parent links only (a shadow root ends the walk), as MutationObserver
+    /// subtree matching requires. Bounded like the other ancestor walks.
+    pub fn is_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let mut current = Some(node);
+        for _ in 0..=inner.nodes.len() {
+            let Some(id) = current else { return false };
+            if id == ancestor {
+                return true;
+            }
+            current = inner
+                .nodes
+                .get(id.index())
+                .and_then(|entry| entry.as_ref())
+                .and_then(|entry| entry.parent);
+        }
+        false
+    }
+
+    /// Whether `ancestor` is a host-including inclusive ancestor of `node`, the
+    /// DOM pre-insertion check that stops a node from being inserted into its
+    /// own subtree. Uses the same bounded walk as the reparenting guards.
+    pub fn is_host_including_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        if ancestor == node {
+            return true;
+        }
+        let inner = self.inner.borrow();
+        Self::would_create_host_including_cycle(&inner, node, ancestor)
     }
 
     /// DOM insertion rejects a node when it is a host-including inclusive
@@ -568,6 +912,11 @@ impl DomTree {
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
+            let generations = inner.node_generations
+                .get_or_insert_with(|| Box::new(NodeAllocationGenerations::default()));
+            generations.next = generations.next.wrapping_add(1).max(1);
+            let generation = generations.next;
+            generations.reused.insert(NodeId(slot), generation);
             NodeId(slot)
         } else {
             let idx = inner.nodes.len() as u32;
@@ -597,8 +946,25 @@ impl DomTree {
         id
     }
 
+    /// Identity of this allocation of an arena slot. Appended slots need no
+    /// generation entry; reuse changes only the reused slot's identity.
+    pub fn node_allocation_generation(&self, id: NodeId) -> Option<u64> {
+        let inner = self.inner.borrow();
+        inner.nodes.get(id.index())?.as_ref()?;
+        Some(inner.node_generations.as_ref()
+            .and_then(|generations| generations.reused.get(&id)).copied().unwrap_or(0))
+    }
+
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
         self.inner.borrow().nodes.get(id.index())?.clone()
+    }
+
+    /// Read a node without copying its text or attributes. Drop the guard
+    /// before mutating this tree; use `get_node` when an owned snapshot is needed.
+    pub fn borrow_node(&self, id: NodeId) -> Option<std::cell::Ref<'_, Node>> {
+        std::cell::Ref::filter_map(self.inner.borrow(), |inner| {
+            inner.nodes.get(id.index())?.as_ref()
+        }).ok()
     }
 
     pub fn with_node<F, R>(&self, id: NodeId, f: F) -> Option<R>
@@ -613,11 +979,38 @@ impl DomTree {
     where
         F: FnOnce(&mut Node) -> R,
     {
+        self.parser_depth_cache.set(None);
+        let form_cache_active = Arc::strong_count(&self.form_cache_generation) > 1
+            || !self.form_cache_observers.borrow().is_empty()
+            || !self.form_id_cache.borrow().is_empty()
+            || !self.form_controls_cache.borrow().is_empty();
         let mut inner = self.inner.borrow_mut();
-        inner.nodes.get_mut(id.index())?.as_mut().map(f)
+        if inner.nodes.get(id.index()).and_then(Option::as_ref)
+            .is_some_and(|node| matches!(node.data, NodeData::Text { .. })) {
+            Self::invalidate_cssom_source(&mut inner, id);
+        }
+        let old_key = if form_cache_active {
+            inner.nodes.get(id.index()).and_then(Option::as_ref).map(FormOwnershipKey::of)
+        } else { None };
+        let old_form = if !inner.parser_form_owners.is_empty() && inner.parser_form_owners.contains_key(&id) {
+            inner.nodes.get(id.index())?.as_ref()?.get_attribute("form").map(str::to_owned)
+        } else {
+            None
+        };
+        let result = inner.nodes.get_mut(id.index())?.as_mut().map(f);
+        if !inner.parser_form_owners.is_empty() && inner.parser_form_owners.contains_key(&id)
+            && inner.nodes.get(id.index())?.as_ref()?.get_attribute("form") != old_form.as_deref() {
+            inner.parser_form_owners.remove(&id);
+        }
+        let ownership_changed = form_cache_active
+            && inner.nodes.get(id.index()).and_then(Option::as_ref).map(FormOwnershipKey::of) != old_key;
+        drop(inner);
+        if ownership_changed { self.invalidate_form_caches(); }
+        result
     }
 
     pub fn append_child(&self, parent_id: NodeId, child_id: NodeId) {
+        self.parser_depth_cache.set(None);
         // Per DOM spec, appending a node to itself is a HierarchyRequestError;
         // here we treat it as a no-op rather than panic. Without this the
         // sibling-pointer fixup below sets the node's prev_sibling to itself
@@ -674,6 +1067,7 @@ impl DomTree {
         self.detach_for_reparent(child_id, child_connected && !parent_connected);
 
         let mut inner = self.inner.borrow_mut();
+        Self::invalidate_cssom_source(&mut inner, parent_id);
 
         let old_last = inner.nodes.get(parent_id.index())
             .and_then(|n| n.as_ref())
@@ -703,6 +1097,7 @@ impl DomTree {
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
+        self.parser_depth_cache.set(None);
         // Per DOM spec: if the node being inserted IS the reference node,
         // the operation is a no-op (the node is already in its target
         // position). Without this, the linked-list fixup below sets the
@@ -768,6 +1163,7 @@ impl DomTree {
             node.prev_sibling = prev_id;
             node.next_sibling = Some(existing_id);
         }
+        Self::invalidate_cssom_source(&mut inner, parent_id);
 
         if let Some(Some(node)) = inner.nodes.get_mut(existing_id.index()) {
             node.prev_sibling = Some(new_sibling_id);
@@ -790,6 +1186,8 @@ impl DomTree {
     }
 
     fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
+        self.parser_depth_cache.set(None);
+        self.invalidate_form_caches();
         let mut inner = self.inner.borrow_mut();
 
         // The document and registered ShadowRoots have no ordinary parent and
@@ -802,6 +1200,15 @@ impl DomTree {
             Some(node) => (node.parent, node.prev_sibling, node.next_sibling),
             None => return,
         };
+        Self::invalidate_cssom_source(&mut inner, node_id);
+        if parent_id.is_some() && !inner.parser_form_owners.is_empty() {
+            let inner = &mut *inner;
+            let nodes = &inner.nodes;
+            inner.parser_form_owners.retain(|control, form| {
+                !Self::ordinary_ancestor(nodes, node_id, *control)
+                    && !Self::ordinary_ancestor(nodes, node_id, *form)
+            });
+        }
         if disconnect && inner
             .nodes
             .get(node_id.index())
@@ -910,8 +1317,18 @@ impl DomTree {
         // would panic on direct indexing, and freeing an already-freed slot
         // would push it onto the free list a second time — later handing the
         // same NodeId to two live nodes (aliasing).
+        if !inner.parser_form_owners.is_empty() {
+            let freed: HashSet<_> = nodes_to_remove.iter().copied().collect();
+            inner.parser_form_owners.retain(|control, form| {
+                !freed.contains(control) && !freed.contains(form)
+            });
+        }
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
+                inner.form_controls.remove(&id);
+                if let Some(metadata) = inner.node_generations.as_mut() {
+                    metadata.parser_started_scripts.remove(&id);
+                }
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -969,6 +1386,20 @@ impl DomTree {
         result
     }
 
+    /// Find an immediate child without allocating a child-list snapshot.
+    pub fn find_child(&self, parent: NodeId, mut matches: impl FnMut(&Node) -> bool) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let mut child = inner.nodes.get(parent.index())?.as_ref()?.first_child;
+        // Keep the same corrupt-sibling backstop as children().
+        for _ in 0..inner.nodes.len() {
+            let id = child?;
+            let node = inner.nodes.get(id.index())?.as_ref()?;
+            if matches(node) { return Some(id); }
+            child = node.next_sibling;
+        }
+        None
+    }
+
     pub fn children(&self, node_id: NodeId) -> Vec<NodeId> {
         let inner = self.inner.borrow();
         let mut result = Vec::new();
@@ -991,11 +1422,350 @@ impl DomTree {
         result
     }
 
+    /// HTML table rows: header sections first, body/direct rows in tree order,
+    /// and footer sections last. Nested tables do not contribute rows.
+    pub fn table_rows(&self, table: NodeId) -> Option<Vec<NodeId>> {
+        let html_tag = |id| self.html_element_local_name(id);
+        if html_tag(table).as_ref().map(|tag| tag.as_ref()) != Some("table") {
+            return None;
+        }
+        let mut head = Vec::new();
+        let mut body = Vec::new();
+        let mut foot = Vec::new();
+        for child in self.children(table) {
+            let Some(tag) = html_tag(child) else { continue };
+            let rows = match tag.as_ref() {
+                "tr" => { body.push(child); continue; }
+                "thead" => &mut head,
+                "tbody" => &mut body,
+                "tfoot" => &mut foot,
+                _ => continue,
+            };
+            rows.extend(self.children(child).into_iter().filter(|row| {
+                html_tag(*row).as_ref().map(|tag| tag.as_ref()) == Some("tr")
+            }));
+        }
+        head.extend(body);
+        head.extend(foot);
+        Some(head)
+    }
+
+    fn html_named_children(&self, parent: NodeId, parents: &[&str], children: &[&str]) -> Option<Vec<NodeId>> {
+        let tag = self.html_element_local_name(parent)?;
+        if !parents.contains(&tag.as_ref()) { return None; }
+        Some(self.children(parent).into_iter().filter(|child| {
+            self.html_element_local_name(*child).is_some_and(|tag| children.contains(&tag.as_ref()))
+        }).collect())
+    }
+
+    pub fn table_interface(&self, node: NodeId) -> Option<&'static str> {
+        match self.html_element_local_name(node)?.as_ref() {
+            "table" => Some("HTMLTableElement"),
+            "thead" | "tbody" | "tfoot" => Some("HTMLTableSectionElement"),
+            "tr" => Some("HTMLTableRowElement"),
+            "td" | "th" => Some("HTMLTableCellElement"),
+            _ => None,
+        }
+    }
+
+    pub fn table_sections(&self, table: NodeId, section: &str) -> Option<Vec<NodeId>> {
+        if !["thead", "tbody", "tfoot"].contains(&section) { return None; }
+        self.html_named_children(table, &["table"], &[section])
+    }
+
+    pub fn table_section_rows(&self, section: NodeId) -> Option<Vec<NodeId>> {
+        self.html_named_children(section, &["thead", "tbody", "tfoot"], &["tr"])
+    }
+
+    pub fn table_row_cells(&self, row: NodeId) -> Option<Vec<NodeId>> {
+        self.html_named_children(row, &["tr"], &["td", "th"])
+    }
+
+    pub fn table_row_index(&self, row: NodeId, section_only: bool) -> Option<isize> {
+        if self.html_element_local_name(row)?.as_ref() != "tr" { return None; }
+        let Some(parent) = self.with_node(row, |node| node.parent).flatten() else { return Some(-1) };
+        let rows = match self.html_element_local_name(parent).as_ref().map(|tag| tag.as_ref()) {
+            Some("table") => self.table_rows(parent),
+            Some("thead" | "tbody" | "tfoot") if section_only => self.table_section_rows(parent),
+            Some("thead" | "tbody" | "tfoot") => {
+                self.with_node(parent, |node| node.parent).flatten().and_then(|table| self.table_rows(table))
+            }
+            _ => None,
+        };
+        Some(rows.and_then(|rows| rows.iter().position(|candidate| *candidate == row))
+            .map(|index| index as isize).unwrap_or(-1))
+    }
+
+    pub fn table_cell_index(&self, cell: NodeId) -> Option<isize> {
+        let tag = self.html_element_local_name(cell)?;
+        if !["td", "th"].contains(&tag.as_ref()) { return None; }
+        let cells = self.with_node(cell, |node| node.parent).flatten()
+            .and_then(|row| self.table_row_cells(row));
+        Some(cells.and_then(|cells| cells.iter().position(|candidate| *candidate == cell))
+            .map(|index| index as isize).unwrap_or(-1))
+    }
+
+    fn html_element_local_name(&self, id: NodeId) -> Option<LocalName> {
+        self.with_node(id, |node| {
+            node.as_element().filter(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+            }).map(|name| name.local.clone())
+        }).flatten()
+    }
+
+    fn ordinary_ancestor(nodes: &[Option<Node>], ancestor: NodeId, node: NodeId) -> bool {
+        let mut current = Some(node);
+        for _ in 0..=nodes.len() {
+            let Some(id) = current else { return false };
+            if id == ancestor { return true; }
+            current = nodes.get(id.index()).and_then(Option::as_ref).and_then(|node| node.parent);
+        }
+        eprintln!("obscura: form-owner ancestor cap hit - tree has a cycle");
+        false
+    }
+
+    fn invalidate_form_caches(&self) {
+        let generation = self.form_cache_generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        self.form_cache_observers.borrow_mut().retain(|observer| {
+            if let Some(observer) = observer.upgrade() {
+                observer(generation);
+                true
+            } else { false }
+        });
+        self.form_id_cache.borrow_mut().clear();
+        self.form_controls_cache.borrow_mut().clear();
+    }
+
+    pub fn form_cache_generation_handle(&self) -> Arc<AtomicU64> {
+        self.form_cache_generation.clone()
+    }
+
+    pub fn watch_form_cache_generation(&self, observer: Weak<dyn Fn(u64) + Send + Sync>) {
+        self.form_cache_observers.borrow_mut().push(observer);
+    }
+
+    fn ordinary_root(inner: &DomTreeInner, node: NodeId) -> Option<NodeId> {
+        let mut current = node;
+        for _ in 0..=inner.nodes.len() {
+            let node = inner.nodes.get(current.index())?.as_ref()?;
+            match node.parent {
+                Some(parent) => current = parent,
+                None => return Some(current),
+            }
+        }
+        eprintln!("obscura: form-owner root cap hit - tree has a cycle");
+        None
+    }
+
+    fn html_tag(node: &Node) -> Option<&str> {
+        node.as_element().filter(|name| name.ns.as_ref() == "http://www.w3.org/1999/xhtml")
+            .map(|name| name.local.as_ref())
+    }
+
+    fn is_listed_control(node: &Node) -> bool {
+        matches!(Self::html_tag(node), Some("button" | "fieldset" | "input" | "object" | "output" | "select" | "textarea"))
+    }
+
+    // One borrowed preorder walk, carrying the nearest form rather than doing
+    // a DOM op and ancestor walk for every control. Shadow trees stay separate.
+    fn visit_form_tree(
+        inner: &DomTreeInner, root: NodeId,
+        mut visit: impl FnMut(NodeId, &Node, Option<NodeId>) -> bool,
+    ) -> Option<()> {
+        let mut next = Some((root, None));
+        let mut siblings = Vec::new();
+        let mut remaining = inner.nodes.len();
+        while let Some((id, owner)) = next.take() {
+            if remaining == 0 {
+                eprintln!("obscura: form-controls traversal cap hit - tree has a cycle");
+                return None;
+            }
+            remaining -= 1;
+            let node = inner.nodes.get(id.index())?.as_ref()?;
+            if !visit(id, node, owner) { return Some(()); }
+            let sibling = if id == root { None } else { node.next_sibling.map(|id| (id, owner)) };
+            if let Some(child) = node.first_child {
+                if let Some(sibling) = sibling { siblings.push(sibling); }
+                next = Some((child, if Self::html_tag(node) == Some("form") { Some(id) } else { owner }));
+            } else {
+                next = sibling.or_else(|| siblings.pop());
+            }
+        }
+        Some(())
+    }
+
+    pub fn set_parser_form_owner(&self, control: NodeId, form: NodeId, parent: NodeId) {
+        if self.is_inclusive_ancestor(form, parent) { return; }
+        self.invalidate_form_caches();
+        self.inner.borrow_mut().parser_form_owners.insert(control, form);
+    }
+
+    /// Resolve explicit, parser and ancestor ownership within one ordinary tree.
+    pub fn form_owner(&self, control: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let node = inner.nodes.get(control.index())?.as_ref()?;
+        if Self::is_listed_control(node) {
+            if let Some(id) = node.get_attribute("form").filter(|_| node.connected) {
+                if id.is_empty() { return None; }
+                let root = Self::ordinary_root(&inner, control)?;
+                if let Some(ids) = self.form_id_cache.borrow().get(&root) {
+                    return ids.get(id).copied().filter(|nid| {
+                        inner.nodes.get(nid.index()).and_then(Option::as_ref)
+                            .is_some_and(|node| Self::html_tag(node) == Some("form"))
+                    });
+                }
+                let mut ids = HashMap::new();
+                Self::visit_form_tree(&inner, root, |nid, node, _| {
+                    if node.is_element() {
+                        if let Some(id) = node.get_attribute("id") { ids.entry(id.to_owned()).or_insert(nid); }
+                    }
+                    true
+                })?;
+                let found = ids.get(id).copied().filter(|nid| {
+                    inner.nodes.get(nid.index()).and_then(Option::as_ref)
+                        .is_some_and(|node| Self::html_tag(node) == Some("form"))
+                });
+                self.form_id_cache.borrow_mut().insert(root, ids);
+                return found;
+            }
+            if let Some(owner) = inner.parser_form_owners.get(&control).copied() {
+                if Self::ordinary_root(&inner, owner).is_some_and(|root| {
+                    Some(root) == Self::ordinary_root(&inner, control)
+                }) {
+                    return Some(owner);
+                }
+            }
+        }
+        let mut parent = node.parent;
+        for _ in 0..=inner.nodes.len() {
+            let id = parent?;
+            let node = inner.nodes.get(id.index())?.as_ref()?;
+            if Self::html_tag(node) == Some("form") { return Some(id); }
+            parent = node.parent;
+        }
+        eprintln!("obscura: form-owner ancestor cap hit - tree has a cycle");
+        None
+    }
+
+    /// Listed controls owned by a form, in tree order, without selector parsing
+    /// or per-control JavaScript ownership checks.
+    pub fn form_controls(&self, form: NodeId) -> Option<Vec<NodeId>> {
+        let inner = self.inner.borrow();
+        let node = inner.nodes.get(form.index())?.as_ref()?;
+        if Self::html_tag(node) != Some("form") { return None; }
+        if let Some(controls) = self.form_controls_cache.borrow().get(&form) {
+            return Some(controls.clone());
+        }
+        let id = node.get_attribute("id").filter(|id| !id.is_empty());
+        let has_parser_controls = inner.parser_form_owners.values().any(|owner| *owner == form);
+        let root = if (node.connected && id.is_some()) || has_parser_controls {
+            Self::ordinary_root(&inner, form)?
+        } else { form };
+        let mut first_id = None;
+        let mut candidates = Vec::new();
+        Self::visit_form_tree(&inner, root, |nid, node, ancestor_form| {
+            if first_id.is_none() && id.is_some() && node.is_element() && node.get_attribute("id") == id {
+                first_id = Some(nid);
+            }
+            if Self::is_listed_control(node) {
+                if let Some(attribute) = node.get_attribute("form").filter(|_| node.connected) {
+                    if Some(attribute) == id { candidates.push((nid, true)); }
+                } else {
+                    let owner = inner.parser_form_owners.get(&nid).copied().or(ancestor_form);
+                    if owner == Some(form) { candidates.push((nid, false)); }
+                }
+            }
+            true
+        })?;
+        let controls: Vec<_> = candidates.into_iter().filter_map(|(nid, explicit)| {
+            (!explicit || first_id == Some(form)).then_some(nid)
+        }).collect();
+        self.form_controls_cache.borrow_mut().insert(form, controls.clone());
+        Some(controls)
+    }
+
+    /// Options owned by this select, excluding nested select, datalist and
+    /// option subtrees rather than treating every descendant as an option.
+    pub fn select_options(&self, select: NodeId) -> Option<Vec<NodeId>> {
+        if self.html_element_local_name(select).as_ref().map(|name| name.as_ref()) != Some("select") {
+            return None;
+        }
+        let mut options = Vec::new();
+        let mut pending: Vec<_> = self.children(select).into_iter().rev().collect();
+        let mut remaining = self.node_slot_count();
+        while let Some(node) = pending.pop() {
+            if remaining == 0 {
+                eprintln!("obscura: select-options traversal cap hit - tree has a cycle");
+                return None;
+            }
+            remaining -= 1;
+            match self.html_element_local_name(node).as_ref().map(|name| name.as_ref()) {
+                Some("option") => options.push(node),
+                Some("select" | "datalist") => {},
+                _ => pending.extend(self.children(node).into_iter().rev()),
+            }
+        }
+        Some(options)
+    }
+
+    pub fn option_index(&self, option: NodeId) -> Option<usize> {
+        if self.html_element_local_name(option).as_ref().map(|name| name.as_ref()) != Some("option") {
+            return None;
+        }
+        let mut parent = self.with_node(option, |node| node.parent).flatten();
+        let mut remaining = self.node_slot_count();
+        while let Some(node) = parent {
+            if remaining == 0 {
+                eprintln!("obscura: option-index traversal cap hit - tree has a cycle");
+                return None;
+            }
+            remaining -= 1;
+            match self.html_element_local_name(node).as_ref().map(|name| name.as_ref()) {
+                Some("select") => return self.select_options(node)
+                    .map(|options| options.iter().position(|id| *id == option).unwrap_or(0)),
+                Some("datalist" | "option") => return Some(0),
+                _ => parent = self.with_node(node, |node| node.parent).flatten(),
+            }
+        }
+        Some(0)
+    }
+
     /// Snapshot the direct children of `host`'s shadow root. Ordinary
     /// `children(host)` continues to return only light children.
     pub fn shadow_children(&self, host: NodeId) -> Option<Vec<NodeId>> {
         let root = self.shadow_root(host)?;
         Some(self.children(root))
+    }
+
+    /// Internal preorder traversal for synchronous reads such as selectors.
+    /// Unlike `descendants`, this does not allocate a snapshot of the subtree
+    /// before the first result. Only deferred siblings on the current ancestor
+    /// path are retained, and no RefCell borrow survives an iterator step.
+    pub(crate) fn descendants_iter(&self, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let mut next = self.with_node(node_id, |node| node.first_child).flatten();
+        let mut siblings = Vec::new();
+        let mut remaining = self.node_slot_count();
+        std::iter::from_fn(move || {
+            let current = next.take()?;
+            if remaining == 0 {
+                eprintln!("obscura: descendants iterator cap hit at node {} - tree has a cycle", node_id.index());
+                siblings.clear();
+                return None;
+            }
+            remaining -= 1;
+            let (child, sibling) = self
+                .with_node(current, |node| (node.first_child, node.next_sibling))
+                .unwrap_or_default();
+            if let Some(child) = child {
+                if let Some(sibling) = sibling {
+                    siblings.push(sibling);
+                }
+                next = Some(child);
+            } else {
+                next = sibling.or_else(|| siblings.pop());
+            }
+            Some(current)
+        })
     }
 
     pub fn descendants(&self, node_id: NodeId) -> Vec<NodeId> {
@@ -1070,12 +1840,12 @@ impl DomTree {
     /// only for HTML slots; same-local-name elements in other namespaces do
     /// not participate in the flattened tree.
     pub fn is_html_slot_element(&self, node: NodeId) -> bool {
-        self.get_node(node).is_some_and(|node| {
+        self.with_node(node, |node| {
             node.as_element().is_some_and(|name| {
                 name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
                     && name.local.as_ref() == "slot"
             })
-        })
+        }).unwrap_or(false)
     }
 
     /// Return the first slot to which `node` is assigned.
@@ -1085,26 +1855,23 @@ impl DomTree {
     /// the empty/default name. The first same-name slot in shadow-tree order
     /// wins, matching the HTML slot assignment algorithm.
     pub fn assigned_slot(&self, node: NodeId) -> Option<NodeId> {
-        let node_ref = self.get_node(node)?;
-        let parent = node_ref.parent?;
-        let name = if node_ref.is_element() {
-            node_ref.get_attribute("slot").unwrap_or("").to_owned()
-        } else if node_ref.text_content_of_text_node().is_some() {
-            String::new()
-        } else {
-            return None;
-        };
-        drop(node_ref);
-
+        let parent = self.with_node(node, |node| node.parent).flatten()?;
         let root = self.shadow_root(parent)?;
-        self.descendants(root).into_iter().find(|candidate| {
-            self.is_html_slot_element(*candidate)
-                && self
-                    .get_node(*candidate)
-                    .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
-                    .unwrap_or_default()
-                    == name
-        })
+        self.with_node(node, |node| {
+            let name = if node.is_element() {
+                node.get_attribute("slot").unwrap_or("")
+            } else if node.text_content_of_text_node().is_some() {
+                ""
+            } else {
+                return None;
+            };
+            self.descendants(root).into_iter().find(|candidate| {
+                self.is_html_slot_element(*candidate)
+                    && self.with_node(*candidate, |slot| {
+                        slot.get_attribute("name").unwrap_or("") == name
+                    }).unwrap_or(false)
+            })
+        }).flatten()
     }
 
     /// Nodes directly assigned to an HTML slot. The first same-name slot wins;
@@ -1117,16 +1884,13 @@ impl DomTree {
         let root = self.containing_shadow_root(slot)?;
         let host = self.shadow_root_info(root)?.host;
         let name = self
-            .get_node(slot)
-            .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
+            .with_node(slot, |slot| slot.get_attribute("name").unwrap_or("").to_owned())
             .unwrap_or_default();
         let is_same_name_slot = |candidate: NodeId| {
             self.is_html_slot_element(candidate)
                 && self
-                    .get_node(candidate)
-                    .and_then(|slot| slot.get_attribute("name").map(str::to_owned))
-                    .unwrap_or_default()
-                    == name
+                    .with_node(candidate, |slot| slot.get_attribute("name").unwrap_or("") == name)
+                    .unwrap_or(false)
         };
         if self
             .descendants(root)
@@ -1140,17 +1904,16 @@ impl DomTree {
             self.children(host)
                 .into_iter()
                 .filter(|candidate| {
-                    let Some(node) = self.get_node(*candidate) else {
-                        return false;
-                    };
-                    let candidate_name = if node.is_element() {
-                        node.get_attribute("slot").unwrap_or("")
-                    } else if node.text_content_of_text_node().is_some() {
-                        ""
-                    } else {
-                        return false;
-                    };
-                    candidate_name == name
+                    self.with_node(*candidate, |node| {
+                        let candidate_name = if node.is_element() {
+                            node.get_attribute("slot").unwrap_or("")
+                        } else if node.text_content_of_text_node().is_some() {
+                            ""
+                        } else {
+                            return false;
+                        };
+                        candidate_name == name
+                    }).unwrap_or(false)
                 })
                 .collect(),
         )
@@ -1431,6 +2194,10 @@ impl DomTree {
         }
         let source_data = self.get_node(source_node_id)?.data;
         let cloned_root = self.new_node(source_data);
+        if let Some(mut state) = self.form_control_state(source_node_id) {
+            state.indeterminate = false;
+            self.update_form_control_state(cloned_root, |control| *control = state);
+        }
         let mut stack = Vec::new();
         self.prepare_cloned_children(source_node_id, cloned_root, deep, &mut stack);
 
@@ -1440,6 +2207,10 @@ impl DomTree {
                 None => continue,
             };
             let cloned_node = self.new_node(source_data);
+            if let Some(mut state) = self.form_control_state(source_node) {
+                state.indeterminate = false;
+                self.update_form_control_state(cloned_node, |control| *control = state);
+            }
             self.append_child(dest_parent, cloned_node);
             self.prepare_cloned_children(source_node, cloned_node, true, &mut stack);
         }
@@ -1499,15 +2270,19 @@ impl DomTree {
         let mut imported_root = None;
         let mut stack = vec![(parent_id, source_node_id)];
         while let Some((dest_parent, src_id)) = stack.pop() {
-            let node_data = {
+            let (node_data, parser_started) = {
                 let source_inner = source.inner.borrow();
                 match source_inner.nodes.get(src_id.index()) {
-                    Some(Some(node)) => node.data.clone(),
+                    Some(Some(node)) => (node.data.clone(), source_inner.node_generations.as_ref()
+                        .is_some_and(|metadata| metadata.parser_started_scripts.contains(&src_id))),
                     _ => continue,
                 }
             };
 
             let new_id = self.new_node(node_data);
+            if parser_started {
+                self.mark_parser_script_started(new_id);
+            }
             self.append_child(dest_parent, new_id);
             // The first node off the stack is source_node_id itself.
             if imported_root.is_none() {
@@ -1554,7 +2329,8 @@ impl DomTree {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.borrow().nodes.iter().filter(|n| n.is_some()).count()
+        let inner = self.inner.borrow();
+        inner.nodes.len() - inner.free_list.len()
     }
 
     // Number of node slots (live plus freed), i.e. the same upper bound
@@ -1642,6 +2418,119 @@ impl Default for DomTree {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reused_node_slots_have_distinct_allocation_identities() {
+        let tree = DomTree::new();
+        let retained = tree.new_node(NodeData::Text { contents: "retained".into() });
+        let removed = tree.new_node(NodeData::Text { contents: "removed".into() });
+        let old = tree.node_allocation_generation(removed).unwrap();
+        tree.remove(removed);
+        assert_eq!(tree.node_allocation_generation(removed), None);
+        let reused = tree.new_node(NodeData::Text { contents: "new".into() });
+        assert_eq!(reused, removed);
+        assert_ne!(tree.node_allocation_generation(reused), Some(old));
+        assert_eq!(tree.node_allocation_generation(retained), Some(0));
+        tree.remove(reused);
+        let next = tree.new_node(NodeData::Text { contents: "next".into() });
+        assert_eq!(next, reused);
+        assert_ne!(tree.node_allocation_generation(next), Some(old));
+        assert_eq!(tree.node_allocation_generation(retained), Some(0));
+    }
+
+    #[test]
+    fn cssom_stylesheet_storage_is_released_when_owner_is_detached() {
+        let tree = DomTree::new();
+        for _ in 0..128 {
+            let parent = element(&tree, "div");
+            let owner = element(&tree, "style");
+            tree.append_child(tree.document(), parent);
+            tree.append_child(parent, owner);
+            assert!(tree.update_cssom_stylesheet(owner, 0, 0, vec![".x { width: 3px }".into()], true));
+            tree.detach(parent);
+        }
+        assert!(tree.external_stylesheets().is_empty(), "detached inline sheets retained native storage");
+    }
+
+    #[test]
+    fn cssom_inline_rules_survive_cross_origin_import_loading() {
+        let tree = DomTree::new();
+        let owner = element(&tree, "style");
+        tree.append_child(tree.document(), owner);
+        assert!(tree.append_external_stylesheet(owner, ".import { color: red }".into(), false));
+        assert!(tree.update_cssom_stylesheet(owner, 0, 0, vec![".own { width: 3px }".into()], true),
+            "a foreign import does not taint its inline owner's own rules");
+        assert!(tree.append_external_stylesheet(owner, ".late { color: blue }".into(), false));
+        let sheet = tree.external_stylesheet(owner).unwrap();
+        assert_eq!(sheet.cssom_rules.unwrap()[0].as_ref(), ".own { width: 3px }");
+        assert_eq!(sheet.sources.len(), 2);
+        assert!(!sheet.origin_clean);
+    }
+
+    #[test]
+    fn find_child_stops_at_the_first_matching_immediate_child() {
+        let tree = DomTree::new();
+        let parent = element(&tree, "div");
+        let text = tree.new_node(NodeData::Text { contents: "before".into() });
+        let first = element(&tree, "span");
+        let last = element(&tree, "b");
+        let nested = element(&tree, "i");
+        for child in [text, first, last] { tree.append_child(parent, child); }
+        tree.append_child(first, nested);
+        let mut visited = 0;
+        assert_eq!(tree.find_child(parent, |node| { visited += 1; node.is_element() }), Some(first));
+        assert_eq!(visited, 2, "matching reads must not walk later siblings or descendants");
+        assert_eq!(tree.find_child(parent, |node| node.as_element().is_some_and(|name| name.local.as_ref() == "i")), None);
+        tree.detach(first);
+        assert_eq!(tree.find_child(parent, Node::is_element), Some(last));
+        assert_eq!(tree.find_child(NodeId::new(u32::MAX), |_| true), None);
+    }
+
+    #[test]
+    fn find_child_bounds_a_corrupted_sibling_cycle() {
+        let tree = DomTree::new();
+        let child = element(&tree, "div");
+        tree.append_child(tree.document(), child);
+        tree.with_node_mut(child, |node| node.next_sibling = Some(child));
+        let mut visited = 0;
+        assert_eq!(tree.find_child(tree.document(), |_| { visited += 1; false }), None);
+        assert_eq!(visited, tree.node_slot_count());
+    }
+
+    #[test]
+    fn streaming_descendants_match_snapshots_and_keep_shadow_roots_separate() {
+        let tree = crate::parse_html("<!doctype html><main id='root'>text<!--gap--><div><i></i><b></b></div><p></p></main><aside id='host'></aside>");
+        let host = tree.get_element_by_id("host").unwrap();
+        let shadow = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let child = element(&tree, "span");
+        tree.append_child(shadow, child);
+        let mut roots = tree.descendants(tree.document());
+        roots.extend([tree.document(), shadow, child]);
+        for root in roots {
+            assert_eq!(tree.descendants_iter(root).collect::<Vec<_>>(), tree.descendants(root));
+        }
+        assert!(!tree.descendants_iter(tree.document()).any(|node| node == child));
+        assert_eq!(tree.descendants_iter(shadow).collect::<Vec<_>>(), vec![child]);
+        tree.detach(child);
+        assert_eq!(tree.descendants_iter(shadow).count(), 0);
+        assert_eq!(tree.descendants_iter(child).count(), 0);
+    }
+
+    #[test]
+    fn streaming_descendants_bound_broken_child_and_sibling_cycles() {
+        for sibling_cycle in [false, true] {
+            let tree = DomTree::new();
+            let child = element(&tree, "div");
+            tree.append_child(tree.document(), child);
+            tree.with_node_mut(child, |node| {
+                if sibling_cycle { node.next_sibling = Some(child); }
+                else { node.first_child = Some(child); }
+            });
+            let mut walk = tree.descendants_iter(tree.document());
+            assert_eq!(walk.by_ref().count(), tree.node_slot_count());
+            assert_eq!(walk.next(), None);
+        }
+    }
+
     fn element(tree: &DomTree, local: &str) -> NodeId {
         tree.new_node(NodeData::Element {
             name: QualName::new(None, ns!(html), LocalName::from(local)),
@@ -1649,6 +2538,84 @@ mod tests {
             template_contents: None,
             mathml_annotation_xml_integration_point: false,
         })
+    }
+
+    #[test]
+    fn form_caches_ignore_unrelated_attributes_and_track_owner_identity() {
+        let tree = crate::parse_html("<form id=f><input id=inside></form><input id=outside form=f>");
+        let form = tree.get_element_by_id("f").unwrap();
+        let outside = tree.get_element_by_id("outside").unwrap();
+        let generation = tree.form_cache_generation_handle();
+        assert_eq!(tree.form_owner(outside), Some(form));
+        assert_eq!(tree.form_controls(form).unwrap().len(), 2);
+        let initial = generation.load(Ordering::Relaxed);
+        for (name, value) in [("class", "changed"), ("style", "color:red"), ("value", "new"), ("name", "field")] {
+            tree.with_node_mut(outside, |node| node.set_attribute(name, value.into()));
+            assert_eq!(generation.load(Ordering::Relaxed), initial);
+            assert_eq!(tree.form_owner(outside), Some(form));
+            assert_eq!(tree.form_controls(form).unwrap().len(), 2);
+        }
+        tree.with_node_mut(form, |node| node.set_attribute("id", "changed".into()));
+        assert_ne!(generation.load(Ordering::Relaxed), initial);
+        assert_eq!(tree.form_owner(outside), None);
+        tree.with_node_mut(form, |node| {
+            if let NodeData::Element { name, .. } = &mut node.data {
+                name.ns = Namespace::from("urn:foreign");
+            }
+        });
+        assert_eq!(tree.form_controls(form), None);
+    }
+
+    #[test]
+    fn form_cache_observers_do_not_keep_retired_subscribers_alive() {
+        let tree = crate::parse_html("<form id=f><input></form>");
+        fn require_send<T: Send>() {}
+        require_send::<DomTree>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let received = generation.clone();
+        let observer: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |value| received.store(value, Ordering::Relaxed));
+        tree.watch_form_cache_generation(Arc::downgrade(&observer));
+        let form = tree.get_element_by_id("f").unwrap();
+        tree.with_node_mut(form, |node| node.set_attribute("id", "changed".into()));
+        assert_eq!(generation.load(Ordering::Relaxed), tree.form_cache_generation_handle().load(Ordering::Relaxed));
+        drop(observer);
+        let last = generation.load(Ordering::Relaxed);
+        tree.with_node_mut(form, |node| node.set_attribute("id", "again".into()));
+        assert_eq!(generation.load(Ordering::Relaxed), last);
+        assert!(tree.form_cache_observers.borrow().is_empty());
+    }
+
+    #[test]
+    fn form_owner_parser_form_moves_do_not_restore_association() {
+        let tree = crate::parse_html("<table><form id=f><tr><td><input id=a></td></tr></form></table>");
+        let form = tree.get_element_by_id("f").unwrap();
+        let input = tree.get_element_by_id("a").unwrap();
+        assert_eq!(tree.form_owner(input), Some(form));
+        assert_eq!(tree.form_controls(form), Some(vec![input]));
+        tree.append_child(tree.document(), form);
+        assert_eq!(tree.form_owner(input), None);
+        assert_eq!(tree.form_controls(form), Some(vec![]));
+        tree.detach(form);
+        tree.append_child(tree.document(), form);
+        assert_eq!(tree.form_owner(input), None);
+    }
+
+    #[test]
+    fn form_controls_reject_foreign_forms_and_bound_cycles() {
+        let tree = DomTree::new();
+        let form = element(&tree, "form");
+        let input = element(&tree, "input");
+        tree.append_child(form, input);
+        assert_eq!(tree.form_controls(form), Some(vec![input]));
+        assert_eq!(tree.form_owner(input), Some(form));
+        tree.with_node_mut(input, |node| node.next_sibling = Some(input));
+        assert_eq!(tree.form_controls(form), None);
+        tree.with_node_mut(form, |node| {
+            if let NodeData::Element { name, .. } = &mut node.data { name.ns = Namespace::from("urn:foreign"); }
+        });
+        assert_eq!(tree.form_controls(form), None);
+        assert_eq!(tree.form_controls(NodeId::new(u32::MAX)), None);
+        assert_eq!(tree.form_owner(NodeId::new(u32::MAX)), None);
     }
 
     fn element_with_id(tree: &DomTree, local: &str, id: &str) -> NodeId {
@@ -1664,11 +2631,168 @@ mod tests {
     }
 
     #[test]
+    fn table_rows_order_sections_and_exclude_nested_or_foreign_rows() {
+        let tree = DomTree::new();
+        let table = element(&tree, "table");
+        let mut expected = Vec::new();
+        for tag in ["tfoot", "tbody", "thead"] {
+            let section = element(&tree, tag);
+            tree.append_child(table, section);
+            let row = element(&tree, "tr");
+            tree.append_child(section, row);
+            expected.push(row);
+        }
+        let direct = element(&tree, "tr");
+        tree.append_child(table, direct);
+        let nested = element(&tree, "table");
+        tree.append_child(expected[1], nested);
+        let nested_row = element(&tree, "tr");
+        tree.append_child(nested, nested_row);
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, Namespace::from("urn:foreign"), LocalName::from("tr")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        tree.append_child(table, foreign);
+        assert_eq!(tree.table_rows(table), Some(vec![expected[2], expected[1], direct, expected[0]]));
+        assert_eq!(tree.table_rows(nested), Some(vec![nested_row]));
+        tree.append_child(table, expected[2]);
+        assert_eq!(tree.table_rows(table), Some(vec![expected[1], direct, expected[2], expected[0]]));
+        assert_eq!(tree.table_rows(foreign), None);
+        assert_eq!(tree.table_rows(NodeId::new(u32::MAX)), None);
+    }
+
+    #[test]
+    fn table_child_collections_and_indices_follow_native_ownership() {
+        let tree = DomTree::new();
+        let table = element(&tree, "table");
+        let mut sections = Vec::new();
+        let mut rows = Vec::new();
+        for tag in ["tfoot", "tbody", "thead"] {
+            let section = element(&tree, tag);
+            let row = element(&tree, "tr");
+            tree.append_child(table, section);
+            tree.append_child(section, row);
+            sections.push(section);
+            rows.push(row);
+        }
+        let first = element(&tree, "th");
+        let second = element(&tree, "td");
+        tree.append_child(rows[1], first);
+        tree.append_child(rows[1], second);
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, Namespace::from("urn:foreign"), LocalName::from("td")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        tree.append_child(rows[1], foreign);
+        assert_eq!(tree.table_sections(table, "tbody"), Some(vec![sections[1]]));
+        assert_eq!(tree.table_section_rows(sections[1]), Some(vec![rows[1]]));
+        assert_eq!(tree.table_row_cells(rows[1]), Some(vec![first, second]));
+        assert_eq!(tree.table_interface(first), Some("HTMLTableCellElement"));
+        assert_eq!(tree.table_interface(foreign), None);
+        assert_eq!(tree.table_row_index(rows[0], false), Some(2));
+        assert_eq!(tree.table_row_index(rows[1], false), Some(1));
+        assert_eq!(tree.table_row_index(rows[1], true), Some(0));
+        assert_eq!(tree.table_cell_index(second), Some(1));
+        assert_eq!(tree.table_cell_index(foreign), None);
+        assert_eq!(tree.table_row_cells(table), None);
+        assert_eq!(tree.table_section_rows(NodeId::new(u32::MAX)), None);
+        tree.append_child(sections[2], rows[1]);
+        assert_eq!(tree.table_row_index(rows[1], false), Some(1));
+        assert_eq!(tree.table_row_index(rows[1], true), Some(1));
+        tree.remove_child(rows[1]);
+        assert_eq!(tree.table_row_index(rows[1], false), Some(-1));
+        assert_eq!(tree.table_row_index(rows[1], true), Some(-1));
+        assert_eq!(tree.table_cell_index(second), Some(1));
+    }
+
+    #[test]
+    fn select_options_follow_native_ownership_boundaries() {
+        let tree = DomTree::new();
+        let select = element(&tree, "select");
+        let first = element(&tree, "option");
+        tree.append_child(select, first);
+        let mut included = vec![first];
+        for tag in ["div", "optgroup", "select", "datalist", "option"] {
+            let parent = element(&tree, tag);
+            let option = element(&tree, "option");
+            tree.append_child(select, parent);
+            tree.append_child(parent, option);
+            match tag {
+                "div" | "optgroup" => included.push(option),
+                "option" => included.push(parent),
+                _ => {},
+            }
+            let expected = if tag == "div" { 1 } else if tag == "optgroup" { 2 } else { 0 };
+            assert_eq!(tree.option_index(option), Some(expected));
+            if tag == "select" { assert_eq!(tree.select_options(parent), Some(vec![option])); }
+        }
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, Namespace::from("urn:foreign"), LocalName::from("select")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        let foreign_child = element(&tree, "option");
+        tree.append_child(select, foreign);
+        tree.append_child(foreign, foreign_child);
+        included.push(foreign_child);
+        assert_eq!(tree.select_options(select), Some(included.clone()));
+        assert_eq!(tree.option_index(foreign_child), Some(4));
+        tree.detach(first);
+        included.remove(0);
+        assert_eq!(tree.select_options(select), Some(included));
+        assert_eq!(tree.option_index(first), Some(0));
+        assert_eq!(tree.option_index(foreign_child), Some(3));
+        assert_eq!(tree.select_options(foreign), None);
+        assert_eq!(tree.option_index(select), None);
+        assert_eq!(tree.select_options(NodeId::new(u32::MAX)), None);
+        assert_eq!(tree.option_index(NodeId::new(u32::MAX)), None);
+    }
+
+    #[test]
+    fn select_options_and_indexes_bound_broken_cycles() {
+        let tree = DomTree::new();
+        let select = element(&tree, "select");
+        let container = element(&tree, "div");
+        let option = element(&tree, "option");
+        tree.append_child(select, container);
+        tree.append_child(container, option);
+        tree.with_node_mut(container, |node| node.first_child = Some(container));
+        assert_eq!(tree.select_options(select), None);
+        tree.with_node_mut(container, |node| node.parent = Some(container));
+        assert_eq!(tree.option_index(option), None);
+    }
+
+    #[test]
     fn test_new_tree_has_document() {
         let tree = DomTree::new();
         assert_eq!(tree.len(), 1);
         let node = tree.get_node(tree.document()).unwrap();
         assert!(node.is_document());
+    }
+
+    #[test]
+    fn live_node_count_does_not_scan_the_arena() {
+        let tree = DomTree::new();
+        let nodes: Vec<_> = (0..100_000)
+            .map(|_| tree.new_node(NodeData::Text { contents: String::new() }))
+            .collect();
+        assert_eq!(tree.len(), 100_001, "detached nodes are still live");
+        for &node in nodes.iter().step_by(2) {
+            tree.remove(node);
+            tree.remove(node);
+        }
+        assert_eq!(tree.len(), 50_001, "a repeated removal cannot free another slot");
+        for _ in 0..100 {
+            tree.new_node(NodeData::Text { contents: String::new() });
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert_eq!(std::hint::black_box(&tree).len(), 50_101);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(500),
+            "repeated live-node counts scanned the arena: {:?}", started.elapsed());
     }
 
     #[test]
@@ -1781,6 +2905,51 @@ mod tests {
     }
 
     #[test]
+    fn slot_assignment_tracks_renames_reordering_and_non_slottable_nodes() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        tree.append_child(tree.document(), host);
+        let light = element(&tree, "span");
+        let text = tree.new_node(NodeData::Text { contents: "text ".repeat(32_768) });
+        let comment = tree.new_node(NodeData::Comment { contents: "comment".into() });
+        for child in [light, text, comment] {
+            tree.append_child(host, child);
+            assert_eq!(tree.assigned_slot(child), None);
+        }
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let first = element(&tree, "slot");
+        let second = element(&tree, "slot");
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(svg), LocalName::from("slot")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        for child in [foreign, first, second] { tree.append_child(root, child); }
+        assert!(!tree.is_html_slot_element(foreign));
+        assert_eq!(tree.assigned_nodes(foreign), None);
+        assert_eq!(tree.assigned_nodes(first), Some(vec![light, text]));
+        assert_eq!(tree.assigned_slot(comment), None);
+        assert_eq!(tree.assigned_slot(text), Some(first));
+
+        tree.with_node_mut(first, |node| node.set_attribute("name", "Title".into()));
+        tree.with_node_mut(light, |node| node.set_attribute("slot", "title".into()));
+        assert_eq!(tree.assigned_slot(light), None);
+        assert_eq!(tree.assigned_slot(text), Some(second));
+        tree.with_node_mut(first, |node| node.set_attribute("name", "title".into()));
+        assert_eq!(tree.assigned_nodes(first), Some(vec![light]));
+        tree.with_node_mut(second, |node| node.set_attribute("name", "title".into()));
+        tree.insert_before(first, second);
+        assert_eq!(tree.assigned_slot(light), Some(second));
+        assert_eq!(tree.assigned_nodes(first), Some(vec![]));
+        assert_eq!(tree.assigned_slot(text), None);
+        tree.remove(second);
+        assert_eq!(tree.assigned_slot(light), Some(first));
+        tree.append_child(tree.document(), light);
+        assert_eq!(tree.assigned_slot(light), None);
+        assert_eq!(tree.assigned_nodes(first), Some(vec![]));
+    }
+
+    #[test]
     fn document_id_lookup_never_exposes_a_shadow_descendant() {
         let tree = DomTree::new();
         let document = tree.document();
@@ -1832,6 +3001,52 @@ mod tests {
         tree.insert_before(shadow_child, host);
         assert_eq!(tree.get_node(host).unwrap().parent, Some(document));
         assert_eq!(tree.children(root), vec![shadow_child]);
+    }
+
+    #[test]
+    fn host_including_ancestor_query_follows_parents_and_hosts() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let outer = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        let leaf = element(&tree, "i");
+        tree.append_child(document, outer);
+        tree.append_child(outer, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        assert!(tree.is_host_including_inclusive_ancestor(shadow_child, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(outer, host));
+        assert!(tree.is_host_including_inclusive_ancestor(host, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(outer, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(document, shadow_child));
+        assert!(!tree.is_host_including_inclusive_ancestor(shadow_child, outer));
+        assert!(!tree.is_host_including_inclusive_ancestor(leaf, outer));
+        assert!(!tree.is_host_including_inclusive_ancestor(host, outer));
+    }
+
+    #[test]
+    fn inclusive_ancestor_query_stops_at_shadow_roots() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let outer = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        tree.append_child(document, outer);
+        tree.append_child(outer, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        assert!(tree.is_inclusive_ancestor(outer, outer));
+        assert!(tree.is_inclusive_ancestor(document, host));
+        assert!(tree.is_inclusive_ancestor(root, shadow_child));
+        assert!(!tree.is_inclusive_ancestor(host, shadow_child));
+        assert!(!tree.is_inclusive_ancestor(host, outer));
     }
 
     #[test]

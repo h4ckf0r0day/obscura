@@ -36,6 +36,16 @@ Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-fe
 - Datadome and Akamai bot manager active challenges.
 - CAPTCHAs.
 - IP-based rate limiting (use proxies).
+- **Passive TCP/IP stack fingerprinting.** Classifiers that inspect the raw SYN
+  packet (tcp_options order, window size, window scaling, ip_id) can distinguish
+  Linux from macOS even when the TLS and HTTP layers are identical, because those
+  fields are set by the OS kernel, not by Obscura. The same binary on Linux
+  (`tcp_options: "M1460,S,T,N,W10"`, window 64240) and macOS
+  (`tcp_options: "M1460,N,W6,N,N,T,S,E,E"`, window 65535) produces a different
+  passive fingerprint. Obscura operates in userspace and cannot override these
+  kernel defaults. If TCP/IP passive detection is a concern, run Obscura on a host or VM
+  with the required kernel, or route
+  connections through a proxy whose TCP stack presents the desired profile.
 
 ## Proxies
 
@@ -65,7 +75,8 @@ obscura fetch https://example.com --user-agent "Mozilla/5.0 (...) ..."
 obscura serve --user-agent "Mozilla/5.0 (...) ..."
 ```
 
-Default UA matches a recent Chrome on the build platform.
+The default profile uses a Windows Chrome identity. `--user-agent` overrides
+the User-Agent; it does not change the host operating system or TLS profile.
 
 ## Browser profile, timezone, and geolocation
 

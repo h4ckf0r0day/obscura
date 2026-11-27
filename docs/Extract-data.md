@@ -23,7 +23,7 @@ obscura fetch https://news.ycombinator.com --dump html > hn.html
 Plain text. No markup.
 
 ```bash
-obscura fetch https://en.wikipedia.org/wiki/Rust_(programming_language) --dump text
+obscura fetch 'https://en.wikipedia.org/wiki/Rust_(programming_language)' --dump text
 ```
 
 ## `markdown`
@@ -36,7 +36,8 @@ obscura fetch https://docs.example.com/page --dump markdown > page.md
 
 ## `links`
 
-Every `<a href>` on the page, one per line.
+Links from the page, one per line. Each line contains the resolved URL and,
+when present, a tab followed by the link text.
 
 ```bash
 obscura fetch https://example.com --dump links
@@ -52,7 +53,8 @@ obscura fetch https://example.com --dump assets
 
 ## `original`
 
-The raw HTML the server sent, before JavaScript ran.
+The raw HTTP response body, including binary content. This bypasses HTML parsing
+and JavaScript execution.
 
 ```bash
 obscura fetch https://my-spa.example --dump original > before.html
@@ -82,3 +84,19 @@ obscura fetch https://my-spa.example --wait-until load --dump markdown
 obscura fetch https://example.com --dump markdown > example.md
 obscura fetch https://example.com --dump text --quiet | wc -w
 ```
+
+## Reader libraries
+
+After loading a reader library such as [Mozilla Readability](https://github.com/mozilla/readability),
+run it on a document clone to leave the page unchanged:
+
+```javascript
+const article = new Readability(document.cloneNode(true)).parse();
+```
+
+Obscura does not bundle Readability. Supply the library through your automation
+client before evaluating this expression. Document clones preserve metadata and
+live form-control state. Attribute clones retain their value and namespace.
+`DOMParser` HTML documents preserve the document structure and root attributes,
+inherit the parser's document URL, and do not execute scripts. XML parsing still
+uses the existing limited XML implementation.

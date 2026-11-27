@@ -10,4 +10,4 @@ pub use tree::{
     AttachShadowError, Attribute, DomTree, Node, NodeData, NodeId, ShadowRoot,
     ShadowRootMode,
 };
-pub use tree_sink::{parse_fragment, parse_fragment_with_context, parse_html};
+pub use tree_sink::{parse_fragment, parse_fragment_with_context, parse_html, parse_srcdoc};

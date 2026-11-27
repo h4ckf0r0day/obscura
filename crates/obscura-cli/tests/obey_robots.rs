@@ -12,6 +12,10 @@ struct RobotsServer {
 
 impl RobotsServer {
     fn spawn() -> Self {
+        Self::with_robots("User-agent: *\nDisallow: /private\n")
+    }
+
+    fn with_robots(robots: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind robots fixture");
         listener
             .set_nonblocking(true)
@@ -20,10 +24,10 @@ impl RobotsServer {
         let paths = Arc::new(Mutex::new(Vec::new()));
         let server_paths = Arc::clone(&paths);
         thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + Duration::from_secs(45);
             while Instant::now() < deadline {
                 match listener.accept() {
-                    Ok((stream, _)) => serve(stream, &server_paths),
+                    Ok((stream, _)) => serve(stream, &server_paths, robots),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -43,7 +47,7 @@ impl RobotsServer {
     }
 }
 
-fn serve(mut stream: TcpStream, paths: &Arc<Mutex<Vec<String>>>) {
+fn serve(mut stream: TcpStream, paths: &Arc<Mutex<Vec<String>>>, robots: &str) {
     stream
         .set_nonblocking(false)
         .expect("set fixture connection blocking");
@@ -60,7 +64,7 @@ fn serve(mut stream: TcpStream, paths: &Arc<Mutex<Vec<String>>>) {
     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
     paths.lock().expect("fixture paths").push(path.to_string());
     let (content_type, body) = if path == "/robots.txt" {
-        ("text/plain", "User-agent: *\nDisallow: /private\n")
+        ("text/plain", robots)
     } else {
         ("text/html", "<!doctype html><title>target reached</title><p>private target</p>")
     };
@@ -107,13 +111,15 @@ fn obey_robots_is_global_and_blocks_fetch_before_target_request() {
 fn obey_robots_reaches_scrape_worker_and_blocks_target_request() {
     let server = RobotsServer::spawn();
     let url = server.url("/private/page");
+    // This checks policy propagation, not cold executable startup speed.
+    // Leave room for the OS loader before the worker can read its first command.
     let output = obscura(&[
         "--obey-robots",
         "--allow-private-network",
         "scrape",
         "--quiet",
         "--timeout",
-        "5",
+        "30",
         &url,
     ]);
 
@@ -164,4 +170,37 @@ fn obey_robots_fetches_an_allowed_target_after_loading_policy() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(server.paths(), vec!["/robots.txt", "/public/page"]);
+}
+
+#[test]
+fn obey_robots_matches_query_and_ignores_fragment() {
+    for (path, allowed, target) in [
+        ("/report.pdf", false, "/report.pdf"),
+        ("/report.pdf#preview", false, "/report.pdf"),
+        ("/report.pdf?", true, "/report.pdf?"),
+        ("/report.pdf?download=1", true, "/report.pdf?download=1"),
+        ("/report.pdf?download=1#preview", true, "/report.pdf?download=1"),
+        ("/report?blocked=1", false, "/report?blocked=1"),
+        ("/report?blocked=1#preview", false, "/report?blocked=1"),
+    ] {
+        let server = RobotsServer::with_robots("User-agent: *\nDisallow: /*.pdf$\nDisallow: /*?blocked=1$\n");
+        let url = server.url(path);
+        let output = obscura(&[
+            "--obey-robots",
+            "--allow-private-network",
+            "fetch",
+            "--quiet",
+            "--wait",
+            "0",
+            &url,
+        ]);
+
+        assert_eq!(output.status.success(), allowed, "{path}: {}", String::from_utf8_lossy(&output.stderr));
+        if allowed {
+            assert_eq!(server.paths(), vec!["/robots.txt", target], "{path}");
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Blocked by robots.txt"), "{path}");
+            assert_eq!(server.paths(), vec!["/robots.txt"], "{path}");
+        }
+    }
 }

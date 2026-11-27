@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; }
+  #panel { display: flex; flex-direction: column; width: 400px; height: 600px;
+    box-sizing: border-box; border: 1px solid; }
+  #header { height: 40px; flex-shrink: 0; background: #e8590c; }
+  #content { flex: 1 1 auto; contain: size layout; padding: 0 8px 8px; }
+  #wrapper { height: 100%; }
+  #grid { display: grid; height: 100%; overflow: auto; background: #1971c2;
+    grid-template-rows: 34px repeat(598, 36px); }
+  #after { width: 400px; height: 20px; background: #7048e8; }
+</style>
+<div id="panel"><div id="header"></div><div id="content">
+  <div id="wrapper"><div id="grid"><div id="cell">Visible text</div></div></div>
+</div></div>
+<div id="after"></div>

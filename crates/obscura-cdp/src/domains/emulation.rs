@@ -65,6 +65,38 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
+        "setEmulatedMedia" => {
+            let features = match params.get("features") {
+                Some(features) => features.as_array().ok_or("Emulation.setEmulatedMedia features must be an array")?.as_slice(),
+                None => &[],
+            };
+            let mut reduce = false;
+            let mut dark = false;
+            for feature in features {
+                let name = feature.get("name").and_then(Value::as_str)
+                    .ok_or("Media feature requires a string name")?;
+                let value = feature.get("value").and_then(Value::as_str)
+                    .ok_or("Media feature requires a string value")?;
+                match name {
+                    "prefers-reduced-motion" => {
+                        if !matches!(value, "" | "reduce" | "no-preference") {
+                            return Err("Invalid prefers-reduced-motion value".into());
+                        }
+                        reduce = value == "reduce";
+                    }
+                    "prefers-color-scheme" => {
+                        if !matches!(value, "" | "dark" | "light" | "no-preference") {
+                            return Err("Invalid prefers-color-scheme value".into());
+                        }
+                        dark = value == "dark";
+                    }
+                    _ => {}
+                }
+            }
+            ctx.get_session_page_mut(session_id).ok_or("No page for session")?
+                .set_media_preferences(reduce, dark);
+            Ok(json!({}))
+        }
         "setDeviceMetricsOverride" => {
             let width = metric_dimension(params, "width")?;
             let height = metric_dimension(params, "height")?;
@@ -121,6 +153,42 @@ pub async fn handle(
             page.set_default_background_color_override(color);
             Ok(json!({}))
         }
+        "setUserAgentOverride" => {
+            let user_agent = params
+                .get("userAgent")
+                .and_then(Value::as_str)
+                .ok_or("Emulation.setUserAgentOverride requires userAgent")?;
+            let accept_language = params.get("acceptLanguage").and_then(Value::as_str);
+            let http_client = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?
+                .http_client
+                .clone();
+            if !user_agent.is_empty() {
+                http_client.set_user_agent(user_agent).await;
+                if let Some(js) = ctx
+                    .get_session_page_mut(session_id)
+                    .and_then(|page| page.js.as_mut())
+                {
+                    js.set_user_agent(user_agent);
+                }
+            }
+            if let Some(accept_language) = accept_language {
+                http_client.set_accept_language(accept_language).await;
+            }
+            Ok(json!({}))
+        }
+        "setLocaleOverride" => {
+            let locale = params
+                .get("locale")
+                .and_then(Value::as_str)
+                .ok_or("Emulation.setLocaleOverride requires locale")?;
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or("No page for session")?;
+            page.set_locale_override((!locale.is_empty()).then(|| locale.to_string()));
+            Ok(json!({}))
+        }
         // Touch emulation does not affect layout yet, but acknowledging it is
         // compatible with clients that pair it with a metrics override.
         "setTouchEmulationEnabled" => Ok(json!({})),
@@ -131,6 +199,45 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn color_scheme_override_persists_and_resets_without_partial_invalid_updates() {
+        let mut ctx = CdpContext::new();
+        let id = ctx.create_page();
+        let session = Some("media-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), id);
+        let both = json!({"features": [
+            {"name": "prefers-color-scheme", "value": "dark"},
+            {"name": "prefers-reduced-motion", "value": "reduce"}
+        ]});
+        handle("setEmulatedMedia", &both, &mut ctx, &session).await.unwrap();
+        let script = "return [matchMedia('(prefers-color-scheme:dark)').matches, matchMedia('(prefers-reduced-motion:reduce)').matches];";
+        for _ in 0..2 {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.navigate("data:text/html,<body>probe</body>").await.unwrap();
+            assert_eq!(page.evaluate(script), json!([true, true]));
+        }
+        for invalid in [
+            json!({"features": null}),
+            json!({"features": [{"name":"prefers-color-scheme", "value":false}]}),
+            json!({"features": [{"name":"prefers-color-scheme", "value":"light"}, {"name":"prefers-reduced-motion", "value":"invalid"}]}),
+            json!({"features": [{"name":"prefers-color-scheme", "value":"invalid"}]}),
+        ] {
+            assert!(handle("setEmulatedMedia", &invalid, &mut ctx, &session).await.is_err());
+            assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([true, true]));
+        }
+        handle("setEmulatedMedia", &json!({}), &mut ctx, &session).await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([false, false]));
+        handle("setEmulatedMedia", &both, &mut ctx, &session).await.unwrap();
+        for value in ["light", "no-preference", ""] {
+            handle("setEmulatedMedia", &json!({"features":[{"name":"prefers-color-scheme", "value":value}]}), &mut ctx, &session).await.unwrap();
+            assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([false, false]));
+            handle("setEmulatedMedia", &both, &mut ctx, &session).await.unwrap();
+        }
+        handle("setEmulatedMedia", &json!({"features":[]}), &mut ctx, &session).await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([false, false]));
+    }
+
 
     #[tokio::test]
     async fn device_metrics_override_updates_page_and_window_viewport() {
@@ -167,6 +274,59 @@ mod tests {
                          screen.availWidth, screen.availHeight, devicePixelRatio];"
             ),
             json!([1024, 768, 1024, 768, 1440, 900, 1440, 900, 2])
+        );
+    }
+
+    #[tokio::test]
+    async fn locale_emulation_reaches_requests_and_survives_navigation() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("locale-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        handle(
+            "setUserAgentOverride",
+            &json!({"userAgent": "", "acceptLanguage": "de-DE"}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("accept-language override");
+        handle(
+            "setLocaleOverride",
+            &json!({"locale": "de-DE"}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("locale override");
+
+        let http_client = ctx
+            .get_session_page(&session_id)
+            .unwrap()
+            .http_client
+            .clone();
+        assert_eq!(http_client.accept_language.read().await.as_str(), "de-DE");
+        assert_eq!(
+            ctx.get_session_page_mut(&session_id)
+                .unwrap()
+                .evaluate("[navigator.language, navigator.languages]"),
+            json!(["de-DE", ["de-DE", "de"]])
+        );
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({"url": "data:text/html,<p>locale</p>", "waitUntil": "load"}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("navigate");
+        assert_eq!(
+            ctx.get_session_page_mut(&session_id)
+                .unwrap()
+                .evaluate("[navigator.language, navigator.languages]"),
+            json!(["de-DE", ["de-DE", "de"]])
         );
     }
 

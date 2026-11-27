@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Emulated color scheme</title>
+<style>
+  body { margin: 0; background: #ffffff; }
+  #probe, #scrolled { width: 240px; height: 80px; background: #00aa00; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #202020; }
+    #probe, #scrolled { width: 160px; background: #0055ff; }
+  }
+  @media (prefers-color-scheme: light) {
+    #probe, #scrolled { height: 100px; }
+  }
+  @media (prefers-color-scheme: dark) and (prefers-reduced-motion: reduce) {
+    #probe, #scrolled { height: 60px; }
+  }
+  @media print and (prefers-color-scheme: dark) {
+    #probe, #scrolled { width: 120px; }
+  }
+  #scrolled { position: absolute; top: 1200px; left: 0; }
+</style>
+<div id="probe"></div><div id="scrolled"></div>

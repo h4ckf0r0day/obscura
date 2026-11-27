@@ -113,11 +113,19 @@ pub async fn handle(
             let committed_document = if let Some(page) = ctx.get_page_mut(&page_id) {
                 if url == "about:blank" || url.is_empty() {
                     page.navigate_blank();
+                    // Chrome keeps the new tab's about:blank as the first
+                    // session history entry, so history.back() can return to it.
+                    page.push_history(page.url_string());
                     None
                 } else {
-                    page.navigate(url).await.ok().map(|_| {
-                        (page.frame_id.clone(), page.url_string())
-                    })
+                    match page.navigate(url).await {
+                        Ok(()) => Some((page.frame_id.clone(), page.url_string())),
+                        Err(error) if page.navigation_was_blocked() => {
+                            ctx.remove_page(&page_id);
+                            return Err(crate::domains::page::navigation_error_message(error.to_string(), true));
+                        }
+                        Err(_) => None,
+                    }
                 }
             } else {
                 None
@@ -129,7 +137,7 @@ pub async fn handle(
             // target entry so getTargets and /json/list report the real url.
             ctx.sync_registry();
 
-            ctx.sessions.insert(session_id.clone(), page_id.clone());
+            ctx.attach_session(session_id.clone(), page_id.clone());
 
             if let Some(page) = ctx.get_page(&page_id) {
                 ctx.pending_events.push(CdpEvent::new(
@@ -173,9 +181,8 @@ pub async fn handle(
             // Playwright calls this on connect to obtain a session for the
             // implicit "browser" target. Returning Unknown method aborts
             // the connect handshake before any user code runs.
-            let session_id = "browser-session".to_string();
-            ctx.sessions
-                .insert(session_id.clone(), "browser".to_string());
+            let session_id = format!("browser-{}", uuid::Uuid::new_v4());
+            ctx.attach_session(session_id.clone(), "browser".to_string());
 
             ctx.pending_events.push(CdpEvent::new(
                 "Target.attachedToTarget",
@@ -243,8 +250,7 @@ pub async fn handle(
                 .find(|t| t.target_id == target_id)
                 .ok_or_else(|| "Target not found".to_string())?;
             let session_id = ctx.next_target_session(target_id);
-            ctx.sessions
-                .insert(session_id.clone(), target_id.to_string());
+            ctx.attach_session(session_id.clone(), target_id.to_string());
 
             // Prefer the live Page when this connection owns it (freshest
             // url/title); for a remote target fall back to the registry
@@ -305,50 +311,41 @@ pub async fn handle(
             {
                 return Err("Target not found".to_string());
             }
-            let mut sessions = ctx
-                .sessions
-                .iter()
-                .filter(|(_, page_id)| page_id.as_str() == target_id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect::<Vec<_>>();
-            sessions.sort_unstable();
-            for session_id in sessions {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.detachedFromTarget",
-                    json!({
-                        "sessionId": session_id,
-                        "targetId": target_id,
-                    }),
-                ));
-            }
-            ctx.pending_events.push(CdpEvent::new(
-                "Target.targetDestroyed",
-                json!({ "targetId": target_id }),
-            ));
 
             if ctx.get_page(target_id).is_some() {
-                // Owned by this connection: full local teardown. `remove_page`
-                // drops the live Page, its registry entry, and this
-                // connection's session routes to it.
-                ctx.remove_page(target_id);
+                // Owned by this connection: announce this connection's
+                // sessions and the destruction, then drop the live Page.
+                close_target(ctx, target_id);
             } else {
                 // Remote-owned page: the live `Page` lives on its owner's
                 // thread (thread-per-connection #430) and cannot be torn down
-                // from here. Tombstone the id so the owner's next
+                // from here. Drop this connection's session routes to it,
+                // announce them, and tombstone the id so the owner's next
                 // sync_registry (getTargets, navigation, createTarget) cannot
-                // resurrect the closed target. Also drop this connection's
-                // own session routes to it.
-                let removed_sessions: Vec<String> = ctx
+                // resurrect the closed target.
+                let mut removed_sessions: Vec<String> = ctx
                     .sessions
                     .iter()
                     .filter(|(_, page_id)| page_id.as_str() == target_id)
                     .map(|(session_id, _)| session_id.clone())
                     .collect();
+                removed_sessions.sort_unstable();
                 for session_id in &removed_sessions {
-                    ctx.sessions.remove(session_id);
+                    ctx.detach_session(session_id);
                     #[cfg(feature = "render")]
                     ctx.screencasts.remove(session_id);
+                    ctx.pending_events.push(CdpEvent::new(
+                        "Target.detachedFromTarget",
+                        json!({
+                            "sessionId": session_id,
+                            "targetId": target_id,
+                        }),
+                    ));
                 }
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.targetDestroyed",
+                    json!({ "targetId": target_id }),
+                ));
                 ctx.registry.mark_closed(&[target_id.to_string()]);
             }
             Ok(json!({ "success": true }))
@@ -390,7 +387,7 @@ pub async fn handle(
                         .map(|(sid, _)| sid.clone());
                     let session_id =
                         existing.unwrap_or_else(|| ctx.next_target_session(&page_id));
-                    ctx.sessions.insert(session_id.clone(), page_id.clone());
+                    ctx.attach_session(session_id.clone(), page_id.clone());
                     if let Some(page) = ctx.get_page(&page_id) {
                         ctx.pending_events.push(CdpEvent::new(
                             "Target.attachedToTarget",
@@ -428,8 +425,7 @@ pub async fn handle(
                             continue;
                         }
                         let session_id = ctx.next_target_session(&target.target_id);
-                        ctx.sessions
-                            .insert(session_id.clone(), target.target_id.clone());
+                        ctx.attach_session(session_id.clone(), target.target_id.clone());
                         ctx.pending_events.push(CdpEvent::new(
                             "Target.attachedToTarget",
                             json!({
@@ -455,7 +451,22 @@ pub async fn handle(
         // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                ctx.release_session(session_id);
+                let page_id = ctx.detach_session(session_id);
+                ctx.forwarded_sessions.remove(session_id);
+                ctx.dom_documents.remove(&Some(session_id.to_string()));
+                ctx.runtime_enabled_sessions.remove(session_id);
+                ctx.lifecycle_enabled_sessions.remove(session_id);
+                if let Some(page_id) = page_id {
+                    ctx.refresh_runtime_event_collection(&page_id);
+                    let params = json!({"sessionId": session_id, "targetId": page_id});
+                    let event = match parent_session_id {
+                        Some(parent) => CdpEvent::with_session("Target.detachedFromTarget", params, parent.clone()),
+                        None => CdpEvent::new("Target.detachedFromTarget", params),
+                    };
+                    ctx.pending_events.push(event);
+                }
+                #[cfg(feature = "render")]
+                ctx.screencasts.remove(session_id);
             }
             Ok(json!({}))
         }
@@ -499,7 +510,17 @@ pub async fn handle(
             Ok(json!({}))
         }
         "getTargetInfo" => {
-            let target_id = params.get("targetId").and_then(|v| v.as_str());
+            // Chrome answers for the target of the session the command was
+            // sent on; only a sessionless call describes the browser target.
+            let session_target = parent_session_id
+                .as_ref()
+                .and_then(|sid| ctx.sessions.get(sid))
+                .filter(|id| ctx.get_page(id).is_some())
+                .cloned();
+            let target_id = params
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .or(session_target.as_deref());
             match target_id {
                 Some(id) => {
                     let page = ctx.get_page(id).ok_or("Target not found")?;
@@ -536,9 +557,107 @@ pub async fn handle(
     }
 }
 
+/// Detach the target's sessions, announce destruction, and release its state.
+pub(crate) fn close_target(ctx: &mut CdpContext, target_id: &str) {
+    let mut sessions = ctx.sessions
+        .iter()
+        .filter(|(_, page_id)| page_id.as_str() == target_id)
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    for session_id in sessions {
+        ctx.pending_events.push(CdpEvent::new(
+            "Target.detachedFromTarget",
+            json!({
+                "sessionId": session_id,
+                "targetId": target_id,
+            }),
+        ));
+    }
+    ctx.pending_events.push(CdpEvent::new(
+        "Target.targetDestroyed",
+        json!({ "targetId": target_id }),
+    ));
+
+    ctx.remove_page(target_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_denials_use_runtime_errors_and_unknown_methods_stay_unknown() {
+        let mut ctx = CdpContext::new();
+        for (method, code) in [("Target.createTarget", -32000), ("Target.notARealMethod", -32601)] {
+            let request = crate::types::CdpRequest {
+                id: 1,
+                method: method.into(),
+                params: json!({"url":"http://127.0.0.1:9/"}),
+                session_id: None,
+            };
+            let response = crate::dispatch::dispatch(&request, &mut ctx).await;
+            assert_eq!(response.id, 1);
+            assert_eq!(response.error.unwrap().code, code);
+            assert!(ctx.pages.is_empty());
+            assert!(ctx.sessions.is_empty());
+            assert!(ctx.pending_events.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_policy_refusals_leave_no_target_or_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut ctx = CdpContext::new();
+        let existing = ctx.create_page();
+        let isolated = ctx.create_browser_context();
+        for context_id in [None, Some(isolated.as_str())] {
+            for host in ["127.0.0.1", "localhost", "[::1]"] {
+                let result = handle("createTarget", &json!({
+                    "url": format!("http://{host}:{port}/marker"),
+                    "browserContextId": context_id,
+                }), &mut ctx, &None).await;
+                let error = result.expect_err("startup navigation must report a policy refusal");
+                assert!(error.contains("not allowed"), "{error}");
+                assert_eq!(ctx.pages.len(), 1);
+                assert!(ctx.get_page(&existing).is_some());
+                assert!(ctx.sessions.is_empty());
+                assert!(ctx.pending_events.is_empty());
+                assert_eq!(ctx.current_loader_ids.len(), 1);
+                assert_eq!(ctx.lifecycle_timestamps.len(), 1);
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(10), listener.accept()).await.is_err(),
+                    "a refused target must not contact the listener");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_navigation_keeps_private_opt_in_and_connection_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 37\r\nConnection: close\r\n\r\n<title>marker</title><p>permitted</p>").await.unwrap();
+        });
+        let context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+            "startup-allowed".into(), None, false, None, None, true,
+        ));
+        let mut ctx = CdpContext::new_with_shared_context(context);
+        let created = handle("createTarget", &json!({"url": format!("http://{address}/")}), &mut ctx, &None)
+            .await.expect("explicit private-network opt-in remains supported");
+        assert_eq!(ctx.get_page(created["targetId"].as_str().unwrap()).unwrap().title, "marker");
+        server.await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let created = handle("createTarget", &json!({"url": format!("http://{address}/")}), &mut ctx, &None)
+            .await.expect("ordinary connection failures still create a target");
+        assert!(ctx.get_page(created["targetId"].as_str().unwrap()).is_some());
+    }
 
     #[tokio::test]
     async fn browser_contexts_are_real_and_do_not_clear_default_cookies() {
@@ -1051,9 +1170,9 @@ mod tests {
             .await
             .expect("attachToBrowserTarget should succeed");
 
-        assert_eq!(result["sessionId"], "browser-session");
+        let session_id = result["sessionId"].as_str().unwrap();
         assert_eq!(
-            ctx.sessions.get("browser-session").map(String::as_str),
+            ctx.sessions.get(session_id).map(String::as_str),
             Some("browser")
         );
 
@@ -1065,8 +1184,28 @@ mod tests {
             .iter()
             .find(|e| e.method == "Target.attachedToTarget")
             .expect("attachedToTarget event must be emitted");
-        assert_eq!(attached_evt.params["sessionId"], "browser-session");
+        assert_eq!(attached_evt.params["sessionId"], session_id);
         assert_eq!(attached_evt.params["targetInfo"]["type"], "browser");
+    }
+
+    #[tokio::test]
+    async fn browser_attachments_detach_independently() {
+        let mut ctx = CdpContext::new();
+        for detach_second in [false, true] {
+            let first = handle("attachToBrowserTarget", &json!({}), &mut ctx, &None)
+                .await.unwrap();
+            let second = handle("attachToBrowserTarget", &json!({}), &mut ctx, &None)
+                .await.unwrap();
+            assert_ne!(first["sessionId"], second["sessionId"]);
+            let (removed, retained) = if detach_second { (&second, &first) } else { (&first, &second) };
+            handle("detachFromTarget", &json!({"sessionId": removed["sessionId"]}), &mut ctx, &None)
+                .await.unwrap();
+            assert!(!ctx.sessions.contains_key(removed["sessionId"].as_str().unwrap()));
+            assert_eq!(ctx.sessions.get(retained["sessionId"].as_str().unwrap()).map(String::as_str), Some("browser"));
+            handle("detachFromTarget", &json!({"sessionId": retained["sessionId"]}), &mut ctx, &None)
+                .await.unwrap();
+            assert!(ctx.sessions.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1123,6 +1262,7 @@ mod tests {
         .await
         .unwrap();
         let session_id = attached["sessionId"].as_str().unwrap().to_string();
+        ctx.pending_events.clear();
 
         handle(
             "detachFromTarget",
@@ -1133,6 +1273,13 @@ mod tests {
         .await
         .expect("detach should succeed");
         assert!(!ctx.sessions.contains_key(&session_id));
+        assert!(ctx.get_page(&page_id).is_some(), "detach must not destroy the target");
+        assert_eq!(ctx.pending_events.len(), 1);
+        let event = &ctx.pending_events[0];
+        assert_eq!(event.method, "Target.detachedFromTarget");
+        assert_eq!(event.session_id, parent_session);
+        assert_eq!(event.params["sessionId"], session_id);
+        assert_eq!(event.params["targetId"], page_id);
     }
 
     #[tokio::test]

@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin:0; }
+  body { height:1800px; }
+  .port { position:absolute;left:20px;top:200px;width:200px;height:200px;
+    overflow:auto;border:5px solid #222;background:#ddd; }
+  #fixed { position:fixed;left:300px; }
+  .before, .after { height:600px; }
+  .target { width:100px;height:40px;background:#087f5b; }
+  #fixed .target { margin-left:600px;background:#7048e8; }
+</style>
+<div class="port"><div class="before"></div><div id="normal-target" class="target"></div><div class="after"></div></div>
+<div id="fixed" class="port"><div class="before"></div><div id="fixed-target" class="target"></div><div class="after"></div></div>
+<script>
+  addEventListener('load', () => {
+    for (const id of ['normal-target', 'fixed-target']) {
+      document.getElementById(id).scrollIntoView({block:'nearest', inline:'nearest'});
+    }
+  });
+</script>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare obstacle-course correctness and report latency changes."""
+"""Gate obstacle-course correctness and material latency regressions."""
 
 from __future__ import annotations
 
@@ -80,6 +80,8 @@ def main() -> None:
     ratios = []
     slow = []
     for name in sorted(base):
+        if not base[name]["pass"] or not candidate[name]["pass"]:
+            continue
         base_ms = float(base[name]["median_ms"])
         candidate_ms = float(candidate[name]["median_ms"])
         if base_ms > 0:
@@ -103,14 +105,19 @@ def main() -> None:
     if regressions:
         lines.append(f"\nRegressed stages: {', '.join(regressions)}\n")
     if slow:
-        lines.append("\nStages above the reporting threshold:\n\n")
+        lines.append("\nStages above the failure threshold:\n\n")
         for name, base_ms, candidate_ms, ratio in slow:
             lines.append(f"- `{name}`: {base_ms:.1f} ms to {candidate_ms:.1f} ms ({ratio:.2f}x)\n")
-            print(f"::warning::obstacle latency {name}: {ratio:.2f}x base")
+            print(f"::error::obstacle latency {name}: {ratio:.2f}x base")
     add_summary("".join(lines))
 
     if regressions:
         raise SystemExit("candidate introduces new obstacle-course failures")
+    if candidate_passed != EXPECTED_STAGE_COUNT:
+        failed = sorted(name for name, result in candidate.items() if not result["pass"])
+        raise SystemExit(f"candidate fails the release obstacle course: {', '.join(failed)}")
+    if slow:
+        raise SystemExit("candidate introduces obstacle-course latency regressions")
 
 
 if __name__ == "__main__":

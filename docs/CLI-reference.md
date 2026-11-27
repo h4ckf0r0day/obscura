@@ -1,9 +1,17 @@
 ## `obscura`
 
-Top-level flags apply to every subcommand.
+`--verbose`, `--proxy`, `--stealth`, `--obey-robots`, `--user-agent`, and
+`--allow-private-network` work before or after a subcommand. `--obey-robots`
+applies to `fetch` and `scrape`. Pass `--port` after `serve` or `mcp`; the
+top-level port selects CDP when no subcommand is given.
+
+`--storage-dir` is declared on `serve` and `fetch`. The top-level copy is read
+only by `mcp`, which exports it to `OBSCURA_STORAGE_DIR`. Pass it after the
+subcommand to use it with `serve` or `fetch`. Pass `--v8-flags` before the
+subcommand.
 
 ```
--v, --verbose                Enable info logging
+-v, --verbose                Enable debug logging
 -p, --port <PORT>            CDP port (default 9222)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --stealth                Consistent browser fingerprint + tracker blocking
@@ -23,7 +31,10 @@ Load a URL and print its content or an evaluated expression.
 ```
     --dump <FORMAT>          html | text | links | markdown | original | assets | cookies
                              (default html)
-    --selector <CSS>         Narrow output to a CSS selector
+    --file <PATH>           Batch raw fetches from a URL list; - reads stdin
+    --concurrency <N>       Parallel batch fetches (default 1; used with --file)
+    --storage-dir <DIR>     Persistent cookies and localStorage
+    --selector <CSS>         Wait for a CSS selector; output still covers the page
     --wait <SECONDS>         Fixed post-load delay; omitted uses adaptive settle (5s cap)
     --timeout <SECONDS>      Navigation timeout (default 30)
     --wait-until <LEVEL>     domcontentloaded | load | networkidle2 | networkidle0
@@ -34,14 +45,18 @@ Load a URL and print its content or an evaluated expression.
 -e, --eval <JS>              Evaluate JS, print the result as JSON
 -o, --output <FILE>          Write to a file instead of stdout
 -s, --screenshot <FILE>      Capture the settled page as PNG (single URL)
--q, --quiet                  Suppress info logging
--v, --verbose                Enable verbose logging
+-q, --quiet                  Suppress logs unless overridden by --verbose or RUST_LOG
+-v, --verbose                Enable debug logging
 ```
 
 `--screenshot` requires a render-enabled build. It uses a 1280×720 viewport by
 default and may be combined with `--eval`; the expression runs before capture,
 which is useful for scrolling or preparing page state. It is not available in
 `--file` batch mode.
+
+Batch mode (`--file urls.txt`) skips empty lines and lines beginning with `#`,
+fetches raw responses, and emits one JSON status line per URL. Use `scrape`
+for JavaScript evaluation across URLs.
 
 When `--wait` is omitted, Obscura drives timers and async work until the page
 becomes quiescent, with a five-second ceiling. Supplying `--wait N` instead
@@ -54,7 +69,7 @@ requests a fixed `N`-second delay. `--timeout` separately bounds navigation.
 | `html`     | Rendered HTML (default)                                   |
 | `text`     | Plain text                                                |
 | `markdown` | Markdown conversion                                       |
-| `links`    | Every `<a href>`, one URL per line                        |
+| `links`    | Links as URL and optional tab-separated text, one per line                        |
 | `assets`   | Every external resource, one JSON object per line (DOM assets plus `fetch()`/XHR requests) |
 | `original` | Raw HTTP response body (binary-safe, bypasses the engine) |
 | `cookies`  | All cookies in the jar as a JSON array, including HttpOnly cookies invisible to `document.cookie` |
@@ -70,14 +85,25 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
+    --max-connections <N>    Live CDP connections per worker (default 128; 0 refuses connections)
+    --ready-file <PATH>      Publish the bound address after startup (--workers 1)
+    --worker-max-connections <N>  Recycle a worker after N CDP connections (--workers > 1)
+    --worker-max-rss <MB>    Recycle a worker above this resident size (Linux)
+    --worker-max-age <SECS>  Recycle a worker after this long
+    --worker-drain-timeout <SECS>  Let a replaced worker finish live connections (default 120)
+    --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
--q, --quiet                  Suppress info logging
--v, --verbose                Enable info logging
+    --quiet                  Suppress logs unless overridden by --verbose or RUST_LOG
+-v, --verbose                Enable debug logging
 ```
 
-Default endpoint is `ws://127.0.0.1:9222`.
+Default endpoint is `ws://127.0.0.1:9222`. `--host` takes an IP address.
+With `--port 0`, the OS chooses a port; `--ready-file` records the bound
+address after V8 initialization. A non-loopback bind requires
+`OBSCURA_CDP_TOKEN` of at least 32 bytes. See
+[CDP authentication](Connect-Puppeteer-or-Playwright.md#authentication).
 
 ## `obscura scrape [URLS]...`
 
@@ -86,13 +112,13 @@ Run a JS expression across many URLs in parallel.
 ```
 -e, --eval <JS>              JS to run on each page
     --concurrency <N>        Parallel pages (default 10)
-    --format <FORMAT>        Output format (default json)
+    --format <FORMAT>        json or tab-separated text (default json)
     --timeout <SECONDS>      Per-URL timeout (default 60)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
--q, --quiet                  Suppress info logging
--v, --verbose                Enable verbose logging
+-q, --quiet                  Suppress logs unless overridden by --verbose or RUST_LOG
+-v, --verbose                Enable debug logging
 ```
 
 `--stealth`, `--proxy`, and `--allow-private-network` are global flags: they work before or after any subcommand, so each worker in a `scrape` run inherits stealth too.
@@ -103,7 +129,7 @@ Read URLs from stdin with `-`:
 cat urls.txt | obscura scrape - --eval "document.title" --concurrency 20
 ```
 
-Requires `obscura-worker` next to `obscura` in `PATH`.
+Keep `obscura-worker` in the same directory as the `obscura` executable.
 
 ## `obscura mcp`
 
@@ -111,18 +137,69 @@ Run obscura as an MCP server.
 
 ```
     --http                   HTTP transport instead of stdio
+    --font-dir <DIR>         Load additional fonts before rendering (repeatable; render build)
     --host <HOST>            HTTP bind host (default 127.0.0.1)
     --port <PORT>            HTTP port (default 3000)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
--v, --verbose                Enable info logging
+-v, --verbose                Enable debug logging
 ```
 
-`--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only; set `0.0.0.0` to bind all interfaces (for example a Docker Compose sidecar) and pair it with `OBSCURA_MCP_ALLOWED_ORIGINS`.
+`--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only. A non-loopback bind requires `OBSCURA_MCP_TOKEN` (at least 32 bytes); use `OBSCURA_MCP_ALLOWED_ORIGINS` as well when a browser-based client needs access.
 
 Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).
 
 Render-enabled builds add `browser_screenshot` and `browser_pdf` to the MCP
 tool list. Streaming screencasts are available through CDP rather than MCP.
+
+## Worker navigation responses
+
+`obscura-worker` accepts newline-delimited JSON commands on stdin and emits one
+JSON response per command on stdout. For example:
+
+```json
+{"cmd":"navigate","url":"https://example.com/"}
+```
+
+A completed navigation includes the final document's HTTP status alongside the
+existing title and URL:
+
+```json
+{"ok":true,"result":{"title":"Example Domain","url":"https://example.com/","status":200}}
+```
+
+`status` is the main document's final HTTP response code after redirects, not a
+script, image, or child frame's response. HTTP errors such as 404 and 503 still
+return `ok: true`: the server responded and the error document can be inspected
+with `dump_html`, `dump_text`, or `evaluate`. Navigation without an HTTP response,
+such as `about:blank`, a `data:` URL, or a tracker blocked before the request,
+returns `status: null`. A transport or
+navigation failure retains the existing `{"ok":false,"error":"..."}` envelope
+without a `result` object.
+
+The status field is additive. Navigation timing and the other worker commands
+are unchanged.
+
+## Worker navigation readiness
+
+`obscura-worker` accepts newline-delimited JSON commands on stdin and writes
+one response per command to stdout. Select a readiness mode per navigation:
+
+```json
+{"cmd":"navigate","url":"https://example.com","waitUntil":"domcontentloaded"}
+```
+
+`waitUntil` accepts `load`, `domcontentloaded`, `networkidle0`, or `networkidle2`.
+Omitting it preserves the existing `load` default. The option applies only to
+that request. Invalid values return an `ok: false` response without navigating;
+the worker remains available for subsequent commands.
+
+These modes use the existing `Page::navigate_with_wait` behavior. Parser scripts
+run in every mode. Network-idle modes additionally drive the event loop until
+active requests remain at or below zero or two, respectively, for 500 ms, with
+the engine's existing five-second idle deadline. `domcontentloaded` uses the
+engine's DOM readiness boundary; it does not change script execution or resource
+warmup semantics. Successful responses retain their existing `title`, `url`, and `status`
+fields.

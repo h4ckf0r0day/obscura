@@ -240,6 +240,12 @@ impl FontSystem {
     /// Get a mutable reference to the database.
     pub fn db_mut(&mut self) -> &mut fontdb::Database {
         self.font_matches_cache.clear();
+        // New faces or changed generic families can change fallback selection
+        // without changing the run's text or attributes.
+        #[cfg(feature = "shape-run-cache")]
+        {
+            self.shape_run_cache = crate::ShapeRunCache::default();
+        }
         &mut self.db
     }
 

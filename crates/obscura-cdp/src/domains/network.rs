@@ -70,13 +70,18 @@ pub async fn handle(
         "setCookie" => {
             let cookie = parse_cdp_cookie(params)
                 .ok_or("setCookie: missing required name/domain (or url)")?;
-            cookie_jar_for(ctx, session_id).set_cookies_from_cdp(vec![cookie]);
+            cookie_jar_for(ctx, session_id)
+                .set_cookies_from_cdp_with_scope([(cookie.cookie, cookie.host_only)]);
             Ok(json!({ "success": true }))
         }
         "setCookies" => {
             if let Some(cookies) = params.get("cookies").and_then(|v| v.as_array()) {
                 let parsed: Vec<_> = cookies.iter().filter_map(parse_cdp_cookie).collect();
-                cookie_jar_for(ctx, session_id).set_cookies_from_cdp(parsed);
+                cookie_jar_for(ctx, session_id).set_cookies_from_cdp_with_scope(
+                    parsed
+                        .into_iter()
+                        .map(|cookie| (cookie.cookie, cookie.host_only)),
+                );
             }
             Ok(json!({}))
         }
@@ -124,9 +129,9 @@ pub async fn handle(
                 .ok_or("Network.getResponseBody requires requestId")?;
 
             let body = if let Some(page) = ctx.get_session_page(session_id) {
-                page.get_response_body(request_id)
+                page.get_response_body_for_cdp(request_id)
             } else {
-                ctx.pages.iter().find_map(|page| page.get_response_body(request_id))
+                ctx.pages.iter().find_map(|page| page.get_response_body_for_cdp(request_id))
             };
 
             match body {
