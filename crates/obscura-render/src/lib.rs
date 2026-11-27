@@ -1744,6 +1744,16 @@ pub(crate) fn is_inline_level_box(style: &LayoutStyle) -> bool {
     style.display == Display::Inline || style.is_inline_block
 }
 
+/// `(inline, flex_row)` for accessibility-style readers: whether the box is
+/// inline-level, and whether it is a flex container laying items out in a row.
+pub fn inline_and_flex_row(style: &LayoutStyle) -> (bool, bool) {
+    let row = !matches!(
+        style.flex_direction,
+        Some(taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse)
+    );
+    (is_inline_level_box(style), style.display == Display::Flex && row)
+}
+
 /// Apply CSS Display blockification while preserving the inner display mode.
 /// Thus inline-flex becomes flex and inline-grid becomes grid, while
 /// inline-block/plain inline become block.
