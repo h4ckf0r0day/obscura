@@ -27,50 +27,10 @@ pub(crate) fn initial_containing_block(viewport: (f32, f32), root_gutters: u8) -
     }
 }
 
+#[cfg(not(feature = "paint"))]
 pub(crate) fn word_spacing_advance(text: &str, spacing: f32) -> f32 {
     if spacing == 0.0 { return 0.0; }
     text.chars().filter(|c| matches!(c, ' ' | '\u{00a0}')).count() as f32 * spacing
-}
-
-/// Text width for layout. With the `paint` feature this is exact (real glyph
-/// metrics from the embedded font, shared with rasterization). Without it
-/// (layout-only builds, e.g. for `getBoundingClientRect`), fall back to a
-/// standard average-character-width heuristic for proportional fonts so
-/// `obscura-render` compiles and gives reasonable geometry with its default
-/// (lightest-weight) feature set, matching RENDER.md's documented "layout
-/// (default)" mode.
-#[cfg(feature = "paint")]
-fn text_width(
-    text: &str,
-    size: f32,
-    is_bold: bool,
-    family: Option<&str>,
-    letter_spacing: f32,
-    word_spacing: f32,
-) -> f32 {
-    crate::paint::measure_text(text, size, is_bold, family)
-        + text.chars().filter(|c| !c.is_control()).count() as f32 * letter_spacing
-        + word_spacing_advance(text, word_spacing)
-}
-
-#[cfg(not(feature = "paint"))]
-fn text_width(
-    text: &str,
-    size: f32,
-    is_bold: bool,
-    _family: Option<&str>,
-    letter_spacing: f32,
-    word_spacing: f32,
-) -> f32 {
-    const AVG_CHAR_WIDTH_EM: f32 = 0.55;
-    let chars = text.chars().filter(|c| !c.is_control()).count() as f32;
-    let glyph_width = chars * size * AVG_CHAR_WIDTH_EM;
-    (if is_bold {
-        glyph_width * 1.08
-    } else {
-        glyph_width
-    }) + chars * letter_spacing
-        + word_spacing_advance(text, word_spacing)
 }
 
 #[derive(Default)]
@@ -6635,7 +6595,6 @@ fn layout_dom_once(
                 // pill became 637px wide). Approximate the native max-content
                 // border box from its label, generated icon, gap, and edges.
                 let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
-                let bold = crate::style::used_font_weight(style) >= 600;
                 let intrinsic_content = native_button_contents.get(&id);
                 let label = intrinsic_content
                     .map(|content| content.text.as_str())
@@ -6643,14 +6602,8 @@ fn layout_dom_once(
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                let mut content_width = text_width(
-                    &label,
-                    font_size,
-                    bold,
-                    style.font_family.as_deref(),
-                    style.letter_spacing.unwrap_or(0.0),
-                    style.word_spacing.unwrap_or(0.0),
-                );
+                let mut content_width =
+                    engine.measure_direct_text_width(&label, font_size, style);
                 content_width += intrinsic_content
                     .map(|content| content.atomic_width)
                     .unwrap_or(0.0);
@@ -6710,19 +6663,9 @@ fn layout_dom_once(
                     .map(|option_id| tree.text_content(option_id).trim().to_string())
                     .collect();
                 let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
-                let bold = crate::style::used_font_weight(style) >= 600;
                 let label_width = option_labels
                     .iter()
-                    .map(|label| {
-                        text_width(
-                            label,
-                            font_size,
-                            bold,
-                            style.font_family.as_deref(),
-                            style.letter_spacing.unwrap_or(0.0),
-                            style.word_spacing.unwrap_or(0.0),
-                        )
-                    })
+                    .map(|label| engine.measure_direct_text_width(label, font_size, style))
                     .fold(0.0f32, f32::max);
                 let horizontal_edges = style.padding.left
                     + style.padding.right
@@ -6831,7 +6774,7 @@ fn layout_dom_once(
                     };
                     let label = node.get_attribute("value").unwrap_or(fallback);
                     (
-                        (label.chars().count() as f32 * font_size * 0.55
+                        (engine.measure_direct_text_width(label, font_size, style)
                             + font_size * 1.5
                             + horizontal_edges)
                             .max(20.0),
@@ -10519,24 +10462,15 @@ fn build_text_words(
     }
 
     let mut fsize = 16.0;
-    let mut is_bold = false;
-    let mut family = None;
     let mut line_height = fsize * 1.2;
     let mut transform = crate::TextTransform::None;
-    let mut letter_spacing = 0.0;
-    let mut word_spacing = 0.0;
-    if let Some(parent_id) = rendered_parent(tree, id) {
-        if let Some(p_style) = styles.get(&parent_id) {
-            fsize = p_style.font_size.unwrap_or(16.0);
-            is_bold = crate::style::used_font_weight(p_style) >= 600;
-            family = p_style.font_family.as_deref();
-            line_height = crate::inline::used_line_height(p_style);
-            transform = p_style.text_transform.unwrap_or(crate::TextTransform::None);
-            letter_spacing = p_style.letter_spacing.unwrap_or(0.0);
-            word_spacing = p_style.word_spacing.unwrap_or(0.0);
-        }
+    let parent_style = rendered_parent(tree, id).and_then(|parent| styles.get(&parent));
+    if let Some(p_style) = parent_style {
+        fsize = p_style.font_size.unwrap_or(16.0);
+        line_height = crate::inline::used_line_height(p_style);
+        transform = p_style.text_transform.unwrap_or(crate::TextTransform::None);
     }
-    if let Some(style) = rendered_parent(tree, id).and_then(|parent| styles.get(&parent)) {
+    if let Some(style) = parent_style {
         let shaped = build_shaped_word_leaves(
             id,
             &display_text,
@@ -10551,16 +10485,22 @@ fn build_text_words(
         }
     }
 
+    let fallback_style;
+    let leaf_style = match parent_style {
+        Some(style) => style,
+        None => {
+            fallback_style = crate::LayoutStyle::default();
+            &fallback_style
+        }
+    };
     display_text = transform_word_leaf_text(&display_text, transform);
     build_word_leaves(
         id,
         &display_text,
         fsize,
         line_height,
-        is_bold,
-        family,
-        letter_spacing,
-        word_spacing,
+        leaf_style,
+        engine,
         taffy_tree,
         words,
     )
@@ -10661,17 +10601,15 @@ fn build_word_leaves(
     text: &str,
     fsize: f32,
     line_height: f32,
-    is_bold: bool,
-    family: Option<&str>,
-    letter_spacing: f32,
-    word_spacing: f32,
+    style: &crate::LayoutStyle,
+    engine: &mut crate::inline::TextEngine,
     taffy_tree: &mut TaffyTree<usize>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
 ) -> Vec<taffy::NodeId> {
     tokenize_with_spaces(text)
         .into_iter()
         .filter_map(|token| {
-            let width = text_width(&token, fsize, is_bold, family, letter_spacing, word_spacing);
+            let width = engine.measure_direct_text_width(&token, fsize, style);
             // A pure-whitespace token is HTML source formatting or a bare
             // inter-element space; it keeps its (small) width so adjacent
             // inline content stays visually separated, but contributes no
@@ -10717,16 +10655,13 @@ fn build_pseudo_content(
     }
 
     let fsize = style.font_size.unwrap_or(16.0);
-    let is_bold = crate::style::used_font_weight(style) >= 600;
     build_word_leaves(
         id,
         content,
         fsize,
         crate::inline::used_line_height(style),
-        is_bold,
-        style.font_family.as_deref(),
-        style.letter_spacing.unwrap_or(0.0),
-        style.word_spacing.unwrap_or(0.0),
+        style,
+        engine,
         taffy_tree,
         words,
     )

@@ -17286,9 +17286,16 @@ class _Canvas2D {
   }
   strokeText(text, x, y) { this.fillText(text, x, y); }
   measureText(t) {
-    const fontSize = parseInt(this.font) || 10;
+    const text = String(t);
+    const font = String(this.font ?? '10px sans-serif');
+    const measure = __obscuraCore.ops.op_canvas_measure_text;
+    if (typeof measure === 'function') {
+      const metrics = measure(text, font, _realmFrameId);
+      if (metrics) return metrics;
+    }
+    const fontSize = parseInt(font, 10) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
+    return { width: text.length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);

@@ -128,11 +128,21 @@ pub use paint::{
     screenshot_prepared_with_scroll,
     screenshot_prepared_with_scroll_and_surface_color,
     screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces,
+    text_engine_for_document,
     validate_capture_region, CaptureError, CaptureRegion, DynamicFontFace, ElementScrollMetrics,
     CanvasSurface, CanvasSurfaceSource, ImageRequestProfile, PreparedRender, RenderResourceCache, RenderResourceLoader,
     ResolvedScrollState, SelectedImage,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CanvasTextMetrics {
+    pub width: f64,
+    pub actual_bounding_box_ascent: f64,
+    pub actual_bounding_box_descent: f64,
+    pub font_bounding_box_ascent: f64,
+    pub font_bounding_box_descent: f64,
+}
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
 // layout-only build keeps the lighter word-split geometry. The stub lets
@@ -140,7 +150,7 @@ pub use paint::{
 #[cfg(feature = "paint")]
 pub mod inline;
 #[cfg(feature = "paint")]
-pub use inline::configure_font_directories;
+pub use inline::{configure_font_directories, text_may_need_emoji_font};
 
 #[cfg(not(feature = "paint"))]
 pub mod inline {
@@ -274,6 +284,23 @@ pub mod inline {
 
         pub(crate) fn measure_word(&mut self, _idx: usize) -> (f32, f32) {
             (0.0, 0.0)
+        }
+
+        pub(crate) fn measure_direct_text_width(
+            &mut self,
+            text: &str,
+            font_size: f32,
+            style: &crate::LayoutStyle,
+        ) -> f32 {
+            const AVG_CHAR_WIDTH_EM: f32 = 0.55;
+            let chars = text.chars().filter(|c| !c.is_control()).count() as f32;
+            let mut width = chars * font_size.max(0.0) * AVG_CHAR_WIDTH_EM;
+            if crate::style::used_font_weight(style) >= 600 {
+                width *= 1.08;
+            }
+            width
+                + chars * style.letter_spacing.unwrap_or(0.0)
+                + crate::dom::word_spacing_advance(text, style.word_spacing.unwrap_or(0.0))
         }
     }
 

@@ -66,7 +66,7 @@ const SYSTEM_FAMILY: &str = "DejaVu Sans";
 /// Keep the color face out of ordinary render passes: its bitmap table is
 /// large, and loading it for every page would spend RSS and startup time even
 /// when no emoji can be shaped.
-pub(crate) fn text_may_need_emoji_font(text: &str) -> bool {
+pub fn text_may_need_emoji_font(text: &str) -> bool {
     text.chars().any(|ch| {
         matches!(
             ch,
@@ -114,20 +114,6 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
         // Unrecognized named webfont: keep scanning for a generic fallback.
     }
     FAMILY
-}
-
-#[cfg(feature = "paint")]
-pub(crate) fn bundled_font_bytes(family: Option<&str>, bold: bool) -> &'static [u8] {
-    match (resolve_font_family(family), bold) {
-        (SYSTEM_FAMILY, true) => SYSTEM_B,
-        (SYSTEM_FAMILY, false) => SYSTEM_R,
-        (SERIF_FAMILY, true) => SERIF_B,
-        (SERIF_FAMILY, false) => SERIF_R,
-        (MONO_FAMILY, true) => MONO_B,
-        (MONO_FAMILY, false) => MONO_R,
-        (_, true) => SANS_B,
-        _ => SANS_R,
-    }
 }
 
 fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
@@ -941,6 +927,7 @@ struct MarkerPlacement {
 pub struct TextEngine {
     font_system: FontSystem,
     loaded_families: HashMap<String, LoadedFamily>,
+    has_emoji_font: bool,
     swash: SwashCache,
     variable_swash: VariableSwashCache,
     shape_templates: HashMap<String, Vec<ShapeTemplate>>,
@@ -1341,6 +1328,21 @@ pub(crate) fn constrained_auto_replaced_size(
     })
 }
 
+fn direct_buffer_line_width(buffer: &Buffer) -> f32 {
+    buffer
+        .layout_runs()
+        .map(|run| {
+            let glyph_end = run
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.x + glyph.w)
+                .fold(0.0f32, f32::max);
+            run.line_w.max(glyph_end)
+        })
+        .fold(0.0f32, f32::max)
+        .max(0.0)
+}
+
 impl Default for TextEngine {
     fn default() -> Self {
         Self::new()
@@ -1397,6 +1399,7 @@ impl TextEngine {
         TextEngine {
             font_system,
             loaded_families,
+            has_emoji_font: load_emoji,
             swash: SwashCache::new(),
             variable_swash: VariableSwashCache::new(),
             shape_templates: HashMap::new(),
@@ -1455,41 +1458,83 @@ impl TextEngine {
         used_line_height_for_font(style, &font)
     }
 
-    /// Shape and paint a single standalone string (such as a form control value,
-    /// placeholder, `<select>` label, or `<img alt>` fallback) through the
-    /// configured font database so `--font-dir` and webfont fallback apply.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn paint_direct_text(
+    pub fn has_emoji_font(&self) -> bool {
+        self.has_emoji_font
+    }
+
+    pub(crate) fn measure_direct_text_width(
         &mut self,
-        pixmap: &mut tiny_skia::Pixmap,
         text: &str,
-        x: f32,
-        y: f32,
-        color: [u8; 4],
         font_size: f32,
-        style: Option<&LayoutStyle>,
-        align_right: bool,
-        clip: Option<Rect>,
-        clip_mask: Option<&tiny_skia::Mask>,
-        raster_scale: f32,
-    ) {
-        if text.is_empty()
-            || color[3] == 0
-            || !font_size.is_finite()
-            || font_size <= 0.0
-            || clip.is_some_and(|c| c.width <= 0.0 || c.height <= 0.0)
-        {
-            return;
+        style: &LayoutStyle,
+    ) -> f32 {
+        let Some((buffer, _)) =
+            self.shape_direct_text_buffer(text, font_size, [0, 0, 0, 255], Some(style), false)
+        else {
+            return 0.0;
+        };
+        direct_buffer_line_width(&buffer)
+    }
+
+    pub fn measure_css_font_text(&mut self, css_font: &str, text: &str) -> crate::CanvasTextMetrics {
+        let style = crate::style::parse_canvas_font_style(css_font);
+        let font_size = style.font_size.unwrap_or(10.0);
+        if !font_size.is_finite() || font_size <= 0.0 {
+            return crate::CanvasTextMetrics::default();
         }
-        // Match the earlier single-line native paint behavior where control
-        // characters never introduce extra vertical lines inside a control.
-        let shaped_text: std::borrow::Cow<'_, str> = if text.chars().any(char::is_control) {
+        let (ascent, descent) = self.inline_font_box_metrics(&style);
+        let ascent = f64::from(ascent);
+        let descent = f64::from(descent);
+        let width = self
+            .shape_direct_text_buffer(text, font_size, [0, 0, 0, 255], Some(&style), true)
+            .map_or(0.0, |(buffer, _)| f64::from(direct_buffer_line_width(&buffer)));
+        crate::CanvasTextMetrics {
+            width,
+            actual_bounding_box_ascent: ascent,
+            actual_bounding_box_descent: descent,
+            font_bounding_box_ascent: ascent,
+            font_bounding_box_descent: descent,
+        }
+    }
+
+    fn shape_direct_text_buffer(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        color: [u8; 4],
+        style: Option<&LayoutStyle>,
+        normalize_canvas_ws: bool,
+    ) -> Option<(Buffer, Vec<Arc<FontVariations>>)> {
+        if text.is_empty() || !font_size.is_finite() || font_size <= 0.0 {
+            return None;
+        }
+        // Native controls strip control characters to stay single-line, while
+        // Canvas2D normalizes ASCII whitespace to U+0020 before shaping.
+        let shaped_text: std::borrow::Cow<'_, str> = if normalize_canvas_ws {
+            if text.chars().any(|c| c != ' ' && (c.is_ascii_whitespace() || c.is_control())) {
+                std::borrow::Cow::Owned(
+                    text.chars()
+                        .filter_map(|c| {
+                            if c.is_ascii_whitespace() {
+                                Some(' ')
+                            } else if c.is_control() {
+                                None
+                            } else {
+                                Some(c)
+                            }
+                        })
+                        .collect(),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(text)
+            }
+        } else if text.chars().any(char::is_control) {
             std::borrow::Cow::Owned(text.chars().filter(|c| !c.is_control()).collect())
         } else {
             std::borrow::Cow::Borrowed(text)
         };
         if shaped_text.is_empty() {
-            return;
+            return None;
         }
         let weight = style
             .map(crate::style::used_font_weight)
@@ -1542,6 +1587,35 @@ impl TextEngine {
         );
         buffer.set_size(&mut self.font_system, None, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
+        Some((buffer, variation_sets))
+    }
+
+    /// Shape and paint a single standalone string (such as a form control value,
+    /// placeholder, `<select>` label, or `<img alt>` fallback) through the
+    /// configured font database so `--font-dir` and webfont fallback apply.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_direct_text(
+        &mut self,
+        pixmap: &mut tiny_skia::Pixmap,
+        text: &str,
+        x: f32,
+        y: f32,
+        color: [u8; 4],
+        font_size: f32,
+        style: Option<&LayoutStyle>,
+        align_right: bool,
+        clip: Option<Rect>,
+        clip_mask: Option<&tiny_skia::Mask>,
+        raster_scale: f32,
+    ) {
+        if color[3] == 0 || clip.is_some_and(|c| c.width <= 0.0 || c.height <= 0.0) {
+            return;
+        }
+        let Some((buffer, variation_sets)) =
+            self.shape_direct_text_buffer(text, font_size, color, style, false)
+        else {
+            return;
+        };
 
         let clip_bounds = clip.map(|c| {
             (

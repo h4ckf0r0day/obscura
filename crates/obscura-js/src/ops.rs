@@ -686,6 +686,8 @@ pub struct ObscuraState {
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
     #[cfg(feature = "render")]
+    pub(crate) canvas_text_engine: Option<obscura_render::inline::TextEngine>,
+    #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
     /// clamped against the cached document overflow and is the single source
@@ -911,6 +913,8 @@ impl ObscuraState {
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
+            #[cfg(feature = "render")]
+            canvas_text_engine: None,
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -2348,6 +2352,7 @@ pub(crate) fn invalidate_render_resource_geometry(state: &mut ObscuraState) {
         state.prepared_render = None;
         state.pending_style_mutations.clear();
     }
+    state.canvas_text_engine = None;
     state.resolved_scroll = None;
 }
 
@@ -2562,6 +2567,7 @@ fn op_external_stylesheet_set(
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
+            state.canvas_text_engine = None;
             state.pending_style_mutations.clear();
             state.resolved_scroll = None;
         }
@@ -2587,6 +2593,7 @@ fn op_external_stylesheet_remove(state: &OpState, owner_nid: u32, frame_id: u32)
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
+            state.canvas_text_engine = None;
             state.pending_style_mutations.clear();
             state.resolved_scroll = None;
         }
@@ -2619,6 +2626,7 @@ fn invalidate_cssom_render(state: &mut ObscuraState) {
     #[cfg(feature = "render")]
     {
         state.prepared_render = None;
+        state.canvas_text_engine = None;
         state.pending_style_mutations.clear();
         state.resolved_scroll = None;
     }
@@ -2971,10 +2979,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     && queue_retained_style_mutation(&mut state.pending_style_mutations, mutation);
                 if !retained {
                     state.prepared_render = None;
+                    state.canvas_text_engine = None;
                     state.pending_style_mutations.clear();
                 }
             } else {
                 state.prepared_render = None;
+                state.canvas_text_engine = None;
                 state.pending_style_mutations.clear();
             }
             state.resolved_scroll = None;
@@ -8922,6 +8932,86 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32, frame_id: u32) -> bool {
     connected
 }
 
+#[cfg(feature = "render")]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsCanvasTextMetrics {
+    width: f64,
+    actual_bounding_box_ascent: f64,
+    actual_bounding_box_descent: f64,
+    font_bounding_box_ascent: f64,
+    font_bounding_box_descent: f64,
+}
+
+#[cfg(feature = "render")]
+impl From<obscura_render::CanvasTextMetrics> for JsCanvasTextMetrics {
+    fn from(metrics: obscura_render::CanvasTextMetrics) -> Self {
+        Self {
+            width: metrics.width,
+            actual_bounding_box_ascent: metrics.actual_bounding_box_ascent,
+            actual_bounding_box_descent: metrics.actual_bounding_box_descent,
+            font_bounding_box_ascent: metrics.font_bounding_box_ascent,
+            font_bounding_box_descent: metrics.font_bounding_box_descent,
+        }
+    }
+}
+
+/// Measure Canvas2D text through the renderer's `TextEngine` so font family,
+/// weight, `--font-dir`, `@font-face`, and `document.fonts` metrics match.
+#[cfg(feature = "render")]
+#[op2]
+#[serde]
+fn op_canvas_measure_text(
+    state: &OpState,
+    #[string] text: &str,
+    #[string] css_font: &str,
+    frame_id: u32,
+) -> Option<JsCanvasTextMetrics> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let mut gs = shared.borrow_mut();
+        let needs_emoji = obscura_render::text_may_need_emoji_font(text);
+        if gs.pending_style_mutations.is_empty() {
+            if let Some(prepared) = gs.prepared_render.as_mut() {
+                if !needs_emoji || prepared.has_emoji_font() {
+                    return Some(prepared.measure_canvas_text(css_font, text).into());
+                }
+            }
+        }
+        let base_url = document_base_url_for_javascript_task(&gs);
+        if gs
+            .canvas_text_engine
+            .as_ref()
+            .is_none_or(|engine| needs_emoji && !engine.has_emoji_font())
+        {
+            let ObscuraState {
+                dom,
+                render_resources,
+                dynamic_fonts,
+                canvas_text_engine,
+                ..
+            } = &mut *gs;
+            let engine = if let Some(dom) = dom.as_ref() {
+                obscura_render::text_engine_for_document(
+                    dom,
+                    base_url.as_deref(),
+                    render_resources,
+                    dynamic_fonts,
+                    needs_emoji,
+                )
+            } else {
+                obscura_render::inline::TextEngine::new()
+            };
+            *canvas_text_engine = Some(engine);
+        }
+        gs.canvas_text_engine
+            .as_mut()
+            .map(|engine| engine.measure_css_font_text(css_font, text).into())
+    }))
+    .ok()
+    .flatten()
+}
+
 #[op2]
 #[string]
 fn op_frame_preload_scripts(state: &OpState) -> String {
@@ -9108,6 +9198,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
+        ops.push(op_canvas_measure_text());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
@@ -9603,6 +9694,7 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
         state.prepared_render = None;
         state.pending_style_mutations.clear();
     }
+    state.canvas_text_engine = None;
     state.resolved_scroll = None;
 }
 

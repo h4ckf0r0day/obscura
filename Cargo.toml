@@ -39,8 +39,6 @@ cssparser = "0.34"
 taffy = { version = "0.12", path = "vendor/taffy" }
 # CPU-only pure-Rust 2D rasterizer for the render layer's paint step.
 tiny-skia = "0.12"
-# Pure-Rust glyph rasterizer for the render layer's text step.
-ab_glyph = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
 # No "cookies" feature: obscura manages cookies through its own CookieJar
