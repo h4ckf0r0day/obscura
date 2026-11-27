@@ -2213,7 +2213,7 @@ impl PreparedRender {
     ) -> Option<HashMap<&'static str, String>> {
         let style = self.layout.styles.get(&id)?;
         let rect = self.layout.rects.get(&id);
-                let mut out = non_geometric_computed_style(style);
+        let mut out = non_geometric_computed_style(style);
         // Layout has already inherited direction and applied the `dir`
         // attribute. The non-geometric fast path does neither, so this stays
         // out of that snapshot.
@@ -18459,7 +18459,7 @@ mod tests {
         assert_eq!(computed("plain")["clear"], "none");
     }
 
-        #[test]
+    #[test]
     fn computed_style_exposes_inherited_direction() {
         let tree = parse_html(
             r#"<html dir="RTL"><style>#css{direction:ltr}</style>

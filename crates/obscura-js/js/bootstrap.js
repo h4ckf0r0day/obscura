@@ -6676,7 +6676,7 @@ class Document extends Node {
     const get = _documentRealmMember(this, 'URL');
     return get ? Reflect.apply(get, this, []) : (_domParse("document_url") ?? "");
   }
-    get documentURI() { return this.URL; }
+  get documentURI() { return this.URL; }
   // Reflects `dir` on the html element only, limited to known values.
   get dir() {
     const root = this.documentElement;
