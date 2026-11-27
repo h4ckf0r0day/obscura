@@ -4779,7 +4779,7 @@ impl NonGeometricStyleCache {
     }
 }
 
-/// Read display/visibility without retaining geometry or styles for completed branches.
+/// Read display/visibility (plus inline-level and flex-row flags) without retaining geometry or styles for completed branches.
 /// Unsupported cascade dependencies leave the full renderer as the authority.
 #[cfg(feature = "paint")]
 pub fn accessibility_styles_without_layout(
@@ -4787,7 +4787,7 @@ pub fn accessibility_styles_without_layout(
     viewport: (f32, f32),
     media_type: crate::CssMediaType,
     cache: &crate::css::StylesheetCache,
-) -> Option<HashMap<NodeId, (bool, Option<bool>)>> {
+) -> Option<HashMap<NodeId, (bool, Option<bool>, bool, bool)>> {
     let sources = document_stylesheet_sources(tree, viewport, media_type);
     // This document-wide read checks every animation owner before returning.
     // Keep ordinary CSSOM cold-read behavior and retained-layout keys unchanged.
@@ -4800,7 +4800,8 @@ pub fn accessibility_styles_without_layout(
         if !tree.with_node(id, |node| node.is_element()).unwrap_or(false) { continue; }
         let style = cascade.resolve_style(tree, id, "visibility")?;
         if style.animation_name.is_some() { return None; }
-        result.insert(id, (style.display == crate::Display::None, style.visibility_hidden));
+        let (inline, flex_row) = crate::inline_and_flex_row(style);
+        result.insert(id, (style.display == crate::Display::None, style.visibility_hidden, inline, flex_row));
         let path = &cascade.path;
         cascade.styles.retain(|id, _| path.contains(id));
         cascade.ancestors.retain(|id, _| path.contains(id));
@@ -15758,6 +15759,20 @@ mod tests {
         assert_eq!(styles[&tree.get_element_by_id("shown").unwrap()].1, Some(false));
         assert!(styles[&tree.get_element_by_id("gone").unwrap()].0);
         assert_eq!(sheets.retained_source_bytes(), 0, "a read must not bless an unrelated retained layout with a new stylesheet key");
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn accessibility_style_reads_report_inline_and_flex_row() {
+        let tree = parse_html("<!doctype html><style>.row{display:flex}.col{display:flex;flex-direction:column}.ib{display:inline-block}.if{display:inline-flex}</style><div class=row id=row></div><div class=col id=col></div><div class=ib id=ib></div><span class=if id=if></span><span id=span></span><div id=div></div>");
+        let styles = accessibility_styles_without_layout(&tree, (400.0,200.0), crate::CssMediaType::Screen, &crate::StylesheetCache::default()).unwrap();
+        let get = |id| { let s = styles[&tree.get_element_by_id(id).unwrap()]; (s.2, s.3) };
+        assert_eq!(get("row"), (false, true));
+        assert_eq!(get("col"), (false, false));
+        assert_eq!(get("ib"), (true, false));
+        assert_eq!(get("if"), (true, true));
+        assert_eq!(get("span"), (true, false));
+        assert_eq!(get("div"), (false, false));
     }
 
     #[cfg(feature = "paint")]

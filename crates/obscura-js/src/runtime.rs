@@ -210,6 +210,10 @@ fn with_sync_render_loading_disabled<R>(
 pub struct AccessibilityStyle {
     pub display_none: bool,
     pub visibility_hidden: Option<bool>,
+    /// Inline-level box (`inline`, `inline-block`, `inline-flex`).
+    pub inline: bool,
+    /// Flex container whose main axis is horizontal (`row`, `row-reverse`, or unset).
+    pub flex_row: bool,
 }
 
 #[doc(hidden)]
@@ -4487,8 +4491,8 @@ impl ObscuraJsRuntime {
                     dom, state.viewport, state.render_media, &state.stylesheet_cache,
                 )
             }) {
-                return styles.into_iter().map(|(id, (display_none, visibility_hidden))| {
-                    (id, AccessibilityStyle { display_none, visibility_hidden })
+                return styles.into_iter().map(|(id, (display_none, visibility_hidden, inline, flex_row))| {
+                    (id, AccessibilityStyle { display_none, visibility_hidden, inline, flex_row })
                 }).collect();
             }
         }
@@ -4500,11 +4504,14 @@ impl ObscuraJsRuntime {
             .styles
             .iter()
             .map(|(id, style)| {
+                let (inline, flex_row) = obscura_render::inline_and_flex_row(style);
                 (
                     *id,
                     AccessibilityStyle {
                         display_none: style.display == obscura_render::Display::None,
                         visibility_hidden: style.visibility_hidden,
+                        inline,
+                        flex_row,
                     },
                 )
             })
@@ -6130,6 +6137,18 @@ mod tests {
         assert_eq!(styles[&ids[1]].visibility_hidden, Some(true));
         assert_eq!(styles[&ids[2]].visibility_hidden, Some(false));
         assert!(rt.state.borrow().prepared_render.is_none(), "a static visibility read must not retain layout/text geometry for an entire document");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn layout_accessibility_styles_report_inline_and_flex_row() {
+        // the container query makes the cascade-only read decline, so this covers the layout path
+        let rt = setup_runtime("<!doctype html><style>.c{container-type:inline-size}@container(min-width:1px){.row{visibility:visible}}.row{display:flex}.col{display:flex;flex-direction:column}.ib{display:inline-block}</style><div class=c><div class=row id=row></div><div class=col id=col></div><span class=ib id=ib></span></div>");
+        let styles = rt.accessibility_styles();
+        assert!(rt.state.borrow().prepared_render.is_some(), "expected the layout path");
+        let ids = rt.with_dom(|dom| ["row", "col", "ib"].map(|id| dom.get_element_by_id(id).unwrap())).unwrap();
+        let get = |i: usize| (styles[&ids[i]].inline, styles[&ids[i]].flex_row);
+        assert_eq!([get(0), get(1), get(2)], [(false, true), (false, false), (true, false)]);
     }
 
     #[test]
