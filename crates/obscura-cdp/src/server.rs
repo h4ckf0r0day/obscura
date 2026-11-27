@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+use crate::registry::TargetRegistry;
 
 // PR #36 comment 4341743194: the deferral queue in `process_with_interception`
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
@@ -260,12 +261,50 @@ struct CdpMessage {
     reply_tx: mpsc::UnboundedSender<String>,
 }
 
+/// A WebSocket stream accepted by the control-plane thread, plus the
+/// per-connection options parsed from its HTTP upgrade request.
+struct WsHandoff {
+    stream: std::net::TcpStream,
+    reconnect_opt_in: bool,
+}
+
 enum ServerMessage {
     Cdp(CdpMessage),
     NewConnection {
         reply_tx: mpsc::UnboundedSender<String>,
     },
+    /// A session-scoped CDP command that targets a page owned by ANOTHER
+    /// connection. Thread-per-connection (#430) confines the live `Page` and
+    /// its V8 isolate to the owning connection's thread, so the caller's
+    /// processor forwards the original request here; the owner executes it
+    /// against its own session for `page_id` and streams the response (and
+    /// any events) back through `reply_tx`, rewriting the session id to the
+    /// caller's so the client can correlate the reply.
+    RemoteExec {
+        text: String,
+        page_id: String,
+        /// Identifies the forwarding connection. The owner uses it together
+        /// with the caller's session id to mint a stable, caller-specific
+        /// owner-side session instead of reusing one of its own sessions.
+        forwarder_id: u64,
+        reply_tx: mpsc::UnboundedSender<String>,
+    },
+    ReleaseRemoteSession(String),
+    /// The client's WebSocket closed. Pages created by this connection are
+    /// NOT torn down: they stay alive on this thread (thread-per-connection
+    /// #430) and remain visible in the global registry and drivable from
+    /// other connections via `RemoteExec`. The processor keeps serving those
+    /// commands and exits once it owns no pages, unwinding the thread.
+    ConnectionClosed,
 }
+
+/// Process-wide map from page target id to the owning connection's processor
+/// channel. Each connection's processor keeps it current after every message
+/// it handles (register its own pages, drop ids it no longer owns); other
+/// connections consult it when a session-scoped command must be routed to the
+/// page's real owner.
+type RemoteOwners =
+    Arc<std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<ServerMessage>>>>;
 
 pub async fn start(port: u16) -> anyhow::Result<()> {
     start_with_options(port, None, false).await
@@ -472,7 +511,17 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         publish_ready_file(path, bound_addr)?;
     }
 
-    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
+    let (ws_tx, mut ws_rx) = mpsc::channel::<WsHandoff>(MAX_PENDING_WS_HANDOFFS);
+
+    // Process-wide page target registry (issue #544). Every connection shares
+    // this one so Target.getTargets on any WebSocket and /json/list on the
+    // HTTP accept thread see the same live pages; page ids minted from it are
+    // unique across the whole server.
+    let target_registry = TargetRegistry::default();
+
+    // Process-wide map from page id to the owning connection's processor
+    // channel, used to route session-scoped commands to remote pages.
+    let remote_owners: RemoteOwners = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Ctrl-C / graceful shutdown coordination.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -500,6 +549,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
     // above any real connect rate, so the kernel backlog cannot overflow
     // under a connection burst.
     let accept_flag = shutdown_flag.clone();
+    let http_registry = target_registry.clone();
     let accept_auth_token = auth_token.clone();
     let accept_allowed_origins = allowed_origins_env();
     std::thread::Builder::new()
@@ -570,6 +620,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
                                 accept_allowed_origins.as_deref(),
                                 &ws_tx,
                                 &head,
+                                &http_registry,
                             ) {
                                 if !format!("{}", e).contains("close") {
                                     error!("Accept dispatch error: {}", e);
@@ -662,10 +713,11 @@ pub async fn start_with_serve_options_limit_and_ready_file(
             stream = ws_rx.recv() => stream,
             _ = shutdown_notify.notified() => None,
         };
-        let stream = match stream {
-            Some(s) => s,
+        let handoff = match stream {
+            Some(h) => h,
             None => break,
         };
+        let stream = handoff.stream;
         // Nagle off + nonblocking on the std socket before it moves to the
         // connection thread. CDP exchanges many small (~100-byte) frames during
         // newPage()/navigate; with Nagle on, each small write waits on an ACK or
@@ -698,11 +750,14 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         }
         run_connection(
             stream,
+            handoff.reconnect_opt_in,
             shared_ctx.clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
             shutdown_notify.clone(),
             live_connections.clone(),
+            remote_owners.clone(),
+            target_registry.clone(),
         );
     }
 
@@ -875,16 +930,20 @@ fn claim_connection_memory_trim(last_trim: &AtomicU64, now: u64, idle: bool) -> 
 /// plumbing is needed.
 fn run_connection(
     std_stream: std::net::TcpStream,
+    reconnect_opt_in: bool,
     context_template: Arc<obscura_browser::BrowserContext>,
     persistence_context: Arc<obscura_browser::BrowserContext>,
     persistence_lock: Arc<std::sync::Mutex<()>>,
     shutdown_notify: Arc<Notify>,
     live_connections: Arc<AtomicUsize>,
+    remote_owners: RemoteOwners,
+    target_registry: TargetRegistry,
 ) {
-    // Releases the slot reserved by the accept loop when the thread unwinds,
-    // however it exits — clean close, error return, or panic. A plain
-    // decrement at the end of the closure would leak slots on the early
-    // returns below until the cap wedged the server shut.
+    // Releases the slot reserved by the accept loop exactly once. The cap
+    // bounds ACTIVE clients, so the normal path releases it as soon as the
+    // socket is gone (a retained connection keeps living as the host of the
+    // pages it created and must not hold a slot); drop covers every early
+    // return and panic, and the taken Option makes the second call a no-op.
     struct SlotGuard(Option<Arc<AtomicUsize>>);
     impl SlotGuard {
         fn release(&mut self) -> Option<usize> {
@@ -926,6 +985,9 @@ fn run_connection(
             // completed navigation. Keep all page/isolate work on this thread,
             // and move only Send protocol strings and the socket to an I/O thread.
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
+            // The processor keeps this sender so it can be told the socket is
+            // gone without reaching into the I/O thread's moved copy.
+            let connection_tx = msg_tx.clone();
             let (io_stop_tx, io_stop_rx) = tokio::sync::oneshot::channel::<()>();
             let (io_done_tx, io_done_rx) = tokio::sync::oneshot::channel::<()>();
             let interrupt_routes = crate::dispatch::InterruptRoutes::default();
@@ -972,20 +1034,33 @@ fn run_connection(
                 }
             };
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async move {
-                // Run the processor in the connection future. A self-waking
-                // LocalSet task can run 61 times before Tokio services I/O,
-                // starving fetch under a continuously ready page scheduler.
-                let processor = cdp_processor(
-                    msg_rx, default_context, shutdown_notify, interrupt_routes,
-                );
-                tokio::pin!(processor);
-                tokio::select! {
-                    _ = &mut processor => {}
-                    // Dropping the processor cancels an in-flight command.
-                    // Detached navigation tasks are dropped with the LocalSet.
-                    _ = io_done_rx => {}
-                }
+            let released_slot = local.block_on(&rt, async move {
+                // The processor outlives the socket: the pages this connection
+                // created survive its disconnect (Chrome semantics), so after
+                // the client goes away it keeps serving RemoteExec for those
+                // pages and exits once its last page is closed, which unwinds
+                // this thread.
+                let processor = tokio::task::spawn_local(cdp_processor(
+                    msg_rx,
+                    default_context,
+                    shutdown_notify,
+                    interrupt_routes,
+                    target_registry,
+                    connection_tx.clone(),
+                    remote_owners,
+                    reconnect_opt_in,
+                ));
+                // Socket I/O lives on the I/O thread, so wait for it rather
+                // than driving the WebSocket on the renderer's LocalSet.
+                let _ = io_done_rx.await;
+                // The client is gone. Release the accept-loop slot now: the cap
+                // counts active clients, and this thread may keep living as the
+                // owner of the pages the connection created.
+                let released = slot_guard.release();
+                let _ = connection_tx.send(ServerMessage::ConnectionClosed);
+                drop(connection_tx);
+                let _ = processor.await;
+                released
             });
             let _ = io_stop_tx.send(());
             let _ = io_thread.join();
@@ -1015,7 +1090,10 @@ fn run_connection(
             }
 
             drop(persisted_context);
-            let idle = slot_guard.release() == Some(0);
+            // The slot was released when the socket closed, so a connection
+            // retained past its client no longer counts as active; `None`
+            // means an earlier path already released it.
+            let idle = released_slot == Some(0);
             release_connection_memory(idle);
         });
 
@@ -1172,6 +1250,22 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
     PeekStatus::Head(String::from_utf8_lossy(head).into_owned())
 }
 
+/// Explicit per-connection opt-in for resuming pages retained by disconnected
+/// CDP clients. It travels as an HTTP header on the WebSocket upgrade, which
+/// `connectOverCDP` forwards from its `headers` option. The header is consumed
+/// here and never logged.
+const RECONNECT_OPT_IN_HEADER: &str = "x-obscura-reconnect";
+
+fn reconnect_opt_in_from_head(head: &str) -> bool {
+    head.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case(RECONNECT_OPT_IN_HEADER)
+            && matches!(value.trim(), "1" | "true")
+    })
+}
+
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
 ///
 /// The connection's request head has already been peeked by the accept loop
@@ -1186,8 +1280,9 @@ fn accept_dispatch(
     forwarded: Option<(std::net::IpAddr, u16)>,
     auth_token: Option<&str>,
     allowed_origins: Option<&str>,
-    ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    ws_tx: &mpsc::Sender<WsHandoff>,
     head: &str,
+    target_registry: &TargetRegistry,
 ) -> anyhow::Result<()> {
     if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token, allowed_origins) {
         refuse_control_connection(stream, refusal);
@@ -1208,7 +1303,7 @@ fn accept_dispatch(
         // The request head is already sitting in the kernel receive buffer;
         // switch back to blocking mode for the synchronous /json serve.
         let _ = stream.set_nonblocking(false);
-        return handle_http_json_blocking(stream, port, ep, head);
+        return handle_http_json_blocking(stream, port, ep, target_registry, head);
     }
     // Fall through: GET request that isn't a /json endpoint → treat as
     // WebSocket upgrade (Chromium DevTools clients issue GET with
@@ -1221,7 +1316,10 @@ fn accept_dispatch(
     // dropped `stream` closes itself; the client will see ECONNRESET and
     // can retry.
     ws_tx
-        .try_send(stream)
+        .try_send(WsHandoff {
+            stream,
+            reconnect_opt_in: reconnect_opt_in_from_head(head),
+        })
         .map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
@@ -1236,6 +1334,7 @@ fn handle_http_json_blocking(
     mut stream: std::net::TcpStream,
     port: u16,
     endpoint: &str,
+    target_registry: &TargetRegistry,
     request_head: &str,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
@@ -1253,15 +1352,30 @@ fn handle_http_json_blocking(
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", authority),
         }))?,
-        "list" => serde_json::to_string_pretty(&json!([{
-            "description": "",
-            "devtoolsFrontendUrl": "",
-            "id": "page-1",
-            "title": "",
-            "type": "page",
-            "url": "about:blank",
-            "webSocketDebuggerUrl": format!("ws://{}/devtools/page/page-1", authority),
-        }]))?,
+        // The list must mirror the live target registry (issue #544), not a
+        // hardcoded synthetic about:blank page. Every page any connection has
+        // created or navigated shows up here with its current url/title.
+        "list" => {
+            let list: Vec<serde_json::Value> = target_registry
+                .all()
+                .into_iter()
+                .map(|target| {
+                    json!({
+                        "description": "",
+                        "devtoolsFrontendUrl": "",
+                        "id": target.target_id,
+                        "title": target.title,
+                        "type": "page",
+                        "url": target.url,
+                        "webSocketDebuggerUrl": format!(
+                            "ws://{}/devtools/page/{}",
+                            authority, target.target_id
+                        ),
+                    })
+                })
+                .collect();
+            serde_json::to_string_pretty(&list)?
+        }
         "protocol" => {
             serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
         }
@@ -1310,8 +1424,13 @@ async fn cdp_processor(
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
     interrupt_routes: crate::dispatch::InterruptRoutes,
+    target_registry: TargetRegistry,
+    my_msg_tx: mpsc::UnboundedSender<ServerMessage>,
+    remote_owners: RemoteOwners,
+    reconnect_opt_in: bool,
 ) {
-    let mut ctx = CdpContext::new_with_shared_context(default_context);
+    let mut ctx = CdpContext::new_with_shared_context_and_registry(default_context, target_registry);
+    ctx.reconnect_opt_in = reconnect_opt_in;
     ctx.interrupt_routes = interrupt_routes;
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
@@ -1338,6 +1457,10 @@ async fn cdp_processor(
     let mut screencast_tick = tokio::time::interval(tokio::time::Duration::from_millis(33));
     screencast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut connection_reply_tx: Option<mpsc::UnboundedSender<String>> = None;
+    // True once the client's WebSocket has closed. Pages created by this
+    // connection survive the disconnect (they stay drivable via RemoteExec
+    // from other connections); the processor exits once it owns no pages.
+    let mut ws_closed = false;
     // A real browser renderer continues servicing timers, networking, posted
     // tasks, and animation callbacks while its DevTools client is silent. Keep
     // one wake-driven deno_core turn armed after work may have been scheduled;
@@ -1486,16 +1609,42 @@ async fn cdp_processor(
         let Some(msg) = msg else {
             continue;
         };
+        let is_connection_closed = matches!(msg, ServerMessage::ConnectionClosed);
 
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 connection_reply_tx = Some(reply_tx.clone());
+                if ctx.reconnect_opt_in {
+                    // A connection that resumes existing pages starts without an
+                    // implicit page of its own. Otherwise each reconnect would
+                    // leave a fresh blank target and processor behind.
+                    let _ = reply_tx.send(json!({"__init": true}).to_string());
+                    continue;
+                }
+                // Issue #543: a browser-level client that connects and immediately
+                // calls Target.getTargets must see the existing page targets (the
+                // CDP spec makes targets globally visible). Without this, a fresh
+                // connection's CdpContext has an empty `pages` registry and
+                // getTargets returns [], which breaks puppeteer/playwright-style
+                // clients before they can call Target.createTarget/attachToTarget.
+                // Mirror the interception path below, which already creates a
+                // page + session per new connection.
+                let pid = ctx.create_page();
+                let sid = format!("{pid}-session");
+                ctx.sessions.insert(sid.clone(), pid.clone());
                 let _ = reply_tx.send(
-                    json!({"__init": true})
-                        .to_string(),
+                    json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string(),
                 );
             }
             ServerMessage::Cdp(cdp_msg) => {
+                // Cross-connection session routing: a session-scoped command
+                // whose session routes to a page owned by ANOTHER connection
+                // is forwarded to that connection's processor (remote exec).
+                // The live Page and its V8 isolate stay on the owner's thread
+                // (#430); only the routing crosses connections.
+                if forward_remote_cdp(&cdp_msg, &ctx, &remote_owners) {
+                    continue;
+                }
                 // Route navigation and reload through the spawn-and-defer path,
                 // not just intercepted ones. Holding the V8 lock across a
                 // multi-second navigate inside the regular dispatch wedges the
@@ -1542,8 +1691,57 @@ async fn cdp_processor(
                     }
                 }
             }
+            ServerMessage::RemoteExec {
+                text,
+                page_id,
+                forwarder_id,
+                reply_tx,
+            } => {
+                handle_remote_exec(
+                    &mut ctx,
+                    &text,
+                    &page_id,
+                    forwarder_id,
+                    &reply_tx,
+                    &mut rx,
+                    &mut intercept_rx,
+                    &mut intercepted_paused,
+                    &mut deferred,
+                )
+                .await;
+            }
+            ServerMessage::ReleaseRemoteSession(session_id) => {
+                ctx.release_session(&session_id);
+            }
+            ServerMessage::ConnectionClosed => {
+                // The client socket is gone, but the pages this connection
+                // created stay alive on this thread (#430): they remain in
+                // the global registry and are still drivable from other
+                // connections via RemoteExec. Stop pumping this connection's
+                // own event stream — there is no socket to receive it — drop
+                // any screencasts bound to the dead session, and drop any
+                // events left queued for the departed client. The autonomous
+                // JS pump is disarmed at the re-arm site below (not here: the
+                // post-match re-arm runs after every message), so orphaned
+                // pages are frozen until a later command re-arms the pump.
+                ws_closed = true;
+                connection_reply_tx = None;
+                ctx.pending_events.clear();
+                #[cfg(feature = "render")]
+                ctx.screencasts.clear();
+                // The live pages stay on this thread, but their client is
+                // gone. Mark them retained so a reconnecting client that
+                // explicitly opted in can auto-attach them through the normal
+                // Playwright/Puppeteer lifecycle. Active clients' pages are
+                // never marked here.
+                let retained: Vec<String> =
+                    ctx.pages.iter().map(|page| page.id.clone()).collect();
+                ctx.registry.mark_retained(&retained);
+            }
         }
 
+        // A deferred navigation belongs to a page whose client is still
+        // connected; drive it through the interception path before re-arming.
         if let (Some(reply_tx), Some((session_id, url, method, body))) = (
             connection_reply_tx.as_ref(),
             take_live_pending_navigation(&ctx),
@@ -1560,17 +1758,311 @@ async fn cdp_processor(
             ).await;
         }
 
-        // Dispatch may have created pages or scheduled work on an idle page.
-        // Recheck after commands, then park on the runtimes' own wakers.
+        // Dispatch may have created a page or scheduled new asynchronous work.
+        // A single live isolate is the connection's current active target; the
+        // pump will park cheaply if its next task is a distant timer.
+        // Disconnect disarms the autonomous pump (the orphaned pages freeze
+        // until driven again); any later message - including a RemoteExec from
+        // another connection driving the surviving pages - re-arms it.
         idle_pages.clear();
-        runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+        runtime_pump_armed = if is_connection_closed {
+            false
+        } else {
+            ctx.pages.iter().any(|page| page.has_js())
+        };
         runtime_pump_error_streak = 0;
+        sync_remote_ownership(&ctx, &remote_owners, &my_msg_tx);
 
+        // An orphaned connection (client disconnected) exits once it owns no
+        // pages: nothing is left to serve, so the thread unwinds and the
+        // connection's slot (already released) and owner-map entries settle.
+        // Pages are removed from the registry as they are closed, so no
+        // targets are stranded by the exit. Any final response for the
+        // message that dropped the last page was already queued to the
+        // caller's channel before this point, so its (earlier-woken) rewrite
+        // task delivers it before this LocalSet tears down.
+        if ws_closed && ctx.pages.is_empty() {
+            break;
+        }
     }
 
     // The connection thread merges this context's cookie delta into the
     // persistence template after the processor stops.
+    //
+    // This connection is going away: unregister every page it owned so other
+    // connections stop routing remote commands to a dead processor.
+    {
+        let mut map = remote_owners.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, tx| !tx.same_channel(&my_msg_tx));
+    }
     let _ = &ctx;
+}
+
+/// Whether a CDP message's session routes to a page owned by another
+/// connection, and if so, forward it to that connection's processor (or fail
+/// it when the target is gone). Returns true when the message was fully
+/// handled (forwarded, or answered with an error) and must not be dispatched
+/// locally.
+fn forward_remote_cdp(
+    cdp_msg: &CdpMessage,
+    ctx: &CdpContext,
+    remote_owners: &RemoteOwners,
+) -> bool {
+    let Ok(req) = serde_json::from_str::<CdpRequest>(&cdp_msg.text) else {
+        return false;
+    };
+
+    if req.method == "Target.detachFromTarget" {
+        if let Some(session_id) = req.params.get("sessionId").and_then(|v| v.as_str()) {
+            if let Some(page_id) = ctx.sessions.get(session_id).filter(|id| ctx.get_page(id).is_none()) {
+                if let Some(owner) = remote_owners.lock().unwrap_or_else(|e| e.into_inner()).get(page_id) {
+                    let _ = owner.send(ServerMessage::ReleaseRemoteSession(
+                        forwarded_session_id(page_id, ctx.connection_id, session_id),
+                    ));
+                }
+            }
+        }
+        return false; // The caller must also drop its local session.
+    }
+
+    // Browser-level `Target.closeTarget` (no sessionId) is browser-global: it
+    // may name a target owned by another connection. Route it to the owner so
+    // the live `Page` is torn down for real — its isolate lives on the owner's
+    // thread (#430), so a local tombstone alone would hide the target from
+    // getTargets//json/list but leak the Page until the owner next syncs,
+    // which an orphaned owner (disconnected client) never does.
+    if req.session_id.is_none() && req.method == "Target.closeTarget" {
+        let Some(target_id) = req.params.get("targetId").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if ctx.get_page(target_id).is_some() {
+            return false; // owned here: normal local dispatch tears it down
+        }
+        if !ctx.registry.all().iter().any(|t| t.target_id == target_id) {
+            return false; // unknown target: local dispatch surfaces the error
+        }
+        let Some(owner_tx) = remote_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(target_id)
+            .cloned()
+        else {
+            // Owner not registered yet: fall back to local dispatch, which
+            // tombstones the target so it still disappears everywhere.
+            return false;
+        };
+        let forwarded = ServerMessage::RemoteExec {
+            text: cdp_msg.text.clone(),
+            page_id: target_id.to_string(),
+            forwarder_id: ctx.connection_id,
+            reply_tx: cdp_msg.reply_tx.clone(),
+        };
+        if owner_tx.send(forwarded).is_err() {
+            // Owner is gone; fail the command rather than pretending success.
+            let resp = crate::types::CdpResponse::error(
+                req.id,
+                -32000,
+                "Target not found".to_string(),
+                req.session_id.clone(),
+            );
+            if let Ok(json) = serde_json::to_string(&resp) {
+                let _ = cdp_msg.reply_tx.send(json);
+            }
+            return true;
+        }
+        return true;
+    }
+
+    let Some(session_id) = &req.session_id else {
+        return false; // browser-level command: handled locally
+    };
+    let Some(page_id) = ctx.sessions.get(session_id) else {
+        return false; // no session route at all: local dispatch surfaces the error
+    };
+    // The implicit browser target is a pseudo-page every connection shares;
+    // its session must stay local (Target.* / Browser.* on it never resolve a
+    // real Page, and it is not a registry target).
+    if page_id == "browser" {
+        return false;
+    }
+    if ctx.get_page(page_id).is_some() {
+        return false; // owned here: normal path
+    }
+    // Remote target. If it left the registry (closed / owner disconnected),
+    // answer with a protocol error instead of forwarding to a dead owner.
+    if !ctx.registry.all().iter().any(|t| t.target_id == *page_id) {
+        let resp = crate::types::CdpResponse::error(
+            req.id,
+            -32000,
+            "Target not found".to_string(),
+            req.session_id.clone(),
+        );
+        if let Ok(json) = serde_json::to_string(&resp) {
+            let _ = cdp_msg.reply_tx.send(json);
+        }
+        return true;
+    }
+    let Some(owner_tx) = remote_owners
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(page_id)
+        .cloned()
+    else {
+        // Owner not registered yet; local dispatch surfaces "No page for
+        // session", which the client can retry.
+        return false;
+    };
+    let forwarded = ServerMessage::RemoteExec {
+        text: cdp_msg.text.clone(),
+        page_id: page_id.clone(),
+        forwarder_id: ctx.connection_id,
+        reply_tx: cdp_msg.reply_tx.clone(),
+    };
+    if owner_tx.send(forwarded).is_err() {
+        // Owner connection is gone but its page lingered in the map; fail the
+        // command rather than letting the client hang on a dead route.
+        let resp = crate::types::CdpResponse::error(
+            req.id,
+            -32000,
+            "Target not found".to_string(),
+            req.session_id.clone(),
+        );
+        if let Ok(json) = serde_json::to_string(&resp) {
+            let _ = cdp_msg.reply_tx.send(json);
+        }
+    }
+    true
+}
+
+/// Execute a forwarded remote command on behalf of another connection. The
+/// request is rewritten to this connection's own session for the page (find
+/// or mint one), executed through the normal pipeline (navigation uses the
+/// spawn-and-defer path, everything else plain dispatch), and every outgoing
+/// message is rewritten back to the caller's session id so the client can
+/// correlate the reply with its session. The page's V8 isolate is never
+/// shared: all execution happens on this (the owning) connection's thread.
+fn forwarded_session_id(page_id: &str, forwarder_id: u64, session_id: &str) -> String {
+    format!("{page_id}-forwarded-{forwarder_id}-{session_id}")
+}
+
+async fn handle_remote_exec(
+    ctx: &mut CdpContext,
+    text: &str,
+    page_id: &str,
+    forwarder_id: u64,
+    caller_reply_tx: &mpsc::UnboundedSender<String>,
+    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
+    deferred: &mut std::collections::VecDeque<ServerMessage>,
+) {
+    let Ok(mut req) = serde_json::from_str::<CdpRequest>(text) else {
+        return;
+    };
+    ctx.reap_forwarded_sessions();
+    let caller_session = req.session_id.clone();
+    // Give every forwarding connection its own owner-side session. Reusing
+    // this connection's existing session for the page collides with the
+    // caller's id in the common case (both are named `{page_id}-session`) and
+    // makes Runtime.enable look like a repeat enable, so the owner suppresses
+    // the executionContextCreated burst the caller needs to initialize the
+    // page. The id is derived from the forwarder and the caller's session, so
+    // repeated commands from one caller keep one stable session while two
+    // reconnects stay isolated. Non-session forwards (browser-level close)
+    // keep the previous find-or-mint behaviour.
+    let owner_session = match caller_session.as_deref() {
+        Some(caller) => {
+            let sid = forwarded_session_id(page_id, forwarder_id, caller);
+            ctx.sessions
+                .entry(sid.clone())
+                .or_insert_with(|| page_id.to_string());
+            ctx.forwarded_sessions.insert(sid.clone(), caller_reply_tx.downgrade());
+            sid
+        }
+        None => ctx
+            .sessions
+            .iter()
+            .find(|(_, pid)| pid.as_str() == page_id)
+            .map(|(sid, _)| sid.clone())
+            .unwrap_or_else(|| {
+                let sid = ctx.next_target_session(page_id);
+                ctx.sessions.insert(sid.clone(), page_id.to_string());
+                sid
+            }),
+    };
+    req.session_id = Some(owner_session.clone());
+    let rewritten = serde_json::to_string(&req).unwrap_or_else(|_| text.to_string());
+
+    // Stream every reply through a rewrite channel: this command's response
+    // and events carry THIS connection's session id, but they belong to the
+    // caller's session.
+    let (wrap_tx, mut wrap_rx) = mpsc::unbounded_channel::<String>();
+    let caller_tx = caller_reply_tx.clone();
+    let owner_sid = owner_session.clone();
+    let caller_sid = caller_session.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(msg) = wrap_rx.recv().await {
+            if let Some(out) = rewrite_session_id(&msg, &owner_sid, caller_sid.as_deref()) {
+                let _ = caller_tx.send(out);
+            }
+        }
+    });
+
+    let is_navigation = is_navigate_method(&req);
+    if is_navigation {
+        process_with_interception(
+            &rewritten, ctx, &wrap_tx, rx, intercept_rx, intercepted_paused, deferred, true,
+        )
+        .await;
+    } else {
+        let fetch_was_resolved = rewritten.contains("Fetch.")
+            && handle_fetch_resolution(&rewritten, &wrap_tx, intercepted_paused);
+        if !fetch_was_resolved {
+            process_cdp_message(&rewritten, ctx, &wrap_tx).await;
+        }
+    }
+}
+
+/// Rewrite the `sessionId` field of an outgoing CDP message from the owner's
+/// session id to the caller's (or strip it when the caller has none).
+/// Messages that do not carry the owner's session id (browser-level events
+/// without a session) pass through untouched.
+fn rewrite_session_id(msg: &str, from: &str, to: Option<&str>) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(msg).ok()?;
+    let obj = value.as_object_mut()?;
+    if obj.get("sessionId").and_then(|v| v.as_str()) != Some(from) {
+        return Some(msg.to_string());
+    }
+    match to {
+        Some(caller) => {
+            obj.insert("sessionId".into(), json!(caller));
+        }
+        None => {
+            obj.remove("sessionId");
+        }
+    }
+    serde_json::to_string(&value).ok()
+}
+
+/// Keep the process-wide owner map in sync with this connection's pages:
+/// register every page this connection currently owns and drop stale entries
+/// for pages it used to own (closed or dropped). Called after every message.
+fn sync_remote_ownership(
+    ctx: &CdpContext,
+    remote_owners: &RemoteOwners,
+    my_msg_tx: &mpsc::UnboundedSender<ServerMessage>,
+) {
+    let mut map = remote_owners.lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|id, tx| {
+        if ctx.pages.iter().any(|p| &p.id == id) {
+            true
+        } else {
+            !tx.same_channel(my_msg_tx)
+        }
+    });
+    for page in &ctx.pages {
+        map.insert(page.id.clone(), my_msg_tx.clone());
+    }
 }
 
 struct PausedIntercept {
@@ -2359,6 +2851,58 @@ async fn process_with_interception(
                             }
                         }
                     }
+                    ServerMessage::RemoteExec {
+                        text,
+                        page_id,
+                        forwarder_id,
+                        reply_tx,
+                    } => {
+                        // Same V8 hazard as a session command: executing a
+                        // forwarded remote command would dispatch (and possibly
+                        // enter an isolate) while this nav task has one
+                        // entered. Defer it to the outer processor queue like
+                        // any other Cdp message.
+                        if deferred.len() >= MAX_DEFERRED_MESSAGES {
+                            tracing::warn!(
+                                "INTERCEPTION: deferred queue full ({}), returning error to client",
+                                MAX_DEFERRED_MESSAGES
+                            );
+                            if let Ok(req) = serde_json::from_str::<CdpRequest>(&text) {
+                                let resp = crate::types::CdpResponse::error(
+                                    req.id,
+                                    -32000,
+                                    "Server busy: navigation in progress, try again later"
+                                        .to_string(),
+                                    req.session_id,
+                                );
+                                if let Ok(json) = serde_json::to_string(&resp) {
+                                    let _ = reply_tx.send(json);
+                                }
+                            }
+                        } else {
+                            tracing::info!(
+                                "INTERCEPTION: deferring remote exec until nav completes"
+                            );
+                            deferred.push_back(ServerMessage::RemoteExec {
+                                text,
+                                page_id,
+                                forwarder_id,
+                                reply_tx,
+                            });
+                        }
+                    }
+                    ServerMessage::ReleaseRemoteSession(session_id) => {
+                        ctx.release_session(&session_id);
+                    }
+                    ServerMessage::ConnectionClosed => {
+                        // No V8 involved: this only flips the processor's
+                        // `ws_closed` flag. It must not be lost (the orphaned
+                        // processor would then never exit once its pages are
+                        // closed), so defer it unconditionally — unlike Cdp /
+                        // RemoteExec it carries no payload that could overflow
+                        // the cap.
+                        deferred.push_back(ServerMessage::ConnectionClosed);
+                    }
                 }
             }
         }
@@ -2408,6 +2952,10 @@ async fn process_with_interception(
     let reached_network_idle = page.lifecycle.is_network_idle();
 
     ctx.pages.push(page);
+    // Navigation changed the page's url/title: refresh its global target
+    // entry so every connection's getTargets and /json/list see the new
+    // document, not the stale about:blank snapshot.
+    ctx.sync_registry();
 
     let response = if cancelled {
         crate::types::CdpResponse::success(req.id,
@@ -2606,17 +3154,42 @@ async fn process_cdp_message_with_pending(
     // Playwright awaits the response and immediately reads state wired up
     // by those events; if the response lands first, accessing
     // Target._page errors with "Cannot read properties of undefined".
-    for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
+    //
+    // Target.setDiscoverTargets is the exception: Chromium acknowledges it
+    // first and only then floods Target.targetCreated for every existing
+    // target. Puppeteer's ChromeTargetManager snapshots the targets known at
+    // the moment the response resolves (#storeExistingTargetsForInit) and
+    // waits for each of them to attach before the connect promise settles;
+    // if the flood arrives first, every discovered target lands in that set
+    // and (with pages excluded from the auto-attach filter) the client waits
+    // forever for attachedToTarget events that never come. Match Chromium's
+    // ordering so connect completes and the flood is processed afterwards.
+    let response_before_events = req.method == "Target.setDiscoverTargets";
+    if response_before_events {
+        if let Ok(json) = serde_json::to_string(&response) {
             let _ = reply_tx.send(json);
+        }
+        for event in ctx.pending_events.drain(..) {
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = reply_tx.send(json);
+            }
+        }
+    } else {
+        for event in ctx.pending_events.drain(..) {
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = reply_tx.send(json);
+            }
         }
     }
 
+    // Defer the response while an awaited evaluation is still pending: it is
+    // answered once the promise settles. Target.setDiscoverTargets already
+    // replied before its event flood, so never send twice.
     if let (Some(evaluation), Some(pending)) = (evaluation, pending_runtime) {
         pending.push(PendingRuntimeReply {
             id: req.id, session_id: req.session_id, reply_tx: reply_tx.clone(), evaluation,
         });
-    } else {
+    } else if !response_before_events {
         if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
     }
 
@@ -2662,6 +3235,11 @@ fn fast_path_response(
 ) -> Option<(String, bool)> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
+    // Only methods with NO side effects may live here: a fast-path reply
+    // bypasses the domain handlers, so any command that emits events or
+    // mutates state must dispatch normally instead (Target.setAutoAttach
+    // used to be short-circuited here, which silently dropped its
+    // attachedToTarget flood).
     if req.method == "Runtime.terminateExecution" {
         let routes = routes.lock().unwrap();
         let page = req.session_id.as_ref().and_then(|session| routes.get(session));
@@ -2688,8 +3266,7 @@ fn fast_path_response(
         "Emulation.setTouchEmulationEnabled" |
         "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
         "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
-        "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
-        "Target.setAutoAttach" => {
+        "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" => {
             Some(json!({}))
         }
         "Browser.getVersion" => {
@@ -2843,6 +3420,14 @@ mod tests {
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// A sender for the processor-owned message channel in tests that do not
+    /// exercise remote forwarding. Its receiver is dropped, so sends fail
+    /// silently and the processor still exits when its own input closes.
+    fn test_msg_sender() -> tokio::sync::mpsc::UnboundedSender<super::ServerMessage> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        tx
+    }
 
     fn is_navigate_method(text: &str) -> bool {
         serde_json::from_str::<super::CdpRequest>(text).as_ref().is_ok_and(super::is_navigate_method)
@@ -3209,7 +3794,8 @@ mod tests {
             let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
             let processor = tokio::task::spawn_local(super::cdp_processor(server_rx, std::sync::Arc::new(context),
-                std::sync::Arc::new(tokio::sync::Notify::new()), Default::default()));
+                std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(), Default::default(), test_msg_sender(), Default::default(), false,
+                ));
             server_tx.send(super::ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
             let send = |value: serde_json::Value| {
@@ -3351,6 +3937,16 @@ mod tests {
     #[test]
     fn control_endpoints_only_match_the_request_target() {
         use std::io::{Read, Write};
+        // The list endpoint mirrors the shared target registry (issue #544)
+        // rather than a hardcoded synthetic page, so seed one page: every
+        // routed list response must advertise its debugger URL.
+        let registry = crate::registry::TargetRegistry::default();
+        registry.upsert(crate::registry::TargetInfo {
+            target_id: "page-1".to_string(),
+            title: String::new(),
+            url: "about:blank".to_string(),
+            browser_context_id: "default".to_string(),
+        });
         for (target, extra, endpoint) in [
             ("/json/version", "", Some("Browser")),
             ("/json/version?client=test", "", Some("Browser")),
@@ -3382,7 +3978,7 @@ mod tests {
             let head = format!("GET {target} HTTP/1.1\r\nHost: {address}\r\n{extra}\r\n");
             client.write_all(head.as_bytes()).unwrap();
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-            super::accept_dispatch(server, address.ip(), address.port(), None, None, None, &tx, &head).unwrap();
+            super::accept_dispatch(server, address.ip(), address.port(), None, None, None, &tx, &head, &registry).unwrap();
             if let Some(key) = endpoint {
                 assert!(rx.try_recv().is_err(), "HTTP endpoint must not be forwarded: {target}");
                 let mut response = String::new();
@@ -3586,9 +4182,10 @@ mod tests {
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             stream.set_nodelay(true).unwrap();
-            let context = crate::dispatch::CdpContext::new().default_context;
-            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
-                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
+            super::run_connection(stream.into_std().unwrap(), false, context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server,
+                Default::default(), Default::default());
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
         accept.await.unwrap();
@@ -3644,9 +4241,10 @@ mod tests {
         let live_server = live.clone();
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let context = crate::dispatch::CdpContext::new().default_context;
-            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
-                Arc::new(std::sync::Mutex::new(())), Arc::new(Notify::new()), live_server);
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
+            super::run_connection(stream.into_std().unwrap(), false, context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(Notify::new()), live_server,
+                Default::default(), Default::default());
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
         accept.await.unwrap();
@@ -3706,12 +4304,13 @@ mod tests {
         let live = Arc::new(AtomicUsize::new(0));
         let live_server = live.clone();
         let accept = tokio::spawn(async move {
-            let context = crate::dispatch::CdpContext::new().default_context;
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
             for _ in 0..8 {
                 let (stream, _) = listener.accept().await.unwrap();
                 live_server.fetch_add(1, Ordering::AcqRel);
-                super::run_connection(stream.into_std().unwrap(), context.clone(), context.clone(),
-                    Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server.clone());
+                super::run_connection(stream.into_std().unwrap(), false, context.clone(), context.clone(),
+                    Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server.clone(),
+                    Default::default(), Default::default());
             }
         });
         for _ in 0..8 {
@@ -3785,9 +4384,10 @@ mod tests {
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             stream.set_nodelay(true).unwrap();
-            let context = crate::dispatch::CdpContext::new().default_context;
-            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
-                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
+            super::run_connection(stream.into_std().unwrap(), false, context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server,
+                Default::default(), Default::default());
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
         accept.await.unwrap();
@@ -3890,12 +4490,17 @@ mod tests {
                 let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
+                let (my_msg_tx, _my_msg_rx) = tokio::sync::mpsc::unbounded_channel();
                 let processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
                     default_context,
                     shutdown,
                     Default::default(),
+                    crate::registry::TargetRegistry::default(),
+                    my_msg_tx,
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
                 ));
 
                 server_tx
@@ -4028,12 +4633,17 @@ mod tests {
                 let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
+                let (my_msg_tx, _my_msg_rx) = tokio::sync::mpsc::unbounded_channel();
                 let processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
                     default_context,
                     shutdown,
                     Default::default(),
+                    crate::registry::TargetRegistry::default(),
+                    my_msg_tx,
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
                 ));
 
                 server_tx
@@ -4154,6 +4764,511 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_connection_sees_page_targets_in_get_targets() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
+                let (my_msg_tx, _my_msg_rx) = tokio::sync::mpsc::unbounded_channel();
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                    Default::default(),
+                    crate::registry::TargetRegistry::default(),
+                    my_msg_tx,
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let init = reply_rx.recv().await.expect("processor init");
+                assert!(init.contains("__init"));
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({"id": 1, "method": "Target.getTargets", "params": {}}));
+
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("getTargets response timeout")
+                        .expect("getTargets response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 1 {
+                        let targets = value["result"]["targetInfos"]
+                            .as_array()
+                            .expect("targetInfos must be an array");
+                        assert!(
+                            !targets.is_empty(),
+                            "getTargets must list the connection's page target"
+                        );
+                        assert_eq!(targets[0]["type"], "page");
+                        break;
+                    }
+                }
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    // Chromium answers Target.setDiscoverTargets before flooding
+    // Target.targetCreated for existing targets. Puppeteer's
+    // ChromeTargetManager snapshots the targets known at the moment the
+    // response resolves and waits for each to attach; if the flood arrived
+    // first, every discovered target would land in that set and the connect
+    // promise would hang forever (no attachedToTarget ever follows for pages
+    // excluded from the auto-attach filter).
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_discover_targets_response_precedes_target_created_flood() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
+                let (my_msg_tx, _my_msg_rx) = tokio::sync::mpsc::unbounded_channel();
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                    Default::default(),
+                    crate::registry::TargetRegistry::default(),
+                    my_msg_tx,
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let _init = reply_rx.recv().await.expect("processor init");
+                server_tx
+                    .send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: json!({
+                            "id": 1,
+                            "method": "Target.setDiscoverTargets",
+                            "params": {},
+                        })
+                        .to_string(),
+                        reply_tx: reply_tx.clone(),
+                    }))
+                    .unwrap();
+
+                let mut saw_response = false;
+                let mut saw_flood = false;
+                for _ in 0..8 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("reply timeout")
+                        .expect("reply channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 1 {
+                        assert!(!saw_response, "duplicate setDiscoverTargets response");
+                        saw_response = true;
+                    } else if value.get("method").and_then(|m| m.as_str())
+                        == Some("Target.targetCreated")
+                    {
+                        assert!(
+                            saw_response,
+                            "targetCreated flood must arrive AFTER the setDiscoverTargets response (got {value})"
+                        );
+                        saw_flood = true;
+                        break;
+                    }
+                }
+                assert!(saw_response, "must receive the setDiscoverTargets response");
+                assert!(saw_flood, "must receive the targetCreated flood");
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    // Regression: Target.setAutoAttach must NOT be served by the reply fast
+    // path (which would ack without emitting anything). It dispatches through
+    // the domain handler, so the client receives Target.attachedToTarget for
+    // its page with a usable session (puppeteer's browser.pages() depends on
+    // that event).
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_auto_attach_emits_attached_to_target_through_server_path() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
+                let (my_msg_tx, _my_msg_rx) = tokio::sync::mpsc::unbounded_channel();
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                    Default::default(),
+                    crate::registry::TargetRegistry::default(),
+                    my_msg_tx,
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let _init = reply_rx.recv().await.expect("processor init");
+                server_tx
+                    .send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: json!({
+                            "id": 1,
+                            "method": "Target.setAutoAttach",
+                            "params": {"autoAttach": true, "flatten": true},
+                        })
+                        .to_string(),
+                        reply_tx: reply_tx.clone(),
+                    }))
+                    .unwrap();
+
+                let mut saw_attached = false;
+                let mut attached_session = None;
+                for _ in 0..6 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("reply timeout")
+                        .expect("reply channel"),
+                    )
+                    .unwrap();
+                    if value.get("method").and_then(|m| m.as_str())
+                        == Some("Target.attachedToTarget")
+                    {
+                        assert_eq!(value["params"]["targetInfo"]["type"], "page");
+                        attached_session = value["params"]["sessionId"].as_str().map(str::to_owned);
+                        saw_attached = true;
+                        break;
+                    }
+                }
+                assert!(
+                    saw_attached,
+                    "setAutoAttach must emit attachedToTarget via the server path (fast-path regression)"
+                );
+                assert!(
+                    attached_session.is_some() && !attached_session.as_deref().unwrap().is_empty(),
+                    "attachedToTarget must carry a session id"
+                );
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    // Cross-connection session routing (#430 follow-up): a command sent on a
+    // session that attaches to a page owned by ANOTHER connection must be
+    // forwarded to that connection's processor and executed there (the page's
+    // V8 isolate is thread-confined), with the response coming back on the
+    // caller's channel carrying the caller's session id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_session_commands_route_to_the_owning_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let registry = crate::registry::TargetRegistry::default();
+                let remote_owners: super::RemoteOwners =
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+                // Owner connection: its NewConnection init creates a page the
+                // caller will drive remotely. The processor's `my_msg_tx` is
+                // the sender of its OWN rx channel (that is what gets
+                // registered in the owner map so forwarded RemoteExec messages
+                // reach this processor). Teardown uses the shutdown Notify
+                // because the processor holds a sender clone of its own rx.
+                let (owner_tx, owner_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (owner_reply_tx, mut owner_reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let owner_default = crate::dispatch::CdpContext::new().default_context.clone();
+                let owner_processor = tokio::task::spawn_local(super::cdp_processor(
+                    owner_rx,
+                    owner_default,
+                    shutdown.clone(),
+                    Default::default(),
+                    registry.clone(),
+                    owner_tx.clone(),
+                    remote_owners.clone(),
+                    false,
+                ));
+                owner_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: owner_reply_tx.clone(),
+                    })
+                    .unwrap();
+                let owner_init: serde_json::Value = serde_json::from_str(
+                    &tokio::time::timeout(std::time::Duration::from_secs(2), owner_reply_rx.recv())
+                        .await
+                        .expect("owner init timeout")
+                        .expect("owner init channel"),
+                )
+                .unwrap();
+                let owner_page = owner_init["pageId"].as_str().unwrap().to_string();
+
+                // Caller connection.
+                let (caller_tx, caller_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (caller_reply_tx, mut caller_reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let caller_default = crate::dispatch::CdpContext::new().default_context.clone();
+                let caller_processor = tokio::task::spawn_local(super::cdp_processor(
+                    caller_rx,
+                    caller_default,
+                    shutdown.clone(),
+                    Default::default(),
+                    registry,
+                    caller_tx.clone(),
+                    remote_owners,
+                    false,
+                ));
+                caller_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: caller_reply_tx.clone(),
+                    })
+                    .unwrap();
+                let _caller_init = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    caller_reply_rx.recv(),
+                )
+                .await
+                .expect("caller init timeout")
+                .expect("caller init channel");
+
+                let send = |value: serde_json::Value,
+                            tx: &tokio::sync::mpsc::UnboundedSender<super::ServerMessage>,
+                            reply: &tokio::sync::mpsc::UnboundedSender<String>| {
+                    tx.send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: value.to_string(),
+                        reply_tx: reply.clone(),
+                    }))
+                    .unwrap();
+                };
+
+                // The caller attaches to the owner's page (globally visible
+                // via the shared registry) and gets its own session for it.
+                send(
+                    json!({
+                        "id": 1,
+                        "method": "Target.attachToTarget",
+                        "params": {"targetId": owner_page, "flatten": true},
+                    }),
+                    &caller_tx,
+                    &caller_reply_tx,
+                );
+                let mut session_id = None;
+                for _ in 0..6 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            caller_reply_rx.recv(),
+                        )
+                        .await
+                        .expect("attach response timeout")
+                        .expect("attach response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 1 {
+                        session_id = value["result"]["sessionId"].as_str().map(str::to_string);
+                        break;
+                    }
+                }
+                let session_id = session_id.expect("attachToTarget must return a session");
+
+                // Drive the REMOTE session. Page.getFrameTree used to fail
+                // with "No page for session" because the caller does not own
+                // the page; it must now be forwarded to the owner, executed
+                // there, and answered on the caller's channel.
+                send(
+                    json!({
+                        "id": 2,
+                        "method": "Page.getFrameTree",
+                        "sessionId": session_id,
+                        "params": {},
+                    }),
+                    &caller_tx,
+                    &caller_reply_tx,
+                );
+                let mut saw_response = false;
+                for _ in 0..8 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            caller_reply_rx.recv(),
+                        )
+                        .await
+                        .expect("getFrameTree response timeout")
+                        .expect("getFrameTree response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 2 {
+                        assert!(
+                            value.get("error").is_none(),
+                            "remote getFrameTree must not error, got: {value}"
+                        );
+                        assert_eq!(
+                            value["sessionId"], session_id,
+                            "response must carry the caller's session id"
+                        );
+                        assert_eq!(
+                            value["result"]["frameTree"]["frame"]["url"],
+                            "about:blank"
+                        );
+                        saw_response = true;
+                        break;
+                    }
+                }
+                assert!(saw_response, "remote getFrameTree response must arrive");
+
+                // Each processor holds a sender clone of its own rx channel,
+                // so dropping the test's senders alone would never close the
+                // channels. Wake the shared shutdown Notify instead.
+                shutdown.notify_waiters();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), owner_processor)
+                    .await
+                    .expect("owner processor shutdown timeout")
+                    .expect("owner processor task");
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), caller_processor)
+                    .await
+                    .expect("caller processor shutdown timeout")
+                    .expect("caller processor task");
+            })
+            .await;
+    }
+
+    // The implicit browser target's session must never be treated as a remote
+    // page: sessions["browser-session"] maps to the pseudo-target "browser",
+    // which is not a registry page, so commands on it (Target.getTargets etc.)
+    // must be served by the attaching connection itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_session_commands_stay_local() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let (my_msg_tx, _my_msg_rx) = tokio::sync::mpsc::unbounded_channel();
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                    Default::default(),
+                    crate::registry::TargetRegistry::default(),
+                    my_msg_tx,
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    false,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let _init = reply_rx.recv().await.expect("processor init");
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Target.attachToBrowserTarget",
+                    "params": {},
+                }));
+                for _ in 0..4 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("attach response timeout")
+                            .expect("attach response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 1 {
+                        break;
+                    }
+                }
+                send(json!({
+                    "id": 2,
+                    "method": "Target.getTargets",
+                    "sessionId": "browser-session",
+                    "params": {},
+                }));
+                let mut saw_response = false;
+                for _ in 0..6 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("getTargets response timeout")
+                            .expect("getTargets response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 2 {
+                        assert!(
+                            value.get("result").and_then(|r| r.get("targetInfos")).is_some(),
+                            "browser-session Target.getTargets must be served locally, got: {value}"
+                        );
+                        saw_response = true;
+                        break;
+                    }
+                }
+                assert!(saw_response, "browser-session response must arrive");
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+
     #[test]
     fn cookie_delta_merges_changes_without_reverting_other_connections() {
         let destination = CookieJar::new();
@@ -4225,9 +5340,10 @@ mod tests {
         tokio::task::LocalSet::new().run_until(async {
             let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
-            let context = crate::dispatch::CdpContext::new().default_context;
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
             let processor = tokio::task::spawn_local(super::cdp_processor(
                 server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(),
+                Default::default(), test_msg_sender(), Default::default(), false,
             ));
             server_tx.send(super::ServerMessage::NewConnection {
                 reply_tx: reply_tx.clone(),
@@ -4323,8 +5439,9 @@ mod tests {
             let (server_tx, server_rx) = mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
             let processor = tokio::task::spawn_local(cdp_processor(
-                server_rx, CdpContext::new().default_context,
+                server_rx, CdpContext::new().default_context.clone(),
                 std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(),
+                Default::default(), test_msg_sender(), Default::default(), false,
             ));
             server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
@@ -4414,9 +5531,10 @@ mod tests {
         tokio::task::LocalSet::new().run_until(async {
             let (server_tx, server_rx) = mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-            let context = CdpContext::new().default_context;
+            let context = CdpContext::new().default_context.clone();
             let processor = tokio::task::spawn_local(cdp_processor(
                 server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(),
+                Default::default(), test_msg_sender(), Default::default(), false,
             ));
             server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
@@ -4506,9 +5624,10 @@ mod tests {
         tokio::task::LocalSet::new().run_until(async {
             let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
-            let context = crate::dispatch::CdpContext::new().default_context;
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
             let processor = tokio::task::spawn_local(super::cdp_processor(
                 server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()), Default::default(),
+                Default::default(), test_msg_sender(), Default::default(), false,
             ));
             server_tx.send(super::ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
@@ -5569,5 +6688,262 @@ mod tests {
             initial_data,
             "RAF-driven paint must capture the updated visible state"
         );
+    }
+
+    // Pages survive the disconnect of the connection that created them: after
+    // `ConnectionClosed` the page stays in the global registry, is still
+    // drivable, and the processor exits only once the page is actually closed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphaned_connection_keeps_pages_until_closed() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
+                let registry = crate::registry::TargetRegistry::default();
+                let remote_owners: super::RemoteOwners =
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown.clone(),
+                    Default::default(),
+                    registry.clone(),
+                    server_tx.clone(),
+                    remote_owners.clone(),
+                    false,
+                ));
+
+                // The connection opens and its init page is registered.
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let init: serde_json::Value = serde_json::from_str(
+                    &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                        .await
+                        .expect("init timeout")
+                        .expect("init channel"),
+                )
+                .unwrap();
+                let page_id = init["pageId"].as_str().unwrap().to_string();
+                assert_eq!(registry.all().len(), 1, "page must be registered");
+
+                // Client disconnects. The page must survive in the registry.
+                server_tx.send(super::ServerMessage::ConnectionClosed).unwrap();
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    registry.all().len(),
+                    1,
+                    "page must persist after the creating connection disconnects"
+                );
+                assert_eq!(registry.all()[0].target_id, page_id);
+
+                // A later connection can still drive the orphaned page.
+                server_tx
+                    .send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: json!({
+                            "id": 10,
+                            "method": "Page.getFrameTree",
+                            "sessionId": format!("{page_id}-session"),
+                            "params": {},
+                        })
+                        .to_string(),
+                        reply_tx: reply_tx.clone(),
+                    }))
+                    .unwrap();
+                let mut saw_drive = false;
+                for _ in 0..8 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("drive response timeout")
+                        .expect("drive response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 10 {
+                        assert!(
+                            value.get("error").is_none(),
+                            "orphaned page must answer commands, got: {value}"
+                        );
+                        saw_drive = true;
+                        break;
+                    }
+                }
+                assert!(saw_drive, "orphaned page must still answer commands");
+
+                // Target.closeTarget tears the orphaned page down for real and
+                // the owner processor exits once it owns no pages.
+                server_tx
+                    .send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: json!({
+                            "id": 11,
+                            "method": "Target.closeTarget",
+                            "params": {"targetId": page_id},
+                        })
+                        .to_string(),
+                        reply_tx: reply_tx.clone(),
+                    }))
+                    .unwrap();
+                let mut saw_close = false;
+                for _ in 0..8 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("close response timeout")
+                        .expect("close response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 11 {
+                        saw_close = true;
+                        break;
+                    }
+                }
+                assert!(saw_close, "closeTarget must be answered");
+                assert!(
+                    registry.all().is_empty(),
+                    "closed target must leave the registry"
+                );
+                let joined = tokio::time::timeout(std::time::Duration::from_secs(5), processor)
+                    .await
+                    .expect("orphaned processor must exit after its last page closes")
+                    .expect("processor task");
+                let _ = joined;
+                shutdown.notify_waiters();
+            })
+            .await;
+    }
+
+    // Browser-level Target.closeTarget (no sessionId) on a REMOTE page must be
+    // forwarded to the owning connection so the live Page is torn down for
+    // real, not just tombstoned (which would leak the isolate on an owner that
+    // never syncs again).
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_close_target_routes_to_owning_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let registry = crate::registry::TargetRegistry::default();
+                let remote_owners: super::RemoteOwners =
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+                // Owner connection: its init page is the remote target the
+                // caller will close.
+                let (owner_tx, owner_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (owner_reply_tx, mut owner_reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let owner_default = crate::dispatch::CdpContext::new().default_context.clone();
+                let owner_processor = tokio::task::spawn_local(super::cdp_processor(
+                    owner_rx,
+                    owner_default,
+                    shutdown.clone(),
+                    Default::default(),
+                    registry.clone(),
+                    owner_tx.clone(),
+                    remote_owners.clone(),
+                    false,
+                ));
+                owner_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: owner_reply_tx.clone(),
+                    })
+                    .unwrap();
+                let owner_init: serde_json::Value = serde_json::from_str(
+                    &tokio::time::timeout(std::time::Duration::from_secs(2), owner_reply_rx.recv())
+                        .await
+                        .expect("owner init timeout")
+                        .expect("owner init channel"),
+                )
+                .unwrap();
+                let owner_page = owner_init["pageId"].as_str().unwrap().to_string();
+
+                // Caller connection.
+                let (caller_tx, caller_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (caller_reply_tx, mut caller_reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let caller_default = crate::dispatch::CdpContext::new().default_context.clone();
+                let caller_processor = tokio::task::spawn_local(super::cdp_processor(
+                    caller_rx,
+                    caller_default,
+                    shutdown.clone(),
+                    Default::default(),
+                    registry.clone(),
+                    caller_tx.clone(),
+                    remote_owners.clone(),
+                    false,
+                ));
+                caller_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: caller_reply_tx.clone(),
+                    })
+                    .unwrap();
+                let _caller_init = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    caller_reply_rx.recv(),
+                )
+                .await
+                .expect("caller init timeout")
+                .expect("caller init channel");
+
+                // Browser-level closeTarget on the owner's page, no sessionId.
+                caller_tx
+                    .send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: json!({
+                            "id": 20,
+                            "method": "Target.closeTarget",
+                            "params": {"targetId": owner_page},
+                        })
+                        .to_string(),
+                        reply_tx: caller_reply_tx.clone(),
+                    }))
+                    .unwrap();
+                let mut saw_close = false;
+                for _ in 0..8 {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            caller_reply_rx.recv(),
+                        )
+                        .await
+                        .expect("close response timeout")
+                        .expect("close response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 20 {
+                        assert!(
+                            value.get("error").is_none(),
+                            "remote closeTarget must succeed, got: {value}"
+                        );
+                        saw_close = true;
+                        break;
+                    }
+                }
+                assert!(saw_close, "remote closeTarget must be answered");
+
+                // The owner sends the response only after `remove_page` ran
+                // (dispatch completes before the reply is queued), so the
+                // registry is already updated once we see the response.
+                assert!(
+                    !registry.all().iter().any(|t| t.target_id == owner_page),
+                    "remotely closed target must leave the registry"
+                );
+
+                shutdown.notify_waiters();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), owner_processor)
+                    .await
+                    .expect("owner processor shutdown timeout")
+                    .expect("owner processor task");
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), caller_processor)
+                    .await
+                    .expect("caller processor shutdown timeout")
+                    .expect("caller processor task");
+            })
+            .await;
     }
 }

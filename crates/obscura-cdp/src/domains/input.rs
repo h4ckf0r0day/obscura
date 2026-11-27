@@ -520,6 +520,54 @@ pub async fn handle(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::dispatch::CdpContext;
+
+    // Hermes types into React/Vue controlled inputs via Input.insertText. It
+    // must insert at the caret of the focused element and dispatch a trusted
+    // `input` event so framework change detection picks the value up.
+    #[tokio::test]
+    async fn insert_text_types_into_focused_input() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<input id=t><script>var seen=[];var el=document.getElementById('t');el.addEventListener('input',function(){seen.push(el.value)});</script>",
+                "waitUntil": "load",
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        // Focus the input and park the caret at position 2 of an existing value.
+        ctx.get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("(function(){var el=document.getElementById('t');el.value='ab';el.focus();el.setSelectionRange(1,1);})()");
+
+        handle("insertText", &json!({ "text": "XY" }), &mut ctx, &session)
+            .await
+            .expect("insertText should succeed");
+
+        let value = ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("document.getElementById('t').value");
+        assert_eq!(value, json!("aXYb"), "text must be inserted at the caret");
+
+        // The trusted input event must have fired so React/Vue see the change.
+        let seen = ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("window.seen.join(',') || ''");
+        assert_eq!(seen, json!("aXYb"), "an input event must announce the new value");
+    }
+
     use super::js_str;
 
     // SEC-501 / #819 — key/code are embedded via js_str; it must escape control
