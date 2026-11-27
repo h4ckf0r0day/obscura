@@ -9,7 +9,7 @@ class ScoopManifest(unittest.TestCase):
         self.manifest = json.loads(path.read_text(encoding="utf-8"))
 
     def release_url(self, version):
-        return ("https://github.com/h4ckf0r0day/obscura/releases/download/"
+        return ("https://github.com/elvergon8888/obscura/releases/download/"
                 f"v{version}/obscura-x86_64-windows.zip")
 
     def test_install_uses_a_literal_versioned_url_and_sha256(self):

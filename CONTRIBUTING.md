@@ -78,7 +78,7 @@ single V8 isolate per process, so the runtime tests fail under it. `nextest`
 runs each test in its own process, which is the only supported way.
 
 The authoritative behavioral gate is the **obstacle course** in the companion
-repo [`obscura-benchmark`](https://github.com/h4ckf0r0day/obscura-benchmark)
+repo [`obscura-benchmark`](https://github.com/elvergon8888/obscura-benchmark)
 (33 capability and speed stages, must stay 33/33):
 
 ```bash

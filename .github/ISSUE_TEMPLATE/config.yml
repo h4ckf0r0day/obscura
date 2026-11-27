@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Questions and API proposals
-    url: https://github.com/h4ckf0r0day/obscura/discussions
+    url: https://github.com/elvergon8888/obscura/discussions
     about: Ask questions or propose larger API designs in Discussions.
   - name: Report a security vulnerability
-    url: https://github.com/h4ckf0r0day/obscura/security/advisories/new
+    url: https://github.com/elvergon8888/obscura/security/advisories/new
     about: Report security issues privately, not as a public issue. See SECURITY.md.

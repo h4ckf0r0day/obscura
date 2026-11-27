@@ -1,7 +1,7 @@
 ## Linux x86_64
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
+curl -LO https://github.com/elvergon8888/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
 tar xzf obscura-x86_64-linux.tar.gz
 ./obscura --version
 ```
@@ -9,7 +9,7 @@ tar xzf obscura-x86_64-linux.tar.gz
 ## Linux ARM64
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+curl -LO https://github.com/elvergon8888/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
 tar xzf obscura-aarch64-linux.tar.gz
 ./obscura --version
 ```
@@ -19,7 +19,7 @@ Linux builds target Ubuntu 22.04 and require glibc 2.35+.
 ## macOS Apple Silicon
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
+curl -LO https://github.com/elvergon8888/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
 ./obscura --version
 ```
@@ -27,14 +27,14 @@ tar xzf obscura-aarch64-macos.tar.gz
 ## macOS Intel
 
 ```bash
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
+curl -LO https://github.com/elvergon8888/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
 tar xzf obscura-x86_64-macos.tar.gz
 ./obscura --version
 ```
 
 ## Windows
 
-Download the `.zip` from [Releases](https://github.com/h4ckf0r0day/obscura/releases), extract, run `obscura.exe --version`.
+Download the `.zip` from [Releases](https://github.com/elvergon8888/obscura/releases), extract, run `obscura.exe --version`.
 
 ## Arch Linux (AUR)
 
@@ -48,10 +48,10 @@ yay -S obscura-browser
 export OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)"
 docker run -d --name obscura -p 127.0.0.1:9222:9222 \
   -e OBSCURA_CDP_TOKEN \
-  h4ckf0r0day/obscura
+  elvergon8888/obscura
 ```
 
-Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc:nonroot`, with no shell or package manager in the runtime image, running as uid 65532. Note the `-p 127.0.0.1:...` above: it publishes the port to host loopback only. A mounted `--storage-dir` must be writable by uid 65532 — see [Run in production at scale](Run-in-production-at-scale.md#the-container-does-not-run-as-root).
+Image: [elvergon8888/obscura](https://hub.docker.com/r/elvergon8888/obscura). Built on `distroless/cc:nonroot`, with no shell or package manager in the runtime image, running as uid 65532. Note the `-p 127.0.0.1:...` above: it publishes the port to host loopback only. A mounted `--storage-dir` must be writable by uid 65532 — see [Run in production at scale](Run-in-production-at-scale.md#the-container-does-not-run-as-root).
 
 The container requires `OBSCURA_CDP_TOKEN` because it binds all container
 interfaces. Send that token in your CDP client's `Authorization: Bearer <token>`

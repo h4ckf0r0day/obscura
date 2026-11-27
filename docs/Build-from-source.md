@@ -12,7 +12,7 @@ and linking. For the scoped incremental runtime workflow, see
 ## Build
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
+git clone https://github.com/elvergon8888/obscura.git
 cd obscura
 cargo build --release -p obscura-cli --bins --features render
 ```

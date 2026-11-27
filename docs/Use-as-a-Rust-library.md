@@ -4,7 +4,7 @@ The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page
 
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", features = ["stealth"] }
+obscura = { git = "https://github.com/elvergon8888/obscura", features = ["stealth"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```
@@ -13,7 +13,7 @@ The first build compiles V8 from source, so it is slow and needs the same build 
 placeholder below with that SHA:
 
 ```toml
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", rev = "<full commit SHA>", features = ["stealth"] }
+obscura = { git = "https://github.com/elvergon8888/obscura", rev = "<full commit SHA>", features = ["stealth"] }
 ```
 
 ## Quickstart

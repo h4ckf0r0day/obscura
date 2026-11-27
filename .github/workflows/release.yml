@@ -250,7 +250,7 @@ jobs:
           mkdir -p "$results_root"
           git rev-parse HEAD > "$results_root/source.txt"
           sha256sum target/release/obscura target/release/obscura-worker > "$results_root/binaries.sha256"
-          baseline_image=h4ckf0r0day/obscura:0.2.6
+          baseline_image=elvergon8888/obscura:0.2.6
           runtime_image=gcr.io/distroless/cc-debian12:nonroot
           docker pull --platform linux/arm64 "$baseline_image"
           docker pull --platform linux/arm64 "$runtime_image"

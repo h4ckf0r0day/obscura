@@ -43,7 +43,7 @@ jobs:
           foreach ($suffix in $fixtures.Keys) {
             $name = "obscura-x86_64-windows$suffix"
             $archive = "$env:RUNNER_TEMP\$name.zip"
-            Invoke-WebRequest "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.6/$name.zip" -OutFile $archive
+            Invoke-WebRequest "https://github.com/elvergon8888/obscura/releases/download/v0.2.6/$name.zip" -OutFile $archive
             if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $fixtures[$suffix]) { throw "Fixture checksum mismatch: $name" }
             $stage = "$env:RUNNER_TEMP\$name"
             Expand-Archive $archive $stage

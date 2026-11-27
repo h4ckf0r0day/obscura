@@ -181,7 +181,7 @@ jobs:
       - name: Checkout pinned obstacle course
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          repository: h4ckf0r0day/obscura-benchmark
+          repository: elvergon8888/obscura-benchmark
           ref: 2d08d9a8e860e423b47209434a9fba9c75e6eee6
           path: obscura-benchmark
           persist-credentials: false
@@ -259,7 +259,7 @@ jobs:
       - name: Checkout pinned obstacle course
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          repository: h4ckf0r0day/obscura-benchmark
+          repository: elvergon8888/obscura-benchmark
           ref: 2d08d9a8e860e423b47209434a9fba9c75e6eee6
           path: obscura-benchmark
           persist-credentials: false

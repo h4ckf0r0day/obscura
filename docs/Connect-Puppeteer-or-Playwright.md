@@ -144,7 +144,7 @@ publish newly inserted children of an already-published parent. `requestChildNod
 `pierce: true` on plain light-DOM subtrees, but rejects requests that would
 require frame or shadow-tree traversal. Detached-node publication and
 `ignorePointerEventsNone: true` hit testing are not supported. The remaining work is tracked in
-[#1291](https://github.com/h4ckf0r0day/obscura/issues/1291).
+[#1291](https://github.com/elvergon8888/obscura/issues/1291).
 
 ## Element visibility queries
 

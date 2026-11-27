@@ -1,6 +1,6 @@
 # obscura
 
-Embeddable Rust API for the [Obscura](https://github.com/h4ckf0r0day/obscura)
+Embeddable Rust API for the [Obscura](https://github.com/elvergon8888/obscura)
 headless browser. Drive a real V8 + DOM browser (`Browser`, `Page`, `Element`,
 `CookieStore`) directly from Rust, with no separate process or CDP round-trips.
 
@@ -12,7 +12,7 @@ first build is large and slow.
 
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", features = ["api"] }
+obscura = { git = "https://github.com/elvergon8888/obscura", features = ["api"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```

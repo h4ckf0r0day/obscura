@@ -18,7 +18,7 @@ exclude = ["vendor/taffy", "vendor/cosmic-text", "vendor/wreq-util"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/h4ckf0r0day/obscura"
+repository = "https://github.com/elvergon8888/obscura"
 
 [workspace.dependencies]
 obscura-dom = { path = "crates/obscura-dom" }

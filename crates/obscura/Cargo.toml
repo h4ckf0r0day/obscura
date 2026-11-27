@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust API for the Obscura headless browser"
 readme = "README.md"
-repository = "https://github.com/h4ckf0r0day/obscura"
+repository = "https://github.com/elvergon8888/obscura"
 license = "Apache-2.0"
 
 [features]

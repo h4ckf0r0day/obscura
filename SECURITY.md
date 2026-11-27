@@ -10,7 +10,7 @@ responsibly disclose what you find and will work with you to address it.
 requests, or discussions.**
 
 Report a vulnerability privately through GitHub: go to the repository's
-**Security** tab and click [**Report a vulnerability**](https://github.com/h4ckf0r0day/obscura/security/advisories/new)
+**Security** tab and click [**Report a vulnerability**](https://github.com/elvergon8888/obscura/security/advisories/new)
 to open a private advisory.
 
 If you cannot use GitHub advisories, email **hello@obscura.sh** with "security"

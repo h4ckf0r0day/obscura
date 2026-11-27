@@ -12,7 +12,7 @@ docker run -d \
   -p 127.0.0.1:9222:9222 \
   -e OBSCURA_CDP_TOKEN \
   -v /srv/obscura/data:/data \
-  h4ckf0r0day/obscura \
+  elvergon8888/obscura \
   serve --host 0.0.0.0 --storage-dir /data
 ```
 

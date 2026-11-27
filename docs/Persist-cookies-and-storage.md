@@ -73,7 +73,7 @@ off, so check that `cookies.json` appears when persistence matters.
 `sessionStorage` is deliberately not written to disk. It belongs to one tab and
 is dropped when the tab goes away, the same as a real browser, but it does
 survive navigation and CDP target switching within the process
-([#678](https://github.com/h4ckf0r0day/obscura/issues/678)).
+([#678](https://github.com/elvergon8888/obscura/issues/678)).
 
 Web Storage is limited to 5 MiB per origin, 32 MiB per backing store and 256
 origins. Failed profile writes and removals stay pending for a later flush.
