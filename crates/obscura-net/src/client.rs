@@ -13,7 +13,7 @@ use tokio::sync::{RwLock, watch};
 use url::Url;
 
 use crate::cookies::{same_site, CookieJar, SameSiteContext};
-use crate::interceptor::{InterceptAction, RequestInterceptor};
+use crate::interceptor::{InterceptAction, RedirectDecision, RedirectHook, RequestInterceptor};
 
 fn configured_root_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
@@ -1514,7 +1514,7 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request_uncached(initial_method, url, initial_body, callbacks, request, None).await
+        self.fetch_request_uncached(initial_method, url, initial_body, callbacks, request, None, None).await
     }
 
     /// A navigation continued by an interceptor uses request-local overrides.
@@ -1531,17 +1531,30 @@ impl ObscuraHttpClient {
         headers: Option<HashMap<String, String>>, initiator: Option<&Url>,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_navigation_request_with_redirect_hook(url, method, body, headers, initiator, callbacks, None).await
+    }
+
+    /// Like `fetch_navigation_request_from_document`, but consults `redirect_hook`
+    /// before requesting each redirect target.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_navigation_request_with_redirect_hook(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, initiator: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>, redirect_hook: Option<&dyn RedirectHook>,
+    ) -> Result<Response, ObscuraNetError> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         let request = initiator.map(ResourceRequest::navigation_from_document)
             .unwrap_or_else(ResourceRequest::navigation);
-        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
+        self.fetch_request_uncached(method, url, body, callbacks, request, headers, redirect_hook).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_request_uncached(
         &self, initial_method: Method, url: &Url, initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>, request: ResourceRequest,
         mut request_headers: Option<HashMap<String, String>>,
+        redirect_hook: Option<&dyn RedirectHook>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -1804,6 +1817,32 @@ impl ObscuraHttpClient {
                         if let Some(headers) = request_headers.as_mut() {
                             headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(),
                                 "content-type" | "content-encoding" | "content-language" | "content-location" | "content-length"));
+                        }
+                    }
+                    if let Some(hook) = redirect_hook {
+                        match hook.before_redirect(&current_url, method.as_str()).await {
+                            RedirectDecision::Follow { url, headers } => {
+                                if let Some(url) = url {
+                                    if url.scheme() != current_url.scheme() {
+                                        return Err(ObscuraNetError::Network("Interception cannot change a navigation's URL scheme".into()));
+                                    }
+                                    validate_url(&url, self.allow_private_network)?;
+                                    validate_request_mode(&request, &url)?;
+                                    current_url = url;
+                                }
+                                if headers.is_some() { request_headers = headers; }
+                            }
+                            RedirectDecision::Fail(error) => return Err(ObscuraNetError::Network(error)),
+                            RedirectDecision::Fulfill(mut response) => {
+                                drop(in_flight);
+                                response.redirected_from = redirects;
+                                let mut captured = document_request.response(response, method.as_str(), referer.as_deref().unwrap_or(""));
+                                captured.complete();
+                                if let Some(cbs) = callbacks {
+                                    cbs.fire_response(&request_info, captured.get()).await;
+                                }
+                                return Ok(captured.finish());
+                            }
                         }
                     }
                     continue;
