@@ -915,20 +915,12 @@ pub(crate) async fn dispatch_with_deferred(
         "Accessibility" => {
             domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
         }
-        "HeapProfiler" if method == "collectGarbage" => {
-            match ctx.get_session_page_mut(&req.session_id).and_then(|page| page.js.as_mut()) {
-                Some(js) => {
-                    js.collect_garbage();
-                    Ok(json!({}))
-                }
-                None => Err("No JavaScript runtime".to_string()),
-            }
-        }
+        "HeapProfiler" => domains::heapprofiler::handle(method, &req.params, ctx, &req.session_id).await,
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
         "Log" | "Performance" | "Security" | "CSS" | "ServiceWorker" | "Inspector" | "Debugger"
-        | "Profiler" | "HeapProfiler" | "Overlay" | "Audits" => Ok(json!({})),
+        | "Profiler" | "Overlay" | "Audits" => Ok(json!({})),
         _ => Err(format!("Unknown domain: {}", domain)),
     };
 

@@ -4,6 +4,7 @@ pub mod dom;
 pub mod domsnapshot;
 pub mod emulation;
 pub mod fetch;
+pub mod heapprofiler;
 pub mod input;
 pub mod io;
 pub mod lp;
